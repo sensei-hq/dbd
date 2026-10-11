@@ -18,11 +18,13 @@ mod apply;
 mod env_guard;
 mod hooks;
 mod import;
+mod marks;
 mod plan;
 mod reconcile;
 mod reset;
 mod scope;
 
+pub use marks::DatabaseMarks;
 pub use plan::{ApplyStrategy, ExecutionPlan, ExecutionStep, build_execution_plan};
 pub use reset::{KeptRole, ResetComplete};
 
@@ -67,6 +69,10 @@ pub struct MigrationPreview {
     /// The migration steps the run takes, in the order it takes them. Empty
     /// when the run migrates nothing.
     pub steps: Vec<MigrationStepPreview>,
+    /// The versions the run records as applied. Not empty with `steps` empty
+    /// for a scoped run that none of the pending migrations touch: it runs
+    /// nothing for them, and still records them and moves the database on.
+    pub recorded: Vec<u32>,
 }
 
 /// One migration step of a run, for a preview.
@@ -90,8 +96,14 @@ pub struct MigrationStepPreview {
 pub enum MigrationAction {
     /// A migration added it; its DDL creates it.
     Create,
-    /// A migration altered it; its `.sql` and `.data.sql` run.
+    /// A migration adds values to it (an enum); they run, and commit, before
+    /// the rest of the version.
+    EnumValues,
+    /// A migration altered it; its `.sql` runs.
     Migrate,
+    /// A migration altered it; its `.data.sql` runs, after every schema change
+    /// of the same version.
+    Data,
     /// A migration dropped it; its drop script runs where it still exists.
     Drop,
 }
@@ -271,14 +283,16 @@ fn ensure_reconcile_not_destructive(plan: &crate::reconcile::ReconcilePlan, allo
     if !plan.destructive || allow_destructive {
         return Ok(());
     }
+    // What is destructive, and only that: listing every altered table named
+    // ones that merely gained a column.
     let details: String = plan
-        .altered
+        .destructive_changes
         .iter()
-        .map(|s| format!("  {}", s.entity_name))
+        .map(|change| format!("  {change}"))
         .collect::<Vec<_>>()
         .join("\n");
     Err(DbdError::Config(format!(
-        "reconcile would make destructive changes (dropped columns, constraints, or indexes) on:\n{details}\n\
+        "reconcile would make destructive changes:\n{details}\n\
          Re-run with --allow-destructive to proceed."
     )))
 }
@@ -584,6 +598,9 @@ pub struct Design {
     /// compare structure must refuse rather than compare nothing and report a
     /// match.
     parser: crate::parser::ParserChoice,
+    /// `source.search_path`, resolved: the path a migration or hook script
+    /// that states none of its own runs on, and its bare names are read on.
+    search_path: Option<Vec<crate::entity::PathEntry>>,
     /// `source.dialect` as the project wrote it.
     ///
     /// Kept beside [`Self::parser`] because a refusal has to name what the
@@ -592,6 +609,11 @@ pub struct Design {
     /// they typed.
     dialect: String,
 }
+
+/// The phrase [`warn_if_no_search_path`] reports with, so
+/// [`Design::search_path_warnings`] finds its warnings among an entity's
+/// others without a second copy of the rule.
+const NO_SEARCH_PATH: &str = "states no `SET search_path`";
 
 /// Report a DDL file that states no `SET search_path` of its own.
 ///
@@ -633,12 +655,45 @@ fn warn_if_no_search_path(entity: &mut Entity, relative: &std::path::Path) {
         _ => "PostgreSQL's session default (\"$user\", public) — set source.search_path to choose".to_string(),
     };
     entity.warnings.push(format!(
-        "{} states no `SET search_path`; unqualified names resolved against {resolved_against}",
+        "{} {NO_SEARCH_PATH}; unqualified names resolved against {resolved_against}",
         relative.display()
     ));
 }
 
 impl Design {
+    /// The environment this design was loaded for (`-e`): what a run records
+    /// in the database, and what picks its `import/<env>/` data.
+    pub fn env(&self) -> &str {
+        &self.env
+    }
+
+    /// Every DDL file a run under `scope` — narrowed to the entity `name`
+    /// selects, if any — executes that states no `SET search_path`, as a
+    /// warning naming the path its unqualified names were resolved against:
+    /// what `apply` and `deploy` print before they run.
+    ///
+    /// `inspect` counted these and nothing else said them, though the design
+    /// is that a forgotten path is never silent: a file the run executes on a
+    /// path nobody wrote into it is how an object lands in a schema nobody
+    /// chose.
+    pub fn search_path_warnings(&self, name: Option<&str>, scope: Option<&ResolvedScope>) -> Result<Vec<String>> {
+        let entities = match scope {
+            Some(s) => self.scoped_entities(s)?,
+            None => self.entities.clone(),
+        };
+        let named = match name {
+            Some(n) => Some(self.resolve_name(n, scope)?.name.clone()),
+            None => None,
+        };
+        Ok(entities
+            .iter()
+            .filter(|e| named.as_ref().is_none_or(|n| &e.name == n))
+            .flat_map(|e| &e.warnings)
+            .filter(|w| w.contains(NO_SEARCH_PATH))
+            .cloned()
+            .collect())
+    }
+
     /// Which reader this project's DDL was read by.
     ///
     /// Exposed because it decides what a caller may ask for: only a reader
@@ -925,8 +980,23 @@ impl Design {
             env: env.to_string(),
             validated: false,
             parser: parser_choice,
+            search_path: project_search_path,
             dialect: dialect_label,
         })
+    }
+
+    /// `source.search_path`, resolved — `None` when the project sets none.
+    /// What a migration or hook script stating no path of its own runs on.
+    pub(crate) fn script_search_path(&self) -> Option<&[crate::entity::PathEntry]> {
+        self.search_path.as_deref()
+    }
+
+    /// Where the hooks are read from, and the path they run on.
+    pub(in crate::design) fn hook_source(&self) -> hooks::HookSource<'_> {
+        hooks::HookSource {
+            dir: &self.project_dir,
+            search_path: self.script_search_path(),
+        }
     }
 
     /// Access the parsed config.
@@ -1172,11 +1242,21 @@ impl Design {
     /// subgraph; `scope` filters to that scope's working set (`None` ⇒ full set).
     pub fn graph(&self, name: Option<&str>, scope: Option<&ResolvedScope>) -> Result<dependency::GraphResult> {
         // An unknown or out-of-scope name produced an empty graph — a valid
-        // document, indistinguishable from an entity with no dependencies.
-        if let Some(n) = name {
-            self.resolve_name(n, scope)?;
+        // document, indistinguishable from an entity with no dependencies. So
+        // did an `external:` one: dbd has no DDL for it, so it is no node of
+        // the graph, and `inspect -n` and `apply -n` refuse it alike.
+        if let Some(n) = name
+            && self.resolve_name(n, scope)?.entity_type == EntityType::External
+        {
+            return Err(DbdError::Config(format!(
+                "{n} is declared `external:` — dbd has no DDL for it, so it has no place in the dependency \
+                 graph; it only resolves references to it"
+            )));
         }
-        let graphable = crate::scope::is_scopable;
+        // A file dbd could not parse is left out, as `dbd graph` tells the user
+        // it is (`Design::unparsed`): kept as a node, it sat in a layer and at
+        // the end of an edge although nothing about it was read.
+        let graphable = |e: &Entity| crate::scope::is_scopable(e) && e.errors.is_empty();
         let non_meta: Vec<Entity> = match scope {
             Some(s) => {
                 let ws = self.working_set(s)?;
@@ -1512,16 +1592,21 @@ mod tests {
         }
     }
 
+    /// The marks of a database whose only record is `m`, this project's.
+    fn own(m: &crate::adapter::ProjectMeta) -> DatabaseMarks {
+        DatabaseMarks::of_own("p", Some(m.clone()))
+    }
+
     #[test]
     fn scope_guard_allows_matching_scope() {
         let m = meta_with_scope(Some("public"));
-        assert!(Design::check_scope_guard(Some(&m), "public", false).is_ok());
+        assert!(Design::check_scope_guard(&own(&m), "public", false).is_ok());
     }
 
     #[test]
     fn scope_guard_blocks_mismatch() {
         let m = meta_with_scope(Some("public"));
-        let err = Design::check_scope_guard(Some(&m), "internal", false).unwrap_err();
+        let err = Design::check_scope_guard(&own(&m), "internal", false).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("public") && msg.contains("internal"), "msg was: {msg}");
     }
@@ -1529,14 +1614,14 @@ mod tests {
     #[test]
     fn scope_guard_unpinned_never_blocks() {
         let m = meta_with_scope(None);
-        assert!(Design::check_scope_guard(Some(&m), "internal", false).is_ok());
-        assert!(Design::check_scope_guard(None, "internal", false).is_ok());
+        assert!(Design::check_scope_guard(&own(&m), "internal", false).is_ok());
+        assert!(Design::check_scope_guard(&DatabaseMarks::of_own("p", None), "internal", false).is_ok());
     }
 
     #[test]
     fn scope_guard_allow_scope_change_bypasses() {
         let m = meta_with_scope(Some("public"));
-        assert!(Design::check_scope_guard(Some(&m), "internal", true).is_ok());
+        assert!(Design::check_scope_guard(&own(&m), "internal", true).is_ok());
     }
 
     #[test]
@@ -1630,6 +1715,69 @@ mod tests {
         assert!(!graph.nodes.is_empty());
         assert!(graph.nodes.iter().all(|n| !n.name.starts_with("staging.")));
         assert!(graph.nodes.iter().any(|n| n.name.starts_with("config.")));
+    }
+
+    /// `dbd graph` said a file it could not parse "is left out" — and kept its
+    /// entity in `nodes`, in `layers`, and at the end of an edge. The graph now
+    /// leaves it out as the message says: no node, no layer entry, no edge to
+    /// it, whole or scoped.
+    #[test]
+    fn graph_leaves_out_an_entity_whose_file_does_not_parse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\nschemas:\n  - app\nscopes:\n  app_only:\n    includes: [app]\n",
+        )
+        .unwrap();
+        for (name, sql) in [
+            ("good", "create table if not exists app.good (id int primary key);\n"),
+            (
+                "bad",
+                "create table if not exists app.bad (id int primary key,, oops;\n",
+            ),
+            (
+                "child",
+                "create table if not exists app.child (id int primary key, bad_id int references app.bad (id));\n",
+            ),
+        ] {
+            std::fs::write(dir.join(format!("ddl/table/app/{name}.ddl")), sql).unwrap();
+        }
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let all = design.resolve_scope(None, None).unwrap();
+        let scoped = design.resolve_scope(Some("app_only"), None).unwrap();
+        for (label, graph) in [
+            ("unscoped", design.graph(None, None).unwrap()),
+            ("all", design.graph(None, Some(&all)).unwrap()),
+            ("scoped", design.graph(None, Some(&scoped)).unwrap()),
+        ] {
+            let names: Vec<&str> = graph.nodes.iter().map(|n| n.name.as_str()).collect();
+            assert!(
+                names.contains(&"app.good") && names.contains(&"app.child"),
+                "{label}: {names:?}"
+            );
+            assert!(!names.contains(&"app.bad"), "{label}: no node for app.bad: {names:?}");
+            assert!(
+                graph.layers.iter().flatten().all(|n| n != "app.bad"),
+                "{label}: no layer holds app.bad: {:?}",
+                graph.layers
+            );
+            assert!(
+                graph.edges.iter().all(|e| e.from != "app.bad" && e.to != "app.bad"),
+                "{label}: no edge reaches app.bad"
+            );
+        }
+        assert_eq!(
+            design
+                .unparsed(&all)
+                .unwrap()
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["app.bad"],
+            "and it is the one named as left out"
+        );
     }
 
     #[tokio::test]
@@ -2281,26 +2429,84 @@ import:
         assert!(result.unwrap_err().to_string().contains("prod"));
     }
 
-    /// `combine` writes the script `apply` would run. Apply adds `public` to every
-    /// `SET search_path` (so an extension installed there resolves); combine
-    /// wrote the files as they were, and `psql -f init.sql` failed where apply
-    /// succeeded.
+    /// `combine` writes the script `apply` would run. Apply keeps `public` on
+    /// every path a file's own `SET search_path` sets (so an extension installed
+    /// there resolves); combine wrote the files as they were, and `psql -f
+    /// init.sql` failed where apply succeeded. The file's own statement is
+    /// still written exactly as it is — `public` comes from a statement of its
+    /// own after it.
     #[test]
     fn combine_writes_the_search_path_apply_uses() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
         std::fs::write(dir.join("design.yaml"), "project:\n  name: t\nschemas:\n  - app\n").unwrap();
-        std::fs::write(
-            dir.join("ddl/table/app/t.ddl"),
-            "set search_path to app;\ncreate table if not exists t (id uuid primary key default uuid_generate_v4());\n",
-        )
-        .unwrap();
+        let file =
+            "set search_path to app;\ncreate table if not exists t (id uuid primary key default uuid_generate_v4());\n";
+        std::fs::write(dir.join("ddl/table/app/t.ddl"), file).unwrap();
         let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
         let out = dir.join("init.sql");
         design.combine(&out, None).unwrap();
         let sql = std::fs::read_to_string(&out).unwrap();
-        assert!(sql.contains("set search_path to app, public;"), "{sql}");
+        assert_eq!(
+            search_path_per_table(&sql).get("t").map(Vec::as_slice),
+            Some(["app".to_string(), "public".to_string()].as_slice()),
+            "the table runs on the file's path, then public:\n{sql}"
+        );
+        assert!(
+            sql.contains("set search_path to app;\n"),
+            "the file's own statement is not rewritten:\n{sql}"
+        );
+    }
+
+    /// The `set search_path to …;` rewrite matched text anywhere, up to the next
+    /// `;`. Supabase's advice for a `SECURITY DEFINER` function is a `SET
+    /// search_path = ''` clause; with `to` it became `'' as $$ select 1, public;`
+    /// and the function failed with `column "public" does not exist`. A string
+    /// literal or a function body quoting the statement was altered the same
+    /// way. Only a top-level `SET search_path` statement is one, and none of
+    /// the text — clause, literal, body — is touched.
+    #[test]
+    fn combine_leaves_every_search_path_text_but_a_statement_as_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/function/app")).unwrap();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        std::fs::write(dir.join("design.yaml"), "project:\n  name: t\nschemas:\n  - app\n").unwrap();
+        let files = [
+            (
+                "ddl/function/app/secure.ddl",
+                "create or replace function app.secure() returns int\n\
+                 language sql security definer set search_path = ''\nas $$ select 1; $$;\n",
+            ),
+            (
+                "ddl/function/app/secure_to.ddl",
+                "create or replace function app.secure_to() returns int\n\
+                 language sql security definer set search_path to ''\nas $$ select 2; $$;\n",
+            ),
+            (
+                "ddl/function/app/greet.ddl",
+                "create or replace function app.greet() returns text\n\
+                 language plpgsql set search_path to app\nas $$ begin return 'g; ok'; end; $$;\n",
+            ),
+            (
+                "ddl/table/app/notes.ddl",
+                "create table if not exists app.notes (id int primary key, \
+                 body text default 'set search_path to x; y', \
+                 note text default E'set search_path to x;\\' y');\n",
+            ),
+        ];
+        for (rel, sql) in files {
+            std::fs::write(dir.join(rel), sql).unwrap();
+        }
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let out = dir.join("init.sql");
+        design.combine(&out, None).unwrap();
+        let sql = std::fs::read_to_string(&out).unwrap();
+        for (rel, text) in files {
+            assert!(sql.contains(text.trim_end()), "{rel} is written byte for byte:\n{sql}");
+        }
+        assert!(pg_query::parse(&sql).is_ok(), "the script parses:\n{sql}");
     }
 
     /// The search path each `CREATE TABLE` in `sql` runs under: the args of the
@@ -2705,7 +2911,7 @@ import:
 
         let result = design.reset(&mock, "postgres", false, false, false, None).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("migrations"));
+        assert!(result.unwrap_err().to_string().contains("versioned at v1"));
     }
 
     #[tokio::test]
@@ -3437,6 +3643,130 @@ import:
             })
             .collect();
         assert!(dropped.contains(&("config.legacy", 2)));
+    }
+
+    /// The refusal of a destructive reconcile listed every altered table under
+    /// "dropped columns, constraints, or indexes" — here `app.b`, which only
+    /// gains a column. It lists what is destructive, and what each drops.
+    #[test]
+    fn the_destructive_refusal_lists_only_what_is_destructive() {
+        use crate::snapshot::{Snapshot, TableSnapshot};
+        let column = |name: &str| crate::entity::ColumnDef {
+            name: name.to_string(),
+            data_type: "text".to_string(),
+            nullable: true,
+            default_value: None,
+            is_pk: false,
+            is_unique: false,
+            identity: None,
+            generated: None,
+            comment: None,
+            inline_fk: None,
+            collation: None,
+        };
+        let table = |name: &str, columns: &[&str]| TableSnapshot {
+            name: name.to_string(),
+            schema: "app".to_string(),
+            columns: columns.iter().map(|c| column(c)).collect(),
+            indexes: vec![],
+            table_constraints: vec![],
+        };
+        let snap = |tables: Vec<TableSnapshot>| Snapshot {
+            version: 0,
+            description: String::new(),
+            timestamp: String::new(),
+            tables,
+            enums: vec![],
+        };
+        let live = snap(vec![table("a", &["id", "gone"]), table("b", &["id"])]);
+        let desired = snap(vec![table("a", &["id"]), table("b", &["id", "added"])]);
+
+        let plan = crate::reconcile::plan_reconcile(&live, &desired);
+        let err = ensure_reconcile_not_destructive(&plan, false).unwrap_err().to_string();
+
+        assert!(err.contains("app.a") && err.contains("gone"), "{err}");
+        assert!(
+            !err.contains("app.b"),
+            "a table only gaining a column is not destructive: {err}"
+        );
+    }
+
+    /// A database versioned at v4 by a fresh install has no migration
+    /// recorded, but `reset` refused it as one with "applied migrations".
+    #[test]
+    fn reset_refuses_a_versioned_database_saying_it_is_versioned() {
+        let meta = crate::adapter::ProjectMeta {
+            project: "p".to_string(),
+            env: "dev".to_string(),
+            version: 4,
+            scope: None,
+            applied_at: None,
+        };
+        let marks = crate::design::DatabaseMarks::of_own("p", Some(meta));
+        let err = Design::check_reset_guard(&marks).unwrap_err().to_string();
+        assert!(err.contains("versioned at v4"), "{err}");
+        assert!(!err.contains("applied migrations"), "{err}");
+    }
+
+    /// The position of the first step `matches` picks out, for asserting order.
+    fn step_at(plan: &ExecutionPlan, matches: impl Fn(&ExecutionStep) -> bool) -> usize {
+        plan.steps
+            .iter()
+            .position(matches)
+            .unwrap_or_else(|| panic!("no such step in {:#?}", plan.steps))
+    }
+
+    /// Migrations ran entity by entity: every pending migration of `t`, then
+    /// every one of `u`, in dependency order. So v3's change to `t` ran before
+    /// v2's change to `u`, and a v3 script reading what v2 adds failed on a
+    /// jump that a stepwise upgrade survived. Each version now runs whole, and
+    /// is recorded, before the next one starts.
+    #[test]
+    fn each_pending_version_runs_whole_before_the_next() {
+        let entities = vec![test_entity("s.t"), test_entity("s.u")];
+        let migrations = vec![
+            test_migration(1, 2, vec![], vec!["s.u"], vec![]),
+            test_migration(2, 3, vec![], vec!["s.t"], vec![]),
+        ];
+
+        let plan = build_execution_plan(&entities, 1, 3, &migrations, None);
+
+        let v2_u = step_at(
+            &plan,
+            |s| matches!(s, ExecutionStep::MigrateEntity { entity_name, migration_version: 2, .. } if entity_name == "s.u"),
+        );
+        let v2_recorded = step_at(&plan, |s| {
+            matches!(s, ExecutionStep::RecordMigration { version: 2, .. })
+        });
+        let v3_t = step_at(
+            &plan,
+            |s| matches!(s, ExecutionStep::MigrateEntity { entity_name, migration_version: 3, .. } if entity_name == "s.t"),
+        );
+        assert!(v2_u < v2_recorded && v2_recorded < v3_t, "{:#?}", plan.steps);
+    }
+
+    /// v2 drops a table and v5 adds it back. The create of v5 ran first — a
+    /// no-op over the old table — and v2's drop after it, so the run ended at
+    /// v5 with no table.
+    #[test]
+    fn a_later_versions_create_runs_after_an_earlier_versions_drop() {
+        let entities = vec![test_entity("app.counters")];
+        let migrations = vec![
+            test_migration(1, 2, vec![], vec![], vec!["app.counters"]),
+            test_migration(4, 5, vec!["app.counters"], vec![], vec![]),
+        ];
+
+        let plan = build_execution_plan(&entities, 1, 5, &migrations, None);
+
+        let dropped = step_at(
+            &plan,
+            |s| matches!(s, ExecutionStep::DropEntity { entity_name, migration_version: 2, .. } if entity_name == "app.counters"),
+        );
+        let created = step_at(
+            &plan,
+            |s| matches!(s, ExecutionStep::CreateEntity(n) if n == "app.counters"),
+        );
+        assert!(dropped < created, "{:#?}", plan.steps);
     }
 
     // ════════════════════════════════════════════════════════

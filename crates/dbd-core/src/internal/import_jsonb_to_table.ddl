@@ -7,8 +7,11 @@
 --
 -- Handles four column categories via pg_catalog:
 --   • json / jsonb (and domains over them) — (data->'col')::type: the JSON value
---     itself, so a string scalar keeps its quotes and a JSON null stays the JSON
---     value null. An absent key is SQL NULL.
+--     itself, so a string scalar keeps its quotes. `null` is SQL NULL, as for
+--     every other column; the JSON value null is written {"$json": null}, and
+--     any one-key {"$json": …} object is unwrapped one level, so a value that
+--     is itself such an object survives as {"$json": {"$json": …}}. An absent
+--     key is SQL NULL.
 --   • Enums (typtype = 'e')  — (data->>'col')::schema.enumtype
 --   • Arrays (typcategory = 'A') — JSON array → PG array via json_array_elements_text
 --     (json_array_elements for an array of json/jsonb); NULL-safe (returns SQL NULL
@@ -66,7 +69,16 @@ begin
                in ('pg_catalog.json'::pg_catalog.regtype, 'pg_catalog.jsonb'::pg_catalog.regtype)
             -- json/jsonb: the JSON value, not its text — `->>` strips a string's
             -- quotes (so the cast fails) and turns a JSON null into SQL NULL.
-            then format('(data::pg_catalog.json->%L)::%s', a.attname, format_type(a.atttypid, a.atttypmod))
+            then format(
+                   $f$case
+                        when pg_catalog.json_typeof(data::pg_catalog.json->%1$L) = 'object'
+                         and (data::pg_catalog.json->%1$L->'$json') is not null
+                         and (select count(*) from pg_catalog.json_object_keys(data::pg_catalog.json->%1$L)) = 1
+                        then (data::pg_catalog.json->%1$L->'$json')::%2$s
+                        when pg_catalog.json_typeof(data::pg_catalog.json->%1$L) = 'null' then null
+                        else (data::pg_catalog.json->%1$L)::%2$s
+                   end$f$,
+                   a.attname, format_type(a.atttypid, a.atttypmod))
 
           when t.typtype = 'e'
             -- Enum scalar: cast text to qualified enum type

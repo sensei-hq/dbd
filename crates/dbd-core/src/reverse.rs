@@ -485,6 +485,70 @@ impl Declared {
     }
 }
 
+/// What a capture of the `selected` schemas needs from outside them, judged
+/// from the database's `deps` (see [`crate::adapter::Dependency`]).
+///
+/// An extension the captured objects use is the database's, not a schema's,
+/// so it is added to `declared` when it can be declared: installed into
+/// `public` (an entry without `schema:`) or into a captured schema. Anything
+/// else they need from a schema left out — a type, a function, a table a view
+/// reads, an extension installed in a left-out schema — is returned as one
+/// line per object, naming what needs it: a database without it cannot take
+/// the project. Left alone: what `declared` already declares external (the
+/// tables foreign keys reach), and the `platform` schemas a Supabase database
+/// provides itself.
+pub fn outside_needs(
+    deps: &[crate::adapter::Dependency],
+    selected: &[String],
+    platform: &[String],
+    declared: &mut Declared,
+) -> Vec<String> {
+    let mut needs: std::collections::BTreeMap<(String, String), std::collections::BTreeSet<&str>> =
+        std::collections::BTreeMap::new();
+    for dep in deps.iter().filter(|d| selected.contains(&d.dependent_schema)) {
+        let (what, schema) = match &dep.extension {
+            Some((extension, _)) if declared.extensions.iter().any(|(name, _)| name == extension) => continue,
+            Some((extension, schema)) if schema == "public" || selected.contains(schema) => {
+                declared
+                    .extensions
+                    .push((extension.clone(), (schema != "public").then(|| schema.clone())));
+                continue;
+            }
+            Some((_, schema)) if platform.contains(schema) => continue,
+            Some((extension, schema)) => (
+                format!("extension `{extension}`, installed in schema `{schema}`"),
+                schema.clone(),
+            ),
+            None => match &dep.referenced_schema {
+                Some(schema)
+                    if !selected.contains(schema)
+                        && !platform.contains(schema)
+                        && !declared.externals.contains(&dep.referenced) =>
+                {
+                    (
+                        format!("{} `{}`, in schema `{schema}`", dep.referenced_kind, dep.referenced),
+                        schema.clone(),
+                    )
+                }
+                _ => continue,
+            },
+        };
+        needs.entry((what, schema)).or_default().insert(&dep.dependent);
+    }
+    declared.extensions.sort();
+    declared.extensions.dedup();
+    needs
+        .into_iter()
+        .map(|((what, schema), users)| {
+            format!(
+                "needs: {what}, which is left out — used by {}; a database without it cannot take this \
+                 project (capture it with --schema {schema}, or create it first)",
+                users.into_iter().collect::<Vec<_>>().join(", ")
+            )
+        })
+        .collect()
+}
+
 /// A YAML scalar for an identifier: plain when it is one YAML reads back as
 /// the same string, double-quoted otherwise.
 fn yaml_scalar(value: &str) -> String {
@@ -889,6 +953,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "tags".into(),
@@ -901,6 +966,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
             ],
             constraints: vec![TableConstraint::PrimaryKey {

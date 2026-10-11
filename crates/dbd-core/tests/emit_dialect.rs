@@ -391,6 +391,143 @@ fn foreign_keys_are_emitted_on_every_target() {
     }
 }
 
+/// A foreign key's `DEFERRABLE INITIALLY DEFERRED` and `MATCH FULL` are part
+/// of what it enforces. SQLite defers a key exactly so, and carries it; MySQL
+/// and SQL Server defer nothing; SQLite parses `MATCH FULL` and enforces it as
+/// `MATCH SIMPLE`, as does MySQL — so on those the key is emitted without the
+/// clause and the loss is reported, never dropped in silence.
+#[test]
+fn a_foreign_keys_deferral_and_match_are_carried_or_reported() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: emitted\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/parent.ddl"),
+        "set search_path to app;\ncreate table if not exists parent (id integer primary key, code integer, \
+         constraint parent_id_code unique (id, code));\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/child.ddl"),
+        "set search_path to app;\ncreate table if not exists child (\n  id integer primary key\n, pid integer\n, pcode integer\n, \
+         constraint child_pid_fk foreign key (pid) references parent (id) deferrable initially deferred\n, \
+         constraint child_full_fk foreign key (pid, pcode) references parent (id, code) match full\n);\n",
+    )
+    .unwrap();
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load");
+
+    let reported = |report: &[Downgrade], what: &str| {
+        report
+            .iter()
+            .any(|d| d.entity.ends_with("child") && d.from.to_uppercase().contains(what))
+    };
+    let (sql, report) = emit_schema(&design, Dialect::Sqlite, None).expect("emits");
+    assert!(
+        sql.to_uppercase().contains("DEFERRABLE INITIALLY DEFERRED"),
+        "SQLite defers: {sql}"
+    );
+    assert!(!reported(&report, "DEFERRABLE"), "carried, so not reported: {report:?}");
+    assert!(
+        reported(&report, "MATCH FULL"),
+        "SQLite does not enforce MATCH FULL: {report:?}"
+    );
+    for dialect in [Dialect::MySql, Dialect::TSql] {
+        let (sql, report) = emit_schema(&design, dialect, None).expect("emits");
+        // The statements, not the inline notes that report the loss.
+        let upper: String = sql
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_uppercase();
+        assert!(
+            !upper.contains("DEFERRABLE") && !upper.contains("MATCH FULL"),
+            "{dialect:?} has neither clause: {sql}"
+        );
+        assert!(
+            reported(&report, "DEFERRABLE"),
+            "{dialect:?}: deferral lost: {report:?}"
+        );
+        assert!(
+            reported(&report, "MATCH FULL"),
+            "{dialect:?}: MATCH FULL lost: {report:?}"
+        );
+    }
+}
+
+/// A column's `COLLATE "C"` names a PostgreSQL collation; no target knows
+/// that name, so the column takes the target's default and the change in how
+/// its values sort and compare is reported.
+#[test]
+fn a_columns_collation_is_reported_on_every_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: emitted\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/codes.ddl"),
+        "set search_path to app;\ncreate table if not exists codes (\n  id integer primary key\n, code varchar(20) collate \"C\"\n);\n",
+    )
+    .unwrap();
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load");
+    for dialect in [Dialect::MySql, Dialect::TSql, Dialect::Sqlite] {
+        let (sql, report) = emit_schema(&design, dialect, None).expect("emits");
+        assert!(
+            report.iter().any(|d| d.entity.ends_with("codes")
+                && d.column.as_deref() == Some("code")
+                && d.from.contains("COLLATE")),
+            "{dialect:?}: the collation is reported: {report:?}\n{sql}"
+        );
+    }
+}
+
+/// No other engine has `EXCLUDE`. The table is emitted without it and the
+/// loss reported — two bookings of one room may then overlap — never dropped
+/// in silence.
+#[test]
+fn an_exclusion_constraint_is_reported_on_every_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: emitted\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/rooms.ddl"),
+        "set search_path to app;\ncreate table if not exists rooms (\n  id integer primary key\n, room integer not null\n, \
+         during tstzrange not null\n, constraint no_overlap exclude using gist (room with =, during with &&)\n);\n",
+    )
+    .unwrap();
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load");
+    for dialect in [Dialect::MySql, Dialect::TSql, Dialect::Sqlite] {
+        let (sql, report) = emit_schema(&design, dialect, None).expect("emits");
+        let statements: String = sql
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_uppercase();
+        assert!(!statements.contains("EXCLUDE"), "{dialect:?} has no EXCLUDE: {sql}");
+        assert!(
+            report
+                .iter()
+                .any(|d| d.entity.ends_with("rooms") && d.from.contains("no_overlap") && d.from.contains("EXCLUDE")),
+            "{dialect:?}: the lost constraint is reported: {report:?}"
+        );
+    }
+}
+
 /// CHECK exists everywhere, but its expression is PostgreSQL SQL that dbd does
 /// not translate — so it is emitted AND reported, the way a view body is.
 #[test]
@@ -2176,4 +2313,160 @@ fn a_mysql_clock_default_has_its_columns_fractional_precision() {
     ] {
         assert!(sql.contains(line), "{line}:\n{sql}");
     }
+}
+
+// ── Key names and NULLS NOT DISTINCT ────────────────────────────────────────
+
+/// Named keys, table-level and inline, and a UNIQUE that treats NULLs as
+/// equal — at table level and on a column.
+const NAMED_KEYS: [(&str, &str); 2] = [
+    (
+        "table/app/t.ddl",
+        "create table t (id integer, code varchar(40), alt varchar(40), \
+         constraint t_pk primary key (id), \
+         constraint t_code_uq unique nulls not distinct (code), \
+         constraint t_alt_uq unique (alt));",
+    ),
+    (
+        "table/app/u.ddl",
+        "create table u (id integer constraint u_pk primary key, \
+         email varchar(40) constraint u_email_uq unique, \
+         phone varchar(40) unique nulls not distinct);",
+    ),
+];
+
+/// `emit` wrote every primary key and UNIQUE without its name — `PRIMARY KEY
+/// (id)` for `constraint t_pk primary key (id)`, and an inline `constraint
+/// u_pk primary key` the same. SQL Server and SQLite take `CONSTRAINT name`
+/// on both, and MySQL on a UNIQUE; MySQL names every primary key `PRIMARY`,
+/// so there the name is reported instead of written.
+#[test]
+fn key_names_are_written_where_the_target_keeps_them() {
+    let keys = [
+        ("t_pk", "PRIMARY KEY"),
+        ("t_code_uq", "UNIQUE"),
+        ("t_alt_uq", "UNIQUE"),
+        ("u_pk", "PRIMARY KEY"),
+        ("u_email_uq", "UNIQUE"),
+    ];
+    for dialect in [Dialect::TSql, Dialect::Sqlite] {
+        let (sql, report) = emit_with(dialect, "", &NAMED_KEYS, None);
+        for (name, kind) in keys {
+            let quoted = if dialect == Dialect::TSql {
+                format!("[{name}]")
+            } else {
+                format!("\"{name}\"")
+            };
+            assert!(
+                sql.contains(&format!("CONSTRAINT {quoted} {kind} (")),
+                "{dialect:?}: `{name}` is written on its {kind}:\n{sql}"
+            );
+        }
+        assert!(
+            !report.iter().any(|d| d.from.contains("_pk") || d.from.contains("_uq`")),
+            "{dialect:?}: a name the target keeps is no loss: {report:?}"
+        );
+    }
+
+    let (mysql, report) = emit_with(Dialect::MySql, "", &NAMED_KEYS, None);
+    for name in ["t_code_uq", "t_alt_uq", "u_email_uq"] {
+        assert!(
+            mysql.contains(&format!("CONSTRAINT `{name}` UNIQUE (")),
+            "MySQL keeps a UNIQUE's name `{name}`:\n{mysql}"
+        );
+    }
+    for (table, name) in [("app.t", "t_pk"), ("app.u", "u_pk")] {
+        assert!(
+            !mysql.contains(&format!("CONSTRAINT `{name}`")),
+            "MySQL ignores it, so it is not written:\n{mysql}"
+        );
+        assert!(
+            report
+                .iter()
+                .any(|d| d.entity == table && d.from.contains(name) && d.to.contains("PRIMARY")),
+            "MySQL reports the primary key's lost name `{name}`: {report:?}"
+        );
+    }
+}
+
+/// `UNIQUE NULLS NOT DISTINCT` refuses a second row with a NULL key; MySQL's
+/// and SQLite's UNIQUE admit it. `emit` wrote a plain UNIQUE and said nothing.
+/// SQL Server's UNIQUE already admits one NULL, so there it is faithful.
+#[test]
+fn a_lost_nulls_not_distinct_is_reported() {
+    for dialect in [Dialect::MySql, Dialect::Sqlite] {
+        let (_, report) = emit_with(dialect, "", &NAMED_KEYS, None);
+        for (table, key) in [("app.t", "code"), ("app.u", "phone")] {
+            assert!(
+                report
+                    .iter()
+                    .any(|d| d.entity == table && d.from.contains("NULLS NOT DISTINCT") && d.from.contains(key)),
+                "{dialect:?}: the UNIQUE on `{key}` loses NULLS NOT DISTINCT: {report:?}"
+            );
+        }
+    }
+    let (_, report) = emit_with(Dialect::TSql, "", &NAMED_KEYS, None);
+    assert!(
+        !report.iter().any(|d| d.from.contains("NULLS NOT DISTINCT")),
+        "SQL Server's UNIQUE admits one NULL: {report:?}"
+    );
+}
+
+/// The clock on a `time` column is the time of day. SQLite got
+/// `CURRENT_TIMESTAMP` — a date and a time in a column of times — and MySQL
+/// a `TIME` defaulting to `CURRENT_TIMESTAMP`, which it refuses.
+const CLOCK: [(&str, &str); 1] = [(
+    "table/app/clock.ddl",
+    "create table clock (id integer primary key, starts time default now(), \
+     at time default current_time, stamp timestamptz default now());",
+)];
+
+#[test]
+fn a_clock_default_on_a_time_column_is_the_time_of_day() {
+    let (sqlite, _) = emit_with(Dialect::Sqlite, "", &CLOCK, None);
+    assert!(sqlite.contains("\"starts\" TEXT DEFAULT CURRENT_TIME,"), "{sqlite}");
+    assert!(sqlite.contains("\"at\" TEXT DEFAULT CURRENT_TIME,"), "{sqlite}");
+    assert!(sqlite.contains("\"stamp\" TEXT DEFAULT CURRENT_TIMESTAMP"), "{sqlite}");
+
+    let (mysql, _) = emit_with(Dialect::MySql, "", &CLOCK, None);
+    assert!(mysql.contains("`starts` TIME(6) DEFAULT (CURRENT_TIME(6))"), "{mysql}");
+    assert!(mysql.contains("`at` TIME(6) DEFAULT (CURRENT_TIME(6))"), "{mysql}");
+
+    let (tsql, _) = emit_with(Dialect::TSql, "", &CLOCK, None);
+    assert!(
+        tsql.contains("[starts] time DEFAULT CONVERT(time, SYSDATETIME())"),
+        "{tsql}"
+    );
+    assert!(
+        tsql.contains("[at] time DEFAULT CONVERT(time, SYSDATETIME())"),
+        "{tsql}"
+    );
+}
+
+/// SQLite checks it: a row given only its key gets times of day.
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_fills_a_time_column_with_the_time_of_day() {
+    let (sql, _) = emit_with(Dialect::Sqlite, "", &CLOCK, None);
+    let row = on_sqlite(
+        &sql,
+        "insert into app_clock (id) values (1);",
+        "select (starts glob '[0-2][0-9]:[0-5][0-9]:[0-5][0-9]') || '|' || (at = starts) from app_clock",
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(row, "1|1", "{sql}");
+}
+
+/// Every key fixture above, emitted for SQLite, applies there.
+#[cfg(feature = "sqlite")]
+#[test]
+fn the_emitted_sqlite_script_with_named_keys_applies() {
+    let (sql, _) = emit_with(Dialect::Sqlite, "", &NAMED_KEYS, None);
+    let names = on_sqlite(
+        &sql,
+        "insert into app_t (id, code) values (1, 'a'); insert into app_u (id, email) values (1, 'x');",
+        "select group_concat(name, ',') from (select name from sqlite_master where type = 'table' order by name)",
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(names, "app_t,app_u");
 }

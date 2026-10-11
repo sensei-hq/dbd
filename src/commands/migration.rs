@@ -41,6 +41,47 @@ fn check_reset_target(target: &str) -> Result<()> {
     Ok(())
 }
 
+/// Refuse, before connecting, a reset whose target is not the kind of
+/// database `url` reaches. `flagged` is whether the target came from
+/// `--target` rather than the design.
+///
+/// The target picks the dialect of the drops and the schemas reset protects.
+/// `reset --target postgres` on a SQLite project was accepted, connected, and
+/// failed on PostgreSQL's `CASCADE` — after reading the database, and under
+/// `--force` with nothing said of why.
+fn check_target_matches_connection(target: &str, flagged: bool, url: &str) -> Result<()> {
+    let sqlite = url.starts_with("sqlite:") || url.starts_with("file:");
+    let (connection, fits, instead) = if sqlite {
+        ("SQLite", target == "sqlite", "--target sqlite")
+    } else if url.starts_with("convex:") {
+        // Not a reset target at all; `check_reset_target` says so.
+        return Ok(());
+    } else {
+        (
+            "PostgreSQL",
+            matches!(target, "postgres" | "supabase"),
+            "--target postgres or --target supabase",
+        )
+    };
+    if fits {
+        return Ok(());
+    }
+    let named = if flagged {
+        format!("--target {target}")
+    } else {
+        format!("the design's target, {target},")
+    };
+    anyhow::bail!(
+        "reset: {named} does not match the database — the connection is {connection}. The target picks the \
+         dialect of the drops, so it must be the kind of database the connection reaches: pass {instead}{}.",
+        if flagged {
+            ", or drop --target to use the design's"
+        } else {
+            ""
+        }
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn cmd_reset(
     config: &Path,
@@ -64,8 +105,12 @@ pub async fn cmd_reset(
     let resolved = design.resolve_scope(scope, deps)?;
     let (kept, total) = design.scope_counts(&resolved)?;
     output::scope_filtered(&resolved, kept, total);
+    let flagged = target.is_some();
     let target = reset_target(target, &design);
     check_reset_target(target)?;
+    if let Some(url) = super::configured_database_url(config, database_url)? {
+        check_target_matches_connection(target, flagged, &url)?;
+    }
     if target == "sqlite" && (drop_schemas || drop_extensions) {
         output::warn("SQLite has no schemas or extensions: --schemas, --extensions and --clean change nothing here.");
     }
@@ -78,7 +123,7 @@ pub async fn cmd_reset(
         // preview does not list a `DROP ROLE` the run will not perform.
         let mut kept = Vec::new();
         if let Some(adapter) = super::dry_run_adapter(config, database_url).await? {
-            check_reset_guards(&*adapter, &resolved, force, allow_scope_change).await?;
+            check_reset_guards(&*adapter, &design, &resolved, force, allow_scope_change).await?;
             kept = design.roles_kept_by_reset(&*adapter, target, Some(&resolved)).await?;
         }
         let keep: Vec<String> = kept.iter().map(|k| k.role.clone()).collect();
@@ -194,7 +239,7 @@ pub(crate) async fn reset_with_adapter(
     resolved: &dbd_core::ResolvedScope,
     allow_scope_change: bool,
 ) -> Result<dbd_core::ResetComplete> {
-    check_reset_guards(adapter, resolved, force, allow_scope_change).await?;
+    check_reset_guards(adapter, design, resolved, force, allow_scope_change).await?;
     Ok(design
         .reset(adapter, target, force, drop_schemas, drop_extensions, Some(resolved))
         .await?)
@@ -210,25 +255,37 @@ pub(crate) async fn reset_with_adapter(
 /// layout.
 pub(crate) async fn check_reset_guards(
     adapter: &dyn dbd_core::DatabaseAdapter,
+    design: &Design,
     resolved: &dbd_core::ResolvedScope,
     force: bool,
     allow_scope_change: bool,
 ) -> Result<()> {
-    let meta = adapter.get_project_meta().await?;
-    Design::check_scope_guard(meta.as_ref(), &resolved.name, force || allow_scope_change)?;
+    let marks = design.database_marks(adapter).await?;
+    Design::check_scope_guard(&marks, &resolved.name, force || allow_scope_change)?;
     if !force {
-        Design::check_reset_guard(meta.as_ref())?;
+        Design::check_reset_guard(&marks)?;
     }
     Ok(())
 }
 
 pub async fn cmd_migrate_status(
     config: &Path,
+    env: &str,
     database_url: Option<&str>,
     project_dir: &Path,
     verbosity: Verbosity,
 ) -> Result<()> {
+    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
     let adapter = get_adapter(config, database_url).await?;
+    // The versions are the whole project's; a database pinned to a scope was
+    // built with that scope's entities alone, and said nothing of it.
+    let unscoped = design.resolve_scope(None, None)?;
+    if let Some((pinned, by)) = super::other_scope_pin(&*adapter, &design, &unscoped).await? {
+        output::always(&format!(
+            "note: this database is pinned to scope '{pinned}'{by} — it was built with that scope's \
+             entities, not the whole design."
+        ));
+    }
     migrate_status_with_adapter(&*adapter, project_dir, verbosity).await
 }
 
@@ -673,7 +730,7 @@ mod tests {
     /// `--allow-scope-change` is the documented override for the scope guard, so
     /// the same mismatch then proceeds and the reset runs.
     ///
-    /// The pinned version stays 0 on purpose: a database with applied migrations
+    /// The pinned version stays 0 on purpose: a versioned database
     /// trips a *separate* safety guard that only `--force` clears, which would
     /// mask whether the scope override worked.
     #[tokio::test]

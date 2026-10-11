@@ -78,6 +78,18 @@ pub async fn cmd_diff(
         None => {}
     }
     let adapter = get_adapter(config, database_url).await?;
+    if let Some((pinned, by)) = super::other_scope_pin(&*adapter, &design, &resolved).await? {
+        let note = format!(
+            "note: this database is pinned to scope '{pinned}'{by}; this diff compares scope '{}', so what \
+             '{pinned}' does not build reads as missing — `--scope {pinned}` compares what it was built with.",
+            resolved.name
+        );
+        if json {
+            eprintln!("{note}");
+        } else {
+            output::always(&note);
+        }
+    }
 
     let diff = design
         .diff_live(&*adapter, Some(&resolved))

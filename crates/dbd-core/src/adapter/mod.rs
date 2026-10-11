@@ -28,6 +28,34 @@ pub struct ProjectMeta {
     pub applied_at: Option<String>,
 }
 
+/// One thing an object in the database needs from another: what Postgres
+/// records in `pg_depend` — a column's type, a default's function, a view's
+/// table, an index's operator class — read at the level of whole objects.
+///
+/// Reverse-engineering a few schemas uses it to find what the captured
+/// objects need from outside them: the extensions to declare, and the types,
+/// functions and tables to name, so a scoped capture says what a new database
+/// must already have. A routine's body is not in `pg_depend` (PL/pgSQL is
+/// checked when it runs), so what one calls is not here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dependency {
+    /// The schema of the object that depends.
+    pub dependent_schema: String,
+    /// The object that depends, qualified — `app.t`, `util.prio()`.
+    pub dependent: String,
+    /// What kind of object it needs, as Postgres names it — `type`,
+    /// `function`, `table`, `sequence`.
+    pub referenced_kind: String,
+    /// The schema of the object it needs, when it has one.
+    pub referenced_schema: Option<String>,
+    /// The object it needs, qualified — `ref.mood`, `core.accounts`; a
+    /// column or index is reported as its table.
+    pub referenced: String,
+    /// The extension that owns the object it needs, if one does, and the
+    /// schema that extension installed into.
+    pub extension: Option<(String, String)>,
+}
+
 /// Catalog data loaded from the database for reference classification.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct CatalogData {
@@ -60,6 +88,18 @@ pub trait DatabaseAdapter: Send + Sync {
     // ── DDL execution ──────────────────────────────────
 
     async fn execute_script(&self, sql: &str) -> Result<()>;
+
+    /// Run a project script — a migration file, a hook — that may name tables
+    /// without their schema, on `search_path`: `source.search_path`, or `None`
+    /// when the project sets none.
+    ///
+    /// The default runs it as written, for a target with no search path.
+    /// PostgreSQL opens it with the path a DDL file stating none runs on (see
+    /// [`crate::script::runnable_script`]).
+    async fn execute_project_script(&self, sql: &str, search_path: Option<&[crate::entity::PathEntry]>) -> Result<()> {
+        let _ = search_path;
+        self.execute_script(sql).await
+    }
 
     async fn apply_entity(&self, entity: &Entity) -> Result<()>;
 
@@ -138,6 +178,15 @@ pub trait DatabaseAdapter: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// The live materialized views that read any of `columns` — `(table,
+    /// column)` pairs, the table as `schema.name` — directly or through views,
+    /// as `schema.name`, deepest first. What blocks `ALTER COLUMN … TYPE` on
+    /// those columns and that dbd never drops. Default: none (targets without
+    /// materialized views).
+    async fn matviews_reading_columns(&self, _columns: &[(String, String)]) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
     /// Record `stamp` — a `dbd:hash` sentinel — as the drift stamp of
     /// materialized view `qualified` (`schema.name`). Kept apart from the view's
     /// own comment, which belongs to its author. Default: no-op (targets without
@@ -184,6 +233,23 @@ pub trait DatabaseAdapter: Send + Sync {
     async fn truncate_table(&self, table: &str) -> Result<()> {
         self.execute_script(&format!("TRUNCATE TABLE {}", crate::sql_quote::qualified(table)))
             .await
+    }
+
+    /// Empty every one of `tables` — given in load order, a referenced table
+    /// before one that references it — before an import reloads them.
+    ///
+    /// By default one at a time, through [`Self::truncate_table`], in reverse
+    /// load order so a referencing table empties before the table it holds a
+    /// key to (SQLite enforces foreign keys on dbd's connections), and with
+    /// the table that failed named — the database's own error names none.
+    /// Postgres truncates them in one statement instead (see its override).
+    async fn truncate_tables(&self, tables: &[String]) -> Result<()> {
+        for table in tables.iter().rev() {
+            self.truncate_table(table).await.map_err(|e| {
+                crate::error::DbdError::Config(format!("emptying {table} before its import failed: {e}"))
+            })?;
+        }
+        Ok(())
     }
 
     /// Export a table's data to a file.
@@ -268,6 +334,14 @@ pub trait DatabaseAdapter: Send + Sync {
         ))
     }
 
+    /// What objects in the database need from other objects, at the level of
+    /// whole objects and across schemas or from extensions — see
+    /// [`Dependency`]. Default: nothing known (a source with no catalog of
+    /// dependencies); Postgres overrides.
+    async fn dependencies(&self) -> Result<Vec<Dependency>> {
+        Ok(Vec::new())
+    }
+
     /// Reverse-engineering safety: `Some(version)` if this DB is dbd-managed (a
     /// `_dbd_meta` table exists in ANY schema), reading the applied version for
     /// `self.project` — `0` if the table exists but has no matching row. `None`
@@ -322,6 +396,19 @@ pub trait DatabaseAdapter: Send + Sync {
 
     async fn get_project_meta(&self) -> Result<Option<ProjectMeta>>;
     async fn set_project_meta(&self, env: &str, version: u32, scope: Option<&str>) -> Result<()>;
+
+    /// The record of every OTHER project the database holds — each row whose
+    /// project is not this adapter's — sorted by project. Read-only, under
+    /// either bookkeeping layout, like [`Self::get_project_meta`].
+    ///
+    /// The record is keyed on `project.name`, and more than one project may
+    /// share a database. The guards read these when this project has none but
+    /// the database holds its objects: the mark of a renamed `project.name`
+    /// (see [`crate::design::DatabaseMarks`]). Default: none — a store with one
+    /// record (Convex's state file) reads it as this project's already.
+    async fn other_projects_meta(&self) -> Result<Vec<ProjectMeta>> {
+        Ok(Vec::new())
+    }
 }
 
 /// The records of a JSON data file, each as its own JSON text.

@@ -45,17 +45,46 @@ impl Design {
         }
         let from_version = adapter.get_db_version().await?;
         let pending = snapshot::pending_migrations(from_version, &self.project_dir);
+        refuse_a_named_apply_over_pending_migrations(name, from_version, to_version, &pending)?;
+        ensure_no_pending_todos(&pending)?;
         let owned: Vec<Entity> = entities.iter().map(|e| (*e).clone()).collect();
         let plan = build_execution_plan(&owned, from_version, to_version, &pending, working_set.as_ref());
 
+        // The version each step belongs to: the plan records a version after
+        // its last step, so walking backwards the next record is its own.
+        let mut versions: Vec<u32> = Vec::with_capacity(plan.steps.len());
+        let mut recorded = to_version;
+        for step in plan.steps.iter().rev() {
+            if let ExecutionStep::RecordMigration { version, .. } = step {
+                recorded = *version;
+            }
+            versions.push(recorded);
+        }
+        versions.reverse();
+
         let mut steps = Vec::new();
-        for step in &plan.steps {
+        // The entities whose enum values a version commits first: their
+        // `.sql` runs those statements again as no-ops, so the preview lists
+        // them once, where they take effect.
+        let mut hoisted: std::collections::HashSet<(u32, &str)> = std::collections::HashSet::new();
+        for (step, version) in plan.steps.iter().zip(versions) {
             match step {
+                ExecutionStep::AddEnumValues {
+                    migration_version,
+                    scripts,
+                } => {
+                    for (entity, script) in scripts {
+                        hoisted.insert((*migration_version, entity.as_str()));
+                        steps.push(MigrationStepPreview {
+                            version: *migration_version,
+                            entity: entity.clone(),
+                            action: MigrationAction::EnumValues,
+                            statements: planned_statements_of(script),
+                            runs: true,
+                        });
+                    }
+                }
                 ExecutionStep::CreateEntity(entity) => {
-                    let version = pending
-                        .iter()
-                        .find(|m| m.added.iter().any(|a| a == entity))
-                        .map_or(to_version, |m| m.to_version);
                     steps.push(MigrationStepPreview {
                         version,
                         entity: entity.clone(),
@@ -64,18 +93,43 @@ impl Design {
                         runs: true,
                     });
                 }
+                // An altered entity with no `.sql` of its own — a table whose
+                // version only maps data — runs nothing at this step.
                 ExecutionStep::MigrateEntity {
                     entity_name,
                     migration_sql_path,
                     migration_version,
-                } => {
-                    let mut statements = planned_statements(migration_sql_path)?;
-                    statements.extend(planned_statements(&migration_sql_path.with_extension("data.sql"))?);
+                } if migration_sql_path.exists() => {
+                    let sql = crate::source_text::read_to_string(migration_sql_path)?;
+                    let statements = if hoisted.contains(&(*migration_version, entity_name.as_str())) {
+                        let rest =
+                            planned_statements_where(&sql, |piece| !crate::script::is_enum_value_addition(piece));
+                        // Nothing left once its values moved ahead.
+                        if rest.is_empty() {
+                            continue;
+                        }
+                        rest
+                    } else {
+                        planned_statements_of(&sql)
+                    };
                     steps.push(MigrationStepPreview {
                         version: *migration_version,
                         entity: entity_name.clone(),
                         action: MigrationAction::Migrate,
                         statements,
+                        runs: true,
+                    });
+                }
+                ExecutionStep::MigrateData {
+                    entity_name,
+                    data_sql_path,
+                    migration_version,
+                } => {
+                    steps.push(MigrationStepPreview {
+                        version: *migration_version,
+                        entity: entity_name.clone(),
+                        action: MigrationAction::Data,
+                        statements: planned_statements(data_sql_path)?,
                         runs: true,
                     });
                 }
@@ -93,15 +147,25 @@ impl Design {
                         runs,
                     });
                 }
-                ExecutionStep::ApplyEntity(_)
+                ExecutionStep::MigrateEntity { .. }
+                | ExecutionStep::ApplyEntity(_)
                 | ExecutionStep::RecordMigration { .. }
                 | ExecutionStep::SetVersion(_) => {}
             }
         }
+        let recorded = plan
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                ExecutionStep::RecordMigration { version, .. } => Some(*version),
+                _ => None,
+            })
+            .collect();
         Ok(MigrationPreview {
             from_version,
             to_version,
             steps,
+            recorded,
         })
     }
 
@@ -206,17 +270,25 @@ impl Design {
     {
         let (working_set, valid_entities) = self.gated_apply_set(name, scope)?;
         // Before the first hook or write: a dev run against a database marked
-        // prod is refused, not left to re-mark it (see `check_env_guard`).
-        self.guard_env(adapter).await?;
-
-        // A project older than the database it points at is refused before
+        // prod is refused, not left to re-mark it (see `check_env_guard`). And
+        // a project older than the database it points at is refused before
         // anything runs — the `apply.before` hooks included — and under
-        // `dry_run` too, since the database is there to ask. Read without
-        // healing the bookkeeping, which is itself a write.
-        Self::check_version_guard(
-            adapter.get_db_version().await?,
-            self.config.project.version.unwrap_or(0),
-        )?;
+        // `dry_run` too, since the database is there to ask. Both read the
+        // database's marks without healing the bookkeeping, which is itself a
+        // write.
+        self.check_apply_guards(&self.database_marks(adapter).await?)?;
+        // Also before the first hook, and under `dry_run` (see the function).
+        let db_version = adapter.get_db_version().await?;
+        let latest_version = self.config.project.version.unwrap_or(0);
+        let pending = snapshot::pending_migrations(db_version, &self.project_dir);
+        refuse_a_named_apply_over_pending_migrations(name, db_version, latest_version, &pending)?;
+        // A pending migration whose `data.sql` still holds a `-- TODO:` is
+        // refused here, before the first hook — and under `dry_run`, which
+        // listed it and said "no issues" while the run refused it. A batch
+        // adapter runs no migration, so has none to refuse.
+        if !adapter.prefers_batch_apply() {
+            ensure_no_pending_todos(&pending)?;
+        }
 
         // A hook is filtered against the same working set the entities were.
         // `None` — unscoped or the all-scope — runs every hook, and skips the
@@ -229,7 +301,7 @@ impl Design {
         // entity, so a hook can prepare the ground the DDL lands on.
         let before = hooks::run_hooks(
             adapter,
-            &self.project_dir,
+            self.hook_source(),
             &self.config.apply.before,
             hooks::HookKind::Before,
             hook_scope,
@@ -245,7 +317,7 @@ impl Design {
             // which is a misconfiguration whether or not we are about to write.
             hooks::run_hooks(
                 adapter,
-                &self.project_dir,
+                self.hook_source(),
                 &self.config.apply.after,
                 hooks::HookKind::After,
                 hook_scope,
@@ -277,7 +349,7 @@ impl Design {
             // one backend, exactly the silent no-op this feature removes.
             let after = hooks::run_hooks(
                 adapter,
-                &self.project_dir,
+                self.hook_source(),
                 &self.config.apply.after,
                 hooks::HookKind::After,
                 hook_scope,
@@ -305,9 +377,6 @@ impl Design {
         let db_version = adapter.get_db_version().await?;
         let latest_version = self.config.project.version.unwrap_or(0);
         let pending = snapshot::pending_migrations(db_version, &self.project_dir);
-
-        // Block apply if any pending migration has unresolved data.sql TODOs.
-        ensure_no_pending_todos(&pending)?;
 
         // Filter entities by name if scoped
         let scoped_entities: Vec<Entity> = valid_entities.iter().map(|e| (*e).clone()).collect();
@@ -355,6 +424,10 @@ impl Design {
         // so an interrupted upgrade rolls back to the prior schema instead of
         // leaving objects half-applied. `DBD_NO_TX` opts out for plans that
         // contain non-transactional DDL (e.g. CREATE INDEX CONCURRENTLY).
+        //
+        // The one exception is a version that adds enum values: the run
+        // commits after running them, and carries on in a new transaction —
+        // see `ExecutionStep::AddEnumValues`.
         let use_txn =
             adapter.supports_transactional_apply() && std::env::var_os("DBD_NO_TX").is_none() && !plan.steps.is_empty();
 
@@ -377,6 +450,12 @@ impl Design {
                     &mut progress.on_done,
                 )
                 .await?;
+                // A version's new enum values commit before the rest of it
+                // uses them (see `ExecutionStep::AddEnumValues`).
+                if use_txn && matches!(step, ExecutionStep::AddEnumValues { .. }) {
+                    adapter.commit_batch().await?;
+                    adapter.begin_batch().await?;
+                }
             }
             Ok(())
         }
@@ -447,7 +526,7 @@ impl Design {
         // RLS is independent of them, so it stays last (see `deploy_with_progress`).
         let after = hooks::run_hooks(
             adapter,
-            &self.project_dir,
+            self.hook_source(),
             &self.config.apply.after,
             hooks::HookKind::After,
             hook_scope,
@@ -527,14 +606,60 @@ impl Design {
                         // dbd writes migrations as UTF-8, but a hand-edit in
                         // SSMS does not stay that way — see `source_text`.
                         let sql = crate::source_text::read_to_string(migration_sql_path)?;
-                        adapter.execute_script(&sql).await?;
-                    }
-                    let data_path = migration_sql_path.with_extension("data.sql");
-                    if data_path.exists() {
-                        let sql = crate::source_text::read_to_string(&data_path)?;
-                        adapter.execute_script(&sql).await?;
+                        // Its enum values already ran, and committed, at the
+                        // head of the version; here they are no-ops.
+                        adapter
+                            .execute_project_script(
+                                &crate::script::idempotent_enum_value_additions(&sql),
+                                self.migration_search_path(entity_map.get(entity_name.as_str()).copied()),
+                            )
+                            .await?;
                     }
                     Ok(())
+                }
+                .await;
+                report_step_result(&desc, on_done, result)?;
+                counts.migrated(entity_name);
+            }
+            ExecutionStep::AddEnumValues {
+                migration_version,
+                scripts,
+            } => {
+                for (entity_name, script) in scripts {
+                    let type_tag = entity_map
+                        .get(entity_name.as_str())
+                        .map(|e| e.entity_type.tag())
+                        .unwrap_or_else(|| "entity".to_string());
+                    let desc = format!("add values {type_tag}:{entity_name} → v{migration_version}");
+                    on_start(&desc);
+                    let result = adapter
+                        .execute_project_script(
+                            script,
+                            self.migration_search_path(entity_map.get(entity_name.as_str()).copied()),
+                        )
+                        .await;
+                    report_step_result(&desc, on_done, result)?;
+                }
+            }
+            ExecutionStep::MigrateData {
+                entity_name,
+                data_sql_path,
+                migration_version,
+            } => {
+                let type_tag = entity_map
+                    .get(entity_name.as_str())
+                    .map(|e| e.entity_type.tag())
+                    .unwrap_or_else(|| "entity".to_string());
+                let desc = format!("migrate data {type_tag}:{entity_name} → v{migration_version}");
+                on_start(&desc);
+                let result: Result<()> = async {
+                    let sql = crate::source_text::read_to_string(data_sql_path)?;
+                    adapter
+                        .execute_project_script(
+                            &sql,
+                            self.migration_search_path(entity_map.get(entity_name.as_str()).copied()),
+                        )
+                        .await
                 }
                 .await;
                 report_step_result(&desc, on_done, result)?;
@@ -558,7 +683,10 @@ impl Design {
                     if drop_sql_path.exists() && adapter.resolve_entity(entity_name).await?.is_some() {
                         // Decoded like the migration's `.sql` and `.data.sql`.
                         let sql = crate::source_text::read_to_string(drop_sql_path)?;
-                        adapter.execute_script(&sql).await?;
+                        // Gone from the design, so `source.search_path` alone.
+                        adapter
+                            .execute_project_script(&sql, self.migration_search_path(None))
+                            .await?;
                         return Ok(true);
                     }
                     Ok(false)
@@ -583,6 +711,28 @@ impl Design {
             }
         }
         Ok(())
+    }
+
+    /// The path a migration file of `entity` runs on when it states none of
+    /// its own: the one `entity`'s DDL file runs on — the path that file
+    /// states, else `source.search_path` — and, for a table the design no
+    /// longer has, `source.search_path`. `None` is the session's default.
+    ///
+    /// `dbd snapshot` writes a column's type as the DDL file wrote it, so a
+    /// generated `ADD COLUMN was mood` needs the file's own path to find
+    /// `mood`; the project's alone failed it with `type "mood" does not
+    /// exist` (see [`crate::script::runnable_script`]).
+    fn migration_search_path<'a>(&'a self, entity: Option<&'a Entity>) -> Option<&'a [crate::entity::PathEntry]> {
+        use crate::entity::PathSource;
+        match entity {
+            Some(e)
+                if matches!(e.schema_path.source, PathSource::File | PathSource::Project)
+                    && !e.schema_path.entries.is_empty() =>
+            {
+                Some(&e.schema_path.entries)
+            }
+            _ => self.script_search_path(),
+        }
     }
 
     /// The pre-existing matviews among `applied` that carry no stamp and whose
@@ -666,9 +816,60 @@ impl Design {
             (&self.config.apply.before, hooks::HookKind::Before),
             (&self.config.apply.after, hooks::HookKind::After),
         ] {
-            skips.extend(hooks::plan_hooks(&self.project_dir, entries, kind, hook_scope)?.warnings);
+            skips.extend(hooks::plan_hooks(self.hook_source(), entries, kind, hook_scope)?.warnings);
         }
         Ok(skips)
+    }
+
+    /// The `apply.before` and `apply.after` hooks a run under `scope` executes,
+    /// as `"apply.before sql/x.sql"`, in the order it runs them — the run's own
+    /// decision ([`hooks::plan_hooks`]), made without running anything.
+    ///
+    /// For a preview of a run that executes hooks: `reconcile --dry-run`
+    /// listed the schema changes and never the hooks its run went on to.
+    pub fn apply_hooks_to_run(&self, scope: Option<&ResolvedScope>) -> Result<Vec<String>> {
+        let working_set = self.scope_working_set(scope)?;
+        let hook_scope = self.hook_scope(scope, working_set.as_ref());
+        let hook_scope = hook_scope.as_ref().map(|(name, outside)| (*name, outside));
+        let mut run = Vec::new();
+        for (entries, phase) in [
+            (&self.config.apply.before, "apply.before"),
+            (&self.config.apply.after, "apply.after"),
+        ] {
+            let kind = if phase == "apply.before" {
+                hooks::HookKind::Before
+            } else {
+                hooks::HookKind::After
+            };
+            run.extend(
+                hooks::plan_hooks(self.hook_source(), entries, kind, hook_scope)?
+                    .runnable
+                    .into_iter()
+                    .map(|(script, _)| format!("{phase} {script}")),
+            );
+        }
+        Ok(run)
+    }
+
+    /// The grants a run under `scope` applies, one line per schema —
+    /// `"app: app_reader (usage, select); app_writer (usage, select, insert)"`
+    /// — sorted. Empty when the design declares none. For a preview: the
+    /// grants [`Self::apply_grants`] runs, said without running them.
+    pub fn grants_to_apply(&self, scope: Option<&ResolvedScope>) -> Result<Vec<String>> {
+        let grants = self.declared_grants(scope)?;
+        let mut lines: Vec<String> = grants
+            .into_iter()
+            .map(|(schema, roles)| {
+                let mut roles: Vec<String> = roles
+                    .into_iter()
+                    .map(|(role, privileges)| format!("{role} ({})", privileges.join(", ")))
+                    .collect();
+                roles.sort();
+                format!("{schema}: {}", roles.join("; "))
+            })
+            .collect();
+        lines.sort();
+        Ok(lines)
     }
 
     /// Apply the design's grants: every `schemas:` entry's `grants:`, with the
@@ -848,6 +1049,42 @@ impl Design {
     }
 }
 
+/// Refuse `apply -n <name>` while the run would migrate.
+///
+/// A named apply builds one entity, but a migrating plan records every pending
+/// version and stamps the latest. So `apply -n app.people` ran v8's change to
+/// `app.people` — and v8's drops, of tables it was not named for — skipped the
+/// rest of v8, and recorded v8 as applied; the next full apply said "Already up
+/// to date" over a missing column. Running every pending migration instead
+/// would do far more than the user asked for, so the run refuses and says how
+/// to proceed. With nothing pending, a named apply applies its entity as ever.
+///
+/// Checked before any write — the `apply.before` hooks included — and by the
+/// preview, so a dry run refuses where the run does.
+fn refuse_a_named_apply_over_pending_migrations(
+    name: Option<&str>,
+    db_version: u32,
+    latest_version: u32,
+    pending: &[PendingMigration],
+) -> Result<()> {
+    let Some(name) = name else { return Ok(()) };
+    if !super::plan::migrates(db_version, latest_version, pending) {
+        return Ok(());
+    }
+    let versions: Vec<String> = pending.iter().map(|m| format!("v{}", m.to_version)).collect();
+    let (noun, verb, them) = if versions.len() == 1 {
+        ("migration", "is", "it")
+    } else {
+        ("migrations", "are", "them")
+    };
+    Err(DbdError::Config(format!(
+        "apply -n {name} refused: the database is at v{db_version} and {noun} {} {verb} pending. A named \
+         apply builds one entity and cannot run {them}, and would record {them} as applied. Run `dbd apply` \
+         first to apply {them}, then `dbd apply -n {name}`.",
+        versions.join(", ")
+    )))
+}
+
 /// The statements of a migration file, one line each, for a preview — empty
 /// when there is no such file, as the run then runs nothing for it.
 ///
@@ -860,9 +1097,25 @@ fn planned_statements(path: &std::path::Path) -> Result<Vec<PlannedStatement>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let sql = crate::source_text::read_to_string(path)?;
-    let pieces: Vec<&str> = pg_query::split_with_parser(&sql).unwrap_or_else(|_| vec![sql.as_str()]);
-    Ok(pieces.into_iter().filter_map(planned_statement).collect())
+    Ok(planned_statements_of(&crate::source_text::read_to_string(path)?))
+}
+
+/// [`planned_statements`] of script text.
+fn planned_statements_of(sql: &str) -> Vec<PlannedStatement> {
+    planned_statements_where(sql, |_| true)
+}
+
+/// [`planned_statements_of`], keeping the statements `keep` accepts. A script
+/// the grammar cannot split is shown whole.
+fn planned_statements_where(sql: &str, keep: impl Fn(&str) -> bool) -> Vec<PlannedStatement> {
+    match pg_query::split_with_parser(sql) {
+        Ok(pieces) => pieces
+            .into_iter()
+            .filter(|p| keep(p))
+            .filter_map(planned_statement)
+            .collect(),
+        Err(_) => planned_statement(sql).into_iter().collect(),
+    }
 }
 
 /// One statement as [`planned_statements`] shows it, or `None` for a piece

@@ -333,7 +333,7 @@ pub enum Commands {
     },
     /// Show every difference between the live database and the design
     /// (read-only): columns, PK/unique, foreign keys, CHECK constraints,
-    /// indexes, comments and enums. Unlike `reconcile --dry-run` it does not
+    /// indexes, column comments and enums. Unlike `reconcile --dry-run` it does not
     /// depend on --prune or --allow-destructive, and it works on a released
     /// project, where reconcile is disabled.
     Diff {
@@ -525,6 +525,20 @@ mod tests {
             ),
             "expected deploy cache flags == true when present"
         );
+    }
+
+    /// `dbd diff` compares column comments and no others: the snapshots it
+    /// reads carry no table, view or enum comment. Its help said "comments",
+    /// promising a check that never runs.
+    #[test]
+    fn diff_help_names_only_the_comments_it_compares() {
+        let help = Cli::command()
+            .find_subcommand_mut("diff")
+            .expect("diff is a subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("column comments"), "{help}");
+        assert!(!help.contains("indexes, comments"), "{help}");
     }
 
     /// `dbd diff` flags default to false and flip to true when present.

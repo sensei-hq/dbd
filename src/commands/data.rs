@@ -74,39 +74,33 @@ fn check_adhoc_import_target(design: &Design, resolved: &dbd_core::ResolvedScope
     Ok(())
 }
 
-/// The scope guard `apply` and `deploy` run, for a command that loads or reads
-/// data under a scope: refuse a database pinned to another one.
-///
-/// `import` and `export` ran on such a database and failed partway — staging
-/// truncated and some loaders called, some files written — because the tables
-/// they touch are another scope's to build. Neither re-pins the database, so
-/// unlike `apply` there is no `--allow-scope-change` to offer: the way through
-/// is the pinned scope, or re-pointing the database with `apply` first. The
-/// decision is [`Design::check_scope_guard`]'s; only the way out differs.
-async fn check_pinned_scope(
+/// What importing under a scope the database is not pinned to would do.
+const PINNED: &str = "Importing under another scope would load tables this database was not built with.";
+
+/// Every guard an import checks before it loads anything: the scope pin, then
+/// the environment — a dev import into a database marked prod would load
+/// `import/dev/` data into production. [`Design::import_data`] checks the
+/// second itself; the ad-hoc `-f` load, which goes to the adapter directly,
+/// and both previews check them here.
+async fn check_import_guards(
     adapter: &dyn dbd_core::DatabaseAdapter,
+    design: &Design,
     resolved: &dbd_core::ResolvedScope,
-    consequence: &str,
 ) -> Result<()> {
-    let meta = adapter.get_project_meta().await?;
-    if Design::check_scope_guard(meta.as_ref(), &resolved.name, false).is_ok() {
-        return Ok(());
-    }
-    let pinned = meta.and_then(|m| m.scope).unwrap_or_default();
-    bail!(
-        "scope guard: this database is pinned to scope '{pinned}', but you requested '{requested}'.\n\
-         {consequence}\n\
-         → re-run with --scope {pinned}, or re-point the database with `dbd apply --scope {requested} \
-         --allow-scope-change` first.",
-        requested = resolved.name
-    )
+    super::check_pinned_scope(adapter, design, resolved, PINNED).await?;
+    design.guard_env(adapter).await?;
+    Ok(())
 }
 
+/// `dbd import --dry-run`. Offline when no database is configured; with one to
+/// ask, it refuses where the import would — a preview of a load the run
+/// refuses is a false promise.
 #[allow(clippy::too_many_arguments)]
-pub fn cmd_import_dry_run(
+pub async fn cmd_import_dry_run(
     config: &Path,
     env: &str,
     project_dir: &Path,
+    database_url: Option<&str>,
     name: Option<&str>,
     file: Option<&Path>,
     scope: Option<&str>,
@@ -114,6 +108,13 @@ pub fn cmd_import_dry_run(
     verbosity: Verbosity,
 ) -> Result<()> {
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
+    // The guards, whenever a database is configured to ask.
+    let guard = async |resolved: &dbd_core::ResolvedScope| -> Result<()> {
+        if let Some(adapter) = super::dry_run_adapter(config, database_url).await? {
+            check_import_guards(&*adapter, &design, resolved).await?;
+        }
+        Ok(())
+    };
 
     // Ad-hoc single-file import plan: print the one line and write nothing.
     if let Some(path) = file {
@@ -126,6 +127,7 @@ pub fn cmd_import_dry_run(
         let (kept, total) = design.scope_counts(&resolved)?;
         output::scope_filtered(&resolved, kept, total);
         check_adhoc_import_target(&design, &resolved, &qualified)?;
+        guard(&resolved).await?;
         output::info(verbosity, &format!("import {qualified} ← {}", path.display()));
         output::summary(0, 0, 1);
         return Ok(());
@@ -138,6 +140,7 @@ pub fn cmd_import_dry_run(
     design.check_scope_gaps(&resolved).context("scope check failed")?;
     let (kept, total) = design.scope_counts(&resolved)?;
     output::scope_filtered(&resolved, kept, total);
+    guard(&resolved).await?;
     let (plan, skips) = design.scoped_import_plan(name, Some(&resolved))?;
 
     // Anything the scan, plan or scope left out, before listing what remains —
@@ -237,8 +240,6 @@ pub(crate) async fn import_with_adapter(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    const PINNED: &str = "Importing under another scope would load tables this database was not built with.";
-
     // Ad-hoc single-file import: `dbd import -n <entity> -f <path>`.
     if let Some(path) = file {
         let name = match name {
@@ -252,7 +253,10 @@ pub(crate) async fn import_with_adapter(
         let (kept, total) = design.scope_counts(&resolved)?;
         output::scope_filtered(&resolved, kept, total);
         check_adhoc_import_target(design, &resolved, &qualified)?;
-        check_pinned_scope(adapter, &resolved, PINNED).await?;
+        // It loads data into the database as any import does, so it is held
+        // to the same guards — the environment guard included, which it
+        // skipped: `-e dev import -n -f` loaded a dev file into production.
+        check_import_guards(adapter, design, &resolved).await?;
         let format = format_from_ext(path);
 
         let mut entity = Entity::new(EntityType::Table, &qualified);
@@ -270,7 +274,7 @@ pub(crate) async fn import_with_adapter(
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
     let (kept, total) = design.scope_counts(&resolved)?;
     output::scope_filtered(&resolved, kept, total);
-    check_pinned_scope(adapter, &resolved, PINNED).await?;
+    super::check_pinned_scope(adapter, design, &resolved, PINNED).await?;
 
     let spinner = output::StepSpinner::new(verbosity);
     let mut import_summary: Option<ImportComplete> = None;
@@ -452,8 +456,9 @@ pub(crate) async fn export_with_adapter(
         output::info(verbosity, "No tables to export.");
         return Ok(());
     }
-    check_pinned_scope(
+    super::check_pinned_scope(
         adapter,
+        design,
         resolved,
         "Exporting under another scope would read tables this database was not built with.",
     )
@@ -461,16 +466,27 @@ pub(crate) async fn export_with_adapter(
 
     output::info(verbosity, &format!("Exporting {}...", export_tally(&tables)));
 
-    // `-o` replaces the project's `export/`; the layout under it is the same.
+    // `-o` replaces the project's `export/`; the layout under it is the same —
+    // unless it names a schema folder of the project's `import/` tree, where
+    // each file is written as that import reads it (see `is_import_schema_folder`).
     let root = output.map_or_else(|| design.project_dir().join("export"), Path::to_path_buf);
+    let into_schema_folder = output.is_some_and(|out| is_import_schema_folder(design.project_dir(), out));
+    if into_schema_folder {
+        refuse_shared_files(&tables, &root)?;
+    }
     for table in &tables {
         // Precedence: per-table config override → CLI --format flag → "csv".
         let effective_format = config_format_map.get(&table.name).map(|s| s.as_str()).unwrap_or(format);
 
         let mut export_entity = (*table).clone();
         export_entity.format = Some(effective_format.to_string());
+        let dir = if into_schema_folder {
+            root.clone()
+        } else {
+            export_dir(&root, &table.name)?
+        };
         adapter
-            .export_data(&export_entity, Some(&export_dir(&root, &table.name)?))
+            .export_data(&export_entity, Some(&dir))
             .await
             .context(format!("Failed to export {}", table.name))?;
         output::detail(verbosity, &format!("  exported {} ({})", table.name, effective_format));
@@ -481,6 +497,76 @@ pub(crate) async fn export_with_adapter(
         &format!("Export complete. Files written to {}", root.display()),
     );
     Ok(())
+}
+
+/// Whether `out` is a schema folder of the project's `import/` tree —
+/// `import/<schema>`, or `import/<env>/<schema>` under an env folder.
+///
+/// Exporting there is how a long-running system's data moves to a new
+/// database: `export -n core.accounts -o import/staging` writes
+/// `import/staging/accounts.csv`, which the new database's import loads into
+/// `staging.accounts`. Written under a schema folder of its own instead —
+/// `import/staging/core/accounts.csv`, `-o`'s layout everywhere else — the
+/// file sat where no import reads, and the round trip loaded nothing.
+///
+/// Compared as resolved paths: `-o` is read against the directory dbd runs
+/// in and the project against `-s`, and either may pass through a symlink
+/// (macOS's `/var` is `/private/var`). The folder need not exist yet.
+fn is_import_schema_folder(project_dir: &Path, out: &Path) -> bool {
+    let (Some(out), Some(import)) = (resolved(out), resolved(&project_dir.join("import"))) else {
+        return false;
+    };
+    let Ok(rel) = out.strip_prefix(&import) else {
+        return false;
+    };
+    let folders: Vec<&str> = rel.iter().filter_map(|c| c.to_str()).collect();
+    match folders.as_slice() {
+        [env, _schema] => dbd_core::scanner::is_env_folder(env),
+        [schema] => !dbd_core::scanner::is_env_folder(schema),
+        _ => false,
+    }
+}
+
+/// `path` made absolute, with its deepest existing ancestor canonicalized —
+/// symlinks resolved — and the rest, which does not exist yet, appended.
+fn resolved(path: &Path) -> Option<std::path::PathBuf> {
+    let absolute = std::path::absolute(path).ok()?;
+    let mut existing = absolute.as_path();
+    let mut rest = Vec::new();
+    loop {
+        if let Ok(real) = existing.canonicalize() {
+            return Some(rest.iter().rev().fold(real, |p, part| p.join(part)));
+        }
+        rest.push(existing.file_name()?);
+        existing = existing.parent()?;
+    }
+}
+
+/// Refuse an export into an import schema folder where two of `tables` would
+/// be one file — `core.accounts` and `staging.accounts` are both
+/// `accounts.csv` there — naming each pair, before anything is written.
+fn refuse_shared_files(tables: &[&dbd_core::Entity], root: &Path) -> Result<()> {
+    let mut by_file: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
+    for table in tables {
+        let (_, bare) = table.name.rsplit_once('.').unwrap_or(("", &table.name));
+        by_file.entry(bare).or_default().push(&table.name);
+    }
+    let shared: Vec<String> = by_file
+        .iter()
+        .filter(|(_, names)| names.len() > 1)
+        .map(|(bare, names)| format!("  {bare}: {}", names.join(", ")))
+        .collect();
+    if shared.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "nothing exported: {} is a schema folder of the import tree, where a table is written as \
+         <table>.<format> — and these tables would be one file there:\n{}\n\
+         Export them one at a time with -n, or to -o {} to keep each under its schema",
+        root.display(),
+        shared.join("\n"),
+        root.parent().map(|p| p.display().to_string()).unwrap_or_default()
+    )
 }
 
 /// The directory `table`'s file is written to: `<root>/<schema>/`, or `<root>/`
@@ -554,50 +640,59 @@ mod tests {
 
     /// Full-plan dry-run against the fixture: resolves scope, builds the import
     /// plan, prints it, writes nothing.
-    #[test]
-    fn import_dry_run_full_plan_on_fixture() {
+    #[tokio::test]
+    async fn import_dry_run_full_plan_on_fixture() {
+        let tmp = testutil::offline_fixture_project();
         cmd_import_dry_run(
-            &testutil::fixture_config(),
+            &tmp.path().join("design.yaml"),
             "dev",
-            &testutil::fixtures(),
+            tmp.path(),
+            None,
             None,
             None,
             None,
             None,
             Verbosity::Verbose,
         )
+        .await
         .unwrap();
     }
 
     /// Ad-hoc single-file dry-run prints one line for the resolved target.
-    #[test]
-    fn import_dry_run_adhoc_file() {
+    #[tokio::test]
+    async fn import_dry_run_adhoc_file() {
+        let tmp = testutil::offline_fixture_project();
         cmd_import_dry_run(
-            &testutil::fixture_config(),
+            &tmp.path().join("design.yaml"),
             "dev",
-            &testutil::fixtures(),
+            tmp.path(),
+            None,
             Some("lookups"),
             Some(Path::new("data/x.csv")),
             None,
             None,
             Verbosity::Normal,
         )
+        .await
         .unwrap();
     }
 
     /// `--file` without `--name` is an actionable error (both dry-run and real).
-    #[test]
-    fn import_dry_run_file_without_name_bails() {
+    #[tokio::test]
+    async fn import_dry_run_file_without_name_bails() {
+        let tmp = testutil::offline_fixture_project();
         let err = cmd_import_dry_run(
-            &testutil::fixture_config(),
+            &tmp.path().join("design.yaml"),
             "dev",
-            &testutil::fixtures(),
+            tmp.path(),
+            None,
             None,
             Some(Path::new("data/x.csv")),
             None,
             None,
             Verbosity::Normal,
         )
+        .await
         .unwrap_err();
         assert!(err.to_string().contains("--file requires --name"), "got: {err}");
     }
@@ -757,18 +852,21 @@ mod tests {
     }
 
     /// The dry run refuses it too, rather than printing a load the run refuses.
-    #[test]
-    fn an_adhoc_dry_run_into_a_table_outside_the_staging_schemas_is_refused() {
+    #[tokio::test]
+    async fn an_adhoc_dry_run_into_a_table_outside_the_staging_schemas_is_refused() {
+        let tmp = testutil::offline_fixture_project();
         let err = cmd_import_dry_run(
-            &testutil::fixture_config(),
+            &tmp.path().join("design.yaml"),
             "dev",
-            &testutil::fixtures(),
+            tmp.path(),
+            None,
             Some("config.lookups"),
             Some(Path::new("data/lookups.csv")),
             None,
             None,
             Verbosity::Normal,
         )
+        .await
         .expect_err("config is not a staging schema");
         assert!(err.to_string().contains("import.staging"), "{err}");
     }

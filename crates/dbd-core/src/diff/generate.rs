@@ -163,7 +163,7 @@ fn constraint_name(con: &TableConstraint) -> Option<&str> {
     match con {
         TableConstraint::PrimaryKey { name, .. } | TableConstraint::Unique { name, .. } => name.as_deref(),
         TableConstraint::ForeignKey(fk) => fk.name.as_deref(),
-        TableConstraint::Check { name, .. } => name.as_deref(),
+        TableConstraint::Check { name, .. } | TableConstraint::Exclude { name, .. } => name.as_deref(),
     }
 }
 
@@ -189,6 +189,7 @@ fn constraint_description(con: &TableConstraint) -> String {
         ),
         TableConstraint::ForeignKey(fk) => format!("FOREIGN KEY ({})", fk.columns.join(", ")),
         TableConstraint::Check { expression, .. } => format!("CHECK ({expression})"),
+        TableConstraint::Exclude { definition, .. } => format!("EXCLUDE {definition}"),
     }
 }
 
@@ -285,6 +286,9 @@ fn generate_field_sql(entity_name: &str, _entity_type: &EntityType, change: &Fie
 /// `ALTER TABLE … ADD COLUMN …` for a newly added column.
 fn column_add_sql(entity_name: &str, col: &crate::entity::ColumnDef) -> String {
     let mut stmt = format!("ALTER TABLE {} ADD COLUMN {} {}", entity_name, col.name, col.data_type);
+    if let Some(collation) = &col.collation {
+        stmt.push_str(&format!(" COLLATE {collation}"));
+    }
     if !col.nullable {
         stmt.push_str(" NOT NULL");
     }
@@ -363,6 +367,14 @@ fn push_column_alter_sql(
     }
 
     let type_changed = old_col.data_type != new_col.data_type;
+    // A collation is changed with the type it qualifies — `ALTER COLUMN … TYPE
+    // t COLLATE c` — and going back to the type's own is `COLLATE "default"`.
+    let collation_changed = old_col.collation != new_col.collation;
+    let collate = match &new_col.collation {
+        Some(collation) => format!(" COLLATE {collation}"),
+        None if collation_changed => " COLLATE \"default\"".to_string(),
+        None => String::new(),
+    };
 
     // A default the new type can't absorb blocks the type change itself —
     // `default for column "c" cannot be cast automatically to type status_t` —
@@ -389,8 +401,13 @@ fn push_column_alter_sql(
         // int → bigint), so it is unconditional rather than gated on a
         // cast-safety guess that can drift from Postgres's own cast catalog.
         lines.push(format!(
-            "ALTER TABLE {} ALTER COLUMN {} TYPE {} USING {}::{};",
+            "ALTER TABLE {} ALTER COLUMN {} TYPE {}{collate} USING {}::{};",
             entity_name, new_col.name, new_col.data_type, new_col.name, new_col.data_type
+        ));
+    } else if collation_changed {
+        lines.push(format!(
+            "ALTER TABLE {} ALTER COLUMN {} TYPE {}{collate};",
+            entity_name, new_col.name, new_col.data_type
         ));
     }
     if old_col.nullable != new_col.nullable {
@@ -514,18 +531,6 @@ fn identity_kind_sql(kind: &crate::entity::IdentityKind) -> &'static str {
     }
 }
 
-/// Convert an FkAction to its SQL keyword.
-fn fk_action_to_sql(action: &crate::entity::FkAction) -> &'static str {
-    use crate::entity::FkAction;
-    match action {
-        FkAction::Cascade => "CASCADE",
-        FkAction::Restrict => "RESTRICT",
-        FkAction::SetNull => "SET NULL",
-        FkAction::SetDefault => "SET DEFAULT",
-        FkAction::NoAction => "NO ACTION",
-    }
-}
-
 /// Generate ADD CONSTRAINT SQL for a table constraint.
 fn constraint_add_sql(entity_name: &str, con: &TableConstraint) -> String {
     match con {
@@ -575,12 +580,7 @@ fn constraint_add_sql(entity_name: &str, con: &TableConstraint) -> String {
                 fk.ref_table,
                 fk.ref_columns.join(", ")
             );
-            if let Some(ref action) = fk.on_delete {
-                sql.push_str(&format!(" ON DELETE {}", fk_action_to_sql(action)));
-            }
-            if let Some(ref action) = fk.on_update {
-                sql.push_str(&format!(" ON UPDATE {}", fk_action_to_sql(action)));
-            }
+            crate::emit::push_fk_clauses(&mut sql, fk);
             sql.push(';');
             sql
         }
@@ -591,6 +591,14 @@ fn constraint_add_sql(entity_name: &str, con: &TableConstraint) -> String {
             // what a shared name would then collide on. Mirrors the FK arm.
             let con_clause = name.as_deref().map(|n| format!("CONSTRAINT {n} ")).unwrap_or_default();
             format!("ALTER TABLE {entity_name} ADD {con_clause}CHECK ({expression});")
+        }
+        // Unnamed, Postgres names it `<table>_<columns>_excl`, as it names a
+        // CHECK — mirrored for the same reason.
+        TableConstraint::Exclude { name, definition } => {
+            format!(
+                "ALTER TABLE {entity_name} ADD {}EXCLUDE {definition};",
+                constraint_clause(name.as_deref())
+            )
         }
     }
 }

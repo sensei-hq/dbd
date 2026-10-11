@@ -421,6 +421,25 @@ pub struct ForeignKey {
     pub ref_columns: Vec<String>,
     pub on_delete: Option<FkAction>,
     pub on_update: Option<FkAction>,
+    /// `MATCH FULL`: a key with some columns NULL and others not is refused,
+    /// where the default `MATCH SIMPLE` lets it through unchecked. Postgres
+    /// implements no other (`MATCH PARTIAL` is refused).
+    ///
+    /// Each of these three is part of what the key enforces, so each is part
+    /// of its identity: a reversed file that dropped them wrote a key that
+    /// accepts rows this one refuses, and `diff` could not see the difference.
+    /// Skipped when false, so snapshots of ordinary keys are unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub match_full: bool,
+    /// `DEFERRABLE`: the check can be put off to the end of the transaction
+    /// (`SET CONSTRAINTS … DEFERRED`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deferrable: bool,
+    /// `INITIALLY DEFERRED`: the check is put off to commit unless a
+    /// transaction says otherwise — so a child row may be inserted before its
+    /// parent. Implies [`Self::deferrable`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub initially_deferred: bool,
     /// Where [`Self::ref_schema`] came from. See [`SchemaSource`], and the note
     /// on this struct for why it is outside `PartialEq`.
     ///
@@ -454,6 +473,9 @@ impl PartialEq for ForeignKey {
             ref_columns,
             on_delete,
             on_update,
+            match_full,
+            deferrable,
+            initially_deferred,
             ref_schema_source: _,
         } = self;
         *name == other.name
@@ -463,6 +485,9 @@ impl PartialEq for ForeignKey {
             && *ref_columns == other.ref_columns
             && *on_delete == other.on_delete
             && *on_update == other.on_update
+            && *match_full == other.match_full
+            && *deferrable == other.deferrable
+            && *initially_deferred == other.initially_deferred
     }
 }
 
@@ -529,6 +554,25 @@ pub enum TableConstraint {
         name: Option<String>,
         expression: String,
     },
+    /// `EXCLUDE …` — no two rows may match on every element under its
+    /// operator: `EXCLUDE USING gist (room WITH =, during WITH &&)` stops two
+    /// bookings of one room overlapping.
+    ///
+    /// `definition` is everything after `EXCLUDE`, as valid SQL in Postgres's
+    /// own order: the access method, the elements with their operators, then
+    /// `INCLUDE`, `WITH`, `WHERE` and `DEFERRABLE` — what
+    /// `pg_get_constraintdef` prints, and what the parser renders from the
+    /// statement. Two spellings of one constraint differ in text (quoting, a
+    /// default operator class written out), so they are compared through
+    /// [`crate::sql_expr::canonical_exclusion`], never as written.
+    ///
+    /// Without it, introspection read only the constraint's backing index:
+    /// a reversed table got a plain gist index — the speed kept, the rule gone
+    /// — and the table parser refused a project that declared one.
+    Exclude {
+        name: Option<String>,
+        definition: String,
+    },
 }
 
 /// How an identity column generates its value (`GENERATED … AS IDENTITY`).
@@ -574,6 +618,30 @@ pub struct ColumnDef {
     pub generated: Option<String>,
     pub comment: Option<String>,
     pub inline_fk: Option<ForeignKey>,
+    /// `COLLATE "C"` — the collation the column's values sort and compare
+    /// under, when it is not its type's default; `None` for the default.
+    /// Held as SQL, built by [`collation_sql`]: each part double-quoted, and
+    /// `pg_catalog` — where the built-in collations live — left off. A name
+    /// may itself hold a dot (`en_US.utf8`), so it is never split apart again.
+    ///
+    /// Part of the column's identity: byte order and a language's order put
+    /// rows in different places, and decide what a `LIKE 'abc%'` index can
+    /// serve. `#[serde(default)]`, and skipped when `None`, so snapshots of
+    /// ordinary columns are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collation: Option<String>,
+}
+
+/// A collation as SQL, for [`ColumnDef::collation`]: `"C"`, or
+/// `"schema"."name"` outside `pg_catalog`. Quoted unconditionally, so `C` —
+/// which Postgres would fold to `c` bare — keeps its case, and so the parser
+/// and the introspector spell one collation the same way.
+pub fn collation_sql(schema: Option<&str>, name: &str) -> String {
+    let quote = |part: &str| format!("\"{}\"", part.replace('"', "\"\""));
+    match schema {
+        Some(schema) if schema != "pg_catalog" => format!("{}.{}", quote(schema), quote(name)),
+        _ => quote(name),
+    }
 }
 
 /// Index definition.
@@ -799,6 +867,19 @@ pub struct Entity {
     /// `None` for the Postgres/DBML paths, which reconstruct DDL from the structured model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_ddl: Option<String>,
+    /// The triggers on this table or view, as the statements that create them — each
+    /// one runnable twice (`CREATE OR REPLACE TRIGGER`, or a `DROP TRIGGER IF
+    /// EXISTS` before a constraint trigger, which Postgres will not replace).
+    ///
+    /// Filled by the Postgres introspector alone, and written by
+    /// [`crate::emit::emit_table`] and [`crate::emit::emit_view`] after the
+    /// table or view, where an authored file keeps its triggers. The parsers read a trigger there only as
+    /// the edge to the function it fires — apply needs the order and nothing
+    /// compares triggers — so a parsed entity leaves this empty. Without it,
+    /// `init --from-db` wrote every table without its triggers, and `merge`
+    /// deleted the triggers from the authored table files it overwrote.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub triggers: Vec<String>,
 }
 
 impl Entity {
@@ -884,6 +965,7 @@ impl Entity {
             table_def: None,
             enum_values: Vec::new(),
             raw_ddl: None,
+            triggers: Vec::new(),
         }
     }
 

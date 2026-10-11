@@ -183,12 +183,14 @@ pub async fn run(
                     config,
                     env,
                     project_dir,
+                    database_url,
                     name.as_deref(),
                     file.as_deref(),
                     scope,
                     deps,
                     verbosity,
                 )
+                .await
             } else {
                 data::cmd_import(
                     config,
@@ -245,7 +247,7 @@ pub async fn run(
 
         Commands::Migrate { status } => {
             if *status {
-                migration::cmd_migrate_status(config, database_url, project_dir, verbosity).await
+                migration::cmd_migrate_status(config, env, database_url, project_dir, verbosity).await
             } else {
                 output::info(
                     verbosity,
@@ -632,44 +634,90 @@ pub(super) fn configured_database_url(config: &Path, database_url: Option<&str>)
 /// [`configured_database_url`] — or `None`, and the dry run stays offline.
 ///
 /// A dry run writes nothing, but a preview of a run the database would refuse
-/// is a false promise: with a database to ask, every dry run checks the scope
-/// pin its real run checks, and `apply`/`deploy` read the version their
+/// is a false promise: with a database to ask, every dry run checks the
+/// guards its real run checks, and `apply`/`deploy` read the version their
 /// pending migrations start from. Named for `reset --dry-run`, which did this
 /// first; a configured database that cannot be reached is an error, as it is
-/// for the run.
+/// for the run. It opens only a database that exists: a SQLite file that is
+/// not there yet is not created — the preview made one — and reads as none.
 pub(super) async fn dry_run_adapter(
     config: &Path,
     database_url: Option<&str>,
 ) -> Result<Option<Box<dyn dbd_core::DatabaseAdapter>>> {
-    match configured_database_url(config, database_url)? {
-        Some(url) => Ok(Some(get_adapter(config, Some(&url)).await?)),
-        None => Ok(None),
-    }
+    let Some(url) = configured_database_url(config, database_url)? else {
+        return Ok(None);
+    };
+    let project = dbd_core::config::read(config)
+        .context("Failed to read config")?
+        .project
+        .name;
+    dbd_core::connect_existing(&url, &project)
+        .await
+        .context("Failed to connect to database")
 }
 
-/// The scope guard for a command that never re-pins the database — `policies`
-/// and `refresh` — so it has no `--allow-scope-change` to offer: the way through
-/// is the pinned scope, or re-pointing the database with `apply` first.
-/// `consequence` says what running another scope here would do.
+/// The scope guard for a command that never re-pins the database — `policies`,
+/// `refresh`, `import` and `export` — so it has no `--allow-scope-change` to
+/// offer: the way through is the pinned scope, or re-pointing the database with
+/// `apply` first. `consequence` says what running another scope here would do.
+/// The decision is [`dbd_core::Design::check_scope_guard`]'s — the pin of this
+/// project's record, or of the one a renamed `project.name` left; only the
+/// way out differs.
 pub(super) async fn check_pinned_scope(
     adapter: &dyn dbd_core::DatabaseAdapter,
+    design: &dbd_core::Design,
     resolved: &dbd_core::ResolvedScope,
     consequence: &str,
 ) -> Result<()> {
-    let pinned = adapter.get_project_meta().await?.and_then(|m| m.scope);
-    if let Some(pinned) = pinned
-        && pinned != resolved.name
-    {
+    let marks = design.database_marks(adapter).await?;
+    if let Some((pinned, by)) = dbd_core::Design::conflicting_pin(&marks, &resolved.name) {
         anyhow::bail!(
-            "scope guard: this database is pinned to scope '{pinned}', but you requested '{}'.\n\
-             {consequence}\n\
+            "scope guard: this database is pinned to scope '{pinned}'{by}, but you requested '{}'.\n\
+             {}{consequence}\n\
              → re-run with --scope {pinned}, or re-point the database with `dbd apply --scope {} \
              --allow-scope-change` first.",
             resolved.name,
+            marks.rename_note(),
             resolved.name
         );
     }
     Ok(())
+}
+
+/// The pin of a database pinned to another scope than `resolved` — the
+/// scope, and `" by project 'x'"` when the pin is a renamed project's old
+/// record (see [`dbd_core::design::DatabaseMarks`]) — or `None` when the pin
+/// is the run's own, or there is none.
+///
+/// For the read-only commands, `diff` and `migrate --status`: they write
+/// nothing, so a pin is noted, never refused. They said nothing of it, and an
+/// unscoped diff of a scoped database listed what the scope does not build
+/// as missing with no word of why.
+pub(super) async fn other_scope_pin(
+    adapter: &dyn dbd_core::DatabaseAdapter,
+    design: &dbd_core::Design,
+    resolved: &dbd_core::ResolvedScope,
+) -> Result<Option<(String, String)>> {
+    let marks = design.database_marks(adapter).await?;
+    Ok(dbd_core::Design::conflicting_pin(&marks, &resolved.name).map(|(pinned, by)| (pinned.to_string(), by)))
+}
+
+/// Say so when a run that records the environment promoted the database from
+/// dev to prod. `before` are the database's marks read before the run, `env`
+/// the run's.
+///
+/// `-e` defaults to prod, so a run without it promotes a dev database. That is
+/// allowed — it only tightens what `reset` allows — but it was silent, and
+/// every later `-e dev` run is refused with no word of what changed.
+pub(super) fn note_promotion(before: &dbd_core::design::DatabaseMarks, env: &str) {
+    let is = |value: &str, wanted: &str| dbd_core::config::normalize_env(Some(value)).is_ok_and(|e| e == wanted);
+    if before.own.as_ref().is_some_and(|own| is(&own.env, "dev")) && is(env, "prod") {
+        output::warn(
+            "This database was marked dev and is now marked prod: this run is -e prod, the default when -e is \
+             not given. dbd never re-marks a prod database dev, so later -e dev runs are refused — to keep it \
+             dev, rebuild it: `dbd reset --force`, then run with -e dev.",
+        );
+    }
 }
 
 /// Print the pending migrations a run would execute: each step under its
@@ -677,6 +725,24 @@ pub(super) async fn check_pinned_scope(
 pub(super) fn print_migration_preview(verbosity: Verbosity, preview: &dbd_core::design::MigrationPreview) {
     use dbd_core::design::MigrationAction;
     // Versions spelled as the run's own summary spells them (`Migrated v1 → v3`).
+    // A scoped run whose pending migrations touch nothing in its scope still
+    // records them: the preview said "No pending migration to run", and the
+    // run then said "Migrated v4 → v7".
+    if preview.steps.is_empty() && !preview.recorded.is_empty() {
+        let versions: Vec<String> = preview.recorded.iter().map(|v| format!("v{v}")).collect();
+        output::info(
+            verbosity,
+            &format!(
+                "Pending migrations, v{} → v{} ({}): nothing in them runs in this scope; the run records \
+                 them and moves the database to v{}.",
+                preview.from_version,
+                preview.to_version,
+                versions.join(", "),
+                preview.to_version
+            ),
+        );
+        return;
+    }
     if preview.steps.is_empty() {
         output::info(
             verbosity,
@@ -701,11 +767,14 @@ pub(super) fn print_migration_preview(verbosity: Verbosity, preview: &dbd_core::
     for step in &preview.steps {
         let action = match step.action {
             MigrationAction::Create => "create",
+            MigrationAction::EnumValues => "add values to",
             MigrationAction::Migrate => "migrate",
+            MigrationAction::Data => "migrate data of",
             MigrationAction::Drop => "drop",
         };
         let note = match (step.action, step.runs) {
             (MigrationAction::Create, _) => " (from its DDL)",
+            (MigrationAction::EnumValues, _) => " (committed before the rest of the version)",
             (MigrationAction::Drop, false) => " — not in this database, so skipped",
             _ => "",
         };
@@ -1301,7 +1370,7 @@ mod tests {
     #[tokio::test]
     async fn run_dispatches_import_dry_run_without_a_database() {
         use crate::cli::Commands;
-        let tmp = testutil::copy_fixture_project();
+        let tmp = testutil::offline_fixture_project();
         run_in_copy(
             &Commands::Import {
                 name: None,

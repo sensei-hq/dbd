@@ -662,6 +662,24 @@ fn operator_name(expr: &pg_query::protobuf::AExpr) -> Option<String> {
     }
 }
 
+/// The matching key for an `EXCLUDE` constraint's definition — everything
+/// after `EXCLUDE` (see [`crate::entity::TableConstraint::Exclude`]).
+///
+/// Read back through Postgres's own grammar and deparser, so two spellings of
+/// one constraint — case, spacing, redundant parentheses — compare equal. A
+/// **key only, never DDL**: libpg_query's deparser writes `WHERE` before
+/// `INCLUDE` and `WITH`, which Postgres's grammar does not accept, so nothing
+/// may emit this text. `None` when the definition does not parse; the caller
+/// keeps the raw text, so a real difference is never hidden.
+pub fn canonical_exclusion(definition: &str) -> Option<String> {
+    const FRAME: &str = "ALTER TABLE t ADD EXCLUDE ";
+    let parsed = pg_query::parse(&format!("{FRAME}{definition}")).ok()?;
+    pg_query::deparse(&parsed.protobuf)
+        .ok()?
+        .strip_prefix(FRAME)
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -19,7 +19,13 @@ use split::*;
 /// Splits the input into statement blocks, formats each individually, and
 /// reassembles. Unparseable statements are preserved with keyword-case
 /// transformation only.
+///
+/// A file PostgreSQL's scanner cannot read — an unterminated string or
+/// comment — is returned as it is: nothing in it can be told from text.
 pub fn format_ddl(input: &str, config: &FormatConfig) -> String {
+    if lex(input).is_none() {
+        return input.to_string();
+    }
     let blocks = split_statements(input);
     let mut output_parts: Vec<String> = Vec::new();
 
@@ -44,8 +50,9 @@ pub fn format_ddl(input: &str, config: &FormatConfig) -> String {
 /// recased; failing that, as written.
 ///
 /// Safety guard: never emit a reformatted statement that changed the SQL. A
-/// layout that does not re-parse to the same AST, or drops a comment or a `$$`
-/// body, is not used. The layout covers some statements only partly (a table's
+/// layout that does not re-parse to the same tree, or changes a string, a
+/// body, a quoted identifier or a comment, is not used (see
+/// [`block_is_faithful`]). The layout covers some statements only partly (a table's
 /// storage parameters), and falling back to the statement untouched left its
 /// keywords in whatever case the file had — `upper` leaving a table lowercase —
 /// so the fallback still recases them.
@@ -73,95 +80,49 @@ fn format_block(original: &str, config: &FormatConfig) -> String {
     }
 }
 
-/// Whether a formatted statement faithfully preserves the original: same parsed
-/// AST (so semantics are unchanged), plus every comment and every `$$` body
-/// retained. Statements sqlparser can't parse fall back to the
-/// comment/body-preservation check (the formatter used a conservative
-/// keyword-case/verbatim path for those).
+/// Whether a formatted statement faithfully preserves the original: it means
+/// the same, and every string, body, quoted identifier and comment in it is
+/// the same text, in the same order (see [`opaque_text`]).
 ///
-/// The trees are compared with both sides' keywords lowercased. A keyword's
-/// case is not meaning — an unquoted word reads the same in any case, Postgres
-/// folds it — but sqlparser keeps a word it reads as a name in the case it was
-/// written: `serial`, `inet`, `search_path` and `sql` are names to it, and
-/// `SERIAL` parsed to a different tree than `serial`. So every table with a
-/// serial or inet column, every SET and every function header failed the guard
-/// in `upper` and was kept lowercase. Lowercasing an unquoted keyword changes
-/// neither side's meaning, and every other difference still counts.
+/// What it means is libpg_query's tree, deparsed — keyword case, layout and
+/// comments aside — whenever the original parses there. A statement libpg_query
+/// cannot parse (another engine's DDL, a SQLite trigger) falls back to
+/// sqlparser's tree, and one neither parses rests on its text alone.
+///
+/// sqlparser's trees are compared with both sides' keywords lowercased. A
+/// keyword's case is not meaning — an unquoted word reads the same in any
+/// case, Postgres folds it — but sqlparser keeps a word it reads as a name in
+/// the case it was written: `serial`, `inet`, `search_path` and `sql` are
+/// names to it, and `SERIAL` parsed to a different tree than `serial`.
 fn block_is_faithful(original: &str, formatted: &str) -> bool {
+    match (opaque_text(original), opaque_text(formatted)) {
+        (Some(a), Some(b)) if a == b => {}
+        _ => return false,
+    }
+    if let Ok(before) = pg_query::parse(original) {
+        // A layout libpg_query cannot read, or a tree it cannot deparse, is
+        // not shown to mean the same — so it is not used.
+        return match (
+            before.deparse(),
+            pg_query::parse(formatted).and_then(|after| after.deparse()),
+        ) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        };
+    }
     let dialect = PostgreSqlDialect {};
     let lowered = |sql: &str| ensure_semicolon(&apply_keyword_case(sql, &KeywordCase::Lower));
-    let po = Parser::parse_sql(&dialect, &lowered(original));
-    let pf = Parser::parse_sql(&dialect, &lowered(formatted));
-    match (po, pf) {
-        (Ok(a), Ok(b)) => {
-            a == b && comments_preserved(original, formatted) && dollar_bodies_preserved(original, formatted)
-        }
+    match (
+        Parser::parse_sql(&dialect, &lowered(original)),
+        Parser::parse_sql(&dialect, &lowered(formatted)),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
         // The formatter turned parseable SQL into something that no longer
         // parses — definitely not faithful.
         (Ok(_), Err(_)) => false,
-        // Original wasn't sqlparser-parseable (SET, COMMENT ON, a $$ body, or
-        // PG-specific DDL); trust the conservative path only if comments and
-        // bodies are intact.
-        (Err(_), _) => comments_preserved(original, formatted) && dollar_bodies_preserved(original, formatted),
+        // Neither parser reads it; the text check above is what stands.
+        (Err(_), _) => true,
     }
-}
-
-/// Every comment in `original` (— line and /* */ block) must appear in `formatted`.
-fn comments_preserved(original: &str, formatted: &str) -> bool {
-    extract_comments(original)
-        .iter()
-        .all(|c| formatted.contains(c.as_str()))
-}
-
-/// Extract trimmed comment text (line `-- …` and block `/* … */`) from SQL,
-/// skipping comment markers inside string literals and `$$` bodies.
-fn extract_comments(sql: &str) -> Vec<String> {
-    let bytes = sql.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            // Skip $$-quoted bodies and string literals — `--`/`/*` inside them
-            // are not comments.
-            b'$' if i + 1 < bytes.len() && bytes[i + 1] == b'$' => {
-                i = scan_dollar_quote(bytes, i);
-            }
-            b'\'' => {
-                i = scan_single_quoted(bytes, i);
-            }
-            b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
-                let end = scan_line_comment(bytes, i);
-                let text = sql[i..end].trim_end().trim_start_matches('-').trim();
-                if !text.is_empty() {
-                    out.push(text.to_string());
-                }
-                i = end;
-            }
-            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
-                let start = i + 2;
-                i += 2;
-                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                    i += 1;
-                }
-                let text = sql[start..i.min(sql.len())].trim();
-                if !text.is_empty() {
-                    out.push(text.to_string());
-                }
-                i += 2;
-            }
-            _ => i += 1,
-        }
-    }
-    out
-}
-
-/// The `$$ … $$` body segments must be byte-identical between original and
-/// formatted (the formatter preserves function/procedure bodies verbatim).
-fn dollar_bodies_preserved(original: &str, formatted: &str) -> bool {
-    fn bodies(s: &str) -> Vec<&str> {
-        s.split("$$").skip(1).step_by(2).collect()
-    }
-    bodies(original) == bodies(formatted)
 }
 
 /// Format a single statement block (including its trailing semicolon).
@@ -171,9 +132,10 @@ fn format_statement_block(block: &str, config: &FormatConfig) -> String {
         return String::new();
     }
 
-    // Check for $$ delimited function/procedure body
-    if contains_dollar_quote(trimmed) {
-        return format_dollar_quoted(trimmed, config);
+    // A statement with a dollar-quoted body (a function's, a `DO` block's) is
+    // only recased: the body is one token of text, left as written.
+    if has_dollar_body(trimmed) {
+        return ensure_semicolon(&apply_keyword_case(trimmed, &config.keyword_case));
     }
 
     // Try parsing with sqlparser
@@ -222,35 +184,6 @@ fn format_parsed_statements(statements: &[Statement], original: &str, config: &F
     ensure_semicolon(&result)
 }
 
-fn contains_dollar_quote(s: &str) -> bool {
-    s.contains("$$")
-}
-
-/// Format a $$ delimited statement (function/procedure).
-/// Format the header, preserve the body verbatim.
-fn format_dollar_quoted(block: &str, config: &FormatConfig) -> String {
-    if let Some(first_dollar) = block.find("$$") {
-        let header = &block[..first_dollar];
-        let rest = &block[first_dollar..];
-        let formatted_header = apply_keyword_case(header, &config.keyword_case);
-
-        // Find the closing $$ after the opening $$
-        let after_open = first_dollar + 2;
-        if let Some(close_pos) = block[after_open..].find("$$") {
-            let body = &block[after_open..after_open + close_pos];
-            let trailer = &block[after_open + close_pos + 2..];
-            let formatted_trailer = apply_keyword_case(trailer, &config.keyword_case);
-            let result = format!("{}$${body}$${}", formatted_header, formatted_trailer.trim_end());
-            ensure_semicolon(&result)
-        } else {
-            // Only opening $$, no closing — preserve as-is with keyword case on header
-            format!("{formatted_header}{rest}")
-        }
-    } else {
-        apply_keyword_case(block, &config.keyword_case)
-    }
-}
-
 // ── Helpers ─────────────────────────────────────────────
 
 /// Apply keyword case to a single token (not a full SQL string).
@@ -259,15 +192,6 @@ fn kw_case(s: &str, case: &KeywordCase) -> String {
         KeywordCase::Lower => s.to_lowercase(),
         KeywordCase::Upper => s.to_uppercase(),
         KeywordCase::Preserve => s.to_string(),
-    }
-}
-
-fn ensure_semicolon(s: &str) -> String {
-    let trimmed = s.trim_end();
-    if trimmed.ends_with(';') {
-        trimmed.to_string()
-    } else {
-        format!("{trimmed};")
     }
 }
 
@@ -597,6 +521,108 @@ mod tests {
         let out = format_ddl(EVERY_LAYOUT, &in_case(KeywordCase::Lower));
         assert!(out.contains(", owner_id"), "the table is laid out:\n{out}");
         assert!(out.contains("on delete cascade"), "{out}");
+    }
+
+    // ── Literals, bodies and comments are text ──────────────
+
+    /// Statements whose text holds what a hand-rolled scanner misreads: an
+    /// `E''` string with a backslash-escaped quote, `U&''` with `UESCAPE`,
+    /// bit and hex strings, a `$tag$` body (one nesting `$$`), a `BEGIN
+    /// ATOMIC` body, nested block comments, quoted identifiers holding `"`,
+    /// `;` and `--`, a comment-only tail and a last statement with no `;`.
+    const TRICKY: &[&str] = &[
+        "create table if not exists t (\n  id int primary key,\n  note text default E'it\\'s; tricky'\n);",
+        "create table u (a text default U&'d\\0061t\\+000061 select', b text default U&'x!0041' uescape '!');",
+        "create table b (b bit(4) default B'0101', x bytea default '\\xDEAD', y bytea default X'FF');",
+        "create table q (a text default 'O''Brien; -- not a comment', b text default 'SELECT /* nor */ this');",
+        "comment on table t is E'line one\\nline two; -- still text';",
+        "create or replace function app.f() returns text language plpgsql as $body$\nBEGIN\n  -- SELECT stays; here\n  RETURN 'x';\nEND;\n$body$;",
+        "create function g() returns text language sql as $fn$ select $$a;b$$ || 'c' $fn$;",
+        "create view v as select 'a;b' as \"Semi;Colon\", \"we\"\"ird\" from t where note <> E'back\\\\slash';",
+        "create table \"we\"\"ird;--\" (\"Col; x\" int, y text default '');",
+        "/* outer /* nested; */ still; */\n-- it's; here\ncreate table c (id int);",
+        "create function h() returns int language sql begin atomic select 1; select 2; end;",
+        "create index t_live_idx on t (note) where note <> 'x;y' and note <> E'a\\'b';",
+        "create type mood as enum ('happy;', 'sad''s', E'it\\'s');",
+        "set search_path to app; -- path\ncreate table app.t2 (id int, s text default 'set search_path to x;');",
+        "do $$ begin raise notice 'it''s; %', 1; end $$;",
+        "create table k (a int -- first; one\n, b text default E'x\\'y' -- second\n);",
+        "create table z (id int);\n-- the end",
+        "select 1 -- trailing, no semicolon",
+    ];
+
+    /// Every token of `sql` that is text rather than SQL — strings of every
+    /// kind (`$tag$` bodies included), quoted identifiers and comments — in
+    /// order, as libpg_query's scanner reads them. A comment's trailing
+    /// spaces are layout, not text.
+    fn opaque_tokens(sql: &str) -> Vec<String> {
+        use pg_query::protobuf::Token;
+        let scanned = pg_query::scan(sql).unwrap_or_else(|e| panic!("{e}:\n{sql}"));
+        scanned
+            .tokens
+            .iter()
+            .filter_map(|t| {
+                let text = &sql[t.start as usize..t.end as usize];
+                match Token::try_from(t.token).ok()? {
+                    Token::Sconst | Token::Usconst | Token::Bconst | Token::Xconst | Token::CComment => {
+                        Some(text.to_string())
+                    }
+                    Token::SqlComment => Some(text.trim_end().to_string()),
+                    Token::Ident | Token::Uident
+                        if !text.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') =>
+                    {
+                        Some(text.to_string())
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    /// What `sql` means: libpg_query's tree for it, deparsed — keyword case,
+    /// layout and comments aside.
+    fn meaning(sql: &str) -> String {
+        pg_query::parse(sql)
+            .and_then(|p| p.deparse())
+            .unwrap_or_else(|e| panic!("{e}:\n{sql}"))
+    }
+
+    /// `E'it\'s; tricky'` became a three-line default: the splitter ended the
+    /// statement at the `;` inside the literal, which it took to close at
+    /// `\'`. A `$tag$` body was split at its own `;`s and its `END` recased.
+    /// Splitting and every rewrite now read the text with libpg_query, so for
+    /// every input, in every keyword case and query style, the output means
+    /// what the input did and every literal, quoted name and comment in it is
+    /// the same, byte for byte.
+    #[test]
+    fn formatting_changes_no_literal_and_no_meaning() {
+        let configs = [KeywordCase::Lower, KeywordCase::Upper, KeywordCase::Preserve]
+            .into_iter()
+            .flat_map(|case| {
+                [crate::config::QueryStyle::River, crate::config::QueryStyle::None].map(|style| FormatConfig {
+                    keyword_case: case.clone(),
+                    query_style: style,
+                    ..Default::default()
+                })
+            })
+            .collect::<Vec<_>>();
+        let whole = TRICKY.join("\n\n");
+        for input in TRICKY.iter().copied().chain([whole.as_str()]) {
+            for config in &configs {
+                let out = format_ddl(input, config);
+                let label = format!("{:?}/{:?}", config.keyword_case, config.query_style);
+                assert_eq!(
+                    meaning(&out),
+                    meaning(input),
+                    "{label} changed the meaning of:\n{input}\n--- into ---\n{out}"
+                );
+                assert_eq!(
+                    opaque_tokens(&out),
+                    opaque_tokens(input),
+                    "{label} changed a literal, name or comment in:\n{input}\n--- into ---\n{out}"
+                );
+            }
+        }
     }
 
     // ── River formatter tests ─────────────────────────────
@@ -1085,5 +1111,22 @@ SELECT 1;
         let nonempty: Vec<&String> = blocks.iter().filter(|b| !b.trim().is_empty()).collect();
         assert_eq!(nonempty.len(), 2, "got: {nonempty:#?}");
         assert!(nonempty[0].contains("LANGUAGE plpgsql"));
+    }
+
+    /// The formatter knew only `$$`: a `$tag$` body was split at each `;` in
+    /// it, a blank line went in at every split, and `keyword_case: upper`
+    /// uppercased the body's `end`. In every keyword case the body is one
+    /// statement and comes out byte for byte.
+    #[test]
+    fn a_tag_quoted_body_is_one_statement_and_kept_as_written() {
+        let body = "$body$\nbegin\n  -- select stays; here\n  return 'x';\nend;\n$body$";
+        let input = format!("create or replace function f() returns text language plpgsql as {body};\nselect 1;\n");
+        let blocks = super::split_statements(&input);
+        let nonempty: Vec<&String> = blocks.iter().filter(|b| !b.trim().is_empty()).collect();
+        assert_eq!(nonempty.len(), 2, "the body ends no statement: {nonempty:#?}");
+        for case in [KeywordCase::Lower, KeywordCase::Upper, KeywordCase::Preserve] {
+            let out = format_ddl(&input, &in_case(case.clone()));
+            assert!(out.contains(body), "{case:?} keeps the body as written:\n{out}");
+        }
     }
 }

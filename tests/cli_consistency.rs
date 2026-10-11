@@ -1405,3 +1405,195 @@ fn reset_accepts_the_targets_its_help_names_and_resets_a_sqlite_database() {
         stderr(&o)
     );
 }
+
+// ── a dry run creates nothing ───────────────────────────────────────────────
+
+/// A dry run asks the configured database for its guards — and the SQLite
+/// adapter opens its file with `create_if_missing`, so a preview of a project
+/// whose database did not exist yet created it: `reset --dry-run` left an
+/// empty database file behind. A dry run writes nothing, so it opens only a
+/// file that is already there, and without one previews as it does with no
+/// database at all.
+#[test]
+fn a_dry_run_does_not_create_a_sqlite_database_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let db = dir.join("not-yet.db");
+    write(
+        dir,
+        "design.yaml",
+        &format!(
+            "project:\n  name: lite\nsource:\n  dialect: sqlite\ntarget:\n  sqlite:\n    url: sqlite://{}\nschemas: []\n",
+            db.display()
+        ),
+    );
+    write(
+        dir,
+        "ddl/table/items.ddl",
+        "CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY);\n",
+    );
+
+    let mut failures: Vec<String> = Vec::new();
+    for args in [
+        &["reset", "--dry-run"][..],
+        &["apply", "--dry-run"],
+        &["deploy", "--dry-run"],
+        &["import", "--dry-run"],
+        &["policies", "--dry-run"],
+    ] {
+        let out = dbd(dir, args);
+        if !out.status.success() {
+            failures.push(format!("{args:?} failed: {}{}", stdout(&out), stderr(&out)));
+        }
+        if db.exists() {
+            failures.push(format!("{args:?} created {}", db.display()));
+            fs::remove_file(&db).unwrap();
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+// ── reset refuses a --target the connection is not ──────────────────────────
+
+/// `reset --target postgres` on a SQLite project was accepted, connected, and
+/// failed on PostgreSQL's `CASCADE` — after it had read the database, and,
+/// with `--force`, with nothing said about why. A `--target` that is not the
+/// kind of database the connection reaches is refused before connecting.
+/// Each URL here leads nowhere, so a reset that connects fails differently.
+#[test]
+fn reset_refuses_a_target_the_connection_is_not() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let cases = [
+        // (the project's target block, the --target it is refused)
+        (
+            format!("sqlite:\n    url: sqlite://{}/no/such/dir/app.db", dir.display()),
+            "postgres",
+            "SQLite",
+        ),
+        (
+            format!("sqlite:\n    url: sqlite://{}/no/such/dir/app.db", dir.display()),
+            "supabase",
+            "SQLite",
+        ),
+        (
+            "postgres:\n    url: postgres://nobody@127.0.0.1:1/absent".to_string(),
+            "sqlite",
+            "PostgreSQL",
+        ),
+    ];
+    let mut failures: Vec<String> = Vec::new();
+    for (target, flag, kind) in &cases {
+        write(
+            dir,
+            "design.yaml",
+            &format!(
+                "project:\n  name: mismatch\nsource:\n  dialect: postgresql\ntarget:\n  {target}\nschemas:\n  - app\n"
+            ),
+        );
+        write(
+            dir,
+            "ddl/table/app/t.ddl",
+            "set search_path to app;\ncreate table if not exists t (id int primary key);\n",
+        );
+        for args in [
+            &["reset", "--force", "--target", flag][..],
+            &["reset", "--dry-run", "--target", flag],
+        ] {
+            let out = dbd(dir, args);
+            let err = stderr(&out);
+            if out.status.success() || !(err.contains(&format!("--target {flag}")) && err.contains(kind)) {
+                failures.push(format!("{args:?} on a {kind} connection: {}{err}", stdout(&out)));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+// ── an external name has no place in the graph ──────────────────────────────
+
+/// `graph -n auth.users` printed an empty graph and exited 0 for a name
+/// declared `external:` — a valid document indistinguishable from an entity
+/// with no dependencies — while `inspect -n` and `apply -n` refuse it: dbd has
+/// no DDL for an external, so it is not a node of the graph.
+#[test]
+fn graph_refuses_an_external_name_as_inspect_and_apply_do() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write(
+        dir,
+        "design.yaml",
+        "project:\n  name: ext\nsource:\n  dialect: postgresql\nschemas:\n  - app\n\
+         external:\n  - name: auth.users\n",
+    );
+    write(
+        dir,
+        "ddl/table/app/t.ddl",
+        "set search_path to app;\ncreate table if not exists t (id integer primary key);\n",
+    );
+
+    let out = dbd(dir, &["graph", "-n", "auth.users"]);
+    assert!(!out.status.success(), "graph refuses it: {}", stdout(&out));
+    assert!(stderr(&out).contains("external"), "saying why: {}", stderr(&out));
+    let out = dbd(dir, &["graph", "-n", "app.t"]);
+    assert!(out.status.success(), "a managed name still graphs: {}", stderr(&out));
+}
+
+// ── merge --from-dbml of a scoped document ──────────────────────────────────
+
+/// A DBML document scoped to some schemas stands a stub in for every table a
+/// foreign key reaches outside them — whether the project builds that table
+/// or somebody else does. `merge --from-dbml` told the user to declare
+/// `core.accounts` under `external:` when the project manages it: an external
+/// is somebody else's table, and declaring one the project builds would stop
+/// it being built. A table the project manages is never called external; one
+/// it does not is still named.
+#[test]
+fn merge_from_a_scoped_dbml_document_never_calls_a_table_the_project_manages_external() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write(
+        dir,
+        "design.yaml",
+        "project:\n  name: scoped\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - core\n  - app\n",
+    );
+    write(
+        dir,
+        "ddl/table/core/accounts.ddl",
+        "set search_path to core;\ncreate table if not exists accounts (id uuid primary key);\n",
+    );
+    write(
+        dir,
+        "app.dbml",
+        "Table \"app\".\"people\" {\n  \"id\" int [pk]\n  \"account_id\" uuid\n  \"invoice_id\" uuid\n}\n\n\
+         Ref: \"app\".\"people\".\"account_id\" > \"core\".\"accounts\".\"id\"\n\
+         Ref: \"app\".\"people\".\"invoice_id\" > \"billing\".\"invoices\".\"id\"\n\n\
+         Table \"core\".\"accounts\" {\n  \"id\" uuid\n\n  indexes {\n    id [unique]\n  }\n\n\
+         \x20 Note: 'Defined in this project, outside this document — only the referenced columns are shown'\n}\n\n\
+         Table \"billing\".\"invoices\" {\n  \"id\" uuid\n\n  indexes {\n    id [unique]\n  }\n\n\
+         \x20 Note: 'External entity — managed outside this project'\n}\n",
+    );
+
+    let o = dbd(
+        dir,
+        &[
+            "merge",
+            "--from-dbml",
+            dir.join("app.dbml").to_str().unwrap(),
+            "--dry-run",
+        ],
+    );
+    assert!(o.status.success(), "merge: {}{}", stdout(&o), stderr(&o));
+    let said = format!("{}{}", stdout(&o), stderr(&o));
+    assert!(
+        !said
+            .lines()
+            .any(|l| l.contains("core.accounts") && l.contains("external")),
+        "core.accounts is the project's own table: {said}"
+    );
+    assert!(
+        said.lines()
+            .any(|l| l.contains("billing.invoices") && l.contains("external")),
+        "a table the project does not build is still named: {said}"
+    );
+}

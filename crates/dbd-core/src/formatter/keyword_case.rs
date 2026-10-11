@@ -244,79 +244,31 @@ pub(in crate::formatter) fn sql_keywords() -> HashSet<&'static str> {
     .collect()
 }
 
-/// `sql` with `recase` applied to each word of SQL in it: every word outside a
-/// string literal, a quoted identifier, a dollar-quoted body (`$$ … $$` or
-/// `$tag$ … $tag$`) and a comment. Those are text, and keep the case they were
-/// written in — a word recased inside a comment or a body is a changed file
-/// the faithfulness guard then rejects whole.
+/// `sql` with `recase` applied to each word of SQL in it: every keyword or
+/// unquoted identifier libpg_query's scanner reads, and nothing inside a
+/// string of any kind (`E''`, `U&''`, a `$$` or `$tag$` body …), a quoted
+/// identifier or a comment. Those are text, and keep the case they were
+/// written in — a word recased inside one is a changed file the faithfulness
+/// guard then rejects whole. Everything between tokens is copied as it is.
+/// Text the scanner cannot read is returned unchanged: none of its words can
+/// be told from text.
 pub(in crate::formatter) fn map_sql_words(sql: &str, mut recase: impl FnMut(&str) -> String) -> String {
+    let Some(tokens) = super::split::lex(sql) else {
+        return sql.to_string();
+    };
     let mut out = String::with_capacity(sql.len());
-    let mut i = 0;
-    while i < sql.len() {
-        let rest = &sql[i..];
-        let first = rest.as_bytes()[0];
-        let len = match first {
-            b'\'' | b'"' => 1 + quoted_len(&rest[1..], first),
-            b'-' if rest.starts_with("--") => rest.find('\n').unwrap_or(rest.len()),
-            b'/' if rest.starts_with("/*") => rest.find("*/").map_or(rest.len(), |p| p + 2),
-            b'$' => match dollar_tag(rest) {
-                Some(tag) => {
-                    let body = &rest[tag.len()..];
-                    tag.len() + body.find(tag).map_or(body.len(), |p| p + tag.len())
-                }
-                None => 1,
-            },
-            b if b.is_ascii_alphabetic() || b == b'_' => {
-                let len = rest
-                    .bytes()
-                    .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
-                    .count();
-                out.push_str(&recase(&rest[..len]));
-                i += len;
-                continue;
-            }
-            _ => rest.chars().next().map_or(1, char::len_utf8),
-        };
-        out.push_str(&rest[..len]);
-        i += len;
-    }
-    out
-}
-
-/// The length of a quoted string or identifier's rest, up to and including
-/// its closing `quote` — a doubled quote is one inside it, as SQL writes one.
-fn quoted_len(rest: &str, quote: u8) -> usize {
-    let bytes = rest.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == quote {
-            if bytes.get(i + 1) == Some(&quote) {
-                i += 2;
-                continue;
-            }
-            return i + 1;
+    let mut copied = 0;
+    for token in &tokens {
+        out.push_str(&sql[copied..token.start]);
+        if token.is_word(sql) {
+            out.push_str(&recase(token.text(sql)));
+        } else {
+            out.push_str(token.text(sql));
         }
-        i += 1;
+        copied = token.end;
     }
-    bytes.len()
-}
-
-/// The dollar-quote tag `s` opens with — `$$` or `$name$` — or `None` when the
-/// `$` is something else (a `$1` parameter).
-fn dollar_tag(s: &str) -> Option<&str> {
-    let after = &s[1..];
-    let name = after
-        .bytes()
-        .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
-        .count();
-    let starts_well = after
-        .bytes()
-        .next()
-        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_');
-    match after.as_bytes().get(name) {
-        Some(b'$') if name == 0 || starts_well => Some(&s[..name + 2]),
-        _ => None,
-    }
+    out.push_str(&sql[copied..]);
+    out
 }
 
 /// Re-case `word` per `case` when it is a SQL keyword; otherwise return it as-is.

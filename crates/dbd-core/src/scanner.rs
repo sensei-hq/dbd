@@ -64,6 +64,10 @@ pub struct ImportScan {
     /// Data files excluded because the leading component under `import/` names a
     /// different env. Each entry is `(env_name, path_relative_to_import_dir)`.
     pub skipped_by_env: Vec<(String, PathBuf)>,
+    /// Data files in a folder layout no import reads, relative to `import/` —
+    /// `staging/sub/x.csv`, `dev/staging/sub/y.csv`. Never loaded, under any
+    /// env, so reported as what they are rather than as another env's.
+    pub unrecognised: Vec<PathBuf>,
 }
 
 impl ImportScan {
@@ -82,20 +86,28 @@ impl ImportScan {
 /// whatever lies under it: a schemaless project (SQLite's) keeps its env-only
 /// data directly in `import/dev/`, where it was taken for a schema called
 /// `dev` that every env loads.
-pub(crate) fn is_env_folder(name: &str) -> bool {
+pub fn is_env_folder(name: &str) -> bool {
     matches!(name, "dev" | "prod")
 }
 
 /// Scan the `import/` folder for data files (.csv, .tsv, .json, .jsonl).
 ///
-/// When `env` is `None`, all files under `import/` are returned regardless of depth.
+/// The layouts an import reads, and nothing else:
+/// - `import/file` and `import/{schema}/file` — every env's;
+/// - `import/{env}/file` and `import/{env}/{schema}/file`, under an env folder
+///   (`dev`, `prod` — see [`is_env_folder`]) — that env's only.
 ///
-/// When `env` is `Some(name)`, the convention `import/{env}/{schema}/file` applies:
-/// - Files directly under `import/` and in `import/{schema}/` are always included.
-/// - Files in an env folder (`import/dev/…`, `import/prod/…` — see
-///   [`is_env_folder`]), and files at depth 2+ under any other first folder
-///   (`import/{first}/{…}/file`), are included only when that first folder
-///   matches `env`.
+/// When `env` is `None`, every env's files are returned. When `env` is
+/// `Some(name)`, another env's are left out and reported in
+/// [`ImportScan::skipped_by_env`].
+///
+/// A file in any other layout — a folder deeper than these, such as
+/// `import/{schema}/{folder}/file` — is never returned, under any env, and is
+/// reported in [`ImportScan::unrecognised`]. Such a file was taken for the env
+/// its first folder names: `import/staging/sub/x.csv` was "skipped — this
+/// run's env is 'prod'", as though some `-e` could load it, and
+/// `import/dev/staging/sub/y.csv` loaded into `staging.y`, its `sub` folder
+/// dropped without a word.
 ///
 /// This lets projects keep shared seed data in `import/staging/` and
 /// environment-specific fixtures in `import/dev/staging/` or `import/prod/staging/`
@@ -130,14 +142,18 @@ pub fn scan_import(root: &Path, env: Option<&str>) -> Result<ImportScan> {
             Ok(r) => r,
             Err(_) => continue,
         };
-        // Count directories between import/ and the file.
-        let parent_depth = relative.parent().map(|p| p.components().count()).unwrap_or(0);
-        let first = relative.iter().next().and_then(|c| c.to_str());
-        // import/file and import/{schema}/file are always included; an env
-        // folder at any depth, and import/{first}/{…}/file, are env-gated.
-        let owning_env = match first {
-            Some(f) if parent_depth >= 2 || (parent_depth == 1 && is_env_folder(f)) => Some(f.to_string()),
-            _ => None,
+        // The folders between import/ and the file.
+        let folders: Vec<&str> = relative
+            .parent()
+            .map(|p| p.iter().filter_map(|c| c.to_str()).collect())
+            .unwrap_or_default();
+        let owning_env = match folders.as_slice() {
+            [env] | [env, _] if is_env_folder(env) => Some(env.to_string()),
+            [] | [_] => None,
+            _ => {
+                scan.unrecognised.push(relative.to_path_buf());
+                continue;
+            }
         };
 
         match (owning_env, env) {
@@ -154,6 +170,7 @@ pub fn scan_import(root: &Path, env: Option<&str>) -> Result<ImportScan> {
 
     scan.files.sort();
     scan.skipped_by_env.sort();
+    scan.unrecognised.sort();
     Ok(scan)
 }
 

@@ -66,6 +66,16 @@ async fn assert_catalog(adapter: &dyn dbd_core::DatabaseAdapter, should_exist: b
         .unwrap_or_else(|e| panic!("assert_catalog({subject}) failed: {e}"));
 }
 
+/// Whether `predicate` finds anything — [`assert_catalog`]'s check, as a value.
+async fn catalog_holds(adapter: &dyn dbd_core::DatabaseAdapter, predicate: &str) -> bool {
+    adapter
+        .execute_script(&format!(
+            "DO $$ BEGIN IF NOT EXISTS ( {predicate} ) THEN RAISE EXCEPTION 'absent'; END IF; END $$"
+        ))
+        .await
+        .is_ok()
+}
+
 fn table_predicate(schema: &str, table: &str) -> String {
     format!("SELECT 1 FROM pg_catalog.pg_tables WHERE schemaname = '{schema}' AND tablename = '{table}'")
 }
@@ -845,8 +855,8 @@ async fn a_json_record_mentioning_set_search_path_imports_unchanged() {
     adapter.import_data(&entity, "", false).await.expect("import failed");
 
     // Read back through the export, not a SQL predicate: a predicate quoting
-    // the same text goes through `execute_script` too, and is rewritten to
-    // match the damage.
+    // the same text goes through `execute_script` too, which once rewrote it
+    // to match the damage.
     let out = tempfile::tempdir().unwrap();
     let mut export = Entity::new(EntityType::Table, "app.notes");
     export.format = Some("jsonl".to_string());
@@ -869,8 +879,8 @@ async fn a_json_record_mentioning_set_search_path_imports_unchanged() {
 /// - `GENERATED ALWAYS` identity ids were renumbered, breaking every foreign
 ///   key pointing at them.
 ///
-/// A JSON null stays the JSON value; an SQL NULL is exported as an absent key
-/// and imports as NULL. Ids import as-is, and the identity then continues past
+/// A JSON null stays the JSON value (exported as `{"$json": null}`); an SQL
+/// NULL is exported as `null` and imports as NULL. Ids import as-is, and the identity then continues past
 /// them, so the next insert does not collide — after a CSV import too, whose
 /// COPY kept the ids and left the sequence behind.
 #[tokio::test]
@@ -1602,6 +1612,7 @@ async fn emitted_index_ddl_applies_to_postgres() {
                 generated: None,
                 comment: None,
                 inline_fk: None,
+                collation: None,
             },
             ColumnDef {
                 name: "title".into(),
@@ -1614,6 +1625,7 @@ async fn emitted_index_ddl_applies_to_postgres() {
                 generated: None,
                 comment: None,
                 inline_fk: None,
+                collation: None,
             },
             ColumnDef {
                 name: "tags".into(),
@@ -1626,6 +1638,7 @@ async fn emitted_index_ddl_applies_to_postgres() {
                 generated: None,
                 comment: None,
                 inline_fk: None,
+                collation: None,
             },
         ],
         constraints: vec![TableConstraint::PrimaryKey {
@@ -3820,6 +3833,60 @@ async fn dbd_schema_excluded_from_introspect_and_survives() {
     assert_table_exists(&*adapter, "dbd", "migrations").await;
 }
 
+/// What an extension owns is the extension's: `CREATE EXTENSION` makes it and
+/// `DROP EXTENSION` removes it. Introspection left out only its functions, so
+/// `init --from-db` wrote an extension's tables, views, sequences and types
+/// into the project as the project's own — and `reset` then failed on every
+/// run, "cannot drop view … because extension … requires it". `diff` and
+/// `reconcile` read the same introspection, so it leaves out everything an
+/// extension owns, schemas included, and keeps the project's own objects —
+/// a table whose columns use an extension's types among them.
+#[tokio::test]
+async fn introspection_leaves_out_every_object_an_extension_owns() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    // pg_cron and PostGIS are not on the embedded server; `ALTER EXTENSION …
+    // ADD` makes an object an extension's exactly as its install script does.
+    adapter
+        .execute_script(
+            "CREATE EXTENSION citext; \
+             CREATE SCHEMA ext_own; ALTER EXTENSION citext ADD SCHEMA ext_own; \
+             CREATE TABLE public.ext_cfg (id int PRIMARY KEY); ALTER EXTENSION citext ADD TABLE public.ext_cfg; \
+             CREATE VIEW public.ext_v AS SELECT 1 AS x; ALTER EXTENSION citext ADD VIEW public.ext_v; \
+             CREATE MATERIALIZED VIEW public.ext_mv AS SELECT 1 AS x; \
+             ALTER EXTENSION citext ADD MATERIALIZED VIEW public.ext_mv; \
+             CREATE SEQUENCE public.ext_seq; ALTER EXTENSION citext ADD SEQUENCE public.ext_seq; \
+             CREATE TYPE public.ext_e AS ENUM ('a'); ALTER EXTENSION citext ADD TYPE public.ext_e; \
+             CREATE FUNCTION public.ext_f() RETURNS int LANGUAGE sql AS 'SELECT 1'; \
+             ALTER EXTENSION citext ADD FUNCTION public.ext_f(); \
+             CREATE TABLE public.mine (id int PRIMARY KEY, e public.ext_e, email citext);",
+        )
+        .await
+        .unwrap();
+
+    let entities = adapter.introspect().await.expect("introspect");
+    let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+    for owned in [
+        "ext_own",
+        "public.ext_cfg",
+        "public.ext_v",
+        "public.ext_mv",
+        "public.ext_seq",
+        "public.ext_e",
+        "public.ext_f",
+    ] {
+        assert!(
+            !names.contains(&owned),
+            "{owned} is citext's, not the project's: {names:?}"
+        );
+    }
+    assert!(
+        names.contains(&"public.mine"),
+        "the project's own table stays: {names:?}"
+    );
+    assert!(names.contains(&"citext"), "and the extension itself: {names:?}");
+}
+
 // ── Reconcile convergence: PRIMARY KEY replacement ────────────────────────────
 
 /// End-to-end: `dbd reconcile` must be able to REPLACE a composite PRIMARY KEY on
@@ -4329,8 +4396,15 @@ async fn removing_an_enum_value_still_in_use_fails_without_half_applying() {
     write_enum("'red', 'green'");
     let failed = load()
         .reconcile(&*adapter, false, true, false, None, Progress::none())
-        .await;
-    assert!(failed.is_err(), "a row holding the removed value must fail the run");
+        .await
+        .expect_err("a row holding the removed value must fail the run")
+        .to_string();
+    // The cast failure named the enum and the value, never the table: the
+    // step is the enum's, and a swap can move columns in many tables.
+    assert!(
+        failed.contains("app.t.c"),
+        "the failure names the column holding the value: {failed}"
+    );
 
     // Nothing half-applied: the type, the row and the view are all as they were.
     assert_catalog(
@@ -5846,7 +5920,7 @@ async fn a_dev_run_against_a_database_marked_prod_is_refused_before_any_write() 
     let meta = adapter.get_project_meta().await.unwrap().expect("meta");
     assert_eq!(meta.env, "prod", "a refused dev run must not re-mark the database");
     assert!(
-        Design::check_reset_guard(Some(&meta)).is_err(),
+        Design::check_reset_guard(&prod.database_marks(&*adapter).await.unwrap()).is_err(),
         "reset must stay blocked on the prod database"
     );
     assert_catalog(
@@ -5893,6 +5967,73 @@ async fn a_forced_full_reset_lets_a_mis_marked_database_be_rebuilt_as_dev() {
     assert_eq!(meta.env, "dev");
 }
 
+/// A design with a `default:` scope: a bare run resolves to it, so the
+/// database is pinned to `default` and a bare `reset --force` is a reset under
+/// `default`. It kept the record — only a reset under the all-scope forgot it —
+/// so the environment guard's own way out (`reset --force`, then `-e dev`)
+/// still refused. A reset under the scope the database was built with leaves
+/// nothing of the project and forgets the record; a narrower one keeps it.
+#[tokio::test]
+async fn a_forced_reset_under_the_scope_the_database_was_built_with_forgets_its_record() {
+    let (pg, _url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(
+        tmp.path(),
+        "project:\n  name: env_guard\nsource:\n  dialect: postgresql\nschemas:\n  - app\n  - core\n\
+         scopes:\n  default:\n    includes: [app, core]\n  narrow:\n    includes: [app]\n",
+        &[
+            (
+                "ddl/table/app/items.ddl",
+                "set search_path to app;\ncreate table if not exists items (id int primary key);\n",
+            ),
+            (
+                "ddl/table/core/regions.ddl",
+                "set search_path to core;\ncreate table if not exists regions (id int primary key);\n",
+            ),
+        ],
+    );
+    let config = tmp.path().join("design.yaml");
+    let prod = Design::from_config_with_dir(&config, "prod", Some(tmp.path())).unwrap();
+    let dev = Design::from_config_with_dir(&config, "dev", Some(tmp.path())).unwrap();
+    let default = prod.resolve_scope(None, None).unwrap();
+    assert_eq!(
+        default.name, "default",
+        "precondition: a bare run resolves to `default`"
+    );
+    let narrow = prod.resolve_scope(Some("narrow"), None).unwrap();
+
+    // The scope the database was built with: the record goes.
+    pg.create_database("built_default").await.unwrap();
+    let adapter = connect(&pg.settings().url("built_default"), "env_guard").await.unwrap();
+    prod.apply(&*adapter, None, false, Some(&default), Progress::none())
+        .await
+        .expect("the prod apply");
+    prod.reset(&*adapter, "postgres", true, false, false, Some(&default))
+        .await
+        .expect("a forced reset under `default`");
+    assert!(
+        adapter.get_project_meta().await.unwrap().is_none(),
+        "a reset under the scope the database was built with forgets its record"
+    );
+    dev.apply(&*adapter, None, false, Some(&default), Progress::none())
+        .await
+        .expect("so the database is rebuilt with -e dev");
+
+    // A narrower scope: the rest of the project stays, and so does its record.
+    pg.create_database("built_narrower").await.unwrap();
+    let adapter = connect(&pg.settings().url("built_narrower"), "env_guard")
+        .await
+        .unwrap();
+    prod.apply(&*adapter, None, false, Some(&default), Progress::none())
+        .await
+        .expect("the prod apply");
+    prod.reset(&*adapter, "postgres", true, false, false, Some(&narrow))
+        .await
+        .expect("a forced reset under the narrower scope");
+    let meta = adapter.get_project_meta().await.unwrap().expect("the record is kept");
+    assert_eq!((meta.env.as_str(), meta.scope.as_deref()), ("prod", Some("default")));
+}
+
 /// The guard is one-way. A database marked dev may be promoted to prod: that
 /// only tightens what `reset` allows.
 #[tokio::test]
@@ -5912,6 +6053,157 @@ async fn a_database_marked_dev_may_be_promoted_to_prod() {
 
     let meta = adapter.get_project_meta().await.unwrap().expect("meta");
     assert_eq!(meta.env, "prod");
+}
+
+// ── A renamed project is held to the record its old name left ────────────────
+
+/// A design named `name` at `version` (0: unversioned) over the one schema
+/// `schema`, with a dev seed file — written into its own directory.
+fn named_design(dir: &std::path::Path, name: &str, version: u32, schema: &str, env: &str) -> Design {
+    let version = match version {
+        0 => String::new(),
+        v => format!("  version: {v}\n"),
+    };
+    write_project(
+        dir,
+        &format!("project:\n  name: {name}\n{version}source:\n  dialect: postgresql\nschemas:\n  - {schema}\n"),
+        &[
+            (
+                &format!("ddl/table/{schema}/items.ddl"),
+                &format!(
+                    "set search_path to {schema};\ncreate table if not exists items (id int primary key, name text);\n"
+                ),
+            ),
+            (&format!("import/dev/{schema}/items.csv"), "id,name\n1,dev-seed\n"),
+        ],
+    );
+    Design::from_config_with_dir(&dir.join("design.yaml"), env, Some(dir)).expect("load design")
+}
+
+/// The audit's repro. Every guard read the database's record by
+/// `project.name` alone, so a renamed design read a production database
+/// another name had built as one dbd had never seen: `reset`, with no
+/// `--force`, dropped every table; a dev run passed the environment guard and
+/// loaded dev seed data; an older revision passed the version guard. The
+/// database still holds the design's objects and the old name's record of
+/// them, so those marks are the guards' marks — refused, naming the project
+/// the database does record and the likely rename — and `--force` still
+/// overrides the reset guard, as it does for the project's own mark.
+#[tokio::test]
+async fn a_renamed_project_is_held_to_the_record_its_old_name_left() {
+    let (pg, _url) = start_pg().await;
+    let (old, new, older) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let alpha = named_design(old.path(), "alpha", 2, "app", "prod");
+    // The same project, renamed — and a revision of it behind the database.
+    let prod = named_design(new.path(), "alpha2", 2, "app", "prod");
+    let dev = named_design(new.path(), "alpha2", 2, "app", "dev");
+    let behind = named_design(older.path(), "alpha2", 1, "app", "prod");
+
+    // Each run against a database of its own, built by `alpha` at v2 and
+    // marked prod, so what one run writes cannot decide another's outcome.
+    let mut failures: Vec<String> = Vec::new();
+    for (i, run) in ["reset", "a dev apply", "a dev import", "an older revision's apply"]
+        .into_iter()
+        .enumerate()
+    {
+        let db = format!("renamed{i}");
+        pg.create_database(&db).await.unwrap();
+        let url = pg.settings().url(&db);
+        let built = connect(&url, "alpha").await.unwrap();
+        alpha
+            .apply(&*built, None, false, None, Progress::none())
+            .await
+            .expect("alpha's prod apply");
+
+        let renamed = connect(&url, "alpha2").await.unwrap();
+        let err = match run {
+            "reset" => prod.reset(&*renamed, "postgres", false, false, false, None).await.err(),
+            "a dev apply" => dev.apply(&*renamed, None, false, None, Progress::none()).await.err(),
+            "a dev import" => dev
+                .import_data(&*renamed, None, false, None, Progress::none())
+                .await
+                .err(),
+            _ => behind.apply(&*renamed, None, false, None, Progress::none()).await.err(),
+        };
+        // Refused, naming the project the database records and the likely
+        // rename. Collected, so one run's failure does not hide another's.
+        match err.map(|e| e.to_string()) {
+            None => failures.push(format!("{run} of the renamed project was not refused")),
+            Some(e) if !(e.contains("'alpha'") && e.contains("project.name")) => {
+                failures.push(format!("{run} did not name 'alpha' and project.name: {e}"))
+            }
+            Some(_) => {}
+        }
+
+        // And nothing written: the tables kept, no dev seed data, no record
+        // made of the renamed project.
+        if !catalog_holds(&*built, &table_predicate("app", "items")).await {
+            failures.push(format!("{run} dropped app.items"));
+        } else if catalog_holds(&*built, "SELECT 1 FROM app.items WHERE name = 'dev-seed'").await {
+            failures.push(format!("{run} loaded dev seed data into the prod database"));
+        }
+        if renamed.get_project_meta().await.unwrap().is_some() {
+            failures.push(format!("{run} recorded the renamed project"));
+        }
+
+        if run == "reset" {
+            prod.reset(&*renamed, "postgres", true, false, false, None)
+                .await
+                .expect("--force overrides the reset guard, as it does on the project's own mark");
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// More than one project may share a database, each with its own record. A
+/// project's guards read its own record, and another project's only when the
+/// database holds this project's objects with no record of it — a rename.
+/// So a second project builds, runs dev, resets and rebuilds beside a
+/// production one at a higher version, and the production one stays guarded.
+#[tokio::test]
+async fn two_projects_in_one_database_are_each_guarded_by_their_own_record() {
+    let (_pg, url) = start_pg().await;
+    let (a_dir, b_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a_prod = named_design(a_dir.path(), "first", 3, "app", "prod");
+    let a_dev = named_design(a_dir.path(), "first", 3, "app", "dev");
+    let b_dev = named_design(b_dir.path(), "second", 0, "bee", "dev");
+    let a = connect(&url, "first").await.unwrap();
+    let b = connect(&url, "second").await.unwrap();
+
+    a_prod
+        .apply(&*a, None, false, None, Progress::none())
+        .await
+        .expect("the first project's prod apply");
+    b_dev
+        .apply(&*b, None, false, None, Progress::none())
+        .await
+        .expect("a second project's first dev apply, below the first's version");
+    b_dev
+        .import_data(&*b, None, false, None, Progress::none())
+        .await
+        .expect("its dev seed data");
+    b_dev
+        .reset(&*b, "postgres", false, false, false, None)
+        .await
+        .expect("its unforced reset: its own record is dev and unversioned");
+    b_dev
+        .apply(&*b, None, false, None, Progress::none())
+        .await
+        .expect("and its dev rebuild");
+
+    assert_table_exists(&*a, "app", "items").await;
+    a_dev
+        .apply(&*a, None, false, None, Progress::none())
+        .await
+        .expect_err("the first project's own prod mark still refuses a dev run");
+    a_prod
+        .reset(&*a, "postgres", false, false, false, None)
+        .await
+        .expect_err("and an unforced reset");
 }
 
 // ── A brownfield matview is adopted only when it is the design's ──────────────
@@ -6150,4 +6442,1848 @@ async fn a_reset_keeps_a_role_another_database_on_the_server_holds() {
         .expect("the first database resets");
     assert_catalog(&*first, false, &role_predicate("app_writer"), "role app_writer").await;
     assert_catalog(&*first, false, &role_predicate("app_reader"), "role app_reader").await;
+}
+
+// ── Migrations run version by version ────────────────────────────────────────
+
+/// Write `files`, remove `gone`, and cut a snapshot of the result — one
+/// version of a released project, as `dbd snapshot` writes it.
+fn cut_version(dir: &std::path::Path, yaml: &str, files: &[(&str, &str)], gone: &[&str], description: &str) {
+    for rel in gone {
+        std::fs::remove_file(dir.join(rel)).unwrap();
+    }
+    let design = write_project(dir, yaml, files);
+    dbd_core::snapshot::create_snapshot(design.entities(), dir, &dir.join("design.yaml"), description).unwrap();
+}
+
+/// The project as its last snapshot left it.
+fn released(dir: &std::path::Path) -> Design {
+    Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design")
+}
+
+/// v2 drops `app.counters` and v5 adds it back with another shape. Applied to
+/// a v1 database, the run created v5's table — a no-op over the old one — and
+/// only then ran v2's drop: it reported success at v5 with no table at all.
+/// Each version now runs whole, in order, so the drop comes first.
+#[tokio::test]
+async fn a_table_dropped_and_later_re_added_ends_in_its_re_added_shape() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "readd_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let yaml = "project:\n  name: readd_test\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+    let counters = "ddl/table/app/counters.ddl";
+    let notes = "ddl/table/app/notes.ddl";
+    let notes_with = |columns: &str| {
+        format!("set search_path to app;\ncreate table if not exists notes (id integer primary key{columns});\n")
+    };
+
+    let (n1, n3, n4) = (notes_with(""), notes_with(", a text"), notes_with(", a text, b text"));
+    cut_version(
+        dir,
+        yaml,
+        &[
+            (
+                counters,
+                "set search_path to app;\ncreate table if not exists counters (id integer primary key, n integer);\n",
+            ),
+            (notes, &n1),
+        ],
+        &[],
+        "v1",
+    );
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+
+    cut_version(dir, yaml, &[], &[counters], "v2 drops counters");
+    cut_version(dir, yaml, &[(notes, &n3)], &[], "v3");
+    cut_version(dir, yaml, &[(notes, &n4)], &[], "v4");
+    cut_version(
+        dir,
+        yaml,
+        &[(
+            counters,
+            "set search_path to app;\ncreate table if not exists counters (id integer primary key, label text not null);\n",
+        )],
+        &[],
+        "v5 re-adds counters",
+    );
+
+    let design = released(dir);
+    assert_eq!(design.config().project.version, Some(5));
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 → v5 applies");
+
+    assert_column_exists(&*adapter, "app", "counters", "label").await;
+    assert_column_absent(&*adapter, "app", "counters", "n").await;
+    assert_column_exists(&*adapter, "app", "notes", "b").await;
+    let diff = design.diff_live(&*adapter, None).await.expect("diff");
+    assert!(diff.is_empty(), "the database is the design: {:?}", diff.changes);
+}
+
+/// v2 adds `s.u.b`; v3 adds `s.t.cnt` with a `data.sql` that counts `u` rows
+/// by `b`. Run one version at a time it works. Jumping v1 → v3 ran every
+/// pending migration of `t` before any of `u` (`u` references `t`), so v3's
+/// script ran before v2 had added the column it reads: `column u.b does not
+/// exist`. Each version now runs whole before the next, so the jump and the
+/// stepwise run end in the same database.
+#[tokio::test]
+async fn a_jump_across_versions_ends_where_running_them_one_at_a_time_does() {
+    let (pg, url) = start_pg().await;
+    pg.create_database("jump").await.unwrap();
+    let stepwise = connect(&url, "jump_test").await.unwrap();
+    let jump = connect(&pg.settings().url("jump"), "jump_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let yaml = "project:\n  name: jump_test\nsource:\n  dialect: postgresql\nschemas:\n  - s\n";
+    let t = "ddl/table/s/t.ddl";
+    let u = "ddl/table/s/u.ddl";
+
+    cut_version(
+        dir,
+        yaml,
+        &[
+            (
+                t,
+                "set search_path to s;\ncreate table if not exists t (id integer primary key);\n",
+            ),
+            (
+                u,
+                "set search_path to s;\ncreate table if not exists u (id integer primary key, t_id integer references t (id));\n",
+            ),
+        ],
+        &[],
+        "v1",
+    );
+    for db in [&stepwise, &jump] {
+        released(dir)
+            .apply(&**db, None, false, None, Progress::none())
+            .await
+            .expect("v1 applies");
+        db.execute_script("INSERT INTO s.t VALUES (1), (2); INSERT INTO s.u VALUES (10, 1), (11, 1), (12, 2);")
+            .await
+            .expect("seed rows");
+    }
+
+    cut_version(
+        dir,
+        yaml,
+        &[(
+            u,
+            "set search_path to s;\n\
+             create table if not exists u (id integer primary key, t_id integer references t (id), b boolean not null default true);\n",
+        )],
+        &[],
+        "v2 adds u.b",
+    );
+    released(dir)
+        .apply(&*stepwise, None, false, None, Progress::none())
+        .await
+        .expect("v1 → v2 applies");
+
+    cut_version(
+        dir,
+        yaml,
+        &[(
+            t,
+            "set search_path to s;\ncreate table if not exists t (id integer primary key, cnt integer);\n",
+        )],
+        &[],
+        "v3 adds t.cnt",
+    );
+    std::fs::write(
+        dir.join("migrations/003/s/t.data.sql"),
+        "update s.t set cnt = (select count(*) from s.u where u.t_id = t.id and u.b);\n",
+    )
+    .unwrap();
+
+    let design = released(dir);
+    design
+        .apply(&*stepwise, None, false, None, Progress::none())
+        .await
+        .expect("v2 → v3 applies");
+    design
+        .apply(&*jump, None, false, None, Progress::none())
+        .await
+        .expect("v1 → v3 applies in one run");
+
+    for db in [&stepwise, &jump] {
+        assert_catalog(
+            &**db,
+            true,
+            "SELECT 1 WHERE (SELECT string_agg(id || ':' || cnt, ',' ORDER BY id) FROM s.t) = '1:2,2:1'",
+            "the counts the v3 data script wrote",
+        )
+        .await;
+        let diff = design.diff_live(&**db, None).await.expect("diff");
+        assert!(diff.is_empty(), "the database is the design: {:?}", diff.changes);
+    }
+    let shape = |entities: Vec<Entity>| {
+        serde_json::to_string_pretty(&dbd_core::reconcile::raw_snapshot_from_entities(&entities)).unwrap()
+    };
+    assert_eq!(
+        shape(stepwise.introspect().await.unwrap()),
+        shape(jump.introspect().await.unwrap()),
+        "the jump and the stepwise run end in the same schema"
+    );
+}
+
+/// Within one version the same holds: `t`'s `data.sql` reads `u.b`, which the
+/// same version adds. Each table ran its `.sql` and then its `.data.sql` before
+/// the next table's `.sql`, so `t`'s script ran before `u` had the column. A
+/// version's data scripts now run after all of its schema changes.
+#[tokio::test]
+async fn a_versions_data_script_runs_after_every_schema_change_of_that_version() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "data_order_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let yaml = "project:\n  name: data_order_test\nsource:\n  dialect: postgresql\nschemas:\n  - s\n";
+    let t = "ddl/table/s/t.ddl";
+    let u = "ddl/table/s/u.ddl";
+    cut_version(
+        dir,
+        yaml,
+        &[
+            (
+                t,
+                "set search_path to s;\ncreate table if not exists t (id integer primary key);\n",
+            ),
+            (
+                u,
+                "set search_path to s;\ncreate table if not exists u (id integer primary key, t_id integer references t (id));\n",
+            ),
+        ],
+        &[],
+        "v1",
+    );
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    adapter
+        .execute_script("INSERT INTO s.t VALUES (1); INSERT INTO s.u VALUES (10, 1), (11, 1);")
+        .await
+        .expect("seed rows");
+
+    cut_version(
+        dir,
+        yaml,
+        &[
+            (
+                t,
+                "set search_path to s;\ncreate table if not exists t (id integer primary key, cnt integer);\n",
+            ),
+            (
+                u,
+                "set search_path to s;\n\
+                 create table if not exists u (id integer primary key, t_id integer references t (id), b boolean not null default true);\n",
+            ),
+        ],
+        &[],
+        "v2 adds t.cnt and u.b",
+    );
+    std::fs::write(
+        dir.join("migrations/002/s/t.data.sql"),
+        "update s.t set cnt = (select count(*) from s.u where u.t_id = t.id and u.b);\n",
+    )
+    .unwrap();
+
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 → v2 applies");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM s.t WHERE id = 1 AND cnt = 2",
+        "the count the v2 data script wrote",
+    )
+    .await;
+}
+
+// ── A named apply never records migrations it did not run ────────────────────
+
+/// `apply -n app.people` on a database with v2 pending ran v2's change to
+/// `app.people` and v2's drop of `app.flags` — a table it was not named for —
+/// skipped v2's change to `core.regions`, and recorded v2 as applied. The next
+/// full apply said "Already up to date (v2)" and `core.regions.iso` was never
+/// added. A named apply now refuses while migrations are pending, before any
+/// write (its `apply.before` hook included), naming them; its preview refuses
+/// alike. With none pending it applies the one entity, as before.
+#[tokio::test]
+async fn a_named_apply_refuses_while_migrations_are_pending() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "named_apply_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let yaml = "project:\n  name: named_apply_test\nsource:\n  dialect: postgresql\nschemas:\n  - app\n  - core\n\
+                apply:\n  before:\n    - sql/mark.sql\n";
+    std::fs::create_dir_all(dir.join("sql")).unwrap();
+    std::fs::write(
+        dir.join("sql/mark.sql"),
+        "create table if not exists public.hook_ran (id integer);\n",
+    )
+    .unwrap();
+    let people = "ddl/table/app/people.ddl";
+    let flags = "ddl/table/app/flags.ddl";
+    let regions = "ddl/table/core/regions.ddl";
+    cut_version(
+        dir,
+        yaml,
+        &[
+            (
+                people,
+                "set search_path to app;\ncreate table if not exists people (id integer primary key);\n",
+            ),
+            (
+                flags,
+                "set search_path to app;\ncreate table if not exists flags (id integer primary key);\n",
+            ),
+            (
+                regions,
+                "set search_path to core;\ncreate table if not exists regions (id integer primary key);\n",
+            ),
+        ],
+        &[],
+        "v1",
+    );
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    adapter
+        .execute_script("DROP TABLE public.hook_ran;")
+        .await
+        .expect("forget the v1 run's hook");
+
+    cut_version(
+        dir,
+        yaml,
+        &[
+            (
+                people,
+                "set search_path to app;\ncreate table if not exists people (id integer primary key, nickname text);\n",
+            ),
+            (
+                regions,
+                "set search_path to core;\ncreate table if not exists regions (id integer primary key, iso text);\n",
+            ),
+        ],
+        &[flags],
+        "v2",
+    );
+    let design = released(dir);
+
+    let err = design
+        .apply(&*adapter, Some("app.people"), false, None, Progress::none())
+        .await
+        .expect_err("a named apply refuses while v2 is pending")
+        .to_string();
+    assert!(err.contains("v2"), "the pending version is named: {err}");
+    assert!(err.contains("dbd apply"), "the way through is named: {err}");
+    assert_column_absent(&*adapter, "app", "people", "nickname").await;
+    assert_column_absent(&*adapter, "core", "regions", "iso").await;
+    assert_table_exists(&*adapter, "app", "flags").await;
+    assert_table_absent(&*adapter, "public", "hook_ran").await;
+    assert_eq!(adapter.get_db_version().await.unwrap(), 1, "nothing is recorded");
+
+    let preview = design
+        .pending_migration_preview(&*adapter, Some("app.people"), None)
+        .await
+        .expect_err("the preview refuses as the run does")
+        .to_string();
+    assert_eq!(preview, err, "the preview says what the run says");
+
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("the full apply runs v2");
+    assert_column_exists(&*adapter, "core", "regions", "iso").await;
+    design
+        .apply(&*adapter, Some("app.people"), false, None, Progress::none())
+        .await
+        .expect("with nothing pending, a named apply applies its entity");
+}
+
+// ── An enum value a version adds can be used in that version ─────────────────
+
+const MOOD_YAML: &str = "project:\n  name: enum_add_test\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+
+/// The enum and table files of a version: `values` for `app.mood`, and the
+/// columns of `app.people` after its key.
+fn mood_files(values: &str, columns: &str) -> [(String, String); 2] {
+    [
+        (
+            "ddl/enum/app/mood.ddl".to_string(),
+            format!("set search_path to app;\ncreate type mood as enum ({values});\n"),
+        ),
+        (
+            "ddl/table/app/people.ddl".to_string(),
+            format!("set search_path to app;\ncreate table if not exists people (id integer primary key{columns});\n"),
+        ),
+    ]
+}
+
+fn cut_mood_version(dir: &std::path::Path, values: &str, columns: &str, description: &str) {
+    let files = mood_files(values, columns);
+    let files: Vec<(&str, &str)> = files.iter().map(|(p, s)| (p.as_str(), s.as_str())).collect();
+    cut_version(dir, MOOD_YAML, &files, &[], description);
+}
+
+/// Adding `'archived'` and making it the default in one version failed with
+/// `unsafe use of new value "archived"`: the migration ran in one transaction,
+/// and Postgres will not use an enum value before the transaction that added
+/// it commits. Reconcile, which commits as it goes, handled the same change.
+/// The value is now committed ahead of the rest of its version — here across
+/// a jump over two such versions.
+#[tokio::test]
+async fn an_enum_value_a_version_adds_can_be_used_in_that_version() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "enum_add_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    cut_mood_version(dir, "'ok', 'bad'", ", mood mood not null default 'ok'", "v1");
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    adapter
+        .execute_script("INSERT INTO app.people (id) VALUES (1);")
+        .await
+        .expect("seed a row");
+
+    cut_mood_version(
+        dir,
+        "'ok', 'bad', 'archived'",
+        ", mood mood not null default 'archived'",
+        "v2 archives by default",
+    );
+    cut_mood_version(
+        dir,
+        "'ok', 'bad', 'archived', 'paused'",
+        ", mood mood not null default 'archived', was mood not null default 'paused'",
+        "v3 adds was",
+    );
+
+    let design = released(dir);
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 → v3 applies");
+
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 WHERE (SELECT enum_range(NULL::app.mood)::text) = '{ok,bad,archived,paused}'",
+        "enum app.mood with archived and paused",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.people WHERE id = 1 AND was = 'paused'",
+        "the row, given the default of the new column",
+    )
+    .await;
+    let diff = design.diff_live(&*adapter, None).await.expect("diff");
+    assert!(diff.is_empty(), "the database is the design: {:?}", diff.changes);
+}
+
+/// What stays atomic. The enum values a version adds commit before the rest of
+/// it runs; everything else of the run is one transaction. So when the rest
+/// fails, the values stay, nothing else of the version does, the database still
+/// records the version before — and the next run, once the script is fixed,
+/// adds nothing twice.
+#[tokio::test]
+async fn a_version_failing_after_its_enum_values_commit_runs_again_once_fixed() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "enum_add_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    cut_mood_version(dir, "'ok', 'bad'", ", mood mood not null default 'ok'", "v1");
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    cut_mood_version(
+        dir,
+        "'ok', 'bad', 'archived'",
+        ", mood mood not null default 'archived'",
+        "v2 archives by default",
+    );
+    let people_sql = dir.join("migrations/002/app/people.sql");
+    let generated = std::fs::read_to_string(&people_sql).unwrap();
+    std::fs::write(&people_sql, format!("{generated}\nSELECT 1 / 0;\n")).unwrap();
+
+    let design = released(dir);
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect_err("the broken script fails the run");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 WHERE (SELECT enum_range(NULL::app.mood)::text) = '{ok,bad,archived}'",
+        "the committed enum value",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM information_schema.columns WHERE table_schema = 'app' AND table_name = 'people' \
+         AND column_name = 'mood' AND column_default LIKE '''ok''%'",
+        "the default the failed run rolled back",
+    )
+    .await;
+    assert_eq!(adapter.get_db_version().await.unwrap(), 1, "v2 is not recorded");
+
+    std::fs::write(&people_sql, generated).unwrap();
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("the fixed version applies over its committed value");
+    assert_eq!(adapter.get_db_version().await.unwrap(), 2);
+    let diff = design.diff_live(&*adapter, None).await.expect("diff");
+    assert!(diff.is_empty(), "the database is the design: {:?}", diff.changes);
+}
+
+// ── A preview refuses and orders as the run does ─────────────────────────────
+
+/// `apply` refuses a pending migration whose `data.sql` still holds a `--
+/// TODO:`, but `apply --dry-run` listed the migration — the TODO's `'???'`
+/// included — and said "no issues". The preview refuses with the run's own
+/// words, and so does `Design::apply` under `dry_run`.
+#[tokio::test]
+async fn a_preview_refuses_a_pending_migration_with_an_unresolved_todo_as_the_run_does() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "enum_add_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    cut_mood_version(dir, "'ok', 'meh', 'bad'", ", mood mood not null default 'ok'", "v1");
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    cut_mood_version(dir, "'ok', 'bad'", ", mood mood not null default 'ok'", "drop meh");
+    let design = released(dir);
+
+    let run = design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect_err("the run refuses the unresolved TODO")
+        .to_string();
+    assert!(run.contains("TODO"), "{run}");
+    let preview = design
+        .pending_migration_preview(&*adapter, None, None)
+        .await
+        .expect_err("the preview refuses it too")
+        .to_string();
+    assert_eq!(preview, run);
+    let dry_run = design
+        .apply(&*adapter, None, true, None, Progress::none())
+        .await
+        .expect_err("and so does a dry run of apply")
+        .to_string();
+    assert_eq!(dry_run, run);
+}
+
+/// The preview listed migration steps grouped by entity — every pending
+/// version of one table, then the next — while the run executes them version
+/// by version. It now lists exactly the steps the run starts, in its order.
+#[tokio::test]
+async fn the_migration_preview_lists_the_steps_in_the_order_the_run_takes_them() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "preview_order_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let yaml = "project:\n  name: preview_order_test\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+    let counters = "ddl/table/app/counters.ddl";
+    let notes = "ddl/table/app/notes.ddl";
+    let notes_with = |columns: &str| {
+        format!("set search_path to app;\ncreate table if not exists notes (id integer primary key{columns});\n")
+    };
+    let (n1, n3, n4) = (notes_with(""), notes_with(", a text"), notes_with(", a text, b text"));
+    cut_version(
+        dir,
+        yaml,
+        &[
+            (
+                counters,
+                "set search_path to app;\ncreate table if not exists counters (id integer primary key);\n",
+            ),
+            (notes, &n1),
+        ],
+        &[],
+        "v1",
+    );
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    cut_version(dir, yaml, &[], &[counters], "v2 drops counters");
+    cut_version(dir, yaml, &[(notes, &n3)], &[], "v3");
+    cut_version(dir, yaml, &[(notes, &n4)], &[], "v4");
+    cut_version(
+        dir,
+        yaml,
+        &[(
+            counters,
+            "set search_path to app;\ncreate table if not exists counters (id integer primary key, label text);\n",
+        )],
+        &[],
+        "v5",
+    );
+    let design = released(dir);
+
+    let preview = design.pending_migration_preview(&*adapter, None, None).await.unwrap();
+    let listed: Vec<(u32, String)> = preview.steps.iter().map(|s| (s.version, s.entity.clone())).collect();
+    assert_eq!(
+        listed,
+        vec![
+            (2, "app.counters".to_string()),
+            (3, "app.notes".to_string()),
+            (4, "app.notes".to_string()),
+            (5, "app.counters".to_string()),
+        ],
+        "{:#?}",
+        preview.steps
+    );
+
+    let mut started: Vec<String> = Vec::new();
+    design
+        .apply(
+            &*adapter,
+            None,
+            false,
+            None,
+            Progress {
+                on_start: |d: &str| started.push(d.to_string()),
+                on_done: |_: &str, _: Option<&str>| {},
+                on_complete: |_| {},
+            },
+        )
+        .await
+        .expect("v1 → v5 applies");
+    let run: Vec<&String> = started
+        .iter()
+        .filter(|d| d.starts_with("drop ") || d.starts_with("migrate ") || d.as_str() == "table:app.counters")
+        .collect();
+    assert_eq!(
+        run,
+        vec![
+            "drop table:app.counters (v2)",
+            "migrate table:app.notes → v3",
+            "migrate table:app.notes → v4",
+            "table:app.counters",
+        ],
+        "the run takes them in the order the preview lists them: {started:#?}"
+    );
+}
+
+// ── Migration and hook scripts run on source.search_path ─────────────────────
+
+/// `source.search_path: [app]`, a `notes` table whose file states no path of
+/// its own, and a `core` table applied after it whose file leaves the session
+/// on `core`. With `hook`, an `apply.after` script naming `notes` bare.
+fn search_path_project(dir: &std::path::Path, hook: bool, notes_columns: &str) -> Design {
+    let mut yaml = "project:\n  name: path_test\nsource:\n  dialect: postgresql\n  search_path: [app]\n\
+                    schemas:\n  - app\n  - core\nscopes:\n  core_only:\n    includes: [core]\n"
+        .to_string();
+    if hook {
+        yaml.push_str("apply:\n  after:\n    - sql/seed.sql\n");
+    }
+    let notes = format!("create table if not exists notes (id integer primary key, body text{notes_columns});\n");
+    write_project(
+        dir,
+        &yaml,
+        &[
+            ("ddl/table/app/notes.ddl", notes.as_str()),
+            (
+                "ddl/table/core/zones.ddl",
+                "set search_path to core;\ncreate table if not exists zones (id integer primary key);\n",
+            ),
+            (
+                "sql/seed.sql",
+                "insert into notes (id, body) values (1, 'seed') on conflict do nothing;\n",
+            ),
+        ],
+    )
+}
+
+/// A hook naming a table bare ran on whatever path the last DDL file left —
+/// here `core` — and failed with `relation "notes" does not exist`, though the
+/// project says bare names resolve on `app`.
+#[tokio::test]
+async fn a_hook_naming_a_table_bare_runs_on_source_search_path() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "path_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    search_path_project(tmp.path(), true, "")
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("the hook finds app.notes");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.notes WHERE id = 1",
+        "the seeded row",
+    )
+    .await;
+}
+
+/// A hand-written `migrations/002/app/notes.data.sql` naming `notes` bare ran
+/// with no path at all and failed with `relation "notes" does not exist`.
+#[tokio::test]
+async fn a_migration_script_naming_a_table_bare_runs_on_source_search_path() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "path_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let config = dir.join("design.yaml");
+    let design = search_path_project(dir, false, "");
+    dbd_core::snapshot::create_snapshot(design.entities(), dir, &config, "v1").unwrap();
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    adapter
+        .execute_script("INSERT INTO app.notes (id, body) VALUES (1, 'a'), (2, 'b');")
+        .await
+        .expect("seed rows");
+
+    let design = search_path_project(dir, false, ", tag text");
+    dbd_core::snapshot::create_snapshot(design.entities(), dir, &config, "v2 tags notes").unwrap();
+    std::fs::write(
+        dir.join("migrations/002/app/notes.data.sql"),
+        "update notes set tag = 'old';\n",
+    )
+    .unwrap();
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("the data script finds app.notes");
+    assert_catalog(
+        &*adapter,
+        false,
+        "SELECT 1 FROM app.notes WHERE tag IS DISTINCT FROM 'old'",
+        "a row the data script missed",
+    )
+    .await;
+}
+
+/// A hook's tables decide whether a scope runs it, and its bare `notes` was
+/// read as `public.notes`: under `core_only`, which leaves `app` out, the hook
+/// was not skipped, ran, and failed the apply. It is read on the path it runs
+/// on — `app.notes` — and skipped, with a warning naming it.
+#[tokio::test]
+async fn a_scope_judges_a_hooks_bare_table_on_source_search_path() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "path_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let design = search_path_project(tmp.path(), true, "");
+    let scope = design.resolve_scope(Some("core_only"), None).unwrap();
+
+    let skips = design.hook_skips(Some(&scope)).unwrap();
+    assert!(
+        skips.len() == 1 && skips[0].contains("app.notes"),
+        "the hook is skipped for app.notes: {skips:?}"
+    );
+    design
+        .apply(&*adapter, None, false, Some(&scope), Progress::none())
+        .await
+        .expect("the scoped apply skips the hook");
+    assert_table_exists(&*adapter, "core", "zones").await;
+}
+
+/// With no `source.search_path`, a hook stating no path is read on the
+/// session's default — that is what its scope analysis assumes — but it ran on
+/// whatever path the last DDL file left: here `zeta`, so `items` meant
+/// `zeta.items`, not the `public.items` the analysis judged.
+#[tokio::test]
+async fn a_hook_stating_no_path_in_a_project_with_none_runs_on_the_session_default() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "path_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let design = write_project(
+        tmp.path(),
+        "project:\n  name: path_test\nsource:\n  dialect: postgresql\nschemas:\n  - public\n  - zeta\n\
+         apply:\n  after:\n    - sql/seed.sql\n",
+        &[
+            (
+                "ddl/table/public/items.ddl",
+                "set search_path to public;\ncreate table if not exists items (id integer primary key);\n",
+            ),
+            (
+                "ddl/table/zeta/items.ddl",
+                "set search_path to zeta;\ncreate table if not exists items (id integer primary key);\n",
+            ),
+            (
+                "sql/seed.sql",
+                "insert into items (id) values (1) on conflict do nothing;\n",
+            ),
+        ],
+    );
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM public.items WHERE id = 1",
+        "the row in public.items",
+    )
+    .await;
+    assert_catalog(&*adapter, false, "SELECT 1 FROM zeta.items", "a row in zeta.items").await;
+}
+
+// ── Enum value removal: a live matview blocks, the type keeps its comment ────
+
+/// The enum, a table using it, a matview reading the column, and one that
+/// reads the table but not the column.
+fn matview_over_enum_files(values: &str) -> [(String, String); 4] {
+    [
+        (
+            "ddl/enum/app/mood.ddl".to_string(),
+            format!("set search_path to app;\ncreate type mood as enum ({values});\ncomment on type mood is 'how they feel';\n"),
+        ),
+        (
+            "ddl/table/app/people.ddl".to_string(),
+            "set search_path to app;\ncreate table if not exists people (id integer primary key, mood mood not null default 'ok');\n"
+                .to_string(),
+        ),
+        (
+            "ddl/materialized_view/app/mood_counts.ddl".to_string(),
+            "set search_path to app;\n\
+             create materialized view if not exists mood_counts as select mood, count(*) as n from people group by mood;\n"
+                .to_string(),
+        ),
+        (
+            "ddl/materialized_view/app/people_count.ddl".to_string(),
+            "set search_path to app;\ncreate materialized view if not exists people_count as select count(*) as n from people;\n"
+                .to_string(),
+        ),
+    ]
+}
+
+fn matview_over_enum_design(dir: &std::path::Path, values: &str) -> Design {
+    let files = matview_over_enum_files(values);
+    let files: Vec<(&str, &str)> = files.iter().map(|(p, s)| (p.as_str(), s.as_str())).collect();
+    write_project(
+        dir,
+        "project:\n  name: matview_block_test\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+        &files,
+    )
+}
+
+/// Reconcile decided whether a materialized view blocked an enum value's
+/// removal from the design, so it could never remove one while the design had
+/// a matview over the table: dropping the matview by hand, as told, and
+/// re-running re-created it and declined again — and every run exited 0,
+/// "Reconciled". It now asks the database which matviews read the column, and
+/// refuses, before any write and with a non-zero exit, naming them and the
+/// steps. A matview that reads the table but not the column blocks nothing.
+#[tokio::test]
+async fn reconcile_refuses_an_enum_value_removal_a_live_matview_blocks_and_goes_on_once_it_is_dropped() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "matview_block_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    matview_over_enum_design(dir, "'ok', 'meh', 'bad'")
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("build");
+
+    let design = matview_over_enum_design(dir, "'ok', 'bad'");
+    let err = design
+        .reconcile(&*adapter, false, true, false, None, Progress::none())
+        .await
+        .expect_err("a live matview over the column blocks the removal")
+        .to_string();
+    for needed in ["app.mood_counts", "DROP MATERIALIZED VIEW", "dbd reconcile", "meh"] {
+        assert!(err.contains(needed), "the refusal names {needed}: {err}");
+    }
+    assert!(
+        !err.contains("people_count"),
+        "a matview not reading the column blocks nothing: {err}"
+    );
+    let dry = design
+        .reconcile(&*adapter, true, true, false, None, Progress::none())
+        .await
+        .expect_err("the dry run refuses as the run does")
+        .to_string();
+    assert_eq!(dry, err);
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 WHERE (SELECT enum_range(NULL::app.mood)::text) = '{ok,meh,bad}'",
+        "the untouched enum",
+    )
+    .await;
+
+    adapter
+        .execute_script("DROP MATERIALIZED VIEW app.mood_counts;")
+        .await
+        .expect("drop it, as told");
+    design
+        .reconcile(&*adapter, false, true, false, None, Progress::none())
+        .await
+        .expect("with the matview gone, the value goes");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 WHERE (SELECT enum_range(NULL::app.mood)::text) = '{ok,bad}'",
+        "enum app.mood without meh",
+    )
+    .await;
+    for matview in ["mood_counts", "people_count"] {
+        assert_catalog(
+            &*adapter,
+            true,
+            &format!("SELECT 1 FROM pg_matviews WHERE schemaname = 'app' AND matviewname = '{matview}'"),
+            &format!("matview app.{matview}"),
+        )
+        .await;
+    }
+}
+
+/// Removing a value renames the type aside and creates it again; its `COMMENT
+/// ON TYPE` stayed on the old one and went with it — in reconcile and in the
+/// migration `dbd snapshot` writes — and `diff` cannot see the loss.
+#[tokio::test]
+async fn removing_an_enum_value_keeps_the_enums_comment() {
+    let (pg, url) = start_pg().await;
+    pg.create_database("migrated").await.unwrap();
+    let reconciled = connect(&url, "enum_comment_test").await.unwrap();
+    let migrated = connect(&pg.settings().url("migrated"), "enum_comment_test")
+        .await
+        .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let yaml = "project:\n  name: enum_comment_test\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+    let files = |values: &str| -> Vec<(String, String)> {
+        vec![
+            (
+                "ddl/enum/app/mood.ddl".to_string(),
+                format!("set search_path to app;\ncreate type mood as enum ({values});\ncomment on type mood is 'how they feel';\n"),
+            ),
+            (
+                "ddl/table/app/people.ddl".to_string(),
+                "set search_path to app;\ncreate table if not exists people (id integer primary key, mood mood not null default 'ok');\n"
+                    .to_string(),
+            ),
+        ]
+    };
+    let version = |values: &str, description: &str| {
+        let f = files(values);
+        let f: Vec<(&str, &str)> = f.iter().map(|(p, s)| (p.as_str(), s.as_str())).collect();
+        cut_version(dir, yaml, &f, &[], description);
+    };
+    let comment = "SELECT 1 WHERE obj_description('app.mood'::regtype, 'pg_type') = 'how they feel'";
+
+    version("'ok', 'meh', 'bad'", "v1");
+    let v1 = released(dir);
+    v1.reconcile(&*reconciled, false, false, false, None, Progress::none())
+        .await
+        .expect("reconcile builds v1");
+    v1.apply(&*migrated, None, false, None, Progress::none())
+        .await
+        .expect("apply builds v1");
+
+    version("'ok', 'bad'", "drop meh");
+    for todo in dbd_core::snapshot::scan_data_sql_todos(dir).unwrap() {
+        let sql = std::fs::read_to_string(&todo.file).unwrap();
+        let resolved: String = sql
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("-- TODO"))
+            .map(|l| format!("{}\n", l.replace("'???'", "'ok'")))
+            .collect();
+        std::fs::write(&todo.file, resolved).unwrap();
+    }
+    let design = released(dir);
+    design
+        .reconcile(&*reconciled, false, true, false, None, Progress::none())
+        .await
+        .expect("reconcile removes meh");
+    design
+        .apply(&*migrated, None, false, None, Progress::none())
+        .await
+        .expect("the migration removes meh");
+
+    for db in [&reconciled, &migrated] {
+        assert_catalog(
+            &**db,
+            true,
+            "SELECT 1 WHERE (SELECT enum_range(NULL::app.mood)::text) = '{ok,bad}'",
+            "enum app.mood without meh",
+        )
+        .await;
+        assert_catalog(&**db, true, comment, "the comment on app.mood").await;
+    }
+}
+
+/// `dbd snapshot` writes a column's type as the DDL file wrote it — `mood`,
+/// resolved by the file's own `set search_path to app`. Run on the session's
+/// default path, the generated `ALTER TABLE app.people ADD COLUMN was mood`
+/// failed with `type "mood" does not exist`; it had worked only when an
+/// earlier file in the run happened to leave the connection on `app`. A
+/// migration file runs on the path its entity's DDL file runs on — and so does
+/// a hand-written `data.sql` naming the table bare.
+#[tokio::test]
+async fn a_migration_runs_on_the_path_its_entitys_ddl_file_states() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "enum_add_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    cut_mood_version(dir, "'ok', 'bad'", ", mood mood not null default 'ok'", "v1");
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    adapter
+        .execute_script("INSERT INTO app.people (id, mood) VALUES (1, 'bad'); RESET search_path;")
+        .await
+        .expect("seed a row");
+
+    cut_mood_version(
+        dir,
+        "'ok', 'bad'",
+        ", mood mood not null default 'ok', was mood",
+        "v2 adds was",
+    );
+    std::fs::write(
+        dir.join("migrations/002/app/people.data.sql"),
+        "update people set was = mood;\n",
+    )
+    .unwrap();
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 → v2 applies");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.people WHERE id = 1 AND was = 'bad'",
+        "the row the data script filled",
+    )
+    .await;
+}
+
+// ── `public` on the search path, without rewriting any text ──────────────────
+
+/// The files `search_path_text_survives_apply_and_combine` applies: two
+/// Supabase-style `SECURITY DEFINER` functions pinned to an empty path (`=`
+/// and `to`), a function whose body follows its `set search_path to` clause,
+/// and a table whose file sets its own path and needs an extension installed
+/// in `public`, with defaults quoting the statement.
+const SEARCH_PATH_FILES: [(&str, &str); 4] = [
+    (
+        "ddl/function/app/secure.ddl",
+        "create or replace function app.secure() returns int\n\
+         language sql security definer set search_path = ''\nas $$ select 1; $$;\n",
+    ),
+    (
+        "ddl/function/app/secure_to.ddl",
+        "create or replace function app.secure_to() returns int\n\
+         language sql security definer set search_path to ''\nas $$ select 2; $$;\n",
+    ),
+    (
+        "ddl/function/app/greet.ddl",
+        "create or replace function app.greet() returns text\n\
+         language plpgsql set search_path to app\nas $$ begin return 'g; ok'; end; $$;\n",
+    ),
+    (
+        "ddl/table/app/notes.ddl",
+        "set search_path to app;\n\
+         create table if not exists notes (id int primary key, addr citext, \
+         body text default 'set search_path to x; y');\n",
+    ),
+];
+
+/// What `SEARCH_PATH_FILES` must leave in a database, however they got there.
+async fn assert_search_path_text_survived(adapter: &dyn dbd_core::DatabaseAdapter, label: &str) {
+    for (function, expected) in [
+        ("secure", "{\"search_path=\\\"\\\"\"}"),
+        ("secure_to", "{\"search_path=\\\"\\\"\"}"),
+        ("greet", "{search_path=app}"),
+    ] {
+        assert_catalog(
+            adapter,
+            true,
+            &format!(
+                "SELECT 1 FROM pg_proc WHERE proname = '{function}' AND proconfig::text = '{}'",
+                expected.replace('\'', "''")
+            ),
+            &format!("{label}: {function} with its own search_path {expected}"),
+        )
+        .await;
+    }
+    assert_catalog(
+        adapter,
+        true,
+        "SELECT 1 WHERE app.greet() = 'g; ok'",
+        &format!("{label}: app.greet() returning the literal in its body"),
+    )
+    .await;
+    assert_catalog(
+        adapter,
+        true,
+        "SELECT 1 FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum \
+         WHERE d.adrelid = 'app.notes'::regclass AND a.attname = 'body' \
+         AND pg_get_expr(d.adbin, d.adrelid) = '''set search_path to x; y''::text'",
+        &format!("{label}: the default quoting `set search_path to x; y`"),
+    )
+    .await;
+}
+
+/// Every script `apply` ran, and the one `combine` wrote, had each `set
+/// search_path to …;` in its text rewritten to add `public` — matched anywhere
+/// and up to the next `;`. A Supabase-style function with `set search_path to
+/// ''` failed with `column "public" does not exist`; a body `return 'g; ok'`
+/// after a `set search_path to app` clause deployed returning `'g, public;
+/// ok'`; a default quoting the statement was changed. Only a top-level `SET
+/// search_path` statement now gets `public` — by a statement after it, so no
+/// text is edited — and the script `combine` writes, run as `psql -f` runs
+/// it, builds the same database.
+#[tokio::test]
+async fn search_path_text_survives_apply_and_combine() {
+    let (pg, url) = start_pg().await;
+    pg.create_database("combined").await.unwrap();
+    let adapter = connect(&url, "search_path_text").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let design = write_project(
+        tmp.path(),
+        "project:\n  name: search_path_text\nsource:\n  dialect: postgresql\nschemas:\n  - app\n\
+         target:\n  postgres:\n    extensions:\n      - citext\n",
+        &SEARCH_PATH_FILES,
+    );
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply");
+    assert_search_path_text_survived(&*adapter, "apply").await;
+
+    let script = tmp.path().join("init.sql");
+    design.combine(&script, None).expect("combine");
+    let combined_url = pg.settings().url("combined");
+    {
+        use sqlx::Connection as _;
+        let mut raw = sqlx::PgConnection::connect(&combined_url).await.unwrap();
+        sqlx::raw_sql(&std::fs::read_to_string(&script).unwrap())
+            .execute(&mut raw)
+            .await
+            .expect("the combined script runs as written");
+    }
+    let combined = connect(&combined_url, "search_path_text").await.unwrap();
+    assert_search_path_text_survived(&*combined, "combine").await;
+}
+
+// ── A reverse-engineered enum file runs twice ─────────────────────────────────
+
+/// Every other file reverse-engineering writes can run twice — `CREATE TABLE
+/// IF NOT EXISTS`, `CREATE OR REPLACE VIEW` — because a reversed project is
+/// applied back to the database it was read from, and `psql -f` over its files
+/// is how many people do that. An enum was a bare `CREATE TYPE`, which fails
+/// the second time with `type … already exists` (`dbd apply` copes by checking
+/// first; nothing else does). It is written in Postgres's idiom for a
+/// conditional `CREATE TYPE` — the `DO … duplicate_object` guard the enum
+/// parser already reads — and reads back to the same labels and comment.
+#[tokio::test]
+async fn a_reverse_engineered_enum_file_runs_twice_and_reads_back_the_same() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    adapter
+        .execute_script(
+            "CREATE SCHEMA app; \
+             CREATE TYPE app.mood AS ENUM ('happy', 'it''s $$ fine', 'sad'); \
+             COMMENT ON TYPE app.mood IS 'how a day went';",
+        )
+        .await
+        .unwrap();
+    let entities = adapter.introspect().await.expect("introspect");
+    let mood = entities
+        .iter()
+        .find(|e| e.name == "app.mood")
+        .expect("app.mood introspected");
+    // What `init --from-db` writes: the emitted DDL through the formatter.
+    let file = dbd_core::formatter::format_ddl(
+        &dbd_core::emit::emit_entity(mood).unwrap(),
+        &dbd_core::config::FormatConfig::default(),
+    );
+
+    // Against the database it came from, and again.
+    for run in 1..=2 {
+        adapter
+            .execute_script(&file)
+            .await
+            .unwrap_or_else(|e| panic!("run {run} of the enum file failed: {e}\n{file}"));
+    }
+    // And against one that has no such type yet.
+    adapter.execute_script("DROP TYPE app.mood").await.unwrap();
+    adapter
+        .execute_script(&file)
+        .await
+        .unwrap_or_else(|e| panic!("the enum file failed on a fresh schema: {e}\n{file}"));
+    // `chr(36)` is `$`: `assert_catalog` wraps its predicate in `DO $$ … $$`,
+    // which a literal `$$` would close.
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_type t WHERE t.oid = 'app.mood'::regtype \
+           AND (SELECT array_agg(enumlabel ORDER BY enumsortorder) FROM pg_enum WHERE enumtypid = t.oid) \
+               = ARRAY['happy', 'it''s ' || repeat(chr(36), 2) || ' fine', 'sad']::name[]",
+        "app.mood with its three labels in order",
+    )
+    .await;
+
+    let back = dbd_core::parser::parse_entity(std::path::Path::new("ddl/enum/app/mood.ddl"), &file).unwrap();
+    assert!(back.errors.is_empty(), "{:?}\n{file}", back.errors);
+    let labels: Vec<&str> = back.enum_values.iter().map(|v| v.name.as_str()).collect();
+    assert_eq!(labels, ["happy", "it's $$ fine", "sad"], "{file}");
+    assert_eq!(back.comment.as_deref(), Some("how a day went"), "{file}");
+}
+
+// ── A reverse-engineered table keeps its triggers ─────────────────────────────
+
+/// A trigger lives in its table's file — the table parser reads it there, as
+/// the edge to the function it fires. Introspection read none, so
+/// `init --from-db` wrote a table without its triggers, and `merge` overwrote
+/// an authored table file and deleted the triggers in it, without a word.
+/// The emitted table carries each trigger in a form that runs twice — `CREATE
+/// OR REPLACE TRIGGER`, or for a constraint trigger, which Postgres will not
+/// replace, a `DROP TRIGGER IF EXISTS` before it — and the file reads back
+/// clean. A disabled trigger is captured, and said to be disabled.
+#[tokio::test]
+async fn a_reverse_engineered_table_keeps_its_triggers() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    adapter
+        .execute_script(
+            "CREATE SCHEMA app; \
+             CREATE FUNCTION app.touch() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END'; \
+             CREATE TABLE app.tickets (id int PRIMARY KEY, title text); \
+             CREATE TRIGGER tickets_touch BEFORE INSERT OR UPDATE OF title ON app.tickets \
+               FOR EACH ROW EXECUTE FUNCTION app.touch(); \
+             CREATE CONSTRAINT TRIGGER tickets_check AFTER INSERT ON app.tickets \
+               DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (NEW.id > 0) EXECUTE FUNCTION app.touch(); \
+             CREATE TRIGGER tickets_off AFTER DELETE ON app.tickets FOR EACH ROW EXECUTE FUNCTION app.touch(); \
+             ALTER TABLE app.tickets DISABLE TRIGGER tickets_off;",
+        )
+        .await
+        .unwrap();
+
+    let entities = adapter.introspect().await.expect("introspect");
+    let tickets = entities.iter().find(|e| e.name == "app.tickets").expect("app.tickets");
+    let file = dbd_core::formatter::format_ddl(
+        &dbd_core::emit::emit_entity(tickets).unwrap(),
+        &dbd_core::config::FormatConfig::default(),
+    );
+    let upper = file.to_uppercase();
+    for expected in [
+        "CREATE OR REPLACE TRIGGER TICKETS_TOUCH BEFORE INSERT OR UPDATE OF TITLE ON APP.TICKETS",
+        "DROP TRIGGER IF EXISTS \"TICKETS_CHECK\" ON \"APP\".\"TICKETS\"",
+        "CREATE CONSTRAINT TRIGGER TICKETS_CHECK AFTER INSERT ON APP.TICKETS DEFERRABLE INITIALLY DEFERRED",
+        "CREATE OR REPLACE TRIGGER TICKETS_OFF AFTER DELETE ON APP.TICKETS",
+    ] {
+        assert!(upper.contains(expected), "{expected} in:\n{file}");
+    }
+    assert!(
+        tickets
+            .warnings
+            .iter()
+            .any(|w| w.contains("tickets_off") && w.contains("disabled")),
+        "the disabled trigger is said to be disabled: {:?}",
+        tickets.warnings
+    );
+
+    // The file runs against the database it came from, twice.
+    for run in 1..=2 {
+        adapter
+            .execute_script(&file)
+            .await
+            .unwrap_or_else(|e| panic!("run {run} of the table file failed: {e}\n{file}"));
+    }
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_trigger WHERE tgrelid = 'app.tickets'::regclass AND NOT tgisinternal \
+         HAVING count(*) = 3",
+        "the three triggers, once each",
+    )
+    .await;
+
+    let back = dbd_core::parser::parse_entity(std::path::Path::new("ddl/table/app/tickets.ddl"), &file).unwrap();
+    assert!(back.errors.is_empty(), "{:?}\n{file}", back.errors);
+    assert!(
+        back.refers_to("app.touch"),
+        "the file still fires app.touch: {:?}",
+        back.refs
+    );
+}
+
+/// An updatable view's `INSTEAD OF` trigger is the view's behaviour: without
+/// it, an insert into the view fails. Its file carries it as a table file
+/// carries a table's, and the view then depends on the function it fires —
+/// functions apply after views by default, so without that edge a fresh apply
+/// would create the trigger before its function existed.
+#[tokio::test]
+async fn a_reverse_engineered_view_keeps_its_instead_of_trigger() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    adapter
+        .execute_script(
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.items (id int PRIMARY KEY, name text); \
+             CREATE VIEW app.items_v AS SELECT id, name FROM app.items; \
+             CREATE FUNCTION app.items_v_insert() RETURNS trigger LANGUAGE plpgsql AS \
+               'BEGIN INSERT INTO app.items VALUES (NEW.id, NEW.name); RETURN NEW; END'; \
+             CREATE TRIGGER items_v_insert INSTEAD OF INSERT ON app.items_v \
+               FOR EACH ROW EXECUTE FUNCTION app.items_v_insert();",
+        )
+        .await
+        .unwrap();
+
+    let entities = adapter.introspect().await.expect("introspect");
+    let view = entities.iter().find(|e| e.name == "app.items_v").expect("app.items_v");
+    let file = dbd_core::formatter::format_ddl(
+        &dbd_core::emit::emit_entity(view).unwrap(),
+        &dbd_core::config::FormatConfig::default(),
+    );
+    assert!(
+        file.to_uppercase()
+            .contains("CREATE OR REPLACE TRIGGER ITEMS_V_INSERT INSTEAD OF INSERT ON APP.ITEMS_V"),
+        "{file}"
+    );
+    for run in 1..=2 {
+        adapter
+            .execute_script(&file)
+            .await
+            .unwrap_or_else(|e| panic!("run {run} of the view file failed: {e}\n{file}"));
+    }
+    let back = dbd_core::parser::parse_entity(std::path::Path::new("ddl/view/app/items_v.ddl"), &file).unwrap();
+    assert!(back.errors.is_empty(), "{:?}\n{file}", back.errors);
+    assert!(
+        back.refers_to("app.items_v_insert"),
+        "the view depends on the function its trigger fires: {:?}",
+        back.refs
+    );
+}
+
+// ── What a constraint's state a reversed file cannot carry is said ────────────
+
+/// A `NOT VALID` CHECK was captured as `CHECK (CHECK (n > 0) NOT VALID)` —
+/// `pg_get_constraintdef`'s text with only its prefix stripped — which no
+/// parser accepts, so the reversed project would not load. The expression is
+/// read on its own. What the state of a constraint means cannot be written in
+/// a table file that runs twice: `NOT VALID` takes `ALTER TABLE … ADD
+/// CONSTRAINT`, which fails the second time (inside `CREATE TABLE` Postgres
+/// validates it anyway), and `NOT ENFORCED` is not in the grammar dbd parses.
+/// So each is captured as an ordinary constraint and named, with what that
+/// means for the rows the database already holds.
+#[tokio::test]
+async fn a_constraints_state_a_reversed_file_cannot_carry_is_named() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    adapter
+        .execute_script(
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.parent (id int PRIMARY KEY); \
+             CREATE TABLE app.loose (id int PRIMARY KEY, n int, pid int, m int, k int); \
+             INSERT INTO app.loose VALUES (1, -5, 99, -1, -1); \
+             ALTER TABLE app.loose ADD CONSTRAINT loose_n_pos CHECK (n > 0) NOT VALID; \
+             ALTER TABLE app.loose ADD CONSTRAINT loose_pid_fk FOREIGN KEY (pid) REFERENCES app.parent (id) NOT VALID; \
+             ALTER TABLE app.loose ADD CONSTRAINT loose_m_pos CHECK (m > 0) NOT ENFORCED; \
+             ALTER TABLE app.loose ADD CONSTRAINT loose_k_pos CHECK (k > 0) NO INHERIT NOT VALID;",
+        )
+        .await
+        .unwrap();
+
+    let entities = adapter.introspect().await.expect("introspect");
+    let loose = entities.iter().find(|e| e.name == "app.loose").expect("app.loose");
+    let file = dbd_core::emit::emit_entity(loose).unwrap();
+    for check in ["CHECK (n > 0)", "CHECK (m > 0)", "CHECK (k > 0)"] {
+        assert!(file.contains(check), "{check} in:\n{file}");
+    }
+    let back = dbd_core::parser::parse_entity(std::path::Path::new("ddl/table/app/loose.ddl"), &file).unwrap();
+    assert!(back.errors.is_empty(), "the file reads back: {:?}\n{file}", back.errors);
+
+    let said = loose.warnings.join("\n");
+    for (constraint, state) in [
+        ("loose_n_pos", "NOT VALID"),
+        ("loose_pid_fk", "NOT VALID"),
+        ("loose_m_pos", "NOT ENFORCED"),
+        ("loose_k_pos", "NO INHERIT"),
+        ("loose_k_pos", "NOT VALID"),
+    ] {
+        assert!(
+            loose
+                .warnings
+                .iter()
+                .any(|w| w.contains(constraint) && w.contains(state)),
+            "{constraint} is named as {state}: {said}"
+        );
+    }
+    // And nothing else: Postgres marks every primary key, unique and foreign
+    // key `connoinherit`, which says nothing a table file loses.
+    assert_eq!(loose.warnings.len(), 5, "one note per lost state, no more: {said}");
+    let parent = entities.iter().find(|e| e.name == "app.parent").expect("app.parent");
+    assert!(parent.warnings.is_empty(), "{:?}", parent.warnings);
+}
+
+// ── A foreign key's deferrability and MATCH survive reverse, diff, reconcile ──
+
+/// `DEFERRABLE INITIALLY DEFERRED` decides whether a transaction may insert a
+/// child before its parent; `MATCH FULL` whether a half-NULL key passes. The
+/// foreign-key model held neither, so `init --from-db` wrote both keys as
+/// plain ones — an application that relies on deferral then fails on the new
+/// database — and `diff` reported no difference, because neither side could
+/// say. Both are part of the key now: captured, emitted, parsed, compared,
+/// and converged by `reconcile`.
+#[tokio::test]
+async fn a_foreign_keys_deferrability_and_match_survive_reverse_diff_and_reconcile() {
+    use dbd_core::diff::{DiffAction, FieldType};
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "fk_attrs").await.unwrap();
+    const PARENT: &str = "set search_path to app;\n\
+        create table if not exists parent (id int primary key, code text, constraint parent_id_code unique (id, code));\n";
+    const DB: &str = "CREATE SCHEMA app; \
+        CREATE TABLE app.parent (id int PRIMARY KEY, code text, CONSTRAINT parent_id_code UNIQUE (id, code)); \
+        CREATE TABLE app.child (id int PRIMARY KEY, pid int, pcode text, \
+          CONSTRAINT child_pid_fk FOREIGN KEY (pid) REFERENCES app.parent (id) DEFERRABLE INITIALLY DEFERRED, \
+          CONSTRAINT child_full_fk FOREIGN KEY (pid, pcode) REFERENCES app.parent (id, code) MATCH FULL);";
+    adapter.execute_script(DB).await.unwrap();
+
+    // Reverse: both keys come out as they are.
+    let entities = adapter.introspect().await.expect("introspect");
+    let child = entities.iter().find(|e| e.name == "app.child").expect("app.child");
+    let reversed = dbd_core::emit::emit_entity(child).unwrap();
+    assert!(reversed.contains("MATCH FULL"), "{reversed}");
+    assert!(reversed.contains("DEFERRABLE INITIALLY DEFERRED"), "{reversed}");
+    let back = dbd_core::parser::parse_entity(std::path::Path::new("ddl/table/app/child.ddl"), &reversed).unwrap();
+    assert!(back.errors.is_empty(), "{:?}", back.errors);
+
+    let project = |child: &str| {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: fk_attrs\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("ddl/table/app/parent.ddl"), PARENT).unwrap();
+        std::fs::write(dir.join("ddl/table/app/child.ddl"), child).unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        (tmp, design)
+    };
+    let fk_changed = |d: &dbd_core::SchemaDiff| {
+        d.changes.iter().any(|c| {
+            c.entity_name == "app.child"
+                && matches!(&c.action, DiffAction::Change(fcs) if fcs.iter().any(|f| f.field_type == FieldType::Constraint))
+        })
+    };
+
+    // Diff: a design with plain keys differs from this database; the reversed one does not.
+    let (_plain_dir, plain) = project(
+        "set search_path to app;\n\
+         create table if not exists child (id int primary key, pid int, pcode text,\n\
+           constraint child_pid_fk foreign key (pid) references parent (id),\n\
+           constraint child_full_fk foreign key (pid, pcode) references parent (id, code));\n",
+    );
+    let d = plain.diff_live(&*adapter, None).await.expect("diff_live");
+    assert!(fk_changed(&d), "plain keys are not these keys: {:?}", d.changes);
+    let (_rev_dir, rev) = project(&reversed);
+    let d = rev.diff_live(&*adapter, None).await.expect("diff_live");
+    assert!(!fk_changed(&d), "the reversed keys are these keys: {:?}", d.changes);
+
+    // Reconcile: a database with plain keys converges onto the reversed design.
+    adapter
+        .execute_script(
+            "ALTER TABLE app.child DROP CONSTRAINT child_pid_fk, DROP CONSTRAINT child_full_fk, \
+               ADD CONSTRAINT child_pid_fk FOREIGN KEY (pid) REFERENCES app.parent (id), \
+               ADD CONSTRAINT child_full_fk FOREIGN KEY (pid, pcode) REFERENCES app.parent (id, code);",
+        )
+        .await
+        .unwrap();
+    rev.reconcile(&*adapter, false, true, false, None, Progress::none())
+        .await
+        .expect("reconcile");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_constraint WHERE conrelid = 'app.child'::regclass AND contype = 'f' \
+           AND confkey = ARRAY[1]::int2[] AND condeferrable AND condeferred",
+        "a deferrable, initially deferred key on app.child (pid)",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_constraint WHERE conrelid = 'app.child'::regclass AND contype = 'f' \
+           AND array_length(conkey, 1) = 2 AND confmatchtype = 'f'",
+        "a MATCH FULL key on app.child (pid, pcode)",
+    )
+    .await;
+    let d = rev.diff_live(&*adapter, None).await.expect("diff_live");
+    assert!(!fk_changed(&d), "converged: {:?}", d.changes);
+}
+
+// ── An EXCLUDE constraint is a constraint, end to end ─────────────────────────
+
+/// `EXCLUDE USING gist (room WITH =, during WITH &&)` is what stops two
+/// bookings of one room overlapping. Introspection read only its backing
+/// index, so `init --from-db` wrote a plain gist index — the speed kept, the
+/// rule gone — and `diff` stayed empty; a project could not declare one at all,
+/// because the table parser refused it. It is a constraint now: captured,
+/// emitted, parsed, compared by `diff`, converged by `reconcile`, applied.
+#[tokio::test]
+async fn an_exclusion_constraint_survives_reverse_diff_reconcile_and_apply() {
+    use dbd_core::diff::{DiffAction, FieldType};
+    let (pg, url) = start_pg().await;
+    let adapter = connect(&url, "excl").await.unwrap();
+    adapter
+        .execute_script(
+            "CREATE EXTENSION btree_gist; CREATE SCHEMA app; \
+             CREATE TABLE app.rooms (id int PRIMARY KEY, room int NOT NULL, during tstzrange NOT NULL, \
+               CONSTRAINT no_overlap EXCLUDE USING gist (room WITH =, during WITH &&));",
+        )
+        .await
+        .unwrap();
+
+    let entities = adapter.introspect().await.expect("introspect");
+    let rooms = entities.iter().find(|e| e.name == "app.rooms").expect("app.rooms");
+    let reversed = dbd_core::emit::emit_entity(rooms).unwrap();
+    assert!(
+        reversed.contains("CONSTRAINT \"no_overlap\" EXCLUDE USING gist (room WITH =, during WITH &&)"),
+        "{reversed}"
+    );
+    assert!(
+        !reversed.to_uppercase().contains("CREATE INDEX"),
+        "not a plain index: {reversed}"
+    );
+    let back = dbd_core::parser::parse_entity(std::path::Path::new("ddl/table/app/rooms.ddl"), &reversed).unwrap();
+    assert!(back.errors.is_empty(), "a project can declare one: {:?}", back.errors);
+
+    let project = |rooms: &str| {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: excl\nsource:\n  dialect: postgresql\n\
+             target:\n  postgres:\n    extensions:\n      - btree_gist\nschemas:\n  - app\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("ddl/table/app/rooms.ddl"), rooms).unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        (tmp, design)
+    };
+    let rooms_changed = |d: &dbd_core::SchemaDiff| {
+        d.changes.iter().any(|c| {
+            c.entity_name == "app.rooms"
+                && matches!(&c.action, DiffAction::Change(fcs)
+                    if fcs.iter().any(|f| matches!(f.field_type, FieldType::Constraint | FieldType::Index)))
+        })
+    };
+
+    // Diff: the old capture — a plain gist index — is not this table; the new one is.
+    let (_weak_dir, weak) = project(
+        "set search_path to app;\n\
+         create table if not exists rooms (id int primary key, room int not null, during tstzrange not null);\n\
+         create index if not exists no_overlap on rooms using gist (room, during);\n",
+    );
+    let d = weak.diff_live(&*adapter, None).await.expect("diff_live");
+    assert!(
+        rooms_changed(&d),
+        "a gist index is not an exclusion constraint: {:?}",
+        d.changes
+    );
+    let (_rev_dir, rev) = project(&reversed);
+    let d = rev.diff_live(&*adapter, None).await.expect("diff_live");
+    assert!(!rooms_changed(&d), "the reversed table is this table: {:?}", d.changes);
+
+    // Reconcile puts a missing one back.
+    adapter
+        .execute_script("ALTER TABLE app.rooms DROP CONSTRAINT no_overlap")
+        .await
+        .unwrap();
+    let d = rev.diff_live(&*adapter, None).await.expect("diff_live");
+    assert!(
+        rooms_changed(&d),
+        "a dropped exclusion constraint is drift: {:?}",
+        d.changes
+    );
+    rev.reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("reconcile");
+    let exclusion = "SELECT 1 FROM pg_constraint WHERE conrelid = 'app.rooms'::regclass AND contype = 'x'";
+    assert_catalog(&*adapter, true, exclusion, "the exclusion constraint on app.rooms").await;
+    let d = rev.diff_live(&*adapter, None).await.expect("diff_live");
+    assert!(!rooms_changed(&d), "converged: {:?}", d.changes);
+
+    // And the reversed project builds it on a database that has none of it.
+    pg.create_database("fresh").await.unwrap();
+    let fresh = connect(&pg.settings().url("fresh"), "excl").await.unwrap();
+    rev.apply(&*fresh, None, false, None, Progress::none())
+        .await
+        .expect("apply to a fresh database");
+    assert_catalog(&*fresh, true, exclusion, "the exclusion constraint on a fresh database").await;
+}
+
+// ── A column's collation survives reverse, diff and reconcile ─────────────────
+
+/// `COLLATE "C"` decides how a column's values sort and compare — byte order
+/// rather than the language's — and what a `LIKE 'abc%'` index can serve. The
+/// column model had no collation, so `init --from-db` wrote every such column
+/// with the database default, and `diff` could not see the difference. It is
+/// part of the column now: captured, emitted, parsed, compared, converged.
+#[tokio::test]
+async fn a_columns_collation_survives_reverse_diff_and_reconcile() {
+    use dbd_core::diff::{DiffAction, FieldType};
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "coll").await.unwrap();
+    adapter
+        .execute_script(
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.names (id int PRIMARY KEY, code text COLLATE \"C\", \
+               label varchar(20) COLLATE \"POSIX\", plain text);",
+        )
+        .await
+        .unwrap();
+
+    let entities = adapter.introspect().await.expect("introspect");
+    let names = entities.iter().find(|e| e.name == "app.names").expect("app.names");
+    let reversed = dbd_core::emit::emit_entity(names).unwrap();
+    assert!(reversed.contains("\"code\" text COLLATE \"C\""), "{reversed}");
+    assert!(
+        reversed.contains("\"label\" character varying(20) COLLATE \"POSIX\""),
+        "{reversed}"
+    );
+    assert!(
+        !reversed.contains("\"plain\" text COLLATE"),
+        "the default is not written: {reversed}"
+    );
+    let back = dbd_core::parser::parse_entity(std::path::Path::new("ddl/table/app/names.ddl"), &reversed).unwrap();
+    assert!(back.errors.is_empty(), "{:?}", back.errors);
+
+    let project = |names: &str| {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: coll\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("ddl/table/app/names.ddl"), names).unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        (tmp, design)
+    };
+    let columns_changed = |d: &dbd_core::SchemaDiff| {
+        d.changes.iter().any(|c| {
+            c.entity_name == "app.names"
+                && matches!(&c.action, DiffAction::Change(fcs) if fcs.iter().any(|f| f.field_type == FieldType::Column))
+        })
+    };
+
+    let (_plain_dir, plain) = project(
+        "set search_path to app;\n\
+         create table if not exists names (id int primary key, code text, label varchar(20), plain text);\n",
+    );
+    let d = plain.diff_live(&*adapter, None).await.expect("diff_live");
+    assert!(
+        columns_changed(&d),
+        "default-collated columns are not these: {:?}",
+        d.changes
+    );
+    let (_rev_dir, rev) = project(&reversed);
+    let d = rev.diff_live(&*adapter, None).await.expect("diff_live");
+    assert!(!columns_changed(&d), "the reversed columns are these: {:?}", d.changes);
+
+    // Reconcile moves a default-collated column onto the design's collation.
+    adapter
+        .execute_script("ALTER TABLE app.names ALTER COLUMN code TYPE text COLLATE \"default\"")
+        .await
+        .unwrap();
+    rev.reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("reconcile");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_attribute a JOIN pg_collation c ON c.oid = a.attcollation \
+           WHERE a.attrelid = 'app.names'::regclass AND a.attname = 'code' AND c.collname = 'C'",
+        "app.names.code collated \"C\"",
+    )
+    .await;
+    let d = rev.diff_live(&*adapter, None).await.expect("diff_live");
+    assert!(!columns_changed(&d), "converged: {:?}", d.changes);
+}
+
+// ── What dbd's table model cannot hold is named, and partitions fold in ───────
+
+/// A partition is storage of its partitioned table, not a table of the
+/// project's: introspection flattened each into a table of its own beside a
+/// plain copy of its parent — so an export of both put every row in twice,
+/// and `reconcile --prune` read each partition of a declared table as an
+/// orphan to drop. A partitioned table is captured as one plain table that
+/// holds every row, and named with its partition key and partitions, as is
+/// what else the model has no field for: a deferrable primary key or unique
+/// constraint, inheritance, and `UNLOGGED`.
+#[tokio::test]
+async fn what_the_table_model_cannot_hold_is_named_and_partitions_fold_into_their_table() {
+    use dbd_core::diff::DiffAction;
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "unmodeled").await.unwrap();
+    adapter
+        .execute_script(
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.events (id int, at date NOT NULL, PRIMARY KEY (id, at)) PARTITION BY RANGE (at); \
+             CREATE TABLE app.events_2025 PARTITION OF app.events FOR VALUES FROM ('2025-01-01') TO ('2026-01-01'); \
+             CREATE TABLE app.events_2026 PARTITION OF app.events FOR VALUES FROM ('2026-01-01') TO ('2027-01-01'); \
+             CREATE TABLE app.base (id int PRIMARY KEY, kind text); \
+             CREATE TABLE app.special (extra text) INHERITS (app.base); \
+             CREATE UNLOGGED TABLE app.scratch (id int PRIMARY KEY); \
+             CREATE TABLE app.slots (id int, pos int, \
+               CONSTRAINT slots_pkey PRIMARY KEY (id) DEFERRABLE, \
+               CONSTRAINT slots_pos_key UNIQUE (pos) DEFERRABLE INITIALLY DEFERRED);",
+        )
+        .await
+        .unwrap();
+
+    let entities = adapter.introspect().await.expect("introspect");
+    let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+    for partition in ["app.events_2025", "app.events_2026"] {
+        assert!(
+            !names.contains(&partition),
+            "{partition} is storage, not a table: {names:?}"
+        );
+    }
+    let warned = |table: &str, words: &[&str]| {
+        let e = entities
+            .iter()
+            .find(|e| e.name == table)
+            .unwrap_or_else(|| panic!("{table}"));
+        assert!(
+            e.warnings.iter().any(|w| words.iter().all(|word| w.contains(word))),
+            "{table} is named with {words:?}: {:?}",
+            e.warnings
+        );
+    };
+    warned(
+        "app.events",
+        &[
+            "PARTITION BY RANGE (at)",
+            "app.events_2025",
+            "app.events_2026",
+            "FOR VALUES FROM",
+        ],
+    );
+    warned("app.special", &["inherits", "app.base"]);
+    warned("app.scratch", &["UNLOGGED"]);
+    warned("app.slots", &["slots_pkey", "DEFERRABLE"]);
+    warned("app.slots", &["slots_pos_key", "INITIALLY DEFERRED"]);
+
+    // A design that declares the partitioned table has no orphans in its partitions.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: unmodeled\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    let events = entities.iter().find(|e| e.name == "app.events").unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/events.ddl"),
+        dbd_core::emit::emit_entity(events).unwrap(),
+    )
+    .unwrap();
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+    let d = design.diff_live(&*adapter, None).await.expect("diff_live");
+    assert!(
+        !d.changes
+            .iter()
+            .any(|c| c.entity_name.starts_with("app.events_") && matches!(c.action, DiffAction::Drop)),
+        "no partition reads as an orphan: {:?}",
+        d.changes
+    );
+}
+
+// ── JSONL: SQL NULL, JSON null and an omitted key each mean one thing ─────────
+
+/// The JSONL export wrote a json/jsonb column's SQL NULL as an absent key —
+/// to keep it apart from the JSON value `null` — and an import gives a column
+/// absent from every record its DEFAULT, so a json column NULL in every row
+/// came back as `'{"d": 1}'`. Now every column's key is written, `null` is SQL
+/// NULL for every type (as Postgres's own `json_populate_record` reads it),
+/// and the JSON value `null` is `{"$json": null}`. A hand-written seed keeps
+/// its meanings: `null` is NULL, and a key left out takes the DEFAULT.
+#[tokio::test]
+async fn sql_null_json_null_and_an_omitted_key_each_survive_a_jsonl_round_trip() {
+    const TABLE: &str = "CREATE TABLE app.docs (id int PRIMARY KEY, \
+        j jsonb DEFAULT '{\"d\": 1}', k json DEFAULT '[1]', t text DEFAULT 'dflt');";
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    adapter
+        .execute_script(&format!(
+            "CREATE SCHEMA app; {TABLE} \
+             INSERT INTO app.docs VALUES (1, NULL, NULL, NULL), (2, NULL, NULL, 'x'); \
+             CREATE TABLE app.expected AS SELECT id, j, k::text AS k, k IS NULL AS k_null, t FROM app.docs;"
+        ))
+        .await
+        .unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let mut entity = Entity::new(EntityType::Table, "app.docs");
+    entity.format = Some("jsonl".to_string());
+    adapter.export_data(&entity, Some(out.path())).await.expect("export");
+    adapter
+        .execute_script(&format!("DROP TABLE app.docs; {TABLE}"))
+        .await
+        .unwrap();
+    entity.file = Some(out.path().join("docs.jsonl"));
+    adapter.import_data(&entity, "", false).await.expect("import");
+    assert_catalog(
+        &*adapter,
+        false,
+        "(SELECT id, j, k::text, k IS NULL, t FROM app.docs EXCEPT ALL SELECT * FROM app.expected) \
+         UNION ALL (SELECT * FROM app.expected EXCEPT ALL SELECT id, j, k::text, k IS NULL, t FROM app.docs)",
+        "a row that differs after the round trip (a NULL json column read back as its DEFAULT)",
+    )
+    .await;
+
+    // A hand-written seed: `null` is NULL, a key left out is the DEFAULT, and
+    // `{"$json": null}` is the JSON value null.
+    adapter.execute_script("TRUNCATE app.docs").await.unwrap();
+    let seed = out.path().join("seed.jsonl");
+    std::fs::write(
+        &seed,
+        "{\"id\": 10, \"j\": null, \"t\": null}\n{\"id\": 11, \"t\": \"y\"}\n{\"id\": 12, \"j\": {\"$json\": null}, \"t\": \"z\"}\n",
+    )
+    .unwrap();
+    let mut seeded = Entity::new(EntityType::Table, "app.docs");
+    seeded.format = Some("jsonl".to_string());
+    seeded.file = Some(seed);
+    adapter.import_data(&seeded, "", false).await.expect("import the seed");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.docs WHERE id = 10 AND j IS NULL AND t IS NULL AND k::text = '[1]'",
+        "id 10: null is NULL, and k, left out of every record, takes its DEFAULT",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.docs WHERE id = 12 AND j IS NOT NULL AND jsonb_typeof(j) = 'null'",
+        "id 12: {\"$json\": null} is the JSON value null",
+    )
+    .await;
 }

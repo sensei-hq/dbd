@@ -15,7 +15,6 @@ use crate::config::ResolvedMatview;
 use crate::entity::{Entity, EntityType};
 use crate::error::{DbdError, Result};
 use crate::script;
-use crate::script::ensure_public_in_search_path;
 
 /// Convert a Postgres `confdeltype`/`confupdtype` single character to `FkAction`.
 /// 'a' = NO ACTION (unspecified — return None so the emitter omits the clause),
@@ -183,16 +182,49 @@ pub struct PostgresAdapter {
     bookkeeping: Bookkeeping,
 }
 
+/// How long [`PostgresAdapter::new`] waits for the server to answer.
+///
+/// sqlx's pool retries a failed connection until its acquire timeout — 30 s —
+/// so a dead port or a mistyped host took half a minute to fail, and then said
+/// only `pool timed out while waiting for an open connection`. A server that
+/// is there answers well within this, a cold-starting serverless one included.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 impl PostgresAdapter {
     /// Create a new adapter from a connection URL.
+    ///
+    /// One connection is made first, bounded by [`CONNECT_TIMEOUT`], so a
+    /// database that cannot be reached fails fast with the reason and the
+    /// `host:port` it tried — never the URL, which may hold a password. The
+    /// pool itself keeps sqlx's own timeouts for the run.
     pub async fn new(url: &str, project: &str) -> Result<Self> {
         use sha2::{Digest, Sha256};
+        use sqlx::Connection as _;
+
+        let options: sqlx::postgres::PgConnectOptions = url
+            .parse()
+            .map_err(|e| DbdError::Config(format!("Database connection failed: invalid URL: {e}")))?;
+        let target = format!("{}:{}", options.get_host(), options.get_port());
+        match tokio::time::timeout(CONNECT_TIMEOUT, sqlx::PgConnection::connect_with(&options)).await {
+            Err(_) => {
+                return Err(DbdError::Config(format!(
+                    "Database connection failed: no answer from {target} within {}s — is the server \
+                     running, and are the host and port right?",
+                    CONNECT_TIMEOUT.as_secs()
+                )));
+            }
+            Ok(Err(e)) => return Err(DbdError::Config(format!("Database connection failed: {target}: {e}"))),
+            Ok(Ok(probe)) => {
+                // Only a probe: whether it closes cleanly says nothing more.
+                let _ = probe.close().await;
+            }
+        }
 
         let pool = PgPoolOptions::new()
             .max_connections(5)
-            .connect(url)
+            .connect_with(options)
             .await
-            .map_err(|e| DbdError::Config(format!("Database connection failed: {e}")))?;
+            .map_err(|e| DbdError::Config(format!("Database connection failed: {target}: {e}")))?;
 
         let mut hasher = Sha256::new();
         hasher.update(url.as_bytes());
@@ -440,11 +472,30 @@ impl PostgresAdapter {
         )
     }
 
+    /// SQL that is true when the object `oid` of the system catalog `catalog`
+    /// (`pg_class`, `pg_type`, …) is **not** a member of an extension.
+    ///
+    /// What an extension owns — `pg_depend.deptype = 'e'` — is the
+    /// extension's: `CREATE EXTENSION` makes it, `DROP EXTENSION` removes it,
+    /// and dropping it on its own is refused. So it is never part of a
+    /// project, and every introspection query leaves it out; `diff` and
+    /// `reconcile` read the same queries, so neither sees it as drift or as an
+    /// orphan to prune. The `classid` is matched as well as the `objid`: oids
+    /// are only unique within one catalog.
+    fn not_extension_member(catalog: &str, oid: &str) -> String {
+        format!(
+            "NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend ext_dep \
+             WHERE ext_dep.classid = '{catalog}'::regclass AND ext_dep.objid = {oid} \
+               AND ext_dep.deptype = 'e')"
+        )
+    }
+
     // ── Private introspection helpers ──────────────────────────────────────────
 
     async fn introspect_schemas(&self) -> crate::error::Result<Vec<Entity>> {
         let filter = Self::schema_filter_column("nspname");
-        let sql = format!("SELECT nspname FROM pg_namespace WHERE {filter} ORDER BY nspname");
+        let owned = Self::not_extension_member("pg_namespace", "oid");
+        let sql = format!("SELECT nspname FROM pg_namespace WHERE {filter} AND {owned} ORDER BY nspname");
         let rows = sqlx::query(&sql)
             .fetch_all(&self.pool)
             .await
@@ -498,12 +549,13 @@ impl PostgresAdapter {
         // every run, forever, without ever converging.
         // `obj_description(…, 'pg_type')` is the enum's own `COMMENT ON TYPE`,
         // which the enum file carries and the parser reads back.
+        let owned = Self::not_extension_member("pg_type", "t.oid");
         let sql = format!(
             "SELECT n.nspname, t.typname, e.enumlabel, obj_description(t.oid, 'pg_type') AS comment \
              FROM pg_type t \
              JOIN pg_namespace n ON t.typnamespace = n.oid \
              LEFT JOIN pg_enum e ON e.enumtypid = t.oid \
-             WHERE t.typtype = 'e' AND {ns_filter} \
+             WHERE t.typtype = 'e' AND {ns_filter} AND {owned} \
              ORDER BY n.nspname, t.typname, e.enumsortorder"
         );
         let rows = sqlx::query(&sql)
@@ -552,11 +604,32 @@ impl PostgresAdapter {
         //    tables (`_dbd_meta`, `_dbd_migrations`) — they are created/managed by
         //    `dbd apply`, not authored DDL, so they must never be reverse-engineered
         //    into the project (mirrors the sqlite adapter's exclusion).
+        let owned = Self::not_extension_member("pg_class", "cls.oid");
+        // A partition is storage of its partitioned table, not a table of its
+        // own: left out here, and named in its table's note. Flattened into a
+        // table beside a plain copy of its parent, an export of both put every
+        // row in twice, and `reconcile --prune` read the partitions of a
+        // declared table as orphans to drop.
         let tables_sql = format!(
-            "SELECT c.table_schema, c.table_name \
+            "SELECT c.table_schema, c.table_name, cls.relpersistence::text AS persistence, \
+                    pg_get_partkeydef(cls.oid) AS partition_key, \
+                    (SELECT array_agg(pn.nspname || '.' || pc.relname \
+                              || coalesce(' (' || pg_get_expr(pc.relpartbound, pc.oid) || ')', '') \
+                              || CASE WHEN pc.relkind = 'p' THEN ', itself partitioned' ELSE '' END \
+                              ORDER BY pn.nspname, pc.relname) \
+                     FROM pg_inherits i JOIN pg_class pc ON pc.oid = i.inhrelid \
+                     JOIN pg_namespace pn ON pn.oid = pc.relnamespace \
+                     WHERE i.inhparent = cls.oid) AS children, \
+                    (SELECT array_agg(pn.nspname || '.' || pc.relname ORDER BY i.inhseqno) \
+                     FROM pg_inherits i JOIN pg_class pc ON pc.oid = i.inhparent \
+                     JOIN pg_namespace pn ON pn.oid = pc.relnamespace \
+                     WHERE i.inhrelid = cls.oid) AS parents \
              FROM information_schema.tables c \
+             JOIN pg_class cls ON cls.oid = format('%I.%I', c.table_schema, c.table_name)::regclass \
              WHERE c.table_type = 'BASE TABLE' AND {ns_filter} \
              AND c.table_name NOT IN ('_dbd_meta', '_dbd_migrations') \
+             AND NOT cls.relispartition \
+             AND {owned} \
              ORDER BY c.table_schema, c.table_name"
         );
         let table_rows = sqlx::query(&tables_sql)
@@ -569,9 +642,11 @@ impl PostgresAdapter {
         for trow in &table_rows {
             let schema: String = trow.get("table_schema");
             let table: String = trow.get("table_name");
+            let table_notes = Self::unmodeled_table_notes(&format!("{schema}.{table}"), trow);
 
             let columns = self.introspect_columns(&schema, &table).await?;
-            let (constraints, constraint_index_oids) = self.introspect_constraints(&schema, &table).await?;
+            let (constraints, constraint_index_oids, constraint_warnings) =
+                self.introspect_constraints(&schema, &table).await?;
             let indexes = self.introspect_indexes(&schema, &table, &constraint_index_oids).await?;
 
             let table_comment = self.introspect_table_comment(&schema, &table).await?;
@@ -597,10 +672,136 @@ impl PostgresAdapter {
 
             let mut entity = Entity::new(EntityType::Table, &format!("{schema}.{table}"));
             entity.table_def = Some(table_def);
+            entity.warnings = table_notes;
+            entity.warnings.extend(constraint_warnings);
             entities.push(entity);
         }
 
         Ok(entities)
+    }
+
+    /// Every user trigger on a table or view in a user schema, as `(schema.name,
+    /// statement, warning)`: the statement that creates it, runnable twice, and
+    /// what it could not carry.
+    ///
+    /// `pg_get_triggerdef` gives the `CREATE [CONSTRAINT] TRIGGER` itself.
+    /// Postgres replaces an ordinary trigger (`CREATE OR REPLACE TRIGGER`) but
+    /// refuses to replace a constraint trigger, so one of those is dropped if
+    /// it exists first. Left out: the internal triggers behind foreign keys
+    /// (`tgisinternal`), the clones a partitioned table's trigger leaves on each
+    /// partition (`tgparentid`), and what an extension owns.
+    ///
+    /// Whether a trigger is enabled is not part of its definition: a disabled
+    /// one is captured as enabled, and the warning says so.
+    async fn introspect_triggers(&self) -> crate::error::Result<Vec<(String, String, Option<String>)>> {
+        let ns_filter = Self::schema_filter_column("n.nspname");
+        let owned = Self::not_extension_member("pg_trigger", "t.oid");
+        // `tgparentid` exists from PG 13; read through `to_jsonb` so an older
+        // server yields NULL (no clones to skip) instead of an error.
+        let sql = format!(
+            "SELECT n.nspname, c.relname, t.tgname, pg_get_triggerdef(t.oid, true) AS def, \
+                    t.tgconstraint <> 0 AS is_constraint, t.tgenabled::text AS enabled \
+             FROM pg_trigger t \
+             JOIN pg_class c ON c.oid = t.tgrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE NOT t.tgisinternal \
+               AND coalesce((to_jsonb(t) ->> 'tgparentid')::oid, 0) = 0 \
+               AND {ns_filter} AND {owned} \
+             ORDER BY n.nspname, c.relname, t.tgname"
+        );
+        let rows = sqlx::query(&sql)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("introspect_triggers failed: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let schema: String = row.get("nspname");
+                let table: String = row.get("relname");
+                let name: String = row.get("tgname");
+                let def: String = row.get("def");
+                let is_constraint: bool = row.get("is_constraint");
+                let enabled: String = row.get("enabled");
+                let statement = if is_constraint {
+                    format!(
+                        "DROP TRIGGER IF EXISTS {} ON {};\n{def}",
+                        crate::sql_quote::ident(&name),
+                        crate::sql_quote::qualified(&format!("{schema}.{table}"))
+                    )
+                } else {
+                    match def.strip_prefix("CREATE TRIGGER ") {
+                        Some(rest) => format!("CREATE OR REPLACE TRIGGER {rest}"),
+                        None => def,
+                    }
+                };
+                let state = match enabled.as_str() {
+                    "D" => Some("disabled"),
+                    "R" => Some("enabled for replica sessions only"),
+                    "A" => Some("enabled always, replica sessions included"),
+                    _ => None,
+                };
+                let warning = state.map(|state| {
+                    format!(
+                        "trigger {name} on {schema}.{table} is {state} in the database — dbd captures \
+                         its definition, so it is created enabled; run ALTER TABLE … ENABLE/DISABLE \
+                         TRIGGER by hand where that matters"
+                    )
+                });
+                (format!("{schema}.{table}"), statement, warning)
+            })
+            .collect())
+    }
+
+    /// What a table row from `introspect_tables` says that dbd's table model
+    /// has no field for — partitioning, inheritance, `UNLOGGED` — each named
+    /// with what capturing the table without it means.
+    fn unmodeled_table_notes(table: &str, row: &sqlx::postgres::PgRow) -> Vec<String> {
+        let mut notes = Vec::new();
+        let partition_key: Option<String> = row.try_get("partition_key").unwrap_or(None);
+        let children: Vec<String> = row
+            .try_get::<Option<Vec<String>>, _>("children")
+            .unwrap_or(None)
+            .unwrap_or_default();
+        let parents: Vec<String> = row
+            .try_get::<Option<Vec<String>>, _>("parents")
+            .unwrap_or(None)
+            .unwrap_or_default();
+        if let Some(key) = partition_key {
+            let partitions = if children.is_empty() {
+                "no partitions yet".to_string()
+            } else {
+                format!("partitions {}", children.join(", "))
+            };
+            notes.push(format!(
+                "table {table} is partitioned in the database (PARTITION BY {key}; {partitions}) — dbd has no \
+                 partitioning, so it is captured as one plain table that holds every row: its partitions are \
+                 not created, and anything defined on a partition alone (an index, a constraint, a trigger) \
+                 is not captured"
+            ));
+        } else if !children.is_empty() {
+            notes.push(format!(
+                "tables inherit from {table} in the database ({}) — dbd has no inheritance, so each is captured \
+                 as a plain table; an export of {table} also holds the rows of the tables that inherit from it",
+                children.join(", ")
+            ));
+        }
+        if !parents.is_empty() {
+            notes.push(format!(
+                "table {table} inherits {} in the database — dbd has no inheritance, so it is captured as a \
+                 plain table with every column it has, and queries on {} no longer see its rows",
+                parents.join(", "),
+                parents.join(" or ")
+            ));
+        }
+        let persistence: String = row.try_get("persistence").unwrap_or_default();
+        if persistence == "u" {
+            notes.push(format!(
+                "table {table} is UNLOGGED in the database — dbd's table model has no persistence, so it is \
+                 captured as an ordinary, logged table: no row or rule is lost, but writes are slower, and it \
+                 survives a crash and is replicated where the source table was neither"
+            ));
+        }
+        notes
     }
 
     /// Introspect a table's columns.
@@ -627,6 +828,10 @@ impl PostgresAdapter {
                     format_type(a.atttypid, a.atttypmod) AS col_type, \
                     a.atttypid::regtype::text AS underlying_type, \
                     col_description(a.attrelid, a.attnum) AS col_comment, \
+                    CASE WHEN a.attcollation <> 0 AND a.attcollation <> ty.typcollation \
+                      THEN coll.collname::text END AS collation_name, \
+                    CASE WHEN a.attcollation <> 0 AND a.attcollation <> ty.typcollation \
+                      THEN coll_ns.nspname::text END AS collation_schema, \
                     EXISTS ( \
                       SELECT 1 FROM pg_depend d \
                       WHERE d.refclassid = 'pg_class'::regclass \
@@ -640,6 +845,9 @@ impl PostgresAdapter {
              JOIN pg_class cls ON cls.oid = a.attrelid \
              JOIN pg_namespace ns ON ns.oid = cls.relnamespace \
              LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum \
+             JOIN pg_type ty ON ty.oid = a.atttypid \
+             LEFT JOIN pg_collation coll ON coll.oid = a.attcollation \
+             LEFT JOIN pg_namespace coll_ns ON coll_ns.oid = coll.collnamespace \
              WHERE ns.nspname = $1 AND cls.relname = $2 \
                AND a.attnum > 0 AND NOT a.attisdropped \
              ORDER BY a.attnum";
@@ -663,6 +871,12 @@ impl PostgresAdapter {
                 let underlying_type: String = row.get("underlying_type");
                 let owns_default_seq: bool = row.get("owns_default_seq");
                 let comment: Option<String> = row.get("col_comment");
+                // Only a collation other than the type's own: the default is
+                // what an authored column that says nothing gets.
+                let collation_name: Option<String> = row.get("collation_name");
+                let collation_schema: Option<String> = row.get("collation_schema");
+                let collation =
+                    collation_name.map(|name| crate::entity::collation_sql(collation_schema.as_deref(), &name));
 
                 // Identity ('a' = ALWAYS, 'd' = BY DEFAULT, '' = none). Identity
                 // columns carry no user default.
@@ -723,6 +937,7 @@ impl PostgresAdapter {
                     generated,
                     comment,
                     inline_fk: None,
+                    collation,
                 }
             })
             .collect();
@@ -732,12 +947,28 @@ impl PostgresAdapter {
 
     /// Introspect a table's PK/UNIQUE/FK/CHECK constraints. Also returns the set
     /// of index OIDs that back a PK/UNIQUE constraint, so `introspect_indexes`
-    /// can skip re-emitting them as standalone indexes.
+    /// can skip re-emitting them as standalone indexes, and a warning for each
+    /// state of a constraint the captured DDL cannot carry.
+    ///
+    /// A CHECK's expression is `pg_get_expr(conbin)` — the text inside
+    /// `pg_get_constraintdef`'s `CHECK (…)`, with nothing after it. Stripping
+    /// the prefix off the whole definition left a trailing ` NOT VALID` inside
+    /// the parentheses, and the reversed file did not parse.
+    ///
+    /// The states are named rather than written, because no table file that
+    /// runs twice can hold them: `NOT VALID` takes `ALTER TABLE … ADD
+    /// CONSTRAINT`, which fails on the second run (inside `CREATE TABLE`
+    /// Postgres validates the constraint anyway), and the grammar dbd parses
+    /// predates PG 18's `NOT ENFORCED`. `NO INHERIT` has no field in the model.
     async fn introspect_constraints(
         &self,
         schema: &str,
         table: &str,
-    ) -> crate::error::Result<(Vec<crate::entity::TableConstraint>, std::collections::HashSet<i64>)> {
+    ) -> crate::error::Result<(
+        Vec<crate::entity::TableConstraint>,
+        std::collections::HashSet<i64>,
+        Vec<String>,
+    )> {
         use crate::entity::{ForeignKey, TableConstraint};
 
         // `indnullsnotdistinct` decides whether a UNIQUE constraint's NULL rows
@@ -745,10 +976,14 @@ impl PostgresAdapter {
         // It only exists on PG 15+; reading it through `to_jsonb` yields NULL
         // instead of erroring on older servers, matching `introspect_indexes`.
         let cons_sql = "SELECT c.conname, c.contype::text, c.confdeltype::text, c.confupdtype::text, \
+                    c.confmatchtype::text, c.condeferrable, c.condeferred, \
                     c.conindid::int8 AS conindid, \
                     coalesce((to_jsonb(ix) ->> 'indnullsnotdistinct')::boolean, false) \
                         AS nulls_not_distinct, \
                     pg_get_constraintdef(c.oid, true) AS condef, \
+                    pg_get_expr(c.conbin, c.conrelid, true) AS check_expr, \
+                    c.convalidated, c.connoinherit, \
+                    coalesce((to_jsonb(c) ->> 'conenforced')::boolean, true) AS enforced, \
                     (SELECT array_agg(a.attname ORDER BY pos.ord) \
                      FROM unnest(c.conkey) WITH ORDINALITY AS pos(attnum, ord) \
                      JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = pos.attnum \
@@ -766,7 +1001,7 @@ impl PostgresAdapter {
              LEFT JOIN pg_namespace ref_ns ON ref_ns.oid = ref_cls.relnamespace \
              LEFT JOIN pg_index ix ON ix.indexrelid = c.conindid \
              WHERE ns.nspname = $1 AND cls.relname = $2 \
-               AND c.contype IN ('p', 'u', 'f', 'c') \
+               AND c.contype IN ('p', 'u', 'f', 'c', 'x') \
              ORDER BY c.contype, c.conname";
 
         let con_rows = sqlx::query(cons_sql)
@@ -778,10 +1013,50 @@ impl PostgresAdapter {
 
         let mut constraints: Vec<TableConstraint> = Vec::new();
         let mut constraint_index_oids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut warnings: Vec<String> = Vec::new();
 
         for con in &con_rows {
             let conname: String = con.get("conname");
             let contype: String = con.get("contype");
+            let validated: bool = con.try_get("convalidated").unwrap_or(true);
+            let enforced: bool = con.try_get("enforced").unwrap_or(true);
+            let no_inherit: bool = con.try_get("connoinherit").unwrap_or(false);
+            // A NOT ENFORCED constraint is never validated either (PG 18 marks it
+            // `convalidated = false`); its own note says more than NOT VALID would.
+            if !validated && enforced {
+                warnings.push(format!(
+                    "constraint {conname} on {schema}.{table} is NOT VALID in the database — the rows already \
+                     there were never checked against it. It is captured as an ordinary constraint, which a \
+                     new database checks on every row, so rows that break it will not import there"
+                ));
+            }
+            if !enforced {
+                warnings.push(format!(
+                    "constraint {conname} on {schema}.{table} is NOT ENFORCED in the database — it checks \
+                     nothing there. It is captured enforced (the SQL dbd reads has no NOT ENFORCED), so a new \
+                     database refuses rows this one accepts"
+                ));
+            }
+            // A deferrable foreign key is modelled (`ForeignKey::deferrable`); a
+            // primary key or unique constraint's deferral has no field.
+            let deferrable: bool = con.try_get("condeferrable").unwrap_or(false);
+            if deferrable && (contype == "p" || contype == "u") {
+                let deferred: bool = con.try_get("condeferred").unwrap_or(false);
+                warnings.push(format!(
+                    "constraint {conname} on {schema}.{table} is DEFERRABLE{} in the database — dbd's model of a \
+                     primary key or unique constraint has no deferral, so it is captured checked at once: a \
+                     transaction that briefly holds two equal keys (swapping two rows' positions) fails there",
+                    if deferred { " INITIALLY DEFERRED" } else { "" }
+                ));
+            }
+            // Only a CHECK can be inherited; Postgres marks every other kind
+            // `connoinherit`, which says nothing a table file loses.
+            if no_inherit && contype == "c" {
+                warnings.push(format!(
+                    "constraint {conname} on {schema}.{table} is NO INHERIT in the database — it is captured \
+                     without it, so a table that inherits from {schema}.{table} would inherit the check too"
+                ));
+            }
             let col_names: Vec<String> = con.try_get::<Vec<String>, _>("col_names").unwrap_or_default();
             let conindid: Option<i64> = con.try_get("conindid").ok();
 
@@ -827,19 +1102,34 @@ impl PostgresAdapter {
                         ref_columns: ref_col_names,
                         on_delete,
                         on_update,
+                        match_full: con.try_get::<String, _>("confmatchtype").is_ok_and(|m| m == "f"),
+                        deferrable: con.try_get("condeferrable").unwrap_or(false),
+                        initially_deferred: con.try_get("condeferred").unwrap_or(false),
                         // Read from the live catalog, which always states the
                         // schema. Nothing was guessed.
                         ref_schema_source: crate::entity::SchemaSource::Stated,
                     }));
                 }
-                "c" => {
+                // An exclusion constraint, whose backing index is reported
+                // with it rather than as a plain index — read as one, it was
+                // the speed of the rule without the rule.
+                "x" => {
+                    if let Some(oid) = conindid
+                        && oid != 0
+                    {
+                        constraint_index_oids.insert(oid);
+                    }
                     let condef: String = con.get("condef");
-                    // pg_get_constraintdef returns "CHECK (expr)"
-                    let expression = condef
-                        .strip_prefix("CHECK (")
-                        .and_then(|s| s.strip_suffix(')'))
-                        .unwrap_or(&condef)
-                        .to_string();
+                    constraints.push(TableConstraint::Exclude {
+                        name: Some(conname),
+                        definition: condef.strip_prefix("EXCLUDE ").unwrap_or(&condef).to_string(),
+                    });
+                }
+                "c" => {
+                    let expression: String = match con.try_get::<Option<String>, _>("check_expr") {
+                        Ok(Some(expr)) => expr,
+                        _ => con.get("condef"),
+                    };
                     constraints.push(TableConstraint::Check {
                         name: Some(conname),
                         expression,
@@ -849,7 +1139,7 @@ impl PostgresAdapter {
             }
         }
 
-        Ok((constraints, constraint_index_oids))
+        Ok((constraints, constraint_index_oids, warnings))
     }
 
     /// Introspect a table's standalone indexes.
@@ -1031,11 +1321,12 @@ impl PostgresAdapter {
 
     async fn introspect_views(&self) -> crate::error::Result<Vec<Entity>> {
         let ns_filter = Self::schema_filter_column("schemaname");
+        let owned = Self::not_extension_member("pg_class", "format('%I.%I', schemaname, viewname)::regclass");
         let sql = format!(
             "SELECT schemaname, viewname, definition, \
                     obj_description(format('%I.%I', schemaname, viewname)::regclass, 'pg_class') AS comment \
              FROM pg_views \
-             WHERE {ns_filter} \
+             WHERE {ns_filter} AND {owned} \
              ORDER BY schemaname, viewname"
         );
         let rows = sqlx::query(&sql)
@@ -1072,11 +1363,12 @@ impl PostgresAdapter {
         use crate::entity::TableDef;
 
         let ns_filter = Self::schema_filter_column("schemaname");
+        let owned = Self::not_extension_member("pg_class", "format('%I.%I', schemaname, matviewname)::regclass");
         let sql = format!(
             "SELECT schemaname, matviewname, definition, \
                     obj_description(format('%I.%I', schemaname, matviewname)::regclass, 'pg_class') AS comment \
              FROM pg_matviews \
-             WHERE {ns_filter} \
+             WHERE {ns_filter} AND {owned} \
              ORDER BY schemaname, matviewname"
         );
         let rows = sqlx::query(&sql)
@@ -1128,6 +1420,7 @@ impl PostgresAdapter {
     /// `pg_get_sequencedef` exists, so this is reconstruct-from-catalog).
     async fn introspect_sequences(&self) -> crate::error::Result<Vec<Entity>> {
         let ns_filter = Self::schema_filter_column("n.nspname");
+        let owned = Self::not_extension_member("pg_class", "c.oid");
         let sql = format!(
             "SELECT s.schemaname, s.sequencename, \
                     s.start_value, s.min_value, s.max_value, \
@@ -1139,6 +1432,7 @@ impl PostgresAdapter {
              JOIN pg_sequence pgs ON pgs.seqrelid = c.oid \
              WHERE c.relkind = 'S' \
                AND {ns_filter} \
+               AND {owned} \
                AND NOT EXISTS ( \
                    SELECT 1 FROM pg_depend d \
                    WHERE d.classid = 'pg_class'::regclass \
@@ -1199,6 +1493,7 @@ impl PostgresAdapter {
     /// order. This avoids `ddl/<kind>/<schema>/<name>.ddl` path collisions.
     async fn introspect_functions(&self) -> crate::error::Result<Vec<Entity>> {
         let ns_filter = Self::schema_filter_column("n.nspname");
+        let owned = Self::not_extension_member("pg_proc", "p.oid");
         let sql = format!(
             "SELECT n.nspname AS schema, p.proname AS name, p.prokind::text AS kind, \
                     pg_get_functiondef(p.oid) AS definition \
@@ -1206,10 +1501,7 @@ impl PostgresAdapter {
              JOIN pg_namespace n ON n.oid = p.pronamespace \
              WHERE p.prokind IN ('f', 'p') \
                AND {ns_filter} \
-               AND NOT EXISTS ( \
-                   SELECT 1 FROM pg_depend d \
-                   WHERE d.objid = p.oid AND d.deptype = 'e' \
-               ) \
+               AND {owned} \
              ORDER BY n.nspname, p.proname, p.prokind, p.oid"
         );
         let rows = sqlx::query(&sql)
@@ -1355,11 +1647,58 @@ impl DatabaseAdapter for PostgresAdapter {
     }
 
     async fn execute_script(&self, sql: &str) -> Result<()> {
-        // Ensure `public` is always in the search_path — extensions may be
-        // installed there and DDL files often SET search_path without including it.
-        let sql = ensure_public_in_search_path(sql);
+        // `public` stays on every path the script's own `SET search_path` sets —
+        // extensions may be installed there and DDL files often set a path
+        // without it. No text of the script is changed (see the function).
+        let sql = script::keep_public_on_search_path(sql);
         // Route through the open batch transaction if one exists (see `exec_raw`).
         self.exec_raw(&sql).await
+    }
+
+    async fn matviews_reading_columns(&self, columns: &[(String, String)]) -> Result<Vec<String>> {
+        if columns.is_empty() {
+            return Ok(Vec::new());
+        }
+        // A view or matview reading a column depends on it through its rewrite
+        // rule (`pg_depend.refobjsubid` is the column's number): that is what
+        // makes Postgres refuse `ALTER COLUMN … TYPE`. A matview over the table
+        // that reads other columns has no such row and blocks nothing. Walked
+        // through views, since a matview over a view over the column blocks the
+        // view's drop.
+        let tables: Vec<String> = columns.iter().map(|(t, _)| crate::sql_quote::qualified(t)).collect();
+        let names: Vec<String> = columns.iter().map(|(_, c)| c.clone()).collect();
+        let rows = sqlx::query(
+            "WITH RECURSIVE hit(oid, depth) AS ( \
+                 SELECT r.ev_class, 1 \
+                 FROM unnest($1::text[], $2::text[]) AS a(tbl, col) \
+                 JOIN pg_attribute att ON att.attrelid = to_regclass(a.tbl) AND att.attname = a.col \
+                 JOIN pg_depend d ON d.refclassid = 'pg_class'::regclass AND d.refobjid = att.attrelid \
+                                 AND d.refobjsubid = att.attnum AND d.classid = 'pg_rewrite'::regclass \
+                 JOIN pg_rewrite r ON r.oid = d.objid \
+                 WHERE r.ev_class <> att.attrelid \
+               UNION \
+                 SELECT r.ev_class, hit.depth + 1 FROM hit \
+                 JOIN pg_depend d ON d.refclassid = 'pg_class'::regclass AND d.refobjid = hit.oid \
+                                 AND d.classid = 'pg_rewrite'::regclass \
+                 JOIN pg_rewrite r ON r.oid = d.objid \
+                 WHERE r.ev_class <> hit.oid AND hit.depth < 64 \
+             ) \
+             SELECT n.nspname || '.' || c.relname AS name \
+             FROM hit JOIN pg_class c ON c.oid = hit.oid JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relkind = 'm' \
+             GROUP BY n.nspname, c.relname \
+             ORDER BY max(hit.depth) DESC, 1",
+        )
+        .bind(&tables)
+        .bind(&names)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbdError::Config(format!("finding the materialized views over a column failed: {e}")))?;
+        Ok(rows.iter().map(|r| r.get::<String, _>("name")).collect())
+    }
+
+    async fn execute_project_script(&self, sql: &str, search_path: Option<&[crate::entity::PathEntry]>) -> Result<()> {
+        self.execute_script(&script::runnable_script(sql, search_path)).await
     }
 
     async fn apply_entity(&self, entity: &Entity) -> Result<()> {
@@ -1478,10 +1817,10 @@ impl DatabaseAdapter for PostgresAdapter {
                 .await?;
 
                 // Stage each record as a JSON row — bound, not interpolated into
-                // `execute_script`, which rewrites every `set search_path to …;`
-                // in its text to add `public`. A record is data, and a value that
-                // quoted the statement was altered on the way in. On the pool, as
-                // the CSV `COPY` is: an import never runs inside an apply batch.
+                // a script: a record is data, and interpolated into SQL text it
+                // was read as SQL (a value quoting `set search_path to …;` was
+                // once rewritten on the way in). On the pool, as the CSV `COPY`
+                // is: an import never runs inside an apply batch.
                 let insert = format!("INSERT INTO {JSONB_IMPORT_TMP} (data) VALUES ($1::json)");
                 for record in records {
                     sqlx::query(&insert)
@@ -1504,6 +1843,56 @@ impl DatabaseAdapter for PostgresAdapter {
         }
 
         Ok(())
+    }
+
+    /// One `TRUNCATE` for every table an import reloads. Postgres refuses to
+    /// truncate a table another references — unless both are truncated
+    /// together — so staging tables linked by a foreign key failed one at a
+    /// time on every run. Together, they empty; and a statement Postgres still
+    /// refuses empties nothing. Its error names no table, so the tables are
+    /// named, with every key outside the set that holds one of them.
+    async fn truncate_tables(&self, tables: &[String]) -> Result<()> {
+        if tables.is_empty() {
+            return Ok(());
+        }
+        let list = tables
+            .iter()
+            .map(|t| crate::sql_quote::qualified(t))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let Err(e) = self.execute_script(&format!("TRUNCATE TABLE {list}")).await else {
+            return Ok(());
+        };
+        let qualified: Vec<String> = tables.iter().map(|t| crate::sql_quote::qualified(t)).collect();
+        let blockers: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT n.nspname || '.' || c.relname || ' (' || con.conname || ', a key to ' \
+                    || rn.nspname || '.' || rc.relname || ')' \
+             FROM pg_catalog.pg_constraint con \
+             JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             JOIN pg_catalog.pg_class rc ON rc.oid = con.confrelid \
+             JOIN pg_catalog.pg_namespace rn ON rn.oid = rc.relnamespace \
+             WHERE con.contype = 'f' \
+               AND con.confrelid IN (SELECT to_regclass(t) FROM unnest($1::text[]) AS t) \
+               AND con.conrelid NOT IN (SELECT to_regclass(t) FROM unnest($1::text[]) AS t) \
+             ORDER BY 1",
+        )
+        .bind(&qualified)
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+        let why = if blockers.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " — held by {}, outside the tables this import reloads; it truncates only its own",
+                blockers.join(", ")
+            )
+        };
+        Err(DbdError::Config(format!(
+            "emptying {} before the import failed, so nothing was emptied: {e}{why}",
+            tables.join(", ")
+        )))
     }
 
     async fn export_data(&self, entity: &Entity, out_dir: Option<&Path>) -> Result<()> {
@@ -1559,27 +1948,37 @@ impl DatabaseAdapter for PostgresAdapter {
             // file imported back as different values (or as no JSON at all).
             //
             // Each record is built field by field, as `row_to_json` builds it
-            // (`to_json` of each value), with one difference: `row_to_json`
-            // writes `null` for an SQL NULL and for a json/jsonb column holding
-            // the JSON value `null`, so the import could not tell them apart. A
-            // json/jsonb column that is SQL NULL is left out of its record — an
-            // absent key, which imports as NULL — and `null` is the JSON value.
+            // (`to_json` of each value), every column's key always written:
+            // an import gives a column absent from every record its DEFAULT,
+            // so a json column left out for its SQL NULLs came back as that
+            // DEFAULT. `null` is SQL NULL for every type — what Postgres's own
+            // `json_populate_record` reads it as — so the JSON value `null` in
+            // a json/jsonb column is written `{"$json": null}`, and a value
+            // that is itself a one-key `$json` object is wrapped the same way,
+            // so the import unwraps exactly one level (see
+            // `import_jsonb_to_table`).
             let fields: Vec<String> = columns
                 .iter()
                 .map(|c| {
                     let key = crate::sql_quote::literal(&format!("{}:", serde_json::Value::String(c.name.clone())));
-                    let value = format!("to_json(t.{})::text", crate::sql_quote::ident(&c.name));
+                    let column = format!("t.{}", crate::sql_quote::ident(&c.name));
+                    let value = format!("to_json({column})::text");
                     if c.json {
                         format!(
-                            "CASE WHEN t.{} IS NULL THEN NULL ELSE {key} || {value} END",
-                            crate::sql_quote::ident(&c.name)
+                            "{key} || CASE \
+                               WHEN {column} IS NULL THEN 'null' \
+                               WHEN jsonb_typeof(to_jsonb({column})) = 'null' \
+                                 OR (jsonb_typeof(to_jsonb({column})) = 'object' \
+                                     AND to_jsonb({column}) -> '$json' IS NOT NULL \
+                                     AND (SELECT count(*) FROM jsonb_object_keys(to_jsonb({column}))) = 1) \
+                               THEN '{{\"$json\":' || {value} || '}}' \
+                               ELSE {value} END"
                         )
                     } else {
                         format!("{key} || coalesce({value}, 'null')")
                     }
                 })
                 .collect();
-            // `array_to_string` skips the NULL a left-out field is.
             let sql = format!(
                 "SELECT '{{' || array_to_string(ARRAY[{}]::text[], ',') || '}}' FROM {qualified} t",
                 fields.join(", ")
@@ -1830,8 +2229,16 @@ impl DatabaseAdapter for PostgresAdapter {
         out.extend(self.introspect_extensions().await?);
         out.extend(self.introspect_sequences().await?);
         out.extend(self.introspect_enums().await?);
-        out.extend(self.introspect_tables().await?);
-        out.extend(self.introspect_views().await?);
+        // A trigger goes in the file of the table or view it is on.
+        let mut relations = self.introspect_tables().await?;
+        relations.extend(self.introspect_views().await?);
+        for (relation, statement, warning) in self.introspect_triggers().await? {
+            if let Some(entity) = relations.iter_mut().find(|e| e.name == relation) {
+                entity.triggers.push(statement);
+                entity.warnings.extend(warning);
+            }
+        }
+        out.extend(relations);
         out.extend(self.introspect_matviews().await?);
         out.extend(self.introspect_functions().await?);
         Ok(out)
@@ -1898,6 +2305,79 @@ impl DatabaseAdapter for PostgresAdapter {
         Ok(entities)
     }
 
+    /// `pg_depend`, read at the level of whole objects (see [`super::Dependency`]).
+    ///
+    /// Each side is lifted to the object a user names: a column, default,
+    /// constraint, index, rewrite rule or trigger to its table or view (a
+    /// domain's constraint to the domain), and a referenced column or index to
+    /// its table. Kept: what an object needs from another schema, or from an
+    /// extension other than the server's own (`plpgsql`, in `pg_catalog`).
+    /// What an extension owns is no project's, so it is never the dependent.
+    async fn dependencies(&self) -> Result<Vec<super::Dependency>> {
+        const SQL: &str = r#"WITH dep AS (
+  SELECT DISTINCT own.cls, own.obj, d.refclassid, d.refobjid, d.refobjsubid
+  FROM pg_catalog.pg_depend d
+  CROSS JOIN LATERAL (
+    SELECT 'pg_class'::regclass AS cls, coalesce((SELECT i.indrelid FROM pg_catalog.pg_index i WHERE i.indexrelid = d.objid), d.objid) AS obj
+      WHERE d.classid = 'pg_class'::regclass
+    UNION ALL SELECT 'pg_class'::regclass, a.adrelid FROM pg_catalog.pg_attrdef a
+      WHERE d.classid = 'pg_attrdef'::regclass AND a.oid = d.objid
+    UNION ALL SELECT 'pg_class'::regclass, r.ev_class FROM pg_catalog.pg_rewrite r
+      WHERE d.classid = 'pg_rewrite'::regclass AND r.oid = d.objid
+    UNION ALL SELECT CASE WHEN c.conrelid <> 0 THEN 'pg_class'::regclass ELSE 'pg_type'::regclass END,
+                     CASE WHEN c.conrelid <> 0 THEN c.conrelid ELSE c.contypid END
+      FROM pg_catalog.pg_constraint c WHERE d.classid = 'pg_constraint'::regclass AND c.oid = d.objid
+    UNION ALL SELECT 'pg_class'::regclass, t.tgrelid FROM pg_catalog.pg_trigger t
+      WHERE d.classid = 'pg_trigger'::regclass AND t.oid = d.objid
+    UNION ALL SELECT d.classid, d.objid WHERE d.classid IN ('pg_proc'::regclass, 'pg_type'::regclass)
+  ) own
+  WHERE d.deptype IN ('n', 'a')
+), resolved AS (
+  SELECT dep.cls, dep.obj,
+         CASE WHEN dep.refclassid = 'pg_class'::regclass THEN 'pg_class'::regclass ELSE dep.refclassid END AS rcls,
+         CASE WHEN dep.refclassid = 'pg_class'::regclass
+              THEN coalesce((SELECT i.indrelid FROM pg_catalog.pg_index i WHERE i.indexrelid = dep.refobjid), dep.refobjid)
+              ELSE dep.refobjid END AS robj
+  FROM dep
+)
+SELECT DISTINCT o.schema AS dependent_schema, o.identity AS dependent,
+       r.type AS referenced_kind, r.schema AS referenced_schema, r.identity AS referenced,
+       e.extname AS extension, en.nspname AS extension_schema
+FROM resolved x
+CROSS JOIN LATERAL pg_catalog.pg_identify_object(x.cls, x.obj, 0) o
+CROSS JOIN LATERAL pg_catalog.pg_identify_object(x.rcls, x.robj, 0) r
+LEFT JOIN pg_catalog.pg_depend m ON m.classid = x.rcls AND m.objid = x.robj
+     AND m.refclassid = 'pg_catalog.pg_extension'::regclass AND m.deptype = 'e'
+LEFT JOIN pg_catalog.pg_extension e ON e.oid = m.refobjid
+LEFT JOIN pg_catalog.pg_namespace en ON en.oid = e.extnamespace
+WHERE o.schema IS NOT NULL
+  AND o.schema NOT IN ('pg_catalog', 'information_schema', 'dbd') AND o.schema NOT LIKE 'pg_toast%' AND o.schema NOT LIKE 'pg_temp%'
+  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend x2 WHERE x2.classid = x.cls AND x2.objid = x.obj AND x2.deptype = 'e')
+  AND (CASE WHEN e.extname IS NOT NULL THEN en.nspname <> 'pg_catalog'
+            ELSE r.schema IS NOT NULL AND r.schema <> o.schema
+                 AND r.schema NOT IN ('pg_catalog', 'information_schema') AND r.schema NOT LIKE 'pg_toast%' END)
+ORDER BY 1, 2, 4, 5"#;
+        let rows = sqlx::query(SQL)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("reading what objects depend on failed: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let extension: Option<String> = row.get("extension");
+                let extension_schema: Option<String> = row.get("extension_schema");
+                super::Dependency {
+                    dependent_schema: row.get("dependent_schema"),
+                    dependent: row.get("dependent"),
+                    referenced_kind: row.get("referenced_kind"),
+                    referenced_schema: row.get("referenced_schema"),
+                    referenced: row.get("referenced"),
+                    extension: extension.zip(extension_schema),
+                }
+            })
+            .collect())
+    }
+
     async fn reverse_managed_version(&self) -> Result<Option<u32>> {
         self.bookkeeping.detect_managed_version().await
     }
@@ -1946,6 +2426,10 @@ impl DatabaseAdapter for PostgresAdapter {
 
     async fn get_project_meta(&self) -> Result<Option<ProjectMeta>> {
         self.bookkeeping.get_meta().await
+    }
+
+    async fn other_projects_meta(&self) -> Result<Vec<ProjectMeta>> {
+        self.bookkeeping.other_projects().await
     }
 
     async fn set_project_meta(&self, env: &str, version: u32, scope: Option<&str>) -> Result<()> {
@@ -2089,12 +2573,13 @@ impl DatabaseAdapter for PostgresAdapter {
 
     async fn matview_states(&self) -> Result<std::collections::HashMap<String, Option<String>>> {
         let ns_filter = Self::schema_filter_column("n.nspname");
+        let owned = Self::not_extension_member("pg_class", "c.oid");
         let sql = format!(
             "SELECT n.nspname AS schema, c.relname AS name, \
                     obj_description(c.oid, 'pg_class') AS comment \
              FROM pg_class c \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
-             WHERE c.relkind = 'm' AND {ns_filter}"
+             WHERE c.relkind = 'm' AND {ns_filter} AND {owned}"
         );
         let rows = sqlx::query(&sql)
             .fetch_all(&self.pool)
@@ -2152,6 +2637,39 @@ impl DatabaseAdapter for PostgresAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A port nothing listens on, and one whose listener never answers: each
+    /// waited out sqlx's 30 s pool timeout, then said only `pool timed out
+    /// while waiting for an open connection`. A connection that cannot be made
+    /// fails within a few seconds, naming the host and port it tried.
+    #[tokio::test]
+    async fn a_database_that_cannot_be_reached_fails_fast_naming_its_host_and_port() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_port = closed.local_addr().unwrap().port();
+        drop(closed);
+        // Bound and listening, so the TCP handshake completes — and never read.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let silent_port = silent.local_addr().unwrap().port();
+
+        let mut failures = Vec::new();
+        for port in [closed_port, silent_port] {
+            let started = std::time::Instant::now();
+            let url = format!("postgres://nobody@127.0.0.1:{port}/absent");
+            let err = match PostgresAdapter::new(&url, "p").await {
+                Ok(_) => panic!("{url}: nothing there to connect to"),
+                Err(e) => e.to_string(),
+            };
+            let took = started.elapsed();
+            if took > std::time::Duration::from_secs(15) {
+                failures.push(format!("127.0.0.1:{port} took {took:?}: {err}"));
+            }
+            if !err.contains(&format!("127.0.0.1:{port}")) {
+                failures.push(format!("127.0.0.1:{port} is not named: {err}"));
+            }
+        }
+        drop(silent);
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
 
     // Regression tests for sensei-hq/dbd#6: the dbd-managed jsonb-import
     // machinery must be schema-qualified so it resolves independently of the

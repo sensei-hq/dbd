@@ -1,34 +1,46 @@
-//! Hand-rolled DBML *parser* — the inverse of the DBML exporter in [`crate::dbml`].
+//! DBML *parser* — the inverse of the DBML exporter in [`crate::dbml`].
 //!
 //! [`parse_dbml`] reads a `.dbml` document and produces a `Vec<Entity>` that the
 //! reverse engine can feed straight into its emit → write-plan → snapshot path.
-//! The supported subset is exactly what `dbd dbml` emits plus standard
-//! dbdiagram.io DBML for that subset:
+//! It reads what `dbd dbml` writes and the standard DBML a person writes for
+//! the same things, the way @dbml/core (DBML's reference implementation,
+//! checked against 10.3.0) reads them:
 //!
-//! - `Project "name" { … }`           — parsed and skipped (metadata only).
-//! - `Enum "schema"."name" { … }`      — → [`EntityType::Enum`] with `enum_values`.
-//! - `Table "schema"."name" { … }`     — → [`EntityType::Table`] with a [`TableDef`].
-//! - `Ref: <src> > <tgt> [settings]`   — → a [`ForeignKey`] appended to the source table.
-//! - `TableGroup … { … }`, stray `Note`, `//` comments — skipped cleanly.
+//! - `Project`, `TableGroup`, `TablePartial`, `Records` and a sticky `Note` —
+//!   skipped: metadata, or data.
+//! - `Enum schema.name { value [note: '…'] … }` → [`EntityType::Enum`].
+//! - `Table schema.name [as alias] [settings] { … }` → [`EntityType::Table`]:
+//!   columns and their settings — an inline `ref:` among them — an `indexes`
+//!   block, whose `pk` entry is the primary key, a `checks` block, and a
+//!   `Note: '…'` or `Note { '…' }`.
+//! - `Ref [name]: a > b [settings]` and `Ref [name] { a > b … }` → a
+//!   [`ForeignKey`] on the table holding the key; for a one-to-one `-`, the
+//!   right-hand side, where @dbml/core's SQL puts it. A table's alias names it.
 //!
-//! A [`EntityType::Schema`] entity is synthesised for every distinct schema seen
-//! (including `public`) so the generated project is applyable.
+//! What dbd cannot build as written is refused, not guessed: a many-to-many
+//! `<>` Ref, which has no foreign key (@dbml/core builds a junction table for
+//! it), and a table injecting a `TablePartial`'s columns, which are not read.
 //!
-//! The scanner is line-based: the document is split into logical lines, block
-//! boundaries (`{` / `}`) are tracked by brace depth, and `[settings]` and
-//! `'''`-quoted notes are handled with small character-level helpers. Malformed
-//! input returns a [`DbdError::Parse`]; genuinely unknown blocks are skipped
-//! leniently (dbdiagram.io grows constructs over time).
+//! A note reads as @dbml/core reads one — blank leading lines dropped, the
+//! indentation its lines share removed — with one difference: the line a
+//! closing `'''` sits on is layout, not a trailing line break. dbd's own
+//! earlier documents wrote every multi-line note that way, and a comment
+//! ending in a line break nobody typed is not what anyone documented.
+//!
+//! The document is lexed by @dbml/parse's token rules and laid out again one
+//! entry per line ([`logical_lines`]); the reader then works an entry at a
+//! time. A [`EntityType::Schema`] entity is synthesised for every distinct
+//! schema seen (including `public`) so the generated project is applyable.
 
 use crate::entity::{
-    ColumnDef, Entity, EntityType, FkAction, ForeignKey, IndexColumn, IndexDef, TableConstraint, TableDef,
+    ColumnDef, Entity, EntityType, FkAction, ForeignKey, IndexColumn, IndexDef, IndexType, TableConstraint, TableDef,
 };
 use crate::error::{DbdError, Result};
 
 /// Parse a DBML document into entities (schemas, enums, tables, and the FK
-/// constraints attached to their source tables).
+/// constraints attached to the tables that hold them).
 pub fn parse_dbml(text: &str) -> Result<Vec<Entity>> {
-    let mut p = Parser::new(text);
+    let mut p = Parser::new(logical_lines(text)?);
     p.parse()
 }
 
@@ -39,23 +51,310 @@ fn parse_err(message: impl Into<String>) -> DbdError {
     }
 }
 
-/// A pending standalone `Ref:` collected during the scan and resolved into a
-/// [`ForeignKey`] on the source table after all tables are parsed.
+// ── Lexing, by @dbml/parse's rules ────────────────────────────────────────────
+
+/// One token's place in the document, and what [`logical_lines`] needs of it.
+struct Lexed {
+    start: usize,
+    end: usize,
+    kind: LexKind,
+    /// The token's text when it is not its own source: a `'''` string, written
+    /// again as the one-line `'…'` string with the same text.
+    rendered: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum LexKind {
+    OpenBrace,
+    CloseBrace,
+    OpenGroup,
+    CloseGroup,
+    Other,
+}
+
+/// The tokens of `text`, read as @dbml/parse's lexer reads them: `'…'` and
+/// `"…"` on one line, a backslash escaping the character after it; `'''…'''`
+/// across lines, escapes read; `` `…` `` raw, across lines; `//` to the end of
+/// the line and `/* … */` comments, dropped. Everything else is a character
+/// or a word, which is all the layout needs.
+fn lex(text: &str) -> Result<Vec<Lexed>> {
+    let bytes = text.as_bytes();
+    let line_at = |at: usize| text[..at].matches('\n').count() + 1;
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let token = |kind, end| Lexed {
+            start: i,
+            end,
+            kind,
+            rendered: None,
+        };
+        match bytes[i] {
+            b' ' | b'\t' | b'\r' | b'\n' => i += 1,
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                i = text[i..].find('\n').map_or(bytes.len(), |p| i + p);
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                let close = text[i + 2..]
+                    .find("*/")
+                    .ok_or_else(|| parse_err(format!("unterminated /* comment at line {}", line_at(i))))?;
+                i += 2 + close + 2;
+            }
+            b'\'' if text[i..].starts_with("'''") => {
+                let body = i + 3;
+                let close = closing_triple_quote(&text[body..])
+                    .ok_or_else(|| parse_err(format!("unterminated ''' string at line {}", line_at(i))))?;
+                let value = unescape_dbml(&text[body..body + close]);
+                out.push(Lexed {
+                    start: i,
+                    end: body + close + 3,
+                    kind: LexKind::Other,
+                    rendered: Some(one_line_string(without_closing_layout(&value))),
+                });
+                i = body + close + 3;
+            }
+            quote @ (b'\'' | b'"') => {
+                let mut j = i + 1;
+                loop {
+                    match bytes.get(j) {
+                        Some(b'\\') => j += 2,
+                        Some(b'\n') | None => {
+                            return Err(parse_err(format!(
+                                "unterminated {} at line {} — a quoted string ends on the line it starts \
+                                 (a note across lines is written '''…''')",
+                                if quote == b'"' { "quoted name" } else { "string" },
+                                line_at(i)
+                            )));
+                        }
+                        Some(&b) if b == quote => break,
+                        Some(_) => j += 1,
+                    }
+                }
+                out.push(token(LexKind::Other, j + 1));
+                i = j + 1;
+            }
+            b'`' => {
+                let close = text[i + 1..]
+                    .find('`')
+                    .ok_or_else(|| parse_err(format!("unterminated `expression` at line {}", line_at(i))))?;
+                out.push(token(LexKind::Other, i + 1 + close + 1));
+                i += close + 2;
+            }
+            b'{' => {
+                out.push(token(LexKind::OpenBrace, i + 1));
+                i += 1;
+            }
+            b'}' => {
+                out.push(token(LexKind::CloseBrace, i + 1));
+                i += 1;
+            }
+            b'[' | b'(' => {
+                out.push(token(LexKind::OpenGroup, i + 1));
+                i += 1;
+            }
+            b']' | b')' => {
+                out.push(token(LexKind::CloseGroup, i + 1));
+                i += 1;
+            }
+            b if b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80 => {
+                // A word: ASCII letters, digits and `_`, and any non-ASCII
+                // character whole (its bytes are all ≥ 0x80).
+                let len = bytes[i..]
+                    .iter()
+                    .take_while(|&&b| b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80)
+                    .count();
+                out.push(token(LexKind::Other, i + len));
+                i += len;
+            }
+            _ => {
+                out.push(token(LexKind::Other, i + 1));
+                i += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// A `'''` string's text without the line its closing quotes sit on, when
+/// that line holds nothing but indentation.
+fn without_closing_layout(value: &str) -> &str {
+    match value.rsplit_once('\n') {
+        Some((text, last)) if last.trim().is_empty() => text,
+        _ => value,
+    }
+}
+
+/// `text` as a one-line DBML string: `'…'`, with every backslash, quote and
+/// line break escaped as DBML's lexer reads them back.
+fn one_line_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('\'');
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            other => out.push(other),
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// The document as logical lines, each with the line number it starts on:
+/// every element header, column, index, check, note and closing brace on a
+/// line of its own, whatever the layout, and every comment gone.
+///
+/// The reader took each physical line for one entry: a note spanning lines
+/// inside a column's `[ … ]` became several columns, a `Note { … }` block
+/// failed, and a table written on one line lost its columns. So a line now
+/// ends at a line break outside `[ ]` and `( )`, after a `{` — which joins the
+/// line before it, however far down it was written — and on either side of a
+/// `}`. Within a line, tokens keep the spacing between them unless a comment or
+/// a line break stood there, which becomes one space.
+fn logical_lines(text: &str) -> Result<Vec<(String, usize)>> {
+    let line_at = |at: usize| text[..at].matches('\n').count() + 1;
+    let mut lines: Vec<(String, usize)> = Vec::new();
+    let mut current = String::new();
+    let mut current_line = 0;
+    let mut depth = 0usize;
+    let mut previous_end: Option<usize> = None;
+    let flush = |current: &mut String, current_line: usize, lines: &mut Vec<(String, usize)>| {
+        if !current.trim().is_empty() {
+            lines.push((std::mem::take(current), current_line));
+        }
+        current.clear();
+    };
+    for token in lex(text)? {
+        if let Some(previous) = previous_end {
+            let gap = &text[previous..token.start];
+            let breaks = gap.contains('\n');
+            // A `}` starts a line; so does a line break outside `[ ]` and
+            // `( )`, unless what follows it is the `{` of the line before.
+            let new_line =
+                depth == 0 && (token.kind == LexKind::CloseBrace || (breaks && token.kind != LexKind::OpenBrace));
+            if new_line {
+                flush(&mut current, current_line, &mut lines);
+            } else if !current.is_empty() {
+                if !gap.is_empty() && gap.bytes().all(|b| b == b' ' || b == b'\t') {
+                    current.push_str(gap);
+                } else if !gap.is_empty() {
+                    current.push(' ');
+                }
+            }
+        }
+        if current.is_empty() {
+            current_line = line_at(token.start);
+        }
+        current.push_str(token.rendered.as_deref().unwrap_or(&text[token.start..token.end]));
+        match token.kind {
+            LexKind::OpenGroup => depth += 1,
+            LexKind::CloseGroup => depth = depth.saturating_sub(1),
+            LexKind::OpenBrace | LexKind::CloseBrace if depth == 0 => {
+                flush(&mut current, current_line, &mut lines);
+            }
+            _ => {}
+        }
+        previous_end = Some(token.end);
+    }
+    flush(&mut current, current_line, &mut lines);
+    Ok(lines)
+}
+
+/// A note's text as @dbml/core reads one: the blank lines before its first
+/// line of text dropped, and the indentation its non-blank lines share
+/// removed from every line.
+fn note_text(value: &str) -> String {
+    let lines: Vec<&str> = value.split('\n').collect();
+    let Some(first) = lines.iter().position(|l| !l.trim_start().is_empty()) else {
+        // All blank: @dbml/core keeps the last line as it is.
+        return lines.last().map_or_else(String::new, |l| (*l).to_string());
+    };
+    let lines = &lines[first..];
+    let indent = lines
+        .iter()
+        .filter(|l| !l.trim_start().is_empty())
+        .map(|l| l.chars().count() - l.trim_start().chars().count())
+        .min()
+        .unwrap_or(0);
+    lines
+        .iter()
+        .map(|l| l.chars().skip(indent).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+// ── The reader ───────────────────────────────────────────────────────────────
+
+/// One end of a Ref: the table as written — `schema` only when the document
+/// gives one, so a bare name can still be an alias — and its columns.
+#[derive(Clone)]
+struct Endpoint {
+    schema: Option<String>,
+    table: String,
+    columns: Vec<String>,
+}
+
+/// A relationship's operator.
+#[derive(Clone, Copy, PartialEq)]
+enum RefOp {
+    /// `>` — many-to-one: the left side holds the key.
+    ManyToOne,
+    /// `<` — one-to-many: the right side holds it.
+    OneToMany,
+    /// `-` — one-to-one: the right side holds it, as @dbml/core's SQL puts it.
+    OneToOne,
+    /// `<>` — many-to-many: no foreign key at all.
+    ManyToMany,
+}
+
+/// A foreign key collected during the scan and attached to the table that
+/// holds it once every table — and alias — is known.
 struct PendingRef {
-    src_schema: String,
-    src_table: String,
-    src_columns: Vec<String>,
-    tgt_schema: String,
-    tgt_table: String,
-    tgt_columns: Vec<String>,
+    name: Option<String>,
+    /// The side holding the key.
+    holder: Endpoint,
+    /// The side it references.
+    target: Endpoint,
     on_delete: Option<FkAction>,
     on_update: Option<FkAction>,
 }
 
-struct Parser<'a> {
-    /// Logical lines (comments stripped, blanks kept for note bodies but skipped
-    /// at the top level).
-    lines: Vec<&'a str>,
+impl PendingRef {
+    /// The foreign key `left <op> right` describes, or why there is none.
+    fn new(
+        name: Option<String>,
+        left: Endpoint,
+        op: RefOp,
+        right: Endpoint,
+        on_delete: Option<FkAction>,
+        on_update: Option<FkAction>,
+    ) -> Result<Self> {
+        let (holder, target) = match op {
+            RefOp::ManyToOne => (left, right),
+            RefOp::OneToMany | RefOp::OneToOne => (right, left),
+            RefOp::ManyToMany => {
+                return Err(parse_err(format!(
+                    "a many-to-many Ref (`<>`) between `{}` and `{}` has no foreign key to build — \
+                     @dbml/core builds a junction table for it; declare the junction table and its two Refs instead",
+                    left.table, right.table
+                )));
+            }
+        };
+        Ok(Self {
+            name,
+            holder,
+            target,
+            on_delete,
+            on_update,
+        })
+    }
+}
+
+struct Parser {
+    /// Logical lines (see [`logical_lines`]) and the line each starts on.
+    lines: Vec<(String, usize)>,
     pos: usize,
     tables: Vec<Entity>,
     enums: Vec<Entity>,
@@ -64,19 +363,30 @@ struct Parser<'a> {
     refs: Vec<PendingRef>,
     /// Distinct schemas seen, in first-seen order.
     schemas: Vec<String>,
+    /// Each `Table … as alias`: the alias, and the `(schema, table)` it names.
+    aliases: std::collections::HashMap<String, (String, String)>,
 }
 
-impl<'a> Parser<'a> {
-    fn new(text: &'a str) -> Self {
+impl Parser {
+    fn new(lines: Vec<(String, usize)>) -> Self {
         Self {
-            lines: text.lines().collect(),
+            lines,
             pos: 0,
             tables: Vec::new(),
             enums: Vec::new(),
             externals: Vec::new(),
             refs: Vec::new(),
             schemas: Vec::new(),
+            aliases: std::collections::HashMap::new(),
         }
+    }
+
+    fn line(&self) -> &str {
+        self.lines[self.pos].0.trim()
+    }
+
+    fn line_number(&self) -> usize {
+        self.lines.get(self.pos).map_or(0, |(_, n)| *n)
     }
 
     fn note_schema(&mut self, schema: &str) {
@@ -87,41 +397,22 @@ impl<'a> Parser<'a> {
 
     fn parse(&mut self) -> Result<Vec<Entity>> {
         while self.pos < self.lines.len() {
-            let raw = self.lines[self.pos];
-            let line = strip_comment(raw).trim();
-            if line.is_empty() {
-                self.pos += 1;
-                continue;
-            }
-
+            let line = self.line().to_string();
             // Keyword dispatch on the first token (case-insensitive for the
             // block keywords dbd/dbdiagram.io use). Strip a trailing colon so
-            // `Ref:` / `Note:` match `ref` / `note`.
-            let kw = keyword(line);
-            match kw.as_str() {
-                "project" => self.skip_block()?,
+            // `Ref:` matches `ref`.
+            match keyword(&line).as_str() {
                 "enum" => self.parse_enum()?,
                 "table" => self.parse_table()?,
-                "tablegroup" => self.skip_block()?,
-                "ref" => self.parse_standalone_ref(line)?,
-                "note" => {
-                    // Stray top-level Note — may be a single line or a `'''`
-                    // block. Consume its body and discard.
-                    self.consume_note_value(line)?;
-                }
-                _ => {
-                    // Unknown construct. If it opens a block, skip the whole
-                    // block; otherwise skip the single line. Lenient by design.
-                    if line.contains('{') {
-                        self.skip_block()?;
-                    } else {
-                        self.pos += 1;
-                    }
-                }
+                "ref" => self.parse_ref(&line)?,
+                // `Project`, `TableGroup`, `TablePartial`, `Records`, a sticky
+                // or stray `Note`, and anything newer: documentation, data or
+                // metadata, none of it built. Lenient by design.
+                _ => self.skip_element()?,
             }
         }
 
-        // Resolve standalone Refs onto their source tables.
+        // Resolve every Ref onto the table that holds its key.
         self.attach_refs()?;
 
         // Assemble: schemas (synthesised) → enums → tables.
@@ -135,63 +426,57 @@ impl<'a> Parser<'a> {
         Ok(out)
     }
 
-    // ── block skipping ────────────────────────────────────────────────────
+    // ── element skipping ──────────────────────────────────────────────────
 
-    /// Skip a `{ … }` block starting at the current line, balancing braces.
-    /// Used for `Project`, `TableGroup`, and unknown blocks.
-    fn skip_block(&mut self) -> Result<()> {
-        let start = self.pos;
-        // Advance until we find the opening brace (may be on a later line).
-        let mut depth = 0usize;
-        let mut saw_open = false;
-        while self.pos < self.lines.len() {
-            let line = strip_comment(self.lines[self.pos]);
-            depth += line.matches('{').count();
-            if line.contains('{') {
-                saw_open = true;
-            }
-            depth = depth.saturating_sub(line.matches('}').count());
+    /// Skip the element starting at the current line: the line alone, or —
+    /// when it opens a block — through the `}` that closes it. A `{` only ever
+    /// ends a logical line and a `}` is one alone, so the braces are counted
+    /// exactly; one inside a string is part of the string's token.
+    fn skip_element(&mut self) -> Result<()> {
+        let start = self.line_number();
+        if !self.line().ends_with('{') {
             self.pos += 1;
-            if saw_open && depth == 0 {
+            return Ok(());
+        }
+        let mut depth = 0usize;
+        while self.pos < self.lines.len() {
+            let line = self.line();
+            if line.ends_with('{') {
+                depth += 1;
+            } else if line == "}" {
+                depth -= 1;
+            }
+            self.pos += 1;
+            if depth == 0 {
                 return Ok(());
             }
         }
-        if saw_open {
-            return Err(parse_err(format!("unterminated block starting at line {}", start + 1)));
-        }
-        // No brace at all — a single keyword line; we already advanced past it.
-        Ok(())
+        Err(parse_err(format!("unterminated block starting at line {start}")))
     }
 
     // ── enum ───────────────────────────────────────────────────────────────
 
     fn parse_enum(&mut self) -> Result<()> {
-        let header = strip_comment(self.lines[self.pos]).trim().to_string();
-        let after_kw = header.get(first_word(&header).len()..).unwrap_or("").trim();
-        // Everything up to the `{` is the name.
-        let name_part = after_kw.split('{').next().unwrap_or("").trim();
-        let (schema, base) = parse_qualified_name(name_part)?;
+        let header = self.line().to_string();
+        let head = parse_element_header(&header)?;
+        let (schema, base) = head.name;
         self.note_schema(&schema);
         let qualified = format!("{schema}.{base}");
+        if !head.opens_block {
+            return Err(parse_err(format!("enum `{qualified}` is missing `{{`")));
+        }
         let mut entity = Entity::new(EntityType::Enum, &qualified);
         entity.schema = Some(schema);
 
-        // Consume value lines until the closing `}`.
-        // The opening `{` may be on the header line.
+        // Value lines until the closing `}`.
         self.pos += 1;
-        if !header.contains('{') {
-            return Err(parse_err(format!("enum `{qualified}` is missing `{{`")));
-        }
         loop {
             if self.pos >= self.lines.len() {
                 return Err(parse_err(format!("unterminated enum `{qualified}`")));
             }
-            let line = strip_comment(self.lines[self.pos]).trim().to_string();
+            let line = self.line().to_string();
             self.pos += 1;
-            if line.is_empty() {
-                continue;
-            }
-            if line.starts_with('}') {
+            if line == "}" {
                 break;
             }
             // `"value" [note: '…']` or bare `value`.
@@ -206,68 +491,99 @@ impl<'a> Parser<'a> {
     // ── table ────────────────────────────────────────────────────────────────
 
     fn parse_table(&mut self) -> Result<()> {
-        let header = strip_comment(self.lines[self.pos]).trim().to_string();
-        let (schema, base) = self.parse_table_header(&header)?;
+        let header = self.line().to_string();
+        let head = parse_element_header(&header)?;
+        let (schema, base) = head.name;
         let qualified = format!("{schema}.{base}");
-
-        if !header.contains('{') {
+        if !head.opens_block {
             return Err(parse_err(format!("table `{qualified}` is missing `{{`")));
+        }
+        if let Some(alias) = head.alias {
+            self.aliases.insert(alias, (schema.clone(), base.clone()));
         }
 
         let mut columns: Vec<ColumnDef> = Vec::new();
         let mut pk_cols: Vec<String> = Vec::new();
+        let mut pk_index: Option<(Option<String>, Vec<String>)> = None;
         let mut indexes: Vec<IndexDef> = Vec::new();
         let mut uniques: Vec<TableConstraint> = Vec::new();
         let mut checks: Vec<TableConstraint> = Vec::new();
-        let mut table_note: Option<String> = None;
+        // A note in the header's settings, unless the body has its own.
+        let mut table_note: Option<String> = head.settings.as_deref().and_then(note_setting);
 
         self.pos += 1;
         loop {
             if self.pos >= self.lines.len() {
                 return Err(parse_err(format!("unterminated table `{qualified}`")));
             }
-            let raw = self.lines[self.pos];
-            let line = strip_comment(raw).trim().to_string();
-            if line.is_empty() {
-                self.pos += 1;
-                continue;
-            }
-            if line.starts_with('}') {
+            let line = self.line().to_string();
+            if line == "}" {
                 self.pos += 1;
                 break;
             }
 
-            let kw = keyword(&line);
-            match kw.as_str() {
-                "indexes" => {
-                    for entry in self.block_entries(&line, "indexes", &qualified)? {
+            match keyword(&line).as_str() {
+                // Only as block openers: an unquoted column may well be named
+                // `indexes` or `checks`, and `checks int` is a column.
+                "indexes" if opens_block(&line) => {
+                    for entry in self.block_entries("indexes", &qualified)? {
                         match parse_index_line(&entry, &qualified)? {
                             IndexEntry::Index(index) => indexes.push(index),
                             IndexEntry::Unique(unique) => uniques.push(unique),
+                            IndexEntry::PrimaryKey(name, keys) => {
+                                if pk_index.is_some() {
+                                    return Err(parse_err(format!("table `{qualified}` has two `pk` indexes")));
+                                }
+                                pk_index = Some((name, keys));
+                            }
                         }
                     }
                 }
-                // Only as a block opener: an unquoted column may well be named
-                // `checks`, and `checks int` is a column.
                 "checks" if opens_block(&line) => {
-                    for entry in self.block_entries(&line, "checks", &qualified)? {
+                    for entry in self.block_entries("checks", &qualified)? {
                         checks.push(parse_check_line(&entry, &qualified)?);
                     }
                 }
-                "note" => {
-                    table_note = Some(self.consume_note_value(&line)?);
+                // `Note: '…'` or `Note { '…' }` — not a column named `note`.
+                "note" if is_note(&line) => {
+                    table_note = Some(self.consume_note(&line, &qualified)?);
+                }
+                "records" if line.ends_with('{') => self.skip_element()?,
+                _ if line.starts_with('~') => {
+                    return Err(parse_err(format!(
+                        "table `{qualified}` takes columns from a TablePartial (`{line}`), which dbd does not read — \
+                         write the columns into the table"
+                    )));
                 }
                 _ => {
-                    // A column definition, with any `check:` settings it carries.
-                    let (col, col_checks) = parse_column(&line, &qualified)?;
+                    // A column definition, with any `check:` and `ref:`
+                    // settings it carries.
+                    let column = parse_column(&line, &qualified)?;
+                    let col = column.def;
                     if col.is_pk {
                         pk_cols.push(col.name.clone());
                     }
                     checks.extend(
-                        col_checks
+                        column
+                            .checks
                             .into_iter()
                             .map(|expression| TableConstraint::Check { name: None, expression }),
                     );
+                    let here = Endpoint {
+                        schema: Some(schema.clone()),
+                        table: base.clone(),
+                        columns: vec![col.name.clone()],
+                    };
+                    // An inline ref is written from the column's side: `[ref:
+                    // > t.c]` is `col > t.c`, but `[ref: - t.c]` keys the
+                    // column, as @dbml/core reads it (`t.c - col`).
+                    for (op, other) in column.refs {
+                        let pending = match op {
+                            RefOp::OneToOne => PendingRef::new(None, other, op, here.clone(), None, None)?,
+                            _ => PendingRef::new(None, here.clone(), op, other, None, None)?,
+                        };
+                        self.refs.push(pending);
+                    }
                     columns.push(col);
                     self.pos += 1;
                 }
@@ -275,11 +591,29 @@ impl<'a> Parser<'a> {
         }
 
         let mut constraints = Vec::new();
-        if !pk_cols.is_empty() {
-            constraints.push(TableConstraint::PrimaryKey {
+        // The primary key: the columns marked `pk` (two or more are a composite
+        // key, as in @dbml/core), or the `pk` index — which is how DBML names
+        // one. Both may say the same thing; two different keys are refused.
+        match pk_index {
+            Some((name, keys)) => {
+                if !pk_cols.is_empty() && pk_cols != keys {
+                    return Err(parse_err(format!(
+                        "table `{qualified}` declares two primary keys: ({}) by its columns and ({}) by its indexes",
+                        pk_cols.join(", "),
+                        keys.join(", ")
+                    )));
+                }
+                for col in columns.iter_mut().filter(|c| keys.contains(&c.name)) {
+                    col.is_pk = true;
+                    col.nullable = false;
+                }
+                constraints.push(TableConstraint::PrimaryKey { name, columns: keys });
+            }
+            None if !pk_cols.is_empty() => constraints.push(TableConstraint::PrimaryKey {
                 name: None,
                 columns: pk_cols,
-            });
+            }),
+            None => {}
         }
         constraints.append(&mut uniques);
         constraints.append(&mut checks);
@@ -308,18 +642,6 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    /// Parse a table header line into `(schema, base)`, stripping the leading
-    /// keyword, an inline `{`, and any trailing `[settings]`. The schema is
-    /// noted by the caller, once it knows the table is not a stub.
-    fn parse_table_header(&self, header: &str) -> Result<(String, String)> {
-        let after_kw = header.get(first_word(header).len()..).unwrap_or("").trim();
-        let name_part = after_kw.split('{').next().unwrap_or("").trim();
-        // Tables may carry their own `[settings]` (e.g. `[headercolor: …]`);
-        // strip a trailing settings group from the name part.
-        let name_only = name_part.split('[').next().unwrap_or(name_part).trim();
-        parse_qualified_name(name_only)
-    }
-
     /// Assemble a table's `TableComments` from its `note` plus per-column notes
     /// (mirrors what introspection surfaces).
     fn table_comments_from(table_note: Option<String>, columns: &[ColumnDef]) -> crate::entity::TableComments {
@@ -336,22 +658,17 @@ impl<'a> Parser<'a> {
     }
 
     /// The entry lines of a `<kind> { … }` block inside a table — `indexes` or
-    /// `checks`. `header` is the line beginning with `kind`; the `{` may be on
-    /// that line or a following one.
-    fn block_entries(&mut self, header: &str, kind: &str, table: &str) -> Result<Vec<String>> {
-        self.advance_past_open_brace(header, kind, table)?;
-
+    /// `checks` — whose header is the current line.
+    fn block_entries(&mut self, kind: &str, table: &str) -> Result<Vec<String>> {
+        self.pos += 1;
         let mut entries = Vec::new();
         loop {
             if self.pos >= self.lines.len() {
                 return Err(parse_err(format!("unterminated {kind} block in `{table}`")));
             }
-            let line = strip_comment(self.lines[self.pos]).trim().to_string();
+            let line = self.line().to_string();
             self.pos += 1;
-            if line.is_empty() {
-                continue;
-            }
-            if line.starts_with('}') {
+            if line == "}" {
                 break;
             }
             entries.push(line);
@@ -359,182 +676,117 @@ impl<'a> Parser<'a> {
         Ok(entries)
     }
 
-    /// Advance the cursor just past the `{` that opens a `kind` block —
-    /// whether the brace is on the header line or a following line.
-    fn advance_past_open_brace(&mut self, header: &str, kind: &str, table: &str) -> Result<()> {
-        if header.contains('{') {
+    /// A table's note, from the current line: `Note: '…'`, or a `Note {`
+    /// whose string is the next line and whose `}` follows it.
+    fn consume_note(&mut self, line: &str, table: &str) -> Result<String> {
+        let malformed = || parse_err(format!("malformed Note in `{table}`: {line}"));
+        if line.ends_with('{') {
             self.pos += 1;
-            return Ok(());
+            let value = self
+                .lines
+                .get(self.pos)
+                .and_then(|(l, _)| parse_single_line_string(l))
+                .ok_or_else(malformed)?;
+            self.pos += 1;
+            if self.lines.get(self.pos).map(|(l, _)| l.trim()) != Some("}") {
+                return Err(malformed());
+            }
+            self.pos += 1;
+            return Ok(note_text(&value));
         }
-        // Brace on a following line: advance to it.
         self.pos += 1;
-        while self.pos < self.lines.len() {
-            let l = strip_comment(self.lines[self.pos]).trim().to_string();
-            self.pos += 1;
-            if l.is_empty() {
-                continue;
-            }
-            if l.contains('{') {
-                return Ok(());
-            }
-            return Err(parse_err(format!("{kind} block in `{table}` is missing `{{`")));
-        }
-        Ok(())
+        let after = line.split_once(':').map(|(_, rest)| rest).ok_or_else(malformed)?;
+        parse_single_line_string(after.trim())
+            .map(|v| note_text(&v))
+            .ok_or_else(malformed)
     }
 
-    // ── standalone Ref ───────────────────────────────────────────────────────
+    // ── Ref ──────────────────────────────────────────────────────────────────
 
-    fn parse_standalone_ref(&mut self, line: &str) -> Result<()> {
-        // The line begins with `Ref` (possibly `Ref name:` or `Ref:`). dbd emits
-        // `Ref: <src> <op> <tgt> [settings]`. A `Ref … { … }` group form opens a
-        // block — handle that by skipping leniently (dbd never emits it).
-        if line.contains('{') {
-            self.skip_block()?;
-            return Ok(());
-        }
-        // Strip everything up to and including the first ':'.
-        let body = match line.split_once(':') {
-            Some((_, rest)) => rest.trim(),
-            None => {
-                return Err(parse_err(format!("malformed Ref (no `:`): {line}")));
-            }
+    /// `Ref[ name]: <a> <op> <b> [settings]`, or the long form `Ref[ name] {`
+    /// with one relationship per line until `}`. The name is the foreign
+    /// key's.
+    fn parse_ref(&mut self, line: &str) -> Result<()> {
+        let rest = line.get(3..).unwrap_or("").trim_start();
+        let (name, rest) = if rest.starts_with(':') || rest.starts_with('{') {
+            (None, rest)
+        } else {
+            let (name, rest) = take_name_part(rest)?;
+            (Some(name), rest.trim_start())
         };
-        let pending = parse_ref_body(body)?;
-        if let Some(p) = pending {
-            self.refs.push(PendingRef {
-                src_schema: p.src_schema.clone(),
-                src_table: p.src_table.clone(),
-                src_columns: p.src_columns.clone(),
-                tgt_schema: p.tgt_schema.clone(),
-                tgt_table: p.tgt_table.clone(),
-                tgt_columns: p.tgt_columns.clone(),
-                on_delete: p.on_delete,
-                on_update: p.on_update,
-            });
-            // No schema is noted here: each end's table notes its own when the
-            // document defines it, and a schema only a Ref names holds a table
-            // the document does not define — not one the project builds.
+        if rest.starts_with('{') {
+            let start = self.line_number();
+            self.pos += 1;
+            loop {
+                let Some((body, _)) = self.lines.get(self.pos) else {
+                    return Err(parse_err(format!("unterminated Ref block starting at line {start}")));
+                };
+                let body = body.trim().to_string();
+                self.pos += 1;
+                if body == "}" {
+                    return Ok(());
+                }
+                self.refs.push(parse_ref_body(&body, name.clone())?);
+            }
         }
+        let body = rest
+            .strip_prefix(':')
+            .ok_or_else(|| parse_err(format!("malformed Ref (no `:`): {line}")))?;
+        self.refs.push(parse_ref_body(body.trim(), name)?);
         self.pos += 1;
         Ok(())
     }
 
-    /// Resolve each collected Ref onto its source table as a `ForeignKey`
-    /// constraint. A Ref whose source table is absent is skipped (lenient).
+    /// The `(schema, table)` an endpoint names: as written when it states a
+    /// schema, the table an alias stands for, else `public`.
+    fn resolve(&self, end: &Endpoint) -> (String, String) {
+        match &end.schema {
+            Some(schema) => (schema.clone(), end.table.clone()),
+            None => self
+                .aliases
+                .get(&end.table)
+                .cloned()
+                .unwrap_or_else(|| ("public".to_string(), end.table.clone())),
+        }
+    }
+
+    /// Attach each collected Ref to the table holding its key as a
+    /// `ForeignKey` constraint. A Ref whose holder is absent is skipped
+    /// (lenient).
     fn attach_refs(&mut self) -> Result<()> {
         let refs = std::mem::take(&mut self.refs);
         for r in refs {
-            let src_qualified = format!("{}.{}", r.src_schema, r.src_table);
+            let (holder_schema, holder_table) = self.resolve(&r.holder);
+            let (target_schema, target_table) = self.resolve(&r.target);
             let fk = ForeignKey {
-                name: None,
-                columns: r.src_columns,
-                ref_schema: Some(r.tgt_schema),
-                ref_table: r.tgt_table,
-                ref_columns: r.tgt_columns,
+                name: r.name,
+                columns: r.holder.columns,
+                ref_schema: Some(target_schema),
+                ref_table: target_table,
+                ref_columns: r.target.columns,
                 on_delete: r.on_delete,
                 on_update: r.on_update,
-                // A DBML `Ref` always names both sides' schemas, so nothing
-                // here was inferred.
+                // DBML has no words for these; a `Ref` is a plain key.
+                match_full: false,
+                deferrable: false,
+                initially_deferred: false,
+                // A DBML Ref's tables resolve to a schema, so nothing here
+                // was inferred from a search path.
                 ref_schema_source: crate::entity::SchemaSource::Stated,
             };
-            if let Some(entity) = self.tables.iter_mut().find(|e| e.name == src_qualified)
+            let holder = format!("{holder_schema}.{holder_table}");
+            if let Some(entity) = self.tables.iter_mut().find(|e| e.name == holder)
                 && let Some(td) = entity.table_def.as_mut()
             {
                 td.constraints.push(TableConstraint::ForeignKey(fk));
             }
-            // else: source table not found — skip leniently.
+            // else: the holder is not in the document — skip leniently.
         }
         Ok(())
-    }
-
-    // ── note value ───────────────────────────────────────────────────────────
-
-    /// Consume a `Note:` value starting at the current line and return its text.
-    /// Handles single-line `'…'`, `"…"`, and triple-quoted `'''…'''` (possibly
-    /// spanning multiple lines). Advances `self.pos` past the consumed lines.
-    fn consume_note_value(&mut self, first_line: &str) -> Result<String> {
-        // Take the part after the first ':'.
-        let after = match first_line.split_once(':') {
-            Some((_, rest)) => rest.trim_start(),
-            None => "",
-        };
-
-        if let Some(rest) = after.strip_prefix("'''") {
-            // Triple-quoted, possibly multi-line.
-            return self.consume_triple_quoted(rest);
-        }
-
-        // Single-line quoted value on this line.
-        self.pos += 1;
-        let value = parse_single_line_string(after.trim())
-            .ok_or_else(|| parse_err(format!("malformed Note value: {first_line}")))?;
-        Ok(value)
-    }
-
-    /// `rest` is the text following the opening `'''` on the first line.
-    fn consume_triple_quoted(&mut self, rest: &str) -> Result<String> {
-        let mut body = String::new();
-        // Closing `'''` may be on the same line.
-        if let Some(end) = closing_triple_quote(rest) {
-            self.pos += 1;
-            return Ok(unescape_dbml(&rest[..end]));
-        }
-        if !rest.is_empty() {
-            body.push_str(rest);
-            body.push('\n');
-        }
-        self.pos += 1;
-        loop {
-            if self.pos >= self.lines.len() {
-                return Err(parse_err("unterminated triple-quoted note"));
-            }
-            let raw = self.lines[self.pos];
-            self.pos += 1;
-            if let Some(end) = closing_triple_quote(raw) {
-                body.push_str(&raw[..end]);
-                break;
-            }
-            body.push_str(raw);
-            body.push('\n');
-        }
-        // dbd emits `'''\n<text>\n'''`, so the first body line is empty and the
-        // last has a trailing newline — trim one leading and one trailing
-        // newline to recover the original text. Trimmed before unescaping, so
-        // an escaped `\n` at either end is text, not layout.
-        let trimmed = body.strip_prefix('\n').unwrap_or(&body);
-        let trimmed = trimmed.strip_suffix('\n').unwrap_or(trimmed);
-        Ok(unescape_dbml(trimmed))
     }
 }
 
 // ── free functions ──────────────────────────────────────────────────────────
-
-/// Strip a `//` line comment (outside of quotes) from a raw line.
-fn strip_comment(line: &str) -> &str {
-    let bytes = line.as_bytes();
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i] as char;
-        match c {
-            // While inside a single-quoted string a backslash escapes the next
-            // character — skip both without toggling quote state.
-            '\\' if in_single && i + 1 < bytes.len() => {
-                i += 2;
-                continue;
-            }
-            '\'' if !in_double => in_single = !in_single,
-            '"' if !in_single => in_double = !in_double,
-            '/' if !in_single && !in_double && i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
-                return &line[..i];
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    line
-}
 
 /// The first whitespace-delimited word of a line.
 fn first_word(line: &str) -> &str {
@@ -547,20 +799,87 @@ fn keyword(line: &str) -> String {
     first_word(line).trim_end_matches(':').to_ascii_lowercase()
 }
 
-/// Parse a (possibly schema-qualified) name into `(schema, base)`.
-/// Accepts `"s"."n"`, `s.n`, `"n"`, `n`. Unqualified names default to `public`.
-fn parse_qualified_name(input: &str) -> Result<(String, String)> {
-    let input = input.trim();
-    if input.is_empty() {
-        return Err(parse_err("empty name"));
+/// Whether a line beginning with `note` is a note — `Note: '…'`, `Note {` —
+/// rather than a column named `note`.
+fn is_note(line: &str) -> bool {
+    let rest = line.get(4..).unwrap_or("").trim_start();
+    rest.starts_with(':') || rest.starts_with('{')
+}
+
+/// A `Table` or `Enum` header: `<keyword> <name> [as <alias>] [settings] {`.
+struct ElementHeader {
+    name: (String, String),
+    alias: Option<String>,
+    settings: Option<String>,
+    opens_block: bool,
+}
+
+fn parse_element_header(header: &str) -> Result<ElementHeader> {
+    let rest = header.get(first_word(header).len()..).unwrap_or("").trim();
+    let (opens_block, rest) = match rest.strip_suffix('{') {
+        Some(before) => (true, before.trim_end()),
+        None => (false, rest),
+    };
+    let (parts, mut rest) = take_dotted_name(rest)?;
+    let name = match parts.as_slice() {
+        [base] => ("public".to_string(), base.clone()),
+        [schema, base] => (schema.clone(), base.clone()),
+        _ => return Err(parse_err(format!("unexpected qualified name in: {header}"))),
+    };
+    rest = rest.trim_start();
+    let mut alias = None;
+    if let Some(after) = rest.strip_prefix("as").or_else(|| rest.strip_prefix("AS"))
+        && after.starts_with(char::is_whitespace)
+    {
+        let (a, after) = take_name_part(after.trim_start())?;
+        alias = Some(a);
+        rest = after.trim_start();
     }
-    // Split on the top-level '.' that is not inside quotes.
-    let parts = split_dotted(input);
-    match parts.as_slice() {
-        [single] => Ok(("public".to_string(), unquote(single))),
-        [schema, base] => Ok((unquote(schema), unquote(base))),
-        _ => Err(parse_err(format!("unexpected qualified name: {input}"))),
+    let settings = split_trailing_settings(rest).1.map(str::to_string);
+    Ok(ElementHeader {
+        name,
+        alias,
+        settings,
+        opens_block,
+    })
+}
+
+/// Take a dotted name — `a.b`, `"a"."b c"` — off the front of `s`.
+fn take_dotted_name(s: &str) -> Result<(Vec<String>, &str)> {
+    let mut parts = Vec::new();
+    let mut rest = s;
+    loop {
+        let (part, after) = take_name_part(rest)?;
+        parts.push(part);
+        match after.strip_prefix('.') {
+            Some(next) => rest = next,
+            None => return Ok((parts, after)),
+        }
     }
+}
+
+/// Take one name off the front of `s`: `"quoted"` (read with DBML's escapes),
+/// or bare — up to whitespace or one of `.[{(:`.
+fn take_name_part(s: &str) -> Result<(String, &str)> {
+    let s = s.trim_start();
+    if s.starts_with('"') {
+        let bytes = s.as_bytes();
+        let mut j = 1;
+        while j < bytes.len() && bytes[j] != b'"' {
+            j += if bytes[j] == b'\\' { 2 } else { 1 };
+        }
+        if j >= bytes.len() {
+            return Err(parse_err(format!("unterminated quoted name: {s}")));
+        }
+        return Ok((unescape_dbml(&s[1..j]), &s[j + 1..]));
+    }
+    let end = s
+        .find(|c: char| c.is_whitespace() || ".[{(:".contains(c))
+        .unwrap_or(s.len());
+    if end == 0 {
+        return Err(parse_err(format!("expected a name: {s}")));
+    }
+    Ok((s[..end].to_string(), &s[end..]))
 }
 
 /// Split on `.` separators that are outside of double quotes.
@@ -615,25 +934,32 @@ fn take_identifier(s: &str) -> Result<(String, &str)> {
     }
 }
 
+/// The `note:` in a settings group's inner text, read as a note.
+fn note_setting(settings: &str) -> Option<String> {
+    extract_settings(settings)?
+        .into_iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("note"))
+        .and_then(|(_, value)| value.as_deref().and_then(parse_single_line_string))
+        .map(|v| note_text(&v))
+}
+
 /// Parse an optional `[note: '…']` setting following an enum value, returning
 /// the note text if present.
 fn parse_value_note(rest: &str) -> Option<String> {
     let (_, inner) = split_trailing_settings(rest.trim());
-    let settings = extract_settings(inner?)?;
-    for (key, value) in settings {
-        if key.eq_ignore_ascii_case("note")
-            && let Some(v) = value
-            && let Some(s) = parse_single_line_string(&v)
-        {
-            return Some(s);
-        }
-    }
-    None
+    note_setting(inner?)
 }
 
-/// Parse a column definition line: `"name" <type> [settings]`, returning the
-/// column and the expressions of any `check:` settings on it.
-fn parse_column(line: &str, table: &str) -> Result<(ColumnDef, Vec<String>)> {
+/// A column line read: the column, the expressions of its `check:` settings,
+/// and its inline `ref:`s.
+struct ParsedColumn {
+    def: ColumnDef,
+    checks: Vec<String>,
+    refs: Vec<(RefOp, Endpoint)>,
+}
+
+/// Parse a column definition line: `"name" <type> [settings]`.
+fn parse_column(line: &str, table: &str) -> Result<ParsedColumn> {
     let (name, rest) = take_identifier(line).map_err(|e| parse_err(format!("column in `{table}`: {e}")))?;
     let rest = rest.trim_start();
 
@@ -652,8 +978,11 @@ fn parse_column(line: &str, table: &str) -> Result<(ColumnDef, Vec<String>)> {
         generated: None,
         comment: None,
         inline_fk: None,
+        // DBML has no collation.
+        collation: None,
     };
     let mut checks = Vec::new();
+    let mut refs = Vec::new();
 
     if let Some(settings_str) = settings_part {
         let settings = extract_settings(settings_str)
@@ -703,7 +1032,7 @@ fn parse_column(line: &str, table: &str) -> Result<(ColumnDef, Vec<String>)> {
                     if let Some(v) = value
                         && let Some(s) = parse_single_line_string(&v)
                     {
-                        col.comment = Some(s);
+                        col.comment = Some(note_text(&s));
                     }
                 }
                 // dbd's custom property for a generated column's expression.
@@ -719,12 +1048,34 @@ fn parse_column(line: &str, table: &str) -> Result<(ColumnDef, Vec<String>)> {
                     })?;
                     checks.push(expression);
                 }
+                // An inline relationship: `ref: > table.column`.
+                "ref" => {
+                    let value = value.unwrap_or_default();
+                    let (op, other) = parse_inline_ref(&value)
+                        .ok_or_else(|| parse_err(format!("malformed ref on `{}` in `{table}`: {value}", col.name)))?;
+                    refs.push((op, parse_ref_endpoint(other)?));
+                }
                 _ => { /* unknown setting — ignore (forward-compatible) */ }
             }
         }
     }
 
-    Ok((col, checks))
+    Ok(ParsedColumn { def: col, checks, refs })
+}
+
+/// An inline `ref:` value — an operator, then the other end: `> table.column`.
+fn parse_inline_ref(value: &str) -> Option<(RefOp, &str)> {
+    let v = value.trim();
+    let (op, rest) = if let Some(rest) = v.strip_prefix("<>") {
+        (RefOp::ManyToMany, rest)
+    } else if let Some(rest) = v.strip_prefix('<') {
+        (RefOp::OneToMany, rest)
+    } else if let Some(rest) = v.strip_prefix('>') {
+        (RefOp::ManyToOne, rest)
+    } else {
+        (RefOp::OneToOne, v.strip_prefix('-')?)
+    };
+    Some((op, rest.trim()))
 }
 
 /// Whether a table-body line opens a block: the keyword alone, or followed by
@@ -811,11 +1162,13 @@ fn parse_default_value(v: &str) -> String {
     v.to_string()
 }
 
-/// An entry of an `indexes { … }` block: an index, or the table-level UNIQUE
-/// constraint dbd wrote as one (see `crate::dbml::index_note`).
+/// An entry of an `indexes { … }` block: an index, the table-level UNIQUE
+/// constraint dbd wrote as one (see `crate::dbml::index_note`), or the
+/// primary key — a `pk` entry, named or not, on these columns.
 enum IndexEntry {
     Index(IndexDef),
     Unique(TableConstraint),
+    PrimaryKey(Option<String>, Vec<String>),
 }
 
 /// Parse an index line: `(<cols>) [settings]` or `<col> [settings]`.
@@ -843,8 +1196,10 @@ fn parse_index_line(line: &str, table: &str) -> Result<IndexEntry> {
     }
 
     let mut unique = false;
+    let mut pk = false;
     let mut name = None;
     let mut note = None;
+    let mut index_type = None;
     if let Some(settings_str) = settings_part {
         let settings = extract_settings(settings_str)
             .ok_or_else(|| parse_err(format!("malformed index settings in `{table}`: {settings_str}")))?;
@@ -852,40 +1207,60 @@ fn parse_index_line(line: &str, table: &str) -> Result<IndexEntry> {
             let k = key.to_ascii_lowercase();
             match k.as_str() {
                 "unique" => unique = true,
+                "pk" => pk = true,
                 "name" => {
                     if let Some(v) = value {
                         name = parse_single_line_string(&v);
                     }
                 }
-                "note" => note = value.as_deref().and_then(parse_single_line_string),
-                _ => { /* pk / type on indexes — ignore */ }
+                "note" => {
+                    note = value
+                        .as_deref()
+                        .and_then(parse_single_line_string)
+                        .map(|n| note_text(&n))
+                }
+                // The access method, an identifier: `type: gin`.
+                "type" => index_type = value.map(|v| IndexType::from_amname(v.trim())),
+                _ => {}
             }
         }
+    }
+
+    // The primary key is a plain list of columns.
+    if pk {
+        if keys.iter().any(|k| k.is_expression) {
+            return Err(parse_err(format!(
+                "a `pk` index in `{table}` has an expression key, which a primary key cannot: {line}"
+            )));
+        }
+        return Ok(IndexEntry::PrimaryKey(name, keys.into_iter().map(|k| k.name).collect()));
     }
 
     let mut index = IndexDef {
         name,
         columns: keys,
         unique,
+        index_type,
         ..Default::default()
     };
-    // The partial `WHERE`, key order and `NULLS NOT DISTINCT` have no DBML
-    // syntax; dbd carries them in the note (see `crate::dbml::index_note`).
-    // An operator class, `INCLUDE` and storage parameters are not carried and
-    // stay at their defaults.
+    // What DBML's index settings cannot say — a partial `WHERE`, key order,
+    // `NULLS NOT DISTINCT`, `INCLUDE`, operator classes, storage parameters —
+    // dbd carries in the note (see `crate::dbml::index_note`).
     let constraint = note.as_deref().is_some_and(crate::dbml::index_note::marks_a_constraint);
     if let Some(note) = note {
         crate::dbml::index_note::read(&note, &mut index);
     }
     // A UNIQUE constraint is a plain list of columns; an entry marked as one
-    // that holds an expression, a predicate or a key order is something a
-    // constraint cannot be, and stays the index it says it is.
+    // that holds anything a constraint cannot is the index it says it is.
     let plain = index.unique
         && index.predicate.is_none()
+        && index.include.is_empty()
+        && index.with_options.is_empty()
+        && index.index_type.is_none()
         && index
             .columns
             .iter()
-            .all(|k| !k.is_expression && k.order.is_none() && k.nulls_first.is_none());
+            .all(|k| !k.is_expression && k.order.is_none() && k.nulls_first.is_none() && k.opclass.is_none());
     if constraint && plain {
         return Ok(IndexEntry::Unique(TableConstraint::Unique {
             name: index.name,
@@ -914,77 +1289,34 @@ fn parse_index_key(key: &str) -> IndexColumn {
     }
 }
 
-/// Parse the body of a standalone `Ref:` (everything after the `:`).
-/// `<src> <op> <tgt> [settings]`. Returns `None` only if the body is empty.
-fn parse_ref_body(body: &str) -> Result<Option<ParsedRef>> {
+/// A Ref's body (everything after `Ref[ name]:`): `<a> <op> <b> [settings]`.
+fn parse_ref_body(body: &str, name: Option<String>) -> Result<PendingRef> {
     let body = body.trim();
-    if body.is_empty() {
-        return Ok(None);
-    }
-    // Strip trailing `[settings]`.
     let (refs_part, settings_part) = split_trailing_settings(body);
-    let refs_part = refs_part.trim();
-
-    // Find the relationship operator. dbd emits `>`; accept `<`, `-`, `<>`.
-    let (left, op, right) =
-        split_ref_operator(refs_part).ok_or_else(|| parse_err(format!("Ref missing relationship operator: {body}")))?;
-
-    let (mut l_schema, mut l_table, mut l_cols) = parse_ref_endpoint(left)?;
-    let (mut r_schema, mut r_table, mut r_cols) = parse_ref_endpoint(right)?;
-
-    // dbd emits many-to-one `child > parent` (source > target). For `<` the
-    // source is on the right, so swap. `-`/`<>` are non-directional: treat the
-    // left as the source (matches dbd's child-side convention) with no actions.
-    if op == "<" {
-        std::mem::swap(&mut l_schema, &mut r_schema);
-        std::mem::swap(&mut l_table, &mut r_table);
-        std::mem::swap(&mut l_cols, &mut r_cols);
-    }
+    let (left, op, right) = split_ref_operator(refs_part.trim())
+        .ok_or_else(|| parse_err(format!("Ref missing relationship operator: {body}")))?;
+    let left = parse_ref_endpoint(left)?;
+    let right = parse_ref_endpoint(right)?;
 
     let mut on_delete = None;
     let mut on_update = None;
-    // Only `>`/`<` carry FK semantics; `-`/`<>` have no action.
-    if (op == ">" || op == "<")
-        && let Some(settings_str) = settings_part
-    {
+    if let Some(settings_str) = settings_part {
         let settings = extract_settings(settings_str)
             .ok_or_else(|| parse_err(format!("malformed Ref settings: {settings_str}")))?;
         for (key, value) in settings {
-            let k = key.to_ascii_lowercase();
-            match k.as_str() {
+            match key.to_ascii_lowercase().as_str() {
                 "delete" => on_delete = value.as_deref().and_then(FkAction::from_dbml),
                 "update" => on_update = value.as_deref().and_then(FkAction::from_dbml),
                 _ => {}
             }
         }
     }
-
-    Ok(Some(ParsedRef {
-        src_schema: l_schema,
-        src_table: l_table,
-        src_columns: l_cols,
-        tgt_schema: r_schema,
-        tgt_table: r_table,
-        tgt_columns: r_cols,
-        on_delete,
-        on_update,
-    }))
-}
-
-struct ParsedRef {
-    src_schema: String,
-    src_table: String,
-    src_columns: Vec<String>,
-    tgt_schema: String,
-    tgt_table: String,
-    tgt_columns: Vec<String>,
-    on_delete: Option<FkAction>,
-    on_update: Option<FkAction>,
+    PendingRef::new(name, left, op, right, on_delete, on_update)
 }
 
 /// Locate the relationship operator (`<>`, `>`, `<`, `-`) outside of quotes and
 /// parentheses, returning `(left, op, right)`.
-fn split_ref_operator(s: &str) -> Option<(&str, &'static str, &str)> {
+fn split_ref_operator(s: &str) -> Option<(&str, RefOp, &str)> {
     let bytes = s.as_bytes();
     let mut in_quote = false;
     let mut paren = 0i32;
@@ -996,17 +1328,16 @@ fn split_ref_operator(s: &str) -> Option<(&str, &'static str, &str)> {
             '(' if !in_quote => paren += 1,
             ')' if !in_quote => paren -= 1,
             '<' if !in_quote && paren == 0 => {
-                // `<>` or `<`.
                 if i + 1 < bytes.len() && bytes[i + 1] == b'>' {
-                    return Some((s[..i].trim(), "<>", s[i + 2..].trim()));
+                    return Some((s[..i].trim(), RefOp::ManyToMany, s[i + 2..].trim()));
                 }
-                return Some((s[..i].trim(), "<", s[i + 1..].trim()));
+                return Some((s[..i].trim(), RefOp::OneToMany, s[i + 1..].trim()));
             }
             '>' if !in_quote && paren == 0 => {
-                return Some((s[..i].trim(), ">", s[i + 1..].trim()));
+                return Some((s[..i].trim(), RefOp::ManyToOne, s[i + 1..].trim()));
             }
             '-' if !in_quote && paren == 0 => {
-                return Some((s[..i].trim(), "-", s[i + 1..].trim()));
+                return Some((s[..i].trim(), RefOp::OneToOne, s[i + 1..].trim()));
             }
             _ => {}
         }
@@ -1016,8 +1347,8 @@ fn split_ref_operator(s: &str) -> Option<(&str, &'static str, &str)> {
 }
 
 /// Parse a Ref endpoint: `"s"."t"."c"` or `"s"."t".(c1, c2)` (or unquoted /
-/// unqualified variants). Returns `(schema, table, columns)`.
-fn parse_ref_endpoint(s: &str) -> Result<(String, String, Vec<String>)> {
+/// unqualified variants — an unqualified table may be an alias).
+fn parse_ref_endpoint(s: &str) -> Result<Endpoint> {
     let s = s.trim();
     // Composite: a `.(...)` tuple at the end.
     if let Some(paren_at) = s.find(".(") {
@@ -1027,34 +1358,44 @@ fn parse_ref_endpoint(s: &str) -> Result<(String, String, Vec<String>)> {
             .strip_prefix('(')
             .and_then(|t| t.strip_suffix(')'))
             .ok_or_else(|| parse_err(format!("malformed composite ref endpoint: {s}")))?;
-        let cols: Vec<String> = inner
+        let columns: Vec<String> = inner
             .split(',')
             .map(|c| unquote(c.trim()))
             .filter(|c| !c.is_empty())
             .collect();
-        let (schema, table) = parse_schema_table(prefix)?;
-        if cols.is_empty() {
+        if columns.is_empty() {
             return Err(parse_err(format!("composite ref has no columns: {s}")));
         }
-        return Ok((schema, table, cols));
+        let parts = split_dotted(prefix.trim());
+        return match parts.as_slice() {
+            [schema, table] => Ok(Endpoint {
+                schema: Some(unquote(schema)),
+                table: unquote(table),
+                columns,
+            }),
+            [table] => Ok(Endpoint {
+                schema: None,
+                table: unquote(table),
+                columns,
+            }),
+            _ => Err(parse_err(format!("malformed ref table prefix: {prefix}"))),
+        };
     }
 
-    // Simple: `schema.table.column` / `table.column` / `column`.
+    // Simple: `schema.table.column` / `table.column`.
     let parts = split_dotted(s);
     match parts.as_slice() {
-        [schema, table, col] => Ok((unquote(schema), unquote(table), vec![unquote(col)])),
-        [table, col] => Ok(("public".to_string(), unquote(table), vec![unquote(col)])),
+        [schema, table, col] => Ok(Endpoint {
+            schema: Some(unquote(schema)),
+            table: unquote(table),
+            columns: vec![unquote(col)],
+        }),
+        [table, col] => Ok(Endpoint {
+            schema: None,
+            table: unquote(table),
+            columns: vec![unquote(col)],
+        }),
         _ => Err(parse_err(format!("malformed ref endpoint: {s}"))),
-    }
-}
-
-/// Parse a `schema.table` (or `table`) prefix used before a composite tuple.
-fn parse_schema_table(s: &str) -> Result<(String, String)> {
-    let parts = split_dotted(s.trim());
-    match parts.as_slice() {
-        [schema, table] => Ok((unquote(schema), unquote(table))),
-        [table] => Ok(("public".to_string(), unquote(table))),
-        _ => Err(parse_err(format!("malformed ref table prefix: {s}"))),
     }
 }
 
@@ -1747,6 +2088,7 @@ mod tests {
                     generated: None,
                     comment: Some("The user's primary biography".into()),
                     inline_fk: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "nickname".into(),
@@ -1759,6 +2101,7 @@ mod tests {
                     generated: None,
                     comment: Some("User's display name".into()),
                     inline_fk: None,
+                    collation: None,
                 },
             ],
             constraints: vec![],
@@ -1841,6 +2184,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "tenant_id".into(),
@@ -1853,6 +2197,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
             ],
             constraints: vec![TableConstraint::PrimaryKey {
@@ -1883,6 +2228,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "code".into(),
@@ -1895,6 +2241,7 @@ mod tests {
                     generated: None,
                     comment: Some("Order code".into()),
                     inline_fk: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "user_id".into(),
@@ -1907,6 +2254,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "tenant_id".into(),
@@ -1919,6 +2267,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "qty".into(),
@@ -1931,6 +2280,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
             ],
             constraints: vec![
@@ -2218,6 +2568,7 @@ mod tests {
             generated: None,
             comment: Some(r"Windows path, e.g. C:\temp — the user's".into()),
             inline_fk: None,
+            collation: None,
         };
         let table_with_note = |name: &str, note: &str| {
             let mut t = Entity::new(EntityType::Table, name);
@@ -2273,5 +2624,175 @@ mod tests {
             );
             assert_eq!(td.comments.table.as_deref(), Some(note), "{name}:\n{dbml}");
         }
+    }
+
+    // ── Hand-written DBML, read as @dbml/core reads it ───────────────────────
+    //
+    // Every document below is valid DBML: @dbml/core 10.3.0 parses each, and
+    // the expected values are what it reads — but for the line a closing
+    // `'''` sits on, which is layout here and a trailing line break there.
+
+    /// The foreign keys of `table`, as `(columns, ref_schema.ref_table,
+    /// ref_columns, name, on_delete)`.
+    #[allow(clippy::type_complexity)]
+    fn fks(
+        entities: &[Entity],
+        table: &str,
+    ) -> Vec<(Vec<String>, String, Vec<String>, Option<String>, Option<FkAction>)> {
+        let td = find_table(entities, table).table_def.as_ref().unwrap();
+        td.constraints
+            .iter()
+            .filter_map(|c| match c {
+                TableConstraint::ForeignKey(fk) => Some((
+                    fk.columns.clone(),
+                    format!("{}.{}", fk.ref_schema.as_deref().unwrap_or("public"), fk.ref_table),
+                    fk.ref_columns.clone(),
+                    fk.name.clone(),
+                    fk.on_delete,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn strings(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `Table app.users as U` was read as a table named `users as U`, and a
+    /// Ref to `U.id` as one to a table `public.U`.
+    #[test]
+    fn a_table_alias_names_the_table_it_stands_for() {
+        let dbml = "Table app.users as U {\n  id int [pk]\n}\nTable app.posts {\n  id int [pk]\n  author_id int [ref: > U.id]\n  editor_id int\n}\nRef: app.posts.editor_id > U.id [delete: cascade]\n";
+        let entities = parse_dbml(dbml).unwrap();
+        assert!(
+            entities
+                .iter()
+                .any(|e| e.entity_type == EntityType::Table && e.name == "app.users")
+        );
+        assert!(!entities.iter().any(|e| e.name.contains(" as ")), "{entities:#?}");
+        let mut found = fks(&entities, "app.posts");
+        found.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            found,
+            vec![
+                (
+                    strings(&["author_id"]),
+                    "app.users".into(),
+                    strings(&["id"]),
+                    None,
+                    None
+                ),
+                (
+                    strings(&["editor_id"]),
+                    "app.users".into(),
+                    strings(&["id"]),
+                    None,
+                    Some(FkAction::Cascade)
+                ),
+            ]
+        );
+    }
+
+    /// An inline `[ref: …]` was ignored as an unknown setting, so the key was
+    /// silently missing. `>` and `-` both put the key on the column; a
+    /// one-to-one `Ref: a - b` puts it on `b`, as @dbml/core's SQL does.
+    #[test]
+    fn an_inline_ref_is_a_foreign_key_and_one_to_one_keys_the_right_side() {
+        let dbml = "Table app.users {\n  id int [pk]\n}\nTable app.posts {\n  id int [pk]\n  user_id int [ref: > app.users.id, not null]\n  buddy int [ref: - app.users.id]\n  solo int\n}\nRef: app.users.id - app.posts.solo\n";
+        let entities = parse_dbml(dbml).unwrap();
+        let mut found = fks(&entities, "app.posts");
+        found.sort_by(|a, b| a.0.cmp(&b.0));
+        let key = |col: &str| (strings(&[col]), "app.users".to_string(), strings(&["id"]), None, None);
+        assert_eq!(found, vec![key("buddy"), key("solo"), key("user_id")]);
+        assert!(fks(&entities, "app.users").is_empty(), "nothing keys the users table");
+        let td = find_table(&entities, "app.posts").table_def.as_ref().unwrap();
+        assert!(!td.columns[1].nullable, "the other settings still apply");
+    }
+
+    /// A many-to-many Ref has no foreign key to build — @dbml/core makes a
+    /// junction table of it. Reading it as a key from one side to the other
+    /// built a constraint the document never described.
+    #[test]
+    fn a_many_to_many_ref_is_refused_with_why() {
+        let dbml = "Table app.a {\n  id int [pk]\n}\nTable app.b {\n  id int [pk]\n}\nRef: app.a.id <> app.b.id\n";
+        let err = parse_dbml(dbml).unwrap_err().to_string();
+        assert!(err.contains("<>") && err.contains("junction"), "{err}");
+    }
+
+    /// A multi-line note in a column's settings broke the column into
+    /// several, a table's `Note { … }` block failed to parse, and an indented
+    /// note kept its indentation. Each reads as @dbml/core reads it: its
+    /// common indentation removed, settings may span lines.
+    #[test]
+    fn multi_line_notes_and_settings_read_as_dbml_reads_them() {
+        let dbml = "Table app.t {\n  id int [pk]\n  email text [note: '''\n    The address we write to.\n    Never shared.\n  ''']\n  code text [\n    not null,\n    note: 'x'\n  ]\n  Note {\n    '''\n    Blog posts.\n      Indented line.\n    '''\n  }\n}\nEnum app.mood {\n  happy [note: '''\n    very\n    happy\n  ''']\n  sad\n}\n";
+        let entities = parse_dbml(dbml).unwrap();
+        let td = find_table(&entities, "app.t").table_def.as_ref().unwrap();
+        let names: Vec<&str> = td.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["id", "email", "code"]);
+        assert_eq!(
+            td.columns[1].comment.as_deref(),
+            Some("The address we write to.\nNever shared.")
+        );
+        assert_eq!(td.columns[2].comment.as_deref(), Some("x"));
+        assert!(!td.columns[2].nullable);
+        assert_eq!(td.comments.table.as_deref(), Some("Blog posts.\n  Indented line."));
+        let mood = find_enum(&entities, "app.mood");
+        assert_eq!(mood.enum_values[0].note.as_deref(), Some("very\nhappy"));
+        assert_eq!(mood.enum_values.len(), 2);
+    }
+
+    /// An index entry marked `pk` is the table's primary key — DBML's way of
+    /// writing a composite one, and the only way to name one. It was read as
+    /// a plain index, and the table had no key.
+    #[test]
+    fn a_pk_index_is_the_primary_key() {
+        let dbml = "Table app.t {\n  a int\n  b int\n  indexes {\n    (a, b) [pk, name: 't_pk']\n  }\n}\n";
+        let entities = parse_dbml(dbml).unwrap();
+        let td = find_table(&entities, "app.t").table_def.as_ref().unwrap();
+        assert!(td.indexes.is_empty(), "{:?}", td.indexes);
+        assert_eq!(
+            td.constraints,
+            vec![TableConstraint::PrimaryKey {
+                name: Some("t_pk".into()),
+                columns: strings(&["a", "b"]),
+            }]
+        );
+        assert!(td.columns.iter().all(|c| c.is_pk && !c.nullable));
+    }
+
+    /// A Ref's name — `Ref name:` or the long form `Ref name { … }` — is the
+    /// foreign key's name, and an index's `type:` its access method. A table
+    /// may sit on one line.
+    #[test]
+    fn ref_names_index_types_and_one_line_tables_are_read() {
+        let dbml = "Table app.a { id int [pk] }\nTable app.b {\n  id int [pk]\n  a_id int\n  c_id int\n  data jsonb\n  indexes {\n    data [type: gin, name: 'b_data_idx']\n  }\n}\nRef b_a_fk: app.b.a_id > app.a.id [delete: cascade]\nRef \"b c fk\" {\n  app.b.c_id > app.a.id\n}\n";
+        let entities = parse_dbml(dbml).unwrap();
+        let a = find_table(&entities, "app.a").table_def.as_ref().unwrap();
+        assert_eq!(a.columns.len(), 1);
+        let mut found = fks(&entities, "app.b");
+        found.sort_by(|x, y| x.0.cmp(&y.0));
+        assert_eq!(
+            found,
+            vec![
+                (
+                    strings(&["a_id"]),
+                    "app.a".into(),
+                    strings(&["id"]),
+                    Some("b_a_fk".into()),
+                    Some(FkAction::Cascade)
+                ),
+                (
+                    strings(&["c_id"]),
+                    "app.a".into(),
+                    strings(&["id"]),
+                    Some("b c fk".into()),
+                    None
+                ),
+            ]
+        );
+        let b = find_table(&entities, "app.b").table_def.as_ref().unwrap();
+        assert_eq!(b.indexes[0].index_type, Some(crate::entity::IndexType::Gin));
     }
 }

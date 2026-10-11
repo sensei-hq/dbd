@@ -6,7 +6,7 @@
 //
 // Regenerate: DBD_REGEN_DOC_EXAMPLES=1 cargo test --test doc_examples
 //
-// docs-digest: 0x2ca497cb25a857a4
+// docs-digest: 0xc8821ea62887608d
 #![allow(dead_code, unused_imports, non_snake_case)]
 
 // README.md — block 0
@@ -1233,8 +1233,10 @@ async fn doc_docs_guide_12_embedding_md_16() -> dbd_core::Result<()> {
     let scope = design.resolve_scope(None, None)?;
 
     // What `dbd apply` checks before it writes. `true` would be --allow-scope-change.
-    let meta = adapter.get_project_meta().await?;
-    Design::check_scope_guard(meta.as_ref(), &scope.name, false)?;
+    // The marks are this project's record — or, after a `project.name` rename, the
+    // record of the name the database was built under.
+    let marks = design.database_marks(&*adapter).await?;
+    Design::check_scope_guard(&marks, &scope.name, false)?;
 
     if design.config().project.released {
         // released: change the schema with snapshots and apply, not reconcile

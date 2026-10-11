@@ -455,7 +455,7 @@ it) and defaulted `existing_objects`, `roles_held_elsewhere` and `live_matviews`
 `Design::reconcile` does **not** check `project.released`, and
 `Design::apply`/`deploy`/`reconcile`/`reset`/`import_data` and `design::apply_policies` do not
 run the scope guard — the CLI does both, so an embedder must
-(`Design::check_scope_guard(meta, &scope.name, false)`). The guide page https://dbd.sensei-hq.com/guide/embedding covers
+(`Design::check_scope_guard(&design.database_marks(&*adapter).await?, &scope.name, false)`). The guide page https://dbd.sensei-hq.com/guide/embedding covers
 the whole API with compiled examples.
 
 ### The schema model as a wire format
