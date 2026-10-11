@@ -86,7 +86,7 @@ impl ImportScan {
 /// whatever lies under it: a schemaless project (SQLite's) keeps its env-only
 /// data directly in `import/dev/`, where it was taken for a schema called
 /// `dev` that every env loads.
-pub(crate) fn is_env_folder(name: &str) -> bool {
+pub fn is_env_folder(name: &str) -> bool {
     matches!(name, "dev" | "prod")
 }
 
