@@ -1493,6 +1493,74 @@ async fn init_from_db_names_every_schema_it_leaves_out_and_declares_what_a_forei
     );
 }
 
+// ── init --from-db --schema declares or names what the capture needs ────────
+
+/// `init --from-db --schema app` captured `app` and nothing it depends on:
+/// the `citext` its columns use was left out with `public` (so the project
+/// failed on a new database with `type "citext" does not exist`), and the
+/// enum from `ref`, the function from `util` and the extension installed in
+/// `extensions` were not mentioned at all. An extension the captured objects
+/// use is declared — it is the database's, not a schema's — when it installs
+/// into `public` or a captured schema; everything else they need from outside
+/// is named, with what needs it, so the user can capture it too.
+#[tokio::test]
+async fn init_from_db_scoped_declares_the_extensions_its_capture_uses_and_names_what_else_it_needs() {
+    let (pg, url) = start_pg().await;
+    const OUTSIDE: &str = "CREATE SCHEMA extensions; CREATE EXTENSION pgcrypto WITH SCHEMA extensions; \
+         CREATE SCHEMA ref; CREATE TYPE ref.mood AS ENUM ('ok', 'meh'); \
+         CREATE SCHEMA util; CREATE FUNCTION util.prio() RETURNS int LANGUAGE sql AS 'SELECT 1';";
+    dbd_core::connect(&url, "scoped")
+        .await
+        .unwrap()
+        .execute_script(&format!(
+            "CREATE EXTENSION citext; {OUTSIDE} \
+             CREATE SCHEMA other; CREATE TABLE other.unused (id int); \
+             CREATE SCHEMA app; \
+             CREATE TABLE app.t (id int PRIMARY KEY, email citext, mood ref.mood DEFAULT 'ok', \
+               prio int DEFAULT util.prio(), token bytea DEFAULT extensions.gen_random_bytes(8));"
+        ))
+        .await
+        .expect("build the database");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let o = dbd(dir, &url, &["init", "--from-db", "--schema", "app"]);
+    assert!(o.status.success(), "init --from-db failed: {}", combined(&o));
+    let said = combined(&o);
+
+    let config = dbd_core::config::read(&dir.join("design.yaml")).unwrap();
+    let extensions: Vec<&str> = config.target["postgres"].extensions.iter().map(|e| e.name()).collect();
+    assert_eq!(extensions, ["citext"], "the extension app's columns use: {said}");
+    for (needed, by) in [("ref.mood", "app.t"), ("util.prio()", "app.t"), ("pgcrypto", "app.t")] {
+        assert!(
+            said.lines().any(|l| l.contains(needed) && l.contains(by)),
+            "{needed}, needed by {by}, is named: {said}"
+        );
+    }
+    assert!(
+        !said.contains("other.unused"),
+        "what nothing captured uses is not: {said}"
+    );
+
+    // A database that has what the report named takes the project.
+    pg.create_database("fresh").await.unwrap();
+    let fresh = pg.settings().url("fresh");
+    dbd_core::connect(&fresh, "scoped")
+        .await
+        .unwrap()
+        .execute_script(OUTSIDE)
+        .await
+        .unwrap();
+    let o = dbd(dir, &fresh, &["-e", "dev", "apply"]);
+    assert!(
+        o.status.success(),
+        "apply to a database with what was named: {}",
+        combined(&o)
+    );
+    let o = dbd(dir, &fresh, &["diff", "--exit-code"]);
+    assert!(o.status.success(), "drift on the fresh database: {}", combined(&o));
+}
+
 // ── reset says what it did ──────────────────────────────────────────────────
 
 /// `dbd reset` printed nothing on success, so a reset that dropped the whole
