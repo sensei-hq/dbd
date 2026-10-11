@@ -1380,6 +1380,57 @@ mod tests {
         }
     }
 
+    /// A BLOB has no text, and the export's cell readers knew only text and
+    /// numbers, so every BLOB was written as NULL — the file imported back
+    /// without its binary data, in every format. A BLOB is written as `\x`
+    /// and its bytes in hex — what PostgreSQL writes for a `bytea` and reads
+    /// back — and an import decodes that form into a BLOB for a column
+    /// declared `BLOB`, so the round trip is exact; an empty BLOB stays empty,
+    /// NULL stays NULL, and a text column keeps a text that looks like hex.
+    #[tokio::test]
+    async fn a_blob_survives_an_export_and_import_in_every_format() {
+        const DDL: &str = "CREATE TABLE files (id INTEGER PRIMARY KEY, data BLOB, note TEXT)";
+        let a = mem().await;
+        a.execute_script(DDL).await.unwrap();
+        a.execute_script("INSERT INTO files VALUES (1, x'00ff10', 'bytes'), (2, x'', 'empty'), (3, NULL, '\\x00ff')")
+            .await
+            .unwrap();
+        let rows = |pool: &sqlx::SqlitePool| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_as::<_, (i64, Option<Vec<u8>>, String, Option<String>)>(
+                    "SELECT id, data, typeof(data), note FROM files ORDER BY id",
+                )
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let expected = rows(&a.pool).await;
+        assert_eq!(expected[0].1.as_deref(), Some(&[0x00, 0xff, 0x10][..]));
+
+        for format in ["csv", "tsv", "jsonl"] {
+            let mut entity = Entity::new(EntityType::Table, "files");
+            entity.format = Some(format.to_string());
+            let out = tempfile::tempdir().unwrap();
+            a.export_data(&entity, Some(out.path())).await.unwrap();
+            let file = out.path().join(format!("files.{format}"));
+            let body = std::fs::read_to_string(&file).unwrap();
+            assert!(
+                body.contains("\\x00ff10"),
+                "{format}: the bytes, as PostgreSQL writes a bytea: {body}"
+            );
+
+            let b = mem().await;
+            b.execute_script(DDL).await.unwrap();
+            entity.file = Some(file);
+            b.import_data(&entity, "", false)
+                .await
+                .unwrap_or_else(|e| panic!("{format}: import failed: {e}"));
+            assert_eq!(rows(&b.pool).await, expected, "{format}: the rows exported\n{body}");
+        }
+    }
+
     /// A generated column is computed, and SQLite refuses a value for one
     /// ("cannot INSERT into generated column"), so an export that wrote it
     /// could not be imported back. The export writes what an import can, and
