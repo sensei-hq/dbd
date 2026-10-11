@@ -460,6 +460,36 @@ fn a_foreign_keys_deferral_and_match_are_carried_or_reported() {
     }
 }
 
+/// A column's `COLLATE "C"` names a PostgreSQL collation; no target knows
+/// that name, so the column takes the target's default and the change in how
+/// its values sort and compare is reported.
+#[test]
+fn a_columns_collation_is_reported_on_every_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: emitted\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/codes.ddl"),
+        "set search_path to app;\ncreate table if not exists codes (\n  id integer primary key\n, code varchar(20) collate \"C\"\n);\n",
+    )
+    .unwrap();
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load");
+    for dialect in [Dialect::MySql, Dialect::TSql, Dialect::Sqlite] {
+        let (sql, report) = emit_schema(&design, dialect, None).expect("emits");
+        assert!(
+            report.iter().any(|d| d.entity.ends_with("codes")
+                && d.column.as_deref() == Some("code")
+                && d.from.contains("COLLATE")),
+            "{dialect:?}: the collation is reported: {report:?}\n{sql}"
+        );
+    }
+}
+
 /// No other engine has `EXCLUDE`. The table is emitted without it and the
 /// loss reported — two bookings of one room may then overlap — never dropped
 /// in silence.
