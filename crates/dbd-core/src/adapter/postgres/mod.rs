@@ -183,16 +183,49 @@ pub struct PostgresAdapter {
     bookkeeping: Bookkeeping,
 }
 
+/// How long [`PostgresAdapter::new`] waits for the server to answer.
+///
+/// sqlx's pool retries a failed connection until its acquire timeout — 30 s —
+/// so a dead port or a mistyped host took half a minute to fail, and then said
+/// only `pool timed out while waiting for an open connection`. A server that
+/// is there answers well within this, a cold-starting serverless one included.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 impl PostgresAdapter {
     /// Create a new adapter from a connection URL.
+    ///
+    /// One connection is made first, bounded by [`CONNECT_TIMEOUT`], so a
+    /// database that cannot be reached fails fast with the reason and the
+    /// `host:port` it tried — never the URL, which may hold a password. The
+    /// pool itself keeps sqlx's own timeouts for the run.
     pub async fn new(url: &str, project: &str) -> Result<Self> {
         use sha2::{Digest, Sha256};
+        use sqlx::Connection as _;
+
+        let options: sqlx::postgres::PgConnectOptions = url
+            .parse()
+            .map_err(|e| DbdError::Config(format!("Database connection failed: invalid URL: {e}")))?;
+        let target = format!("{}:{}", options.get_host(), options.get_port());
+        match tokio::time::timeout(CONNECT_TIMEOUT, sqlx::PgConnection::connect_with(&options)).await {
+            Err(_) => {
+                return Err(DbdError::Config(format!(
+                    "Database connection failed: no answer from {target} within {}s — is the server \
+                     running, and are the host and port right?",
+                    CONNECT_TIMEOUT.as_secs()
+                )));
+            }
+            Ok(Err(e)) => return Err(DbdError::Config(format!("Database connection failed: {target}: {e}"))),
+            Ok(Ok(probe)) => {
+                // Only a probe: whether it closes cleanly says nothing more.
+                let _ = probe.close().await;
+            }
+        }
 
         let pool = PgPoolOptions::new()
             .max_connections(5)
-            .connect(url)
+            .connect_with(options)
             .await
-            .map_err(|e| DbdError::Config(format!("Database connection failed: {e}")))?;
+            .map_err(|e| DbdError::Config(format!("Database connection failed: {target}: {e}")))?;
 
         let mut hasher = Sha256::new();
         hasher.update(url.as_bytes());

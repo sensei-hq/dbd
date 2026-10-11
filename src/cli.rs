@@ -333,7 +333,7 @@ pub enum Commands {
     },
     /// Show every difference between the live database and the design
     /// (read-only): columns, PK/unique, foreign keys, CHECK constraints,
-    /// indexes, comments and enums. Unlike `reconcile --dry-run` it does not
+    /// indexes, column comments and enums. Unlike `reconcile --dry-run` it does not
     /// depend on --prune or --allow-destructive, and it works on a released
     /// project, where reconcile is disabled.
     Diff {
