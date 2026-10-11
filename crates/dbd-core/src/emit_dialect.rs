@@ -1565,6 +1565,21 @@ fn foreign_key(e: &Entity, fk: &ForeignKey, script: &Script, report: &mut Vec<Do
         quote_all(&fk.columns, target),
         quote_all(&fk.ref_columns, target)
     ));
+    // `MATCH FULL` goes right after the referenced columns. No target enforces
+    // it: SQLite parses it and treats every key as `MATCH SIMPLE`, MySQL
+    // ignores it, SQL Server has no such clause — so a half-NULL key the
+    // PostgreSQL design refuses would pass.
+    if fk.match_full {
+        report.push(Downgrade {
+            entity: e.name.clone(),
+            column: fk.columns.first().cloned(),
+            from: format!("a `MATCH FULL` foreign key ({})", fk.columns.join(", ")),
+            to: "a `MATCH SIMPLE` one".to_string(),
+            reason: "the target does not enforce MATCH FULL, so a key with some columns NULL and \
+                     others not is no longer refused"
+                .to_string(),
+        });
+    }
     for (verb, action) in [("DELETE", fk.on_delete), ("UPDATE", fk.on_update)] {
         let Some(action) = action else { continue };
         match fk_action(action, target) {
@@ -1576,6 +1591,31 @@ fn foreign_key(e: &Entity, fk: &ForeignKey, script: &Script, report: &mut Vec<Do
                 to: "the default action".to_string(),
                 reason: "MySQL's InnoDB rejects SET DEFAULT, so referencing rows are no longer \
                          reset when the parent row changes"
+                    .to_string(),
+            }),
+        }
+    }
+    // SQLite defers a key exactly as `INITIALLY DEFERRED` does. A key that is
+    // deferrable but checked at once by default needs `SET CONSTRAINTS`, which
+    // SQLite lacks; MySQL and SQL Server defer nothing.
+    if fk.deferrable || fk.initially_deferred {
+        match target {
+            Target::Sqlite if fk.initially_deferred => sql.push_str(" DEFERRABLE INITIALLY DEFERRED"),
+            _ => report.push(Downgrade {
+                entity: e.name.clone(),
+                column: fk.columns.first().cloned(),
+                from: format!(
+                    "a `DEFERRABLE{}` foreign key ({})",
+                    if fk.initially_deferred {
+                        " INITIALLY DEFERRED"
+                    } else {
+                        ""
+                    },
+                    fk.columns.join(", ")
+                ),
+                to: "one checked at once".to_string(),
+                reason: "the target cannot put the check off to the end of the transaction, so a \
+                         child row inserted before its parent is refused"
                     .to_string(),
             }),
         }
