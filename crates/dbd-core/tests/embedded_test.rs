@@ -6270,3 +6270,81 @@ async fn a_reverse_engineered_enum_file_runs_twice_and_reads_back_the_same() {
     assert_eq!(labels, ["happy", "it's $$ fine", "sad"], "{file}");
     assert_eq!(back.comment.as_deref(), Some("how a day went"), "{file}");
 }
+
+// ── A reverse-engineered table keeps its triggers ─────────────────────────────
+
+/// A trigger lives in its table's file — the table parser reads it there, as
+/// the edge to the function it fires. Introspection read none, so
+/// `init --from-db` wrote a table without its triggers, and `merge` overwrote
+/// an authored table file and deleted the triggers in it, without a word.
+/// The emitted table carries each trigger in a form that runs twice — `CREATE
+/// OR REPLACE TRIGGER`, or for a constraint trigger, which Postgres will not
+/// replace, a `DROP TRIGGER IF EXISTS` before it — and the file reads back
+/// clean. A disabled trigger is captured, and said to be disabled.
+#[tokio::test]
+async fn a_reverse_engineered_table_keeps_its_triggers() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    adapter
+        .execute_script(
+            "CREATE SCHEMA app; \
+             CREATE FUNCTION app.touch() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END'; \
+             CREATE TABLE app.tickets (id int PRIMARY KEY, title text); \
+             CREATE TRIGGER tickets_touch BEFORE INSERT OR UPDATE OF title ON app.tickets \
+               FOR EACH ROW EXECUTE FUNCTION app.touch(); \
+             CREATE CONSTRAINT TRIGGER tickets_check AFTER INSERT ON app.tickets \
+               DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (NEW.id > 0) EXECUTE FUNCTION app.touch(); \
+             CREATE TRIGGER tickets_off AFTER DELETE ON app.tickets FOR EACH ROW EXECUTE FUNCTION app.touch(); \
+             ALTER TABLE app.tickets DISABLE TRIGGER tickets_off;",
+        )
+        .await
+        .unwrap();
+
+    let entities = adapter.introspect().await.expect("introspect");
+    let tickets = entities.iter().find(|e| e.name == "app.tickets").expect("app.tickets");
+    let file = dbd_core::formatter::format_ddl(
+        &dbd_core::emit::emit_entity(tickets).unwrap(),
+        &dbd_core::config::FormatConfig::default(),
+    );
+    let upper = file.to_uppercase();
+    for expected in [
+        "CREATE OR REPLACE TRIGGER TICKETS_TOUCH BEFORE INSERT OR UPDATE OF TITLE ON APP.TICKETS",
+        "DROP TRIGGER IF EXISTS \"TICKETS_CHECK\" ON \"APP\".\"TICKETS\"",
+        "CREATE CONSTRAINT TRIGGER TICKETS_CHECK AFTER INSERT ON APP.TICKETS DEFERRABLE INITIALLY DEFERRED",
+        "CREATE OR REPLACE TRIGGER TICKETS_OFF AFTER DELETE ON APP.TICKETS",
+    ] {
+        assert!(upper.contains(expected), "{expected} in:\n{file}");
+    }
+    assert!(
+        tickets
+            .warnings
+            .iter()
+            .any(|w| w.contains("tickets_off") && w.contains("disabled")),
+        "the disabled trigger is said to be disabled: {:?}",
+        tickets.warnings
+    );
+
+    // The file runs against the database it came from, twice.
+    for run in 1..=2 {
+        adapter
+            .execute_script(&file)
+            .await
+            .unwrap_or_else(|e| panic!("run {run} of the table file failed: {e}\n{file}"));
+    }
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_trigger WHERE tgrelid = 'app.tickets'::regclass AND NOT tgisinternal \
+         HAVING count(*) = 3",
+        "the three triggers, once each",
+    )
+    .await;
+
+    let back = dbd_core::parser::parse_entity(std::path::Path::new("ddl/table/app/tickets.ddl"), &file).unwrap();
+    assert!(back.errors.is_empty(), "{:?}\n{file}", back.errors);
+    assert!(
+        back.refers_to("app.touch"),
+        "the file still fires app.touch: {:?}",
+        back.refs
+    );
+}
