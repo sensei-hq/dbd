@@ -28,6 +28,10 @@ set it, rather than handed to the driver as a URL. An exported-but-empty
 `$DATABASE_URL` does not override the target's `url`. Interpolation inside a
 longer string is not supported.
 
+A PostgreSQL server that does not answer fails the run within 5 seconds,
+naming the `host:port` it tried — never the URL, which may hold a password —
+rather than waiting out the driver's 30-second pool timeout.
+
 To deploy one design to several databases, keep the one target and change the
 URL per run — pairing it with a [scope](07-scopes.md) when each database needs a
 different subset.
@@ -37,7 +41,7 @@ different subset.
 | URL | Adapter |
 |---|---|
 | `postgres://…`, `postgresql://…` (and anything not listed below) | PostgreSQL, via sqlx |
-| `sqlite://path.db`, `sqlite::memory:`, `file:/abs/path.db` | SQLite, via sqlx — the file is created on first connect |
+| `sqlite://path.db`, `sqlite::memory:`, `file:/abs/path.db` | SQLite, via sqlx — the file is created on first connect, except by a dry run, which previews offline instead |
 | `convex:`, `convex:./dir`, `convex://./dir`, `…?deploy=true` | Convex — a code generator, not a connection |
 | `mysql://`, `mariadb://`, `sqlserver://`, `mssql://`, `jdbc:sqlserver://` | **none** — refused by name |
 
@@ -92,7 +96,9 @@ DBML source, which names no platform.
 `postgres`, `supabase` or `sqlite`: the design's target key by default — the
 first `target:` entry, so a Supabase project's schemas are protected without
 passing anything — or the `--target` flag when given. A design whose target has
-no reset (Convex) is refused before anything connects.
+no reset (Convex) is refused before anything connects, and so is a target that
+is not the kind of database the connection reaches — `--target postgres`
+against a SQLite URL — because the target picks the dialect of the drops.
 
 ```sh
 dbd reset --schemas --dry-run                    # protected set from the design's target key
@@ -112,16 +118,20 @@ The reference target: every feature works here.
 - **One transaction per apply.** `dbd apply` (and the apply phase of
   `dbd deploy`) runs every entity, migration and version stamp in a single
   transaction, so an interrupted upgrade rolls back to the schema it started
-  from instead of leaving objects half-applied. `apply.before` runs before it
-  and outside it, so its effects stay if the batch rolls back; matview
+  from instead of leaving objects half-applied. The one exception is a pending
+  version that adds enum values: Postgres will not use a value inside the
+  transaction that added it, so the run commits up to and including those
+  additions, then carries on in a new transaction. `apply.before` runs before
+  it and outside it, so its effects stay if the batch rolls back; matview
   stamping, pg_cron sync and `apply.after` run after it commits.
   DDL that cannot run inside a transaction — `CREATE INDEX CONCURRENTLY`, for
   one — fails there; set `DBD_NO_TX` (to any value) to apply without the
   transaction.
 - **Bookkeeping** lives in a `dbd` schema: `dbd.meta` (project, environment,
-  version, pinned scope — the row a full `reset` deletes, so the next apply
-  records the database afresh; its environment is what reset's prod guard reads,
-  and why a `-e dev` run against a database marked prod is refused),
+  version, pinned scope — one row per `project.name`, which a reset under the
+  all-scope or the database's pinned scope deletes, so the next apply records
+  the database afresh; its environment is what reset's prod guard reads, and
+  why a `-e dev` run against a database marked prod is refused),
   `dbd.migrations`, and `dbd.matview_stamps` (each
   materialized view's drift stamp — kept out of the view's `COMMENT`, which is
   the author's; `reset` deletes the rows of the matviews it drops), and, once a
@@ -139,15 +149,19 @@ The reference target: every feature works here.
 - **Import** streams CSV and TSV through `COPY`, into the columns the file's
   header names — `COPY t (cols…) FROM STDIN WITH (FORMAT csv)`, with the header
   row taken off first — so the file's column order need not be the table's. JSON
-  and JSON Lines records are staged as bound `jsonb` values in `dbd.import_tmp`
+  and JSON Lines records are staged as bound `json` values in `dbd.import_tmp`
   and moved into the table by `dbd.import_jsonb_to_table`, a procedure the load
   installs itself in dbd's own `dbd` schema; no other schema is created. (Before
   0.25 it lived in a schema called `staging`, created whatever your staging
   schemas were called; a database an earlier dbd imported JSON into keeps its
   `staging.import_jsonb_to_table` — drop it if nothing else uses it.) The
-  truncate before a load is `TRUNCATE`. Ids load as given, and each identity or
-  `serial` sequence is then moved past the largest id loaded — a `setval`, so
-  the importing role needs `UPDATE` on the sequence.
+  truncate before a load is one `TRUNCATE` of every table the import reloads,
+  so staging tables linked by a foreign key empty together, and a referenced
+  table loads before one referencing it; a table outside the import that holds
+  a key to one of them fails the import, named, with nothing emptied. Ids load
+  as given, and each identity or `serial` sequence is then moved past the
+  largest id loaded — a `setval`, so the importing role needs `UPDATE` on the
+  sequence.
 
 ## SQLite
 
@@ -172,11 +186,13 @@ target:
   model).` **Policies** are PostgreSQL SQL, so each policy file fails.
 - **Import** writes multi-row `INSERT … VALUES (?,?),(?,?), …` batches of at most
   500 rows (or 32,000 bound values) in one transaction, matching CSV columns to
-  the header's names and JSON records to their keys. CSV and TSV are read as
+  the header's names and JSON records to their keys — a key a record leaves out
+  takes the column's DEFAULT. CSV and TSV are read as
   RFC 4180, as PostgreSQL reads them — quoted delimiters, line breaks and doubled
   quotes, nothing trimmed, a quoted field never NULL — so a file PostgreSQL
   exported imports unchanged. SQLite has no `TRUNCATE`, so the default truncate
-  runs `DELETE FROM` instead; with `truncate: false`, rows are appended.
+  runs `DELETE FROM` instead, one table at a time, a table that references
+  another emptied first; with `truncate: false`, rows are appended.
 - **Data folders.** With no schemas, the shared data files sit directly in
   `import/` and the environment-only ones directly in `import/dev/` or
   `import/prod/`, which load only under that `-e` (before 0.25 a file directly
@@ -185,13 +201,14 @@ target:
   field, `''` as `""`, and a value holding the delimiter, a quote or a line break
   quoted — with the header even for a table with no rows, and without its
   generated columns — so an export loads back to the same values here or into
-  PostgreSQL. Files land flat in `export/` (or the `-o` directory), as
-  `<table>.<fmt>`.
+  PostgreSQL. A BLOB is written as `\x` and its bytes in hex, as PostgreSQL
+  writes a `bytea`, in every format, and read back into a BLOB column. Files
+  land flat in `export/` (or the `-o` directory), as `<table>.<fmt>`.
 - **Reset** drops the project's tables and views in one transaction, with
   foreign keys deferred to its commit (`PRAGMA defer_foreign_keys = ON`) — the
   verbatim DDL gives dbd no references to order the drops by. `--schemas`,
   `--extensions` and `--clean` change nothing, and say so; the prod and
-  migrations guards apply as on PostgreSQL.
+  versioned-database guards apply as on PostgreSQL.
 - **Not available:** `diff`, `reconcile` and `emit` refuse a SQLite project,
   because the `verbatim` reader builds no structured model to compare or
   translate; `refresh` has no materialized views to refresh.

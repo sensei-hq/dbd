@@ -73,7 +73,7 @@ myproject/
 | `dbd release` (alias `baseline`) | Write a baseline snapshot — or, when snapshots exist, release at the latest — and lock in the snapshot/migration workflow (disables `reconcile`) |
 | `dbd snapshot` | Capture schema state, generate migration SQL |
 | `dbd migrate --status` | Show migration version status |
-| `dbd format` | Format DDL files (river-style; `--check` for CI/pre-commit) |
+| `dbd format` | Format DDL files (river-style; layout and keyword case only — string literals, `$$` bodies, quoted names and comments stay byte for byte; `--check` for CI/pre-commit) |
 | `dbd policies` | Apply RLS policies from `policies/` |
 | `dbd doctor` | Audit/migrate design.yaml + DDL layout |
 | `dbd reset` | Drop the project's own objects (with safety guards; PostgreSQL, Supabase and SQLite) and say what it dropped |
@@ -177,20 +177,33 @@ dbd apply
 
 Smart multi-snapshot: complex changes (column rename, type change, enum value removal) are automatically split into multiple safe migration stages.
 
-`dbd apply --dry-run` with a database configured lists the pending migrations the run would execute,
-each destructive statement marked `⚠`. A project older than the database — a branch checked out
-from before the latest snapshot — is refused by `apply` and `deploy` and their dry runs, rather than
-re-applying its older DDL over the newer schema.
+Pending migrations run version by version, each whole before the next — its creates and alters, then
+its data scripts, then its drops — so a database several versions behind ends where upgrading one
+release at a time would. The run is one transaction, except that a version adding enum values
+commits up to and including those additions first, because Postgres will not use a value in the
+transaction that added it.
+
+`dbd apply --dry-run` with a database configured lists the pending migrations in the order the run
+executes them, each destructive statement marked `⚠`. A project older than the database — a branch
+checked out from before the latest snapshot — is refused by `apply` and `deploy` and their dry runs,
+rather than re-applying its older DDL over the newer schema. `apply -n <entity>` is refused while
+migrations are pending: it builds one entity and cannot run them, so run `dbd apply` first.
 
 ## Environments
 
 `-e` is `dev` or `prod` (default `prod`). It picks which `import/<env>/` data loads, and the
 database records it. A `-e dev` run against a database marked prod is refused — `apply`, `deploy`,
-`reconcile` and `import`, before anything is written — because it would lift `reset`'s prod guard
-and load dev seed data into production. A dev database may be promoted to prod; nothing re-marks a
-prod one, and there is no override. So build a development database with `-e dev` from its first
-run: one built without it is marked prod, and the way back is a full `dbd reset --force` (which
-forgets the database's record of the project), then a run with `-e dev`.
+`reconcile` and `import` (an ad-hoc `import -n -f` too), and their dry runs, before anything is
+written — because it would lift `reset`'s prod guard and load dev seed data into production. A dev
+database may be promoted to prod, and the run that promotes it says so; nothing re-marks a prod
+one, and there is no override. So build a development database with `-e dev` from its first run:
+one built without it is marked prod, and the way back is `dbd reset --force` under the all-scope or
+the scope the database is pinned to (which forgets the database's record of the project), then a
+run with `-e dev`.
+
+The record is keyed on `project.name`. After a rename, a project with no record of its own on a
+database that holds its objects is held to the record the old name left, and a refusal names it —
+set `project.name` back rather than lose the guards.
 
 ## Deploy from GitHub
 
@@ -233,7 +246,7 @@ dbd inspect --scope hub
 - `--deps <report|include>` overrides a scope's own `deps` setting for one run.
 - `external:` is the only sanctioned way to declare a dependency that lives outside the managed scope; references to `external:` entries are never counted as gaps.
 - Omit `default` (or omit `scopes:` entirely) to deploy the full set. Define `default:` only if a bare `dbd deploy` should itself deploy a subset. `--scope all` is always the full set.
-- **Scope guard.** The first `apply`/`deploy`/`reconcile` pins a database to its resolved scope (recorded in `dbd.meta.scope`, or `_dbd_meta.scope` on SQLite); a later `apply`/`deploy`/`reconcile`/`reset`/`import`/`export`/`refresh`/`policies` under a *different* scope is refused — and so are the `apply`, `deploy`, `policies` and `reset` dry runs, given a database — unless you pass `--allow-scope-change` on `apply`/`deploy`/`reconcile` (which re-points the DB; `reset` takes it to bypass the check; `import`, `export`, `refresh` and `policies` have no such flag and never re-pin) — this stops a mistyped or forgotten `--scope` from building a divergent schema in the wrong database, or loading data into one.
+- **Scope guard.** The first `apply`/`deploy`/`reconcile` pins a database to its resolved scope (recorded in `dbd.meta.scope`, or `_dbd_meta.scope` on SQLite); a later `apply`/`deploy`/`reconcile`/`reset`/`import`/`export`/`refresh`/`policies` under a *different* scope is refused — and so are the `apply`, `deploy`, `import`, `policies` and `reset` dry runs, given a database — unless you pass `--allow-scope-change` on `apply`/`deploy`/`reconcile` (which re-points the DB; `reset` takes it to bypass the check; `import`, `export`, `refresh` and `policies` have no such flag and never re-pin) — this stops a mistyped or forgotten `--scope` from building a divergent schema in the wrong database, or loading data into one. `diff` and `migrate --status`, which write nothing, note the pin instead of refusing.
 - **A scope keeps what its entities need**: sequences are selected like tables, a table depends on the enum and sequence its columns use, the schema an allowed extension installs into comes with it (a scope that excludes that schema while keeping the extension is refused), and grants are applied only on the schemas the scope builds. A hook is skipped only when it touches a table the design manages outside the scope.
 - **Every scoped command names its scope** — `scope 'hub': 7 of 12 entities` — except `graph`, which puts it in its JSON.
 - **A scope narrows what is applied, not what the project owns** — `reconcile --prune --scope` never drops a table the design declares outside the scope. Upgrade to 0.24.1 before running a scoped prune: earlier releases did ([#40](https://github.com/sensei-hq/dbd/issues/40)). And upgrade to 0.25 before any `reconcile --prune` in a design with a role or an extension that has no `schema:`: earlier releases treated `public` as managed and dropped every undeclared table there.

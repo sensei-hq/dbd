@@ -140,9 +140,13 @@ scope's entities.
 
 - **Tables**, with their columns, `NOT NULL`, defaults, primary keys, unique
   constraints, foreign keys, `CHECK` constraints, indexes (`CREATE INDEX`) and
-  comments where the target keeps them. A foreign key and a `CHECK` keep their
-  names (`CONSTRAINT [people_amt_ck] CHECK (…)`). Identity and `serial` columns
-  are numbered by the target; generated columns are computed by it.
+  comments where the target keeps them. A UNIQUE, a foreign key and a `CHECK`
+  keep their names on every target (`CONSTRAINT [people_amt_ck] CHECK (…)`),
+  and a primary key keeps its name on SQL Server and SQLite; MySQL names every
+  primary key `PRIMARY`, so there the name is reported. A key named on its
+  column (`id int constraint people_pk primary key`) keeps its name too; a
+  column-level `REFERENCES` does not. Identity and `serial` columns are
+  numbered by the target; generated columns are computed by it.
 - **Views** and **materialized views**, as `CREATE VIEW`. A materialized view
   becomes a plain view, which is reported, and each of its indexes is reported
   and left out. On MySQL and SQL Server the `SELECT` is passed through
@@ -229,7 +233,7 @@ nobody reads.
 | `text`, and `varchar` with no length | `LONGTEXT` | `nvarchar(max)` | `TEXT` |
 | `varchar(n)` | `VARCHAR(n)`; past 16,383, `MEDIUMTEXT` or `LONGTEXT` ⚠ | `nvarchar(n)`; past 4,000, `nvarchar(max)` ⚠ | `TEXT` |
 | `boolean` | `TINYINT(1)` | `bit` | `INTEGER` |
-| `numeric(p,s)` | `DECIMAL(p,s)`, at most 65 digits with 30 after the point ⚠ | `decimal(p,s)`, at most 38 digits ⚠ | `NUMERIC` (⚠ past 15 digits) |
+| `numeric(p,s)` | `DECIMAL(p,s)`, at most 65 digits with 30 after the point ⚠ | `decimal(p,s)`, at most 38 digits ⚠ | `NUMERIC` (⚠ when a value can pass 15 significant digits with a fraction, or 18 whole digits — SQLite rounds it) |
 | `numeric` with no precision | `DECIMAL(65,30)` ⚠ | `decimal(38,10)` ⚠ | `NUMERIC` ⚠ |
 | `double precision` | `DOUBLE` | `float` | `REAL` |
 | `real` / `float4` | `FLOAT` | `real` | `REAL` |
@@ -255,6 +259,7 @@ nobody reads.
 | `DEFAULT nextval('s')` | the table's `AUTO_INCREMENT` on its numbered key ⚠, else no default ⚠ | `NEXT VALUE FOR` (no default ⚠ when the sequence is not in the script) | `AUTOINCREMENT` on its integer key ⚠, else no default ⚠ |
 | a generated column | `GENERATED ALWAYS AS (…) STORED` ⚠ | `AS CAST((…) AS type) PERSISTED` ⚠ | `GENERATED ALWAYS AS (…) STORED` ⚠ |
 | `now()`, `current_date` | `CURRENT_TIMESTAMP(n)` at the column's precision, `(CURRENT_DATE)` | `SYSDATETIMEOFFSET()`, `CONVERT(date, SYSDATETIME())` | `CURRENT_TIMESTAMP`, `CURRENT_DATE` |
+| `now()`, `current_time` or `localtime` on a `time` column | `(CURRENT_TIME(n))` | `CONVERT(time, SYSDATETIME())` | `CURRENT_TIME` |
 | `gen_random_uuid()` | `(UUID())` ⚠ — version 1, not random | `NEWID()` | a random v4 expression over `randomblob` |
 | a literal default | the literal, without its `::cast` | the same | the same |
 | any other default | left out ⚠ | left out ⚠ | left out ⚠ |
@@ -262,6 +267,13 @@ nobody reads.
 | a view's query, a `CHECK` | untranslated ⚠ | untranslated ⚠ | written again ⚠, or left out ⚠ |
 | comments | table and column `COMMENT`; a view's ⚠ | `MS_Description` on tables, columns and views | none ⚠ |
 | a foreign key to a table not in the script | left out ⚠ | left out ⚠ | left out ⚠ |
+| a primary key's name | `PRIMARY` ⚠ | kept | kept |
+| `UNIQUE NULLS NOT DISTINCT` | `UNIQUE` ⚠ — NULL keys may repeat | `UNIQUE` | `UNIQUE` ⚠ — NULL keys may repeat |
+| a foreign key `DEFERRABLE INITIALLY DEFERRED` | checked at once ⚠ | checked at once ⚠ | `DEFERRABLE INITIALLY DEFERRED` |
+| a foreign key `DEFERRABLE` (checked at once by default) | checked at once ⚠ | checked at once ⚠ | checked at once ⚠ |
+| a foreign key `MATCH FULL` | `MATCH SIMPLE` ⚠ | `MATCH SIMPLE` ⚠ | `MATCH SIMPLE` ⚠ |
+| an `EXCLUDE` constraint | nothing ⚠ | nothing ⚠ | nothing ⚠ |
+| a column's `COLLATE` | the target's default ⚠ | the target's default ⚠ | the target's default ⚠ |
 | extensions, roles, grants, RLS policies | nothing ⚠ | nothing ⚠ | nothing ⚠ |
 
 ⚠ = reported. An **enum** column becomes plain text on every target — MySQL's
@@ -297,12 +309,14 @@ Some losses are still **not** reported, so check for them by hand:
 - **Identity options** — an identity column's `START WITH` and `INCREMENT BY`;
   the target's numbering counts from 1 by 1.
 - **Precision and zones** — `timestamptz` loses its time zone on MySQL and
-  SQLite, and `varchar(n)` its length on SQLite.
+  SQLite, `timetz` on SQLite, and `varchar(n)` its length on SQLite.
 - **Index-key length** — MySQL refuses an index key past 3,072 bytes and SQL
   Server one past 900, and neither limit is checked: a `UNIQUE` on a
   `varchar(3000)` is 12,000 bytes on MySQL.
-- **A MySQL `time DEFAULT now()`** is still written `DEFAULT CURRENT_TIMESTAMP`,
-  which MySQL refuses on a `TIME` column.
+- **NULLs in a SQL Server UNIQUE** — SQL Server lets only one row hold a NULL
+  key, where a PostgreSQL `UNIQUE` over a nullable column admits any number.
+- **A column-level foreign key's name** — `pid int constraint p_fk references
+  …` is emitted unnamed.
 - **A view's column list** — `CREATE VIEW v (a, b) AS …` comes out with the
   query's own column names on every target.
 

@@ -71,10 +71,11 @@ because a reconciled database is meant to be the one an apply builds — before
 0.25 it was left with none. An application embedding dbd gets them from
 `Design::deploy` the same way, or from `Design::apply_grants` on its own.
 
-They are not applied by `--dry-run`. Under `--scope`, only the grants on
-schemas the scope builds are applied — a grant on a schema that database was
-never given would fail the run — and on a `supabase` target the PostgREST
-`USAGE` grants below are narrowed the same way.
+They are not applied by `--dry-run`; `reconcile --dry-run` lists the ones its
+run would apply, after the schema changes and the hooks. Under `--scope`, only
+the grants on schemas the scope builds are applied — a grant on a schema that
+database was never given would fail the run — and on a `supabase` target the
+PostgREST `USAGE` grants below are narrowed the same way.
 
 ### When they are revoked
 

@@ -134,20 +134,32 @@ Applies every entity in dependency order. Each type has its place —
 schemas, extensions, roles, sequences, enums, tables, views, materialized
 views, then functions and procedures — and a real dependency moves an entity
 later when it needs to: a view that calls a function is applied after the
-function. On PostgreSQL the whole run is one transaction.
+function. On PostgreSQL the whole run is one transaction — except that a
+pending migration adding enum values commits at that point, since Postgres will
+not use a new value in the transaction that added it (see
+[snapshots and migrations](05-snapshots-migrations.md)).
+
+Before it runs, `apply` names each file that states no `SET search_path`, with
+the path its unqualified names were resolved against — the scaffold's
+`example.ddl` is one. Add a `SET search_path` to the file, or set
+`source.search_path` in `design.yaml`, so where an object lands is never left
+to the session.
 
 The database records which environment it was built for, and a run without `-e`
 is `-e prod`. Build a development database with `-e dev` from its first run:
 one first built without it is marked prod, and from then on a `-e dev` run
 against it is refused, so that dev seed data never reaches production (see
-[global options](04-commands.md#global-options)).
+[global options](04-commands.md#global-options)). A run without `-e` against a
+dev database promotes it to prod, and says so.
 
 ```sh
 dbd apply -e dev
 ```
 
 Preview the order — offline, or, when a database is configured, checked against
-its scope pin and recorded version, with the pending migrations listed:
+its scope pin, its environment and its recorded version, with the pending
+migrations listed in the order the run takes them. A preview never creates a
+database: a SQLite file that does not exist yet is previewed offline.
 
 ```sh
 dbd apply --dry-run

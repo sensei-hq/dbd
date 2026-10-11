@@ -13,9 +13,10 @@ description: >-
   convention, a `--scope` that drops them, a data file outside `import.staging`,
   a CSV header that does not name its table's columns, a JSON key that names no
   column, a file setting a generated column, two procedures with an equal claim
-  to one staging table, a pre-0.25 `export -o import/<schema>` round trip, or a
-  dev database built without `-e dev`), `ddl/extension/`/`ddl/schema/` files
-  dbd never reads, RLS expected from `dbd apply`
+  to one staging table, a data file in a folder deeper than an import reads, or a
+  dev database built without `-e dev`), a renamed `project.name` on a deployed
+  project, `ddl/extension/`/`ddl/schema/` files dbd never reads, RLS expected
+  from `dbd apply`
   without `--with-policies`, post-DDL SQL parked in `import.after` (which
   never runs on `dbd apply`) instead of `apply.after`, a scoped
   `reconcile --prune` on a dbd older than 0.24.1, and any `reconcile --prune`
@@ -83,11 +84,21 @@ file evidence).
      declare. Fix: upgrade first.
    - **Pre-release** project with hand-written migration files / snapshots being authored by hand,
      or someone hand-editing the live DB instead of `reconcile` → violation.
+   - A **renamed `project.name`** on a project that already has databases (check `git log -p
+     design.yaml`) → violation. dbd keys its record of a database on the name. From 0.25 the
+     guards hold the renamed project to the old record while the database holds its objects, and
+     refuse naming it; but a run that trips no guard records a second row, and a design ahead of
+     the old record's version is planned as a fresh install, so its pending migrations never run.
+     Fix: set `project.name` back.
    - Evidence: `project.released`, `snapshots/` contents, and any command/README/script that
      names `reconcile`, `snapshot`, or raw SQL against the DB.
 2. **Non-idempotent DDL** (re-`apply` would error). Flag a `CREATE TABLE`/`CREATE MATERIALIZED
    VIEW`/`CREATE INDEX` missing `IF NOT EXISTS`, or a `CREATE VIEW` missing `OR REPLACE`. (Postgres
-   has no `CREATE OR REPLACE MATERIALIZED VIEW`, so matviews use `IF NOT EXISTS`.)
+   has no `CREATE OR REPLACE MATERIALIZED VIEW`, so matviews use `IF NOT EXISTS`.) A trigger in a
+   table's or view's file is idempotent as `CREATE OR REPLACE TRIGGER`, or — for a constraint
+   trigger, which Postgres cannot replace — as `DROP TRIGGER IF EXISTS` before `CREATE CONSTRAINT
+   TRIGGER`; a `CREATE TYPE … AS ENUM` inside `DO … EXCEPTION WHEN duplicate_object` is too. That is
+   how `dbd init --from-db` writes them — do not flag those shapes.
 3. **Hardcoded secrets** — a `design.yaml` target `url:` with a literal connection string /
    password instead of `$ENV_VAR`.
 4. **Wrong layout** — plural type folders (`ddl/tables/`, `ddl/views/`, …) instead of singular;
@@ -118,14 +129,19 @@ file evidence).
      a schema named `dev` or `prod` cannot keep files directly in that folder.
    - A **dev database built without `-e dev`**: `-e` defaults to prod, so the first `apply`/
      `deploy` without it marks the database prod, and from 0.25 every later `-e dev` run against
-     it — `apply`, `deploy`, `reconcile`, `import` — is refused (the environment guard; no
-     override). Flag a dev setup script whose first build omits `-e dev` while later steps pass
-     it. Fix: pass `-e dev` from the first run; for a database already marked, a full
-     `dbd reset --force` (it forgets the mark), then `-e dev`.
-   - A **pre-0.25 export round trip**: `dbd export … -o import/<schema>` now writes
-     `import/<schema>/<schema>/<table>.<fmt>`, a folder import reads as another env's and never
-     loads. Fix: `-o import` (export keeps the schema folder), or for views in their own schema,
-     export and move the files under the staging schema's folder.
+     it — `apply`, `deploy`, `reconcile`, `import`, an ad-hoc `import -n -f`, and their dry runs —
+     is refused (the environment guard; no override). A run that promotes a dev database prints
+     `This database was marked dev and is now marked prod`. Flag a dev setup script whose first
+     build omits `-e dev` while later steps pass it. Fix: pass `-e dev` from the first run; for a
+     database already marked, `dbd reset --force` under the all-scope or the scope the database is
+     pinned to (a bare reset in a design whose `default:` scope built it) — it forgets the mark; a
+     narrower scope does not — then `-e dev`.
+   - A **data file in a folder deeper than an import reads** — anything below
+     `import/<schema>/` or `import/<env>/<schema>/` (`import/staging/core/accounts.csv`). It never
+     loads (from 0.25 dbd names it; before, `import/dev/staging/sub/y.csv` loaded into
+     `staging.y`). An `export -o` into such a folder lands there too; `-o import/<schema>` (or
+     `import/<env>/<schema>`) writes `<table>.<fmt>` straight into that schema folder, and
+     `-o import` keeps each table under its own schema.
    - Data files outside the convention: anything under `data/` or `seeds/` rather than
      `import/<schema>/<table>.<csv|tsv|json|jsonl>` is never scanned.
    - A `--scope` in the deploy command whose working set excludes the staging tables (or the
@@ -151,7 +167,11 @@ file evidence).
        dropped silently), and any data file — CSV header or JSON key — that **sets a generated
        column**;
      - under a deploy's `--scope`, a staging table the scope keeps whose **loader procedure the
-       scope leaves out**.
+       scope leaves out**;
+     - a data file whose target the design declares as a **view, materialized view or
+       sequence**;
+     - a staging table that a table **outside the import holds a foreign key to** — the
+       truncate fails, naming the holder, before anything is emptied.
    - Evidence: the `import/` tree next to the actual deploy/install invocation; `import.staging`
      in `design.yaml`; the first line of each CSV/TSV against its table's DDL; the procedures
      under `ddl/procedure/` that read each staging table.

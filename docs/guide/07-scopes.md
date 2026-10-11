@@ -222,7 +222,9 @@ for entities in the hub's working set, skips the rest, and still advances the
 database to the latest version. A migration that adds a role or an extension the
 scope keeps installs it, as a fresh scoped install does — so a table typed with
 a new extension's type migrates under a scope too — and the summary counts each
-entity once.
+entity once. When nothing in the pending versions belongs to the scope, the
+dry run says so — the run records them and moves the database on — rather than
+promise there is nothing to do.
 
 A table removed from the design is in no working set any more, so its drop step
 belongs to the scopes that occupy its schema: a scoped `apply` or `deploy` runs
@@ -239,11 +241,13 @@ Both are filtered by what they touch:
   when they depend on a table the design manages outside the working set. A
   table the design does not manage — an `external:` one, or one the hook
   creates itself — never causes a skip. dbd derives a script's tables by
-  parsing it; when the tables are *data* (inside `format()` or an `array[…]`),
-  declare them with `writes:`. A script with no derivable tables and no
-  `writes:` always runs. An `apply.*` skip is named before `apply`, `deploy` or
-  `reconcile` starts and in their dry runs; an `import.after` skip in
-  `import --dry-run` and `deploy --dry-run`, as the real run names it. See
+  parsing it, reading a bare table name on the path the script runs on —
+  `source.search_path`, else the session default — not on `public`; when the
+  tables are *data* (inside `format()` or an `array[…]`), declare them with
+  `writes:`. A script with no derivable tables and no `writes:` always runs.
+  An `apply.*` skip is named before `apply`, `deploy` or `reconcile` starts and
+  in their dry runs; an `import.after` skip in `import --dry-run` and
+  `deploy --dry-run`, as the real run names it. See
   [Hook scripts](03-design-yaml.md#hook-scripts).
 - **Policies** are filtered by path: `policies/<schema>/<table>.sql` names its
   table, and a policy whose table is outside the working set is skipped and
@@ -261,7 +265,7 @@ PostgreSQL, `_dbd_meta` on SQLite). A later `apply`, `deploy`, `reconcile`,
 `reset`, `import`, `export`, `refresh` or `policies` under a different scope is
 refused — the match is exact, so a database pinned to `all` refuses
 `export --scope hub` — as are `reconcile --dry-run`, and the `apply`, `deploy`,
-`policies` and `reset` dry runs when a database is configured:
+`import`, `policies` and `reset` dry runs when a database is configured:
 
 ```
 Error: Safety guard: scope guard: this database is pinned to scope 'public', but you requested 'internal'.
@@ -277,13 +281,26 @@ the flag (like `--force`) only bypasses the check — a reset does not re-pin.
 them re-pins: run them under the pinned scope, or re-point the database with
 `apply --allow-scope-change` first. Each says what running another scope would
 do — load, read, refresh or secure tables the database was not built with —
-and the way through. A
-database created before scopes existed is unpinned and pins on its next write.
+and the way through. A database created before scopes existed is unpinned and
+pins on its next write.
+
+`diff` and `migrate --status` write nothing, so they note a pin rather than
+refuse it: an unscoped `diff` of a database pinned to `hub` says so before it
+lists what `hub` does not build as missing, and `--scope hub` compares what
+the database was built with.
+
+The pin is recorded under `project.name`. A renamed project has no record of
+its own, so on a database that holds its tables, views, matviews, enums or
+sequences it is held to the record the old name left — the refusal names that
+project and says to set `project.name` back. Two projects that share a
+database each keep their own record.
 
 The pin lives in the same bookkeeping row as the environment the database was
-built for, and a full `reset` — `--scope all`, or no `--scope` when no `default:`
-is defined — deletes that row, so the next `apply` pins the database afresh. A
-scoped reset leaves the pin, and the rest of the row, where it was. The
+built for. A `reset` of everything the database was built with — under
+`--scope all`, or under the scope it is pinned to, which is what a bare `reset`
+resolves to in a design whose `default:` built it — deletes that row, so the
+next `apply` pins the database afresh. A reset under a narrower scope leaves
+the pin, and the rest of the row, where it was. The
 environment is guarded the way the scope is: a `-e dev` run against a database
 marked prod is refused (see [global options](04-commands.md#global-options)).
 

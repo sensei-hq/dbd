@@ -373,6 +373,14 @@ keeps things a simpler one would discard:
 - operator classes, `INCLUDE` payloads, `NULLS NOT DISTINCT`, partial-index
   predicates and access-method storage parameters — each of which distinguishes
   two indexes that would otherwise compare equal
+- a column's collation, a foreign key's `DEFERRABLE`/`INITIALLY DEFERRED` and
+  `MATCH FULL`, and `EXCLUDE` constraints (0.25) — before which introspection
+  read an exclusion constraint as a plain gist index and the rest not at all,
+  so a reversed project weakened the database with an empty diff. What the
+  model still cannot hold (`NOT VALID`, `UNLOGGED`, inheritance, partitioning)
+  is named when a database is reversed, never dropped silently; and every
+  object an extension owns is left out of introspection, since the project
+  does not own it.
 
 A table dbd cannot read structurally is an **error**, not a partial result.
 Every other entity type may degrade; this one may not, because a table with no
@@ -604,7 +612,8 @@ pub trait DatabaseAdapter: Send + Sync {
 
 > **Current implementation note (0.25).** The trait in
 > `crates/dbd-core/src/adapter/mod.rs` is the record; this sketch is the original design.
-> 0.25 adds one required method, `forget_project_meta` — a full `reset` deletes the
+> 0.25 adds one required method, `forget_project_meta` — a `reset` of everything the
+> database was built with (the all-scope, or the scope it is pinned to) deletes the
 > database's record of the project (env, version, scope pin), which is what lets a database
 > marked prod by mistake be rebuilt as dev — and several with defaults, each so a run can
 > ask the database rather than assume: `existing_objects` (what `reset` reports it dropped,
@@ -612,10 +621,20 @@ pub trait DatabaseAdapter: Send + Sync {
 > roles another database on the server still uses, which `reset` keeps), `live_matviews`
 > (a deployed matview's definition and index keys, so `apply` can stamp a brownfield one
 > that is the design's), `stamp_matview`/`forget_matview_stamps` (the drift stamp, kept in
-> `dbd.matview_stamps`, out of the matview's comment) and `truncate_table` (the import's
-> truncate, `DELETE FROM` on SQLite, nothing on Convex). `export_data` writes into the
-> directory its caller passes, which the CLI makes `<root>/<schema>/` — the layout
-> `import/` reads.
+> `dbd.matview_stamps`, out of the matview's comment), `truncate_table`/`truncate_tables`
+> (the import's truncate — Postgres empties every staging table in one `TRUNCATE` and names
+> a table outside the import that holds a key to one; the default goes one at a time,
+> referencing table first, `DELETE FROM` on SQLite, nothing on Convex),
+> `matviews_reading_columns` (what blocks reconcile's enum swap, asked of the database
+> rather than the design), `other_projects_meta` (the records the guards read for a renamed
+> `project.name` — see the bookkeeping notes below), `execute_project_script` (a migration
+> or hook run on a search path, since it may name tables bare) and `dependencies`
+> (`pg_depend`, read so `init --from-db --schema` can say what the capture needs from
+> outside). `export_data` writes into the directory its caller passes, which the CLI makes
+> `<root>/<schema>/` — the layout `import/` reads — or, for `-o` naming a schema folder of
+> the project's `import/` tree, that folder itself. The Postgres adapter's constructor makes
+> one probe connection bounded at 5 seconds before it builds the pool, so an unreachable
+> server fails fast naming `host:port`; sqlx alone retried for 30 seconds.
 
 ### Parser trait
 
@@ -1003,8 +1022,11 @@ is two entries and one call. Only procedures are candidates — the step is
 > not a Postgres subset, so a real SQLite grammar would have been new work
 > regardless of which crate was chosen here.
 >
-> `sqlparser-rs` remains a dependency, for `dbd format` and enum-candidate
-> detection. It no longer reads DDL. The rest of this section is kept as the
+> `sqlparser-rs` remains a dependency, for `dbd format`'s layout and enum-candidate
+> detection. It no longer reads DDL, and since 0.25 the formatter no longer trusts it
+> either: statement boundaries come from libpg_query, and a layout is kept only if
+> libpg_query parses it to the same tree with every literal, body, quoted name and
+> comment byte-for-byte unchanged. The rest of this section is kept as the
 > original record.
 
 **`sqlparser-rs`** (Apache DataFusion) is the parser. It replaces both `pg_query` (C FFI) and the regex fallbacks from the Node.js version.
@@ -1643,6 +1665,18 @@ Scenario: Multi-version catch-up
   And _dbd_migrations has entries for v2, v3, v4
 ```
 
+> **Current implementation note (0.25).** Each version runs whole before the next — its
+> creates and `.sql` alters in dependency order, then all its `.data.sql` scripts, then its
+> drops, then its `RecordMigration` — and every entity re-applies after the last
+> (`design::plan::plan_migrate`). The plan ran entity by entity before: a jump ran a later
+> version's change ahead of an earlier version's change to another table, which a stepwise
+> upgrade never does. A version's `ALTER TYPE … ADD VALUE` statements run at its head as
+> `IF NOT EXISTS` (`ExecutionStep::AddEnumValues`) and the batch commits after them, since
+> Postgres refuses a value inside the transaction that added it; the run is one
+> transaction except at those commit points, and the version before is recorded first.
+> A named `apply -n` refuses while migrations are pending, rather than record versions it
+> did not run.
+
 #### Scenario 10: Deploy from GitHub source
 
 End-to-end deploy from a remote source.
@@ -1714,6 +1748,11 @@ Scenario: Dev reset blocked after v1
   And database unchanged
 ```
 
+> **Current implementation note (0.25).** The message is "reset is blocked — the database
+> is versioned at v1 (a released project's database)": the guard reads the recorded
+> version, and a fresh install of a released project records its version having run no
+> migration.
+
 ```gherkin
 Scenario: Dev reset after v1 with an explicit override
   Given _dbd_meta has env = "dev", version = 1
@@ -1768,13 +1807,15 @@ Scenario: Environment mismatch warning
 > **Current implementation note (0.25).** The mismatch is refused, not warned about.
 > Before 0.25 neither the warning nor the "not overwritten" half held: the run proceeded
 > and its upsert re-marked the database dev, which lifted the reset guard below and let
-> `import/dev/` seed data into production. `Design::check_env_guard(meta, env)` now
+> `import/dev/` seed data into production. `Design::check_env_guard(marks, env)` now
 > returns `DbdError::SafetyGuard` for any run whose env is not prod against a database
 > marked prod (`production` rows included), before anything is written; `Design::apply`,
-> `deploy`, `reconcile` and `import_data` call it. It is one-way — a dev database may be
-> promoted to prod, which only tightens what reset allows — and has no override: the case
-> it bites is a dev database first built without `-e` (so marked prod), and the way out is
-> to rebuild it, which a full reset now allows by forgetting the row
+> `deploy`, `reconcile` and `import_data` call it, and so do the CLI's ad-hoc `import -n -f`
+> and every dry run of those given a database. It is one-way — a dev database may be
+> promoted to prod, which only tightens what reset allows, and the CLI says when a run did
+> — and has no override: the case it bites is a dev database first built without `-e` (so
+> marked prod), and the way out is to rebuild it, which a reset of everything the database
+> was built with (the all-scope, or its pinned scope) allows by forgetting the row
 > (`DatabaseAdapter::forget_project_meta`). A flag would unguard a real production
 > database as easily.
 
@@ -1830,9 +1871,17 @@ ON CONFLICT (project) DO UPDATE
 
 (Since 0.25 the upsert can only move `env` from dev to prod: a dev run against a row
 that says prod is refused by `Design::check_env_guard` before it reaches the upsert, and a
-full reset deletes the row rather than leaving it to be overwritten. A project older than
-the row's `version` is refused too, by `Design::check_version_guard`, so `apply` never
-writes a lower version over a higher one.)
+reset under the all-scope or the pinned scope deletes the row rather than leaving it to be
+overwritten. A project older than the row's `version` is refused too, by
+`Design::check_version_guard`, so `apply` never writes a lower version over a higher one.)
+
+(The row is keyed on `project`, so a renamed `project.name` found no row and every guard
+passed — a prod database's tables dropped by a `reset` with no `--force`. Since 0.25 the
+guards read `DatabaseMarks` (`Design::database_marks`): this project's row, or — when it
+has none and the database holds any of the design's tables, views, matviews, enums or
+sequences — every other project's row (`DatabaseAdapter::other_projects_meta`), and a
+refusal names that project. The objects tell a rename from a second project sharing the
+database: each of two such projects has its own row.)
 
 After a snapshot is applied, version is updated:
 
@@ -1870,7 +1919,7 @@ reset called
 
 **Prod is always protected:** Even at version 0, a prod database may have data loaded outside of dbd. Reset always requires `--force`.
 
-> **Current implementation note (0.25).** The guard is `Design::check_reset_guard(meta)`,
+> **Current implementation note (0.25).** The guard is `Design::check_reset_guard(marks)`,
 > public so `dbd reset --dry-run` runs it too whenever a database is configured (`-d`,
 > `DATABASE_URL`, or a `target.url` that resolves) — a preview of a reset the real run
 > would refuse is a false promise; with no database configured the dry run stays an
@@ -1885,9 +1934,12 @@ reset called
 > database on the server holds anything in is kept (`roles_kept_by_reset`, from
 > `DatabaseAdapter::roles_held_elsewhere`) and named, its grants here still revoked —
 > roles are server-wide, and dropping one breaks the database that still uses it. It also
-> deletes the `dbd.matview_stamps` rows of the matviews it dropped, and a full reset (the
-> `all` scope) deletes the meta row itself (`forget_project_meta`), so the next apply
-> records the database afresh. A scoped reset drops without `CASCADE`, in one block that
+> deletes the `dbd.matview_stamps` rows of the matviews it dropped, and a reset of
+> everything the database was built with — the `all` scope, or the scope its row pins
+> (a design's `default:` scope builds and resets under that) — deletes the meta row itself
+> (`forget_project_meta`), so the next apply records the database afresh. A `--target`
+> that is not the kind of database the connection reaches is refused by the CLI before it
+> connects. A scoped reset drops without `CASCADE`, in one block that
 > is all or nothing, and refuses naming the out-of-scope dependents: a cascade from an
 > in-scope enum took an out-of-scope table's column with it. `--target` takes
 > `postgres`, `supabase` or `sqlite`; on SQLite the reset drops tables and views in one

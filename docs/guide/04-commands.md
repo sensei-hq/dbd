@@ -52,9 +52,10 @@ reads it back. The default is `prod`, so a database applied without `-e dev` is
 marked prod.
 
 **A dev run against a database marked prod is refused** — `apply`, `deploy`,
-`reconcile` and `import`, before anything is written. The dev run would re-mark
-the database dev, which lifts reset's prod guard, and would load `import/dev/`
-data into production:
+`reconcile` and `import` (`import -n X -f file` included), and their dry runs
+whenever a database is configured, before anything is written. The dev run
+would re-mark the database dev, which lifts reset's prod guard, and would load
+`import/dev/` data into production:
 
 ```
 Error: Safety guard: environment guard: this database is marked prod, but this run is -e dev.
@@ -63,19 +64,69 @@ A dev run would re-mark it dev, which lifts the prod guard on `dbd reset`, and w
 ```
 
 The mark moves one way only: a dev database may be promoted to prod, which only
-tightens what `reset` allows, and nothing re-marks a prod one. There is no
-override flag, because a flag that let a dev database through would let a real
-production database through too. The case it bites is a dev database first
-built without `-e`, and so marked prod; rebuild it — a full `dbd reset --force`
-forgets the database's record of the project — then run with `-e dev`. A full
-reset is `--scope all`, or no `--scope` when `design.yaml` defines no
-`default:` scope; with one defined, run `dbd reset --force --scope all`, since
-a reset of the `default` scope keeps the record. `import -n X -f file`, which
-loads a file you name rather than an environment's folder, is not checked.
+tightens what `reset` allows, and nothing re-marks a prod one. A run that
+promotes one — any `apply`, `deploy` or `reconcile` without `-e` — says so, since
+every later `-e dev` run will be refused:
+
+```
+⚠ This database was marked dev and is now marked prod: this run is -e prod, the default when -e is not given. dbd never re-marks a prod database dev, so later -e dev runs are refused — to keep it dev, rebuild it: `dbd reset --force`, then run with -e dev.
+```
+
+There is no override flag, because a flag that let a dev database through would
+let a real production database through too. The case it bites is a dev database
+first built without `-e`, and so marked prod; rebuild it with
+`dbd reset --force`, then run with `-e dev`. The reset forgets the database's
+record of the project — env, version and scope pin — when it covers everything
+the database was built with: under the `all` scope, or under the scope the
+database is pinned to. A bare `dbd reset --force` resolves to the design's
+`default:` scope if it has one — the scope a bare apply pins — so on a database
+built that way it forgets the record too; only a reset of a narrower scope
+keeps it.
+
+### Renamed projects
+
+dbd keys its record of a database on `project.name`, and more than one project
+may share a database. So a renamed `project.name` finds no record of its own.
+When that happens and the database holds any of the design's tables, views,
+materialized views, enums or sequences, the guards read the other projects'
+records instead — the environment, version, scope and reset guards alike — and
+a refusal names the project that set the mark:
+
+```
+Error: Safety guard: reset is blocked — project 'shop' marked this database prod.
+This database holds this design's objects but no record of project 'shop2'; it records project 'shop'. dbd keys its record on project.name, so a renamed project.name is the likely cause — if this design was 'shop', set project.name back to 'shop'.
+Use --force to override.
+```
+
+Before 0.25 a rename lifted every guard: `reset` with no `--force` dropped a
+prod database's tables. Two projects sharing a database each read their own
+record, and a project the database holds nothing of — a new one — is held to no
+other's. A run the old record does not refuse records the new name beside the
+old one, which stays; and a renamed design ahead of the old record's version is
+planned as a fresh install, so its pending migrations do not run. Set
+`project.name` back before upgrading.
+
+### Connecting
+
+A PostgreSQL connection is tried once first, bounded at 5 seconds, so a server
+that is down or a mistyped host fails fast, naming the `host:port` it tried and
+never the URL, which may hold a password:
+
+```
+Error: Failed to connect to database: Config error: Database connection failed: no answer from db.example.com:5432 within 5s — is the server running, and are the host and port right?
+```
+
+A refused connection fails at once, with the server's reason after the
+`host:port`. sqlx's pool used to retry for 30 seconds and then say only `pool
+timed out while waiting for an open connection`.
+
+A dry run opens only a database that exists: it reads a configured database to
+check its run's guards, but a SQLite file that is not there yet is not created
+— the dry run treats it as no database configured.
 
 ### Scope guard
 
-The first `apply`/`deploy`/`reconcile` **pins** a database to the scope it was built with — recorded in the `scope` column of the bookkeeping table (`dbd.meta` on Postgres/Supabase, `_dbd_meta` on SQLite). Any later `apply`, `deploy`, `reconcile`, `reset`, `import`, `export`, `refresh` or `policies` that requests a *different* scope is refused — the match is exact, so a database pinned to `all` refuses `export --scope hub`. So are `reconcile --dry-run`, and the `apply`, `deploy`, `policies` and `reset` dry runs whenever a database is configured, so a preview never shows a run that would be refused:
+The first `apply`/`deploy`/`reconcile` **pins** a database to the scope it was built with — recorded in the `scope` column of the bookkeeping table (`dbd.meta` on Postgres/Supabase, `_dbd_meta` on SQLite). Any later `apply`, `deploy`, `reconcile`, `reset`, `import`, `export`, `refresh` or `policies` that requests a *different* scope is refused — the match is exact, so a database pinned to `all` refuses `export --scope hub`. So are `reconcile --dry-run`, and the `apply`, `deploy`, `import`, `policies` and `reset` dry runs whenever a database is configured, so a preview never shows a run that would be refused. A renamed project is held to the pin its old name left (see [renamed projects](#renamed-projects)):
 
 ```
 Error: Safety guard: scope guard: this database is pinned to scope 'public', but you requested 'internal'.
@@ -89,7 +140,17 @@ This stops a mistyped or forgotten `--scope` from building a half-formed, diverg
 Error: scope guard: this database is pinned to scope 'hub', but you requested 'all'.
 Importing under another scope would load tables this database was not built with.
 → re-run with --scope hub, or re-point the database with `dbd apply --scope all --allow-scope-change` first.
-``` To host multiple modules in one database, define a scope in `design.yaml` that includes them rather than switching back and forth. Databases created before this feature are unpinned and pin on their next write.
+```
+
+`diff` and `migrate --status` write nothing, so they note a pin rather than
+refuse it — an unscoped `diff` of a database pinned to `hub` would otherwise
+list everything `hub` does not build as missing, with no word of why:
+
+```
+note: this database is pinned to scope 'hub'; this diff compares scope 'all', so what 'hub' does not build reads as missing — `--scope hub` compares what it was built with.
+```
+
+To host multiple modules in one database, define a scope in `design.yaml` that includes them rather than switching back and forth. Databases created before this feature are unpinned and pin on their next write.
 
 Which commands filter by `--scope`, which also refuse on a dependency gap, and
 which ignore it is set out in [scopes](07-scopes.md#which-commands-honour-scope).
@@ -227,26 +288,61 @@ names each hook the run would skip (see
 `⚠ after-script … skipped — needs …` line the real run prints before it starts.
 
 With a database configured — `-d`, `$DATABASE_URL`, or a `target.url` that
-resolves — the dry run asks it two of the run's questions: it refuses a database
-[pinned](#scope-guard) to another scope and one newer than the project (below),
-and lists the pending migrations the run executes before the entities, each
-statement that destroys something marked `⚠`:
+resolves — the dry run asks it the run's questions before it lists anything. It
+refuses a database [pinned](#scope-guard) to another scope, a dev run on a
+database marked prod ([`--environment`](#global-options)), a database newer than
+the project (below), a named apply over pending migrations, and a pending
+migration with an unresolved `data.sql` TODO. Then it lists the pending
+migrations the run executes before the entities, in the order the run takes
+them, each statement that destroys something marked `⚠`:
 
 ```
-Pending migrations, v1 → v2 — the run executes these first:
+Pending migrations, v1 → v3 — the run executes these first:
   v2 migrate app.a
       ALTER TABLE app.a ADD COLUMN extra int
+  v2 migrate data of app.a
+      UPDATE app.a SET extra = 0
   v2 drop app.b
       ⚠ DROP TABLE app.b CASCADE
+  v3 add values to app.mood (committed before the rest of the version)
+      ALTER TYPE app.mood ADD VALUE IF NOT EXISTS 'archived'
+  v3 migrate app.a
+      ALTER TABLE app.a ALTER COLUMN mood SET DEFAULT 'archived'
 ```
 
 A drop of a table this database does not have is listed as
 `— not in this database, so skipped`, as the run skips it, and with nothing
 pending the line is `No pending migration to run (database at v2, design at
-v2).` A configured database that cannot be reached fails the preview rather than
-falling back to one. With none configured the dry run stays offline, and in a
-project with migrations says that it cannot list them without the version the
-database records.
+v2).` A scoped run whose pending migrations touch nothing in its scope says the
+run records them anyway — `nothing in them runs in this scope; the run records
+them and moves the database to v7.` A configured database that cannot be
+reached fails the preview rather than falling back to one; a SQLite file that
+does not exist yet is not created. With none configured the dry run stays
+offline, and in a project with migrations says that it cannot list them without
+the version the database records.
+
+**Pending migrations run version by version.** Each pending version runs whole
+before the next — its enum value additions, its creates and schema changes, its
+data scripts, its drops, then the record that it ran — and afterwards every
+entity's DDL is re-applied; see
+[how a migration run is ordered](05-snapshots-migrations.md#how-a-migration-run-is-ordered).
+
+**A named apply is refused while migrations are pending.** `apply -n X` builds
+one entity and cannot run the rest of a version, so with migrations pending it
+stops before any write, `apply.before` included, and its dry run refuses the
+same way:
+
+```
+Error: Config error: apply -n app.people refused: the database is at v7 and migration v8 is pending. A named apply builds one entity and cannot run it, and would record it as applied. Run `dbd apply` first to apply it, then `dbd apply -n app.people`.
+```
+
+Before 0.25 it ran the named table's pending changes and every version's drops,
+skipped the rest, and recorded the versions as applied.
+
+**Files with no `SET search_path` are named** before the run and in its
+preview — each DDL file the run executes that states no path, with what its
+names were resolved against (see
+[`source.search_path`](03-design-yaml.md#search_path)).
 
 **An older project is refused on a newer database.** A database records the
 version it was built to, and a project behind it — a branch checked out from
@@ -268,7 +364,11 @@ database marked prod is refused too — see [`--environment`](#global-options).
 
 **One transaction.** On PostgreSQL the entities, pending migrations and version
 stamp run in a single transaction, so an interrupted upgrade rolls back to the
-schema it started from. `apply.before` runs before it — outside it, so a batch
+schema it started from. The exception is a version that adds enum values:
+PostgreSQL will not use a value in the transaction that added it, so the run
+commits after each such version's `ADD VALUE` statements and carries on in a new
+transaction — a failure after that point keeps the values and the earlier
+versions. `apply.before` runs before it — outside it, so a batch
 that rolls back keeps whatever `apply.before` did; matview stamping, pg_cron
 sync and `apply.after` run once it has committed. DDL that cannot run inside a
 transaction (`CREATE INDEX CONCURRENTLY`) fails there — set `DBD_NO_TX` to any
@@ -318,7 +418,7 @@ Load staging data from CSV, TSV, JSON and JSONL files.
 dbd import                         # Import all tables + call procedures
 dbd import -n staging.lookups      # Import one table (from the import/ folder)
 dbd import -n activity.hook_events -f ~/data/events.jsonl   # load a specific file into a table
-dbd import --dry-run               # Show import plan (no DB needed)
+dbd import --dry-run               # Show import plan (offline, or checked against a configured database)
 dbd import -e dev                  # Load dev-only data
 ```
 
@@ -331,9 +431,9 @@ anything else. It loads that file and nothing else — no truncate, no procedure
 scope was not applied to it. `import.staging` holds `-f` to its list like every other load. (On
 `import`, `-f` is the *file*; on `export` it's the *format* — each is unambiguous within its
 command.) It prints the scope line as every scoped run does, and refuses a database pinned to
-another scope like the full import; it is the one import the [environment
-guard](#global-options) does not check, because it loads the file you name rather than an
-environment's folder.
+another scope, or marked prod under `-e dev` (the [environment guard](#global-options)), like
+the full import. Before 0.25 it skipped the environment guard, so `-e dev import -n X -f file`
+loaded a dev file into production.
 
 **`-n`** without `-f` must select a data file this run loads, or the import is refused before
 anything runs — `no entity named 'X'`, `X has no data file under import/ — nothing to import`, or,
@@ -364,6 +464,19 @@ sequence is then moved past the largest id loaded, so the next insert does not r
 `setval`, for which the importing role needs `UPDATE` on the sequence. See
 [import and export](10-data.md#what-a-data-file-cannot-set).
 
+In a JSON record, `null` is SQL NULL for every column type. A json/jsonb column holding the JSON
+value `null` is written `{"$json": null}` (as `dbd export` writes it), and any one-key `{"$json":
+…}` object is unwrapped one level, on PostgreSQL and SQLite alike. A column whose key no record
+carries takes its DEFAULT; on PostgreSQL a key missing from only some records is NULL in those,
+while SQLite gives each record that leaves a key out the DEFAULT.
+
+**Truncation.** Before loading anything, the import empties every table it reloads (unless
+`truncate: false`) — on PostgreSQL in one `TRUNCATE` of them all, since PostgreSQL empties tables
+linked by a foreign key only together, and loads a referenced table before one that references
+it. A table outside the import that holds a key to one of them fails the import, named, with
+nothing emptied (`held by app.orders (orders_customer_fk, a key to staging.customers), outside the
+tables this import reloads`). SQLite empties them one at a time, a referencing table first.
+
 **`import.after`** scripts run after the procedures, on every `dbd import` (with or without
 `-n`) and on `dbd deploy` — not on `dbd apply`, and not with `-f`. `--dry-run` lists them, and
 under a scope names each one the run would skip, with the line the run prints.
@@ -392,12 +505,13 @@ The full guide is [import and export](10-data.md).
 | --- | --- |
 | No `import/` directory | `no import/ directory — nothing to import` |
 | File belongs to another env | `N data file(s) under import/<env>/ skipped — this run's env is '<env>'` |
+| File in a folder no import reads (`import/staging/sub/x.csv`) | `import/staging/sub/x.csv not loaded — an import reads import/<schema>/<table>.<ext>, or import/<env>/<schema>/<table>.<ext> for env dev or prod, and no folder deeper` |
 | Staging file failed to parse | `staging table X not imported — data file failed to parse` |
 | Entry cut by `--scope` | `X not imported — T is outside scope '<name>'`, naming the staging table or target that is |
 | A function reads a staging table no procedure loads | `X has no loader procedure — function F reads it but is not run` |
 | A procedure reads a staging table it does not load | `P reads X but is not called — L is its loader` |
 
-`import --dry-run` prints the same warnings. This is what makes the wrong-`-e` trap visible: a run that seeds no rows now says so instead of reporting a clean, empty success. What the run cannot do safely is refused instead, before anything is truncated: a `-n` that selects no data file, a data file outside `import.staging`, a staging table with two equal claims to its loader, and — under `--scope` — a staging table the scope keeps whose loader procedure it leaves out, since a database built with that scope has no such procedure:
+`import --dry-run` prints the same warnings. This is what makes the wrong-`-e` trap visible: a run that seeds no rows now says so instead of reporting a clean, empty success. (Before 0.25 a file in a deeper folder was reported as another env's, as though some `-e` could load it — or, under an env folder, loaded with its extra folder ignored: `import/dev/staging/sub/y.csv` into `staging.y`.) What the run cannot do safely is refused instead, before anything is truncated: a `-n` that selects no data file, a data file outside `import.staging`, a data file whose target the design declares as a view, materialized view or sequence, a staging table with two equal claims to its loader, and — under `--scope` — a staging table the scope keeps whose loader procedure it leaves out, since a database built with that scope has no such procedure:
 
 ```
 import refused: scope 'imp' leaves out the loader of these staging tables, so a database built with it has no such procedure:
@@ -405,7 +519,7 @@ import refused: scope 'imp' leaves out the loader of these staging tables, so a 
 Add each loader to the scope, or leave its staging table out of the scope too.
 ```
 
-The real run also refuses the wrong database before it truncates: one marked prod under `-e dev`, and one [pinned](#scope-guard) to another scope. `--dry-run` reads no database, so it checks neither.
+The real run also refuses the wrong database before it truncates: one marked prod under `-e dev`, and one [pinned](#scope-guard) to another scope. `--dry-run` checks both whenever a database is configured, and stays offline when none is.
 
 ---
 
@@ -437,8 +551,12 @@ engine.
 The source must be a **PostgreSQL** project — it is the only dialect dbd reads
 into columns and constraints. Tables come with their keys, foreign keys,
 `CHECK` constraints, indexes, identity and `serial` columns (numbered by the
-target), generated columns (computed by it), defaults and comments — a foreign
-key and a `CHECK` with their names (`CONSTRAINT [people_amt_ck] CHECK (…)`); views and
+target), generated columns (computed by it), defaults and comments — each key
+with its name (`CONSTRAINT [people_amt_ck] CHECK (…)`): a primary key on SQL
+Server and SQLite (MySQL names every primary key `PRIMARY`, so the name is
+reported), a UNIQUE, a foreign key and a `CHECK` — a key named on its column
+(`id int constraint t_pk primary key`) included, though a column-level
+`REFERENCES` loses its name; views and
 materialized views as `CREATE VIEW` — a materialized view becomes a plain view,
 reported. On MySQL and SQL Server a view's query and a `CHECK` expression are
 passed through untranslated and reported. On SQLite both are written again from
@@ -471,7 +589,7 @@ so the output is always a complete schema. Each loss marked ⚠ below is reporte
 | `varchar(n)` | `VARCHAR(n)`; past 16,383, `MEDIUMTEXT`/`LONGTEXT` ⚠ | `nvarchar(n)`; past 4,000, `nvarchar(max)` ⚠ | `TEXT` |
 | `char(n)` | `CHAR(n)`; past 255, `VARCHAR(n)` ⚠; past 16,383, text ⚠ | `nchar(n)`; past 4,000, `nvarchar(max)` ⚠ | `TEXT` |
 | `bytea` | `LONGBLOB` | `varbinary(max)` | `BLOB` |
-| `numeric(p,s)` | `DECIMAL(p,s)`, at most 65 digits with 30 after the point ⚠ | `decimal(p,s)`, at most 38 digits ⚠ | `NUMERIC` (⚠ past 15 digits) |
+| `numeric(p,s)` | `DECIMAL(p,s)`, at most 65 digits with 30 after the point ⚠ | `decimal(p,s)`, at most 38 digits ⚠ | `NUMERIC` (⚠ past 15 significant digits with a fraction, or 18 whole) |
 | `numeric` with no precision | `DECIMAL(65,30)` ⚠ | `decimal(38,10)` ⚠ | `NUMERIC` ⚠ |
 | `text[]` | `JSON` ⚠ | `nvarchar(max)` ⚠ | `TEXT` ⚠ |
 | `jsonb` | `JSON` | `nvarchar(max)` ⚠ | `TEXT` ⚠ |
@@ -495,6 +613,13 @@ so the output is always a complete schema. Each loss marked ⚠ below is reporte
 | `text` or unbounded `varchar` in a key | `VARCHAR(255)` ⚠ | `nvarchar(450)` ⚠ | `TEXT` |
 | a row wider than the target stores | the widest non-key `VARCHAR`/`CHAR` → text ⚠ (65,535 bytes) | the widest `nchar` → `nvarchar` ⚠ (8,060 bytes) | — |
 | defaults | literal without its `::cast`; `now()` → `CURRENT_TIMESTAMP(n)` at the column's precision, `current_date`; `gen_random_uuid()` → `(UUID())` ⚠; any other left out ⚠ | literal; `now()`, `current_date`, `gen_random_uuid()` → `NEWID()`; any other left out ⚠ | literal; `now()`, `current_date`, `gen_random_uuid()`; any other left out ⚠ |
+| a clock default on a `time` column (`now()`, `current_time`, `localtime`) | `(CURRENT_TIME(n))` | `CONVERT(time, SYSDATETIME())` | `CURRENT_TIME` |
+| a primary key's name | `PRIMARY` ⚠ | kept | kept |
+| `UNIQUE NULLS NOT DISTINCT` | `UNIQUE` ⚠ | `UNIQUE` (SQL Server's treats NULLs as equal) | `UNIQUE` ⚠ |
+| a foreign key's `DEFERRABLE INITIALLY DEFERRED` | checked at once ⚠ | checked at once ⚠ | kept |
+| a foreign key's `MATCH FULL` | `MATCH SIMPLE` ⚠ | `MATCH SIMPLE` ⚠ | `MATCH SIMPLE` ⚠ |
+| an `EXCLUDE` constraint | left out ⚠ | left out ⚠ | left out ⚠ |
+| a column's `COLLATE` | the target's default ⚠ | the target's default ⚠ | the target's default ⚠ |
 | a foreign key to an `external:` or out-of-scope table | left out ⚠ | left out ⚠ | left out ⚠ |
 
 ⚠ = a real loss of meaning, and therefore reported. A faithful mapping is not
@@ -519,15 +644,15 @@ and SSMS read — SQL Server needs `CREATE SCHEMA` and `CREATE VIEW` each alone 
 a batch. `GO` is not T-SQL, so split the script on it before sending it through
 a driver.
 
-Still not reported: an identity column's `START`/`INCREMENT` options; lost
-precision or time zones (`timestamptz` → `DATETIME(6)` on MySQL and `TEXT` on
+Still not reported: an identity column's `START`/`INCREMENT` options; a lost
+time zone or length (`timestamptz` → `DATETIME(6)` on MySQL and `TEXT` on
 SQLite, `varchar(n)` → `TEXT` on SQLite); an index key longer than MySQL's
 3,072 bytes or SQL Server's 900, which the target refuses (a `UNIQUE` on a
-`varchar(3000)` is 12,000 bytes on MySQL); and a view's column list —
-`CREATE VIEW v (a, b)` comes out with the query's own column names on every
-target. A MySQL `time DEFAULT now()` is still written `CURRENT_TIMESTAMP`, which
-MySQL refuses. On SQLite a generated column's expression and an index predicate
-are still copied verbatim (reported). The MySQL and SQL Server output is written
+`varchar(3000)` is 12,000 bytes on MySQL); a SQL Server `UNIQUE` over a
+nullable column, which admits one NULL where PostgreSQL admits many; and a
+view's column list — `CREATE VIEW v (a, b)` comes out with the query's own
+column names on every target. On SQLite a generated column's expression and an
+index predicate are still copied verbatim (reported). The MySQL and SQL Server output is written
 from documented syntax, not run against a server. The full mapping and the report format are in
 [other dialects](13-other-dialects.md#dbd-emit).
 
@@ -548,7 +673,7 @@ dbd combine --scope hub --deps include  # Expand to the dependency closure first
 
 **In the project's dialect.** The files are concatenated as written, and the statements dbd generates around them follow `source.dialect`: `CREATE SCHEMA IF NOT EXISTS` for PostgreSQL; for T-SQL a guarded `IF SCHEMA_ID(N'x') IS NULL EXEC(N'CREATE SCHEMA [x]');`, with every entity's DDL then ending its own batch with `GO` — SQL Server needs `CREATE VIEW`, `CREATE PROCEDURE` and `CREATE TRIGGER` first in their batch, and a file that already ends in `GO` keeps its own; nothing for MySQL and SQLite, which have no schemas. Extensions and roles are PostgreSQL-only, so in a T-SQL, MySQL or SQLite script each becomes a comment saying it was not created. A file that does not parse is left out without a message — run `dbd inspect` first.
 
-**The `search_path` apply runs.** On a PostgreSQL project every `SET search_path` in the output has `public` appended, exactly as `apply` appends it before running a file — extensions are often installed in `public` — and a file that states no path gets the [`source.search_path`](03-design-yaml.md#search_path) one ahead of it (`SET search_path TO "app", "public";`), as `apply` runs it, so `psql -f init.sql` succeeds where `apply` does and creates each object where `apply` would. `-f` must resolve inside the project, as for `emit`; a bare name resolves against the project root.
+**The `search_path` apply runs.** On a PostgreSQL project, after each top-level `SET search_path` whose path leaves `public` out, the output gets a statement of its own setting the same path with `public` added, exactly as `apply` runs the file — extensions are often installed in `public` — and a file that states no path gets the [`source.search_path`](03-design-yaml.md#search_path) one ahead of it (`SET search_path TO "app", "public";`), so `psql -f init.sql` succeeds where `apply` does and creates each object where `apply` would. The file's own text is copied unchanged: the statements are found in the parse tree, so a function's `SET search_path TO ''` clause, a body or a string literal is never touched. `-f` must resolve inside the project, as for `emit`; a bare name resolves against the project root.
 
 ---
 
@@ -576,6 +701,12 @@ What DBML has no syntax for travels where DBML keeps it, so `init --from-dbml` c
 - **A SQL value keyword default** — `current_date`, `current_user`, … — is written as an expression (`` [default: `current_date`] ``), decided from its parse tree, so it does not come back as the string `'current_date'`.
 - **An enum column's type** is written schema-qualified, as the table's `search_path` resolves it (`app.mood`), so the rebuilt DDL names the type that exists.
 - **A CHECK's name** comes back with it: `init --from-dbml` writes `CONSTRAINT "people_age_ck" CHECK (age >= 0)`.
+- **An index's method** goes in its `type:` setting (`[type: gin]`), and its `INCLUDE` columns, operator classes and storage parameters in its note (`include: a, b`, `opclass: -, text_pattern_ops` — `-` for a key's default — and `with: fillfactor = 70`).
+- **A named primary key** is a `pk` entry in the `indexes` block with its name (`id [pk, name: 'people_pk']`), and **a named foreign key** a named Ref (`Ref "people_org_fk": …`). PostgreSQL's default names — `<table>_pkey`, `<table>_<columns>_fkey` — are left out, so a key nobody named stays unnamed and the database names it again.
+
+**Reading DBML.** `init --from-dbml` and `merge --from-dbml` read a document the way @dbml/core reads it — dbd's own output and the DBML a person writes: table aliases (`Table app.users as U`), an inline `[ref: > t.c]`, notes and settings that span lines, `Note { … }` blocks, one-line tables, a `pk` index entry, `Ref name:` and `Ref name { … }`, an index's `type:`, and a table header's `[note: …]`. A one-to-one `Ref: a - b` puts the foreign key on `b`, as @dbml/core's SQL does; an inline `[ref: - t.c]` puts it on its own column. What dbd cannot build as written is refused, with why, rather than guessed: a many-to-many `<>` Ref, which has no foreign key (@dbml/core builds a junction table for it), and a table taking a `TablePartial`'s columns. A note is dedented as @dbml/core dedents one — blank leading lines dropped, the indentation its lines share removed — except that the line a closing `'''` sits on is layout, not a trailing line break. A one-line note loses its leading whitespace, and a quote escaped inside a quoted name (`"we\"ird"`) is not unescaped.
+
+DBML has no syntax for a foreign key's deferral or `MATCH FULL`, an `EXCLUDE` constraint or a column's collation, so `dbd dbml` leaves them out and they do not survive the round trip.
 
 `checks` blocks need `@dbml/core` 5.0 or later and custom column properties 9.1 or later; tooling older than that cannot read a document that uses them.
 
@@ -613,9 +744,9 @@ dbd graph --scope hub              # Only the 'hub' scope's working set
 
 Output: `{ "nodes": [...], "edges": [...], "layers": [...], "scope": "hub" | null }`
 
-`--scope`/`--deps` filter the graph to the scope's working set (closure under `include`). `-n` (entity subgraph) and `--scope` compose; a `-n` that names nothing, or something outside the scope, is an error rather than an empty graph.
+`--scope`/`--deps` filter the graph to the scope's working set (closure under `include`). `-n` (entity subgraph) and `--scope` compose; a `-n` that names nothing, something outside the scope, or an `external:` table — dbd has no DDL for it, so it is no node of the graph — is an error rather than an empty graph.
 
-Everything but the JSON goes to stderr, so `dbd graph | jq` — and `dbd graph -v | jq` — always parses: a file that does not parse is named there (`⚠ ./ddl/table/app/broken.ddl could not be parsed, so app.broken is left out: …`), as `dbml` and `diagram` name it, and so is `-v`'s count (`4 nodes, 2 edges, 3 layers`).
+Everything but the JSON goes to stderr, so `dbd graph | jq` — and `dbd graph -v | jq` — always parses: a file that does not parse is named there (`⚠ ./ddl/table/app/broken.ddl could not be parsed, so app.broken is left out: …`), as `dbml` and `diagram` name it, and so is `-v`'s count (`4 nodes, 2 edges, 3 layers`). That entity is left out of the nodes, layers and edges alike, as the warning says.
 
 **`scope` (added in v0.12.0)** names the scope the graph was narrowed to, or is `null` for an unscoped run. It lives in the JSON rather than being printed beside it, because stdout here is a contract (`dbd graph | jq`) — and a graph silently missing a schema is indistinguishable from a complete one. Every other command that takes a scope — `inspect`, `apply`, `deploy`, `import`, `reconcile`, `diff`, `combine`, `emit`, `dbml`, `diagram`, `export`, `refresh`, `policies` and `reset`, and their dry runs — prints `scope '<name>': <kept> of <total> entities` instead (`diff --json` prints it on stderr, keeping stdout JSON); unscoped runs print nothing.
 
@@ -678,24 +809,30 @@ dbd reset --scope hub --dry-run    # Only the objects the 'hub' scope occupies
 **The guards** read the database, not the flags of this run: a reset is refused
 when the bookkeeping row says the database is `prod` (rows older versions wrote
 as `production` included) — and any database applied without `-e dev` is — or
-when it has reached version 1 or later, in any environment:
+when it records version 1 or later — a released project's database, in any
+environment, whether or not a migration has run on it:
 
 ```
 reset is blocked — database is marked as prod. Use --force to override.
-reset is blocked — database has applied migrations. Use --force to override.
+reset is blocked — the database is versioned at v3 (a released project's database). Use --force to override.
 ```
 
-**A full reset forgets the database's record of the project** — its env,
-version and scope pin, the bookkeeping row the guards read — because it leaves
-nothing of the project behind, and the next apply records the database afresh.
-That is how a dev database first built without `-e` (and so marked prod) is
-rebuilt as dev: `dbd reset --force`, then a run with `-e dev`, which the
-[environment guard](#global-options) would otherwise refuse. A full reset is
-`--scope all`, or no `--scope` when `design.yaml` defines no `default:` scope; a
-reset of any other scope, `default` included, keeps the record, as it keeps the
-rest of the project.
+After a rename of `project.name`, the guards read the record the old name left,
+and the refusal names that project (see
+[renamed projects](#renamed-projects)).
 
-**`--dry-run` checks the same guards** — prod, applied migrations, and the
+**A reset of everything the database was built with forgets its record of the
+project** — env, version and scope pin, the bookkeeping row the guards read —
+because it leaves nothing of the project behind, and the next apply records the
+database afresh. That is how a dev database first built without `-e` (and so
+marked prod) is rebuilt as dev: `dbd reset --force`, then a run with `-e dev`,
+which the [environment guard](#global-options) would otherwise refuse.
+"Everything" is the `all` scope, or the scope the database is pinned to — so a
+design with a `default:` scope, which builds and resets under it, forgets the
+record on a bare `reset --force` too. A reset of a narrower scope keeps the
+record, as it keeps the rest of the project.
+
+**`--dry-run` checks the same guards** — prod, a versioned database, and the
 [scope pin](#scope-guard) — whenever a database is configured: `-d`,
 `$DATABASE_URL`, or a `target.url` that resolves (a `$VAR` that is unset does
 not). `--force` and `--allow-scope-change` clear them as they clear the real
@@ -703,7 +840,7 @@ run's, and a configured database that cannot be reached fails to connect rather
 than falling back to a preview. With no database configured, the dry run is an
 offline preview of the script.
 
-**Entity-level by default.** `reset` drops the project's own objects individually — functions/procedures (every overload, via a `DROP ROUTINE` block), materialized views (before the views/tables they read), views, tables, sequences and enums — in reverse dependency order, with `CASCADE` on a full reset. It does **not** `DROP SCHEMA` or `DROP EXTENSION`, so `public`, custom schemas, and installed extensions (e.g. `pgvector`) survive untouched; the next `dbd apply` repopulates the schemas. This avoids churning extensions and never aborts on `public`. The bookkeeping of what it dropped goes with it: the project's recorded migrations, the `dbd.matview_stamps` row of every materialized view the reset removed — by name, with its schema, or by `CASCADE` — so a later matview of the same name is not vouched for by a stale stamp, and on a full reset the record of the project (above).
+**Entity-level by default.** `reset` drops the project's own objects individually — functions/procedures (every overload, via a `DROP ROUTINE` block), materialized views (before the views/tables they read), views, tables, sequences and enums — in reverse dependency order, with `CASCADE` on a full reset: one under the `all` scope — `--scope all`, or no `--scope` when the design defines no `default:` scope. It does **not** `DROP SCHEMA` or `DROP EXTENSION`, so `public`, custom schemas, and installed extensions (e.g. `pgvector`) survive untouched; the next `dbd apply` repopulates the schemas. This avoids churning extensions and never aborts on `public`. The bookkeeping of what it dropped goes with it: the project's recorded migrations, the `dbd.matview_stamps` row of every materialized view the reset removed — by name, with its schema, or by `CASCADE` — so a later matview of the same name is not vouched for by a stale stamp, and on a reset of everything the database was built with the record of the project (above).
 
 **It says what it dropped**, counted by kind, with roles named — or that it found
 nothing — read from the database before and after the drop, since every drop is
@@ -725,7 +862,12 @@ Reset dropped nothing — none of the project's objects were in the database.
 `sqlite`. It defaults to the design's target key — the first `target:` entry —
 so a Supabase project's schemas are protected without passing anything; pass
 `--target` to override. A design whose target has no reset (Convex) is refused
-before anything connects. Every role the design declares — `ddl/role/` files as
+before anything connects, and so is a target that is not the kind of database
+the connection reaches, since the target picks the dialect of the drops:
+
+```
+Error: reset: --target postgres does not match the database — the connection is SQLite. The target picks the dialect of the drops, so it must be the kind of database the connection reaches: pass --target sqlite, or drop --target to use the design's.
+``` Every role the design declares — `ddl/role/` files as
 well as the target's `roles:` — is dropped on a full reset, and only when the
 target is `postgres`.
 
@@ -733,8 +875,8 @@ target is `postgres`.
 with foreign keys deferred to its commit (`PRAGMA defer_foreign_keys = ON`):
 SQLite's DDL is read verbatim, so dbd has no references to order the drops by.
 SQLite has no schemas or extensions, so `--schemas`, `--extensions` and
-`--clean` change nothing there, and say so. The prod and migrations guards
-apply as on PostgreSQL.
+`--clean` change nothing there, and say so. The prod and versioned-database
+guards apply as on PostgreSQL.
 
 **Roles and the grants dbd made.** PostgreSQL refuses to drop a role that still
 holds a privilege, so before the `DROP ROLE`s the reset revokes what `apply`
@@ -824,6 +966,10 @@ leaves the recorded version where it is when no migration under `snapshots/`
 bridges the gap; or the database is ahead of the latest snapshot, applied from
 a newer design.
 
+A database [pinned](#scope-guard) to a scope is noted — `note: this database is pinned to scope
+'hub' — it was built with that scope's entities, not the whole design.` — since the versions are
+the whole project's.
+
 Use `dbd apply` to execute pending migrations. There is no separate migrate --apply.
 
 ---
@@ -908,10 +1054,14 @@ scope 'hub': 4 of 7 entities
 ```
 
 With a database configured, the dry run also asks it what `apply --dry-run`
-asks — the scope pin and the version guard — and lists the pending migrations
-after the entity count (`No pending migration to run (…)` when there are none).
-An unreachable configured database fails the preview; with none configured it
-stays offline.
+asks — the scope pin, the environment guard, the version guard and the pending
+migrations' unresolved TODOs — and lists the pending migrations after the entity
+count, in the order the run takes them (`No pending migration to run (…)` when
+there are none). An unreachable configured database fails the preview, and a
+SQLite file that does not exist yet is not created; with none configured it
+stays offline. Like `apply`, the run and its preview name each DDL file that
+states no `SET search_path`, and a run without `-e` that promotes a dev
+database to prod says so.
 
 ---
 
@@ -941,7 +1091,9 @@ design's `apply.before` and `apply.after` hooks and then its `grants:`, scoped a
 them. `apply.before` runs after every gate — the `--allow-destructive` refusal included, so a
 refused run fires no hook — and before the first write; `apply.after` after the writes and the
 pg_cron sync; the grants last. A hook the scope skips is named before the run, and `--dry-run`
-names it too and refuses a hook file that is missing. The summary counts the hooks that ran:
+names it too, refuses a hook file that is missing, and lists after the plan the hooks and grants
+the run goes on to (`  run apply.after sql/realtime.sql`, `  grant on app: app_reader (usage,
+select)`). The summary counts the hooks that ran:
 
 ```
 Reconciled — 2 created, 0 altered, 3 re-applied, 0 re-stamped, 0 pruned, 3 hook script(s) run.
@@ -958,7 +1110,10 @@ around the whole run is not possible: an enum value added by `ALTER TYPE … ADD
 until its transaction commits, and a default or `CHECK` naming it later in the run would fail.)
 
 The diff is scoped to the schemas the design declares, so reconcile never touches tables in other
-schemas. Two kinds of destruction each need an explicit opt-in:
+schemas, and it leaves out everything an extension owns — a table, view, sequence, enum or function
+an extension created is the extension's, never drift or an orphan. Two kinds of destruction each
+need an explicit opt-in, and without it the refusal lists each destructive change by entity
+(`app.people: drops column nickname`) and nothing else:
 
 - **`--allow-destructive`** — drop a *column*, constraint, foreign key, or index from a managed table,
   or remove a *value* from an enum (see **Enum value removal** below).
@@ -995,7 +1150,9 @@ added (`ADD FOREIGN KEY …`, Postgres auto-names it), and an FK the design drop
 shape (unique flag, access method incl. `USING gin/gist/brin/hash`, ordered columns) so a same-shape
 index under a different name is no change; a declared index the live DB lacks is added
 (`CREATE INDEX IF NOT EXISTS …`) and one the design dropped is removed (`DROP INDEX …`, gated behind
-`--allow-destructive`). Indexes that merely back a PK/UNIQUE constraint are ignored on both sides.
+`--allow-destructive`). An index that backs a PK/UNIQUE constraint is ignored on both sides — told
+apart by the constraint's name, not its columns, so a separate index over a key's columns is
+compared like any other, and dropping it from the database is seen.
 Check constraints converge too, matched by canonicalized expression rather than name (an authored
 `status in ('a','b')` matches the `status = ANY (ARRAY[…])` Postgres reports).
 
@@ -1004,8 +1161,8 @@ Check constraints converge too, matched by canonicalized expression rather than 
 the managed views that read a table with a column of the enum — and the views over those — are
 dropped (deepest first), column defaults are taken off, the type is renamed aside and recreated
 with exactly the declared values in declared order, each dependent column is moved across with
-`USING <col>::text::<type>` (`::text[]` for an array column), the defaults are restored, and the
-displaced type is dropped. An index that reads the column — a partial index's predicate, an
+`USING <col>::text::<type>` (`::text[]` for an array column), the defaults are restored, the type's
+`COMMENT ON TYPE` is carried over, and the displaced type is dropped. An index that reads the column — a partial index's predicate, an
 expression key — is dropped and rebuilt around the swap; left in place, Postgres re-reads it
 against the renamed type and fails with `operator does not exist`. Only views are dropped: a view is what blocks `ALTER COLUMN … TYPE`, and
 tables, functions and procedures that merely reference the table are never dropped. The dropped
@@ -1014,11 +1171,25 @@ behind `--allow-destructive`.
 
 The recreation runs as one statement batch, in a single implicit transaction, so every way it can
 fail undoes the whole recreation and names the object — and stops the run, with the steps before it
-applied: a row still holding the removed value fails the cast, a default naming a removed value
-fails the `SET DEFAULT`, and a dependent view dbd does not manage fails the `ALTER … TYPE`. A dependent
-*materialized view* is declined rather than attempted — dbd never auto-drops one — and reported with
-the manual steps. (This is distinct from an *orphaned* enum, i.e. the whole type gone from the
+applied: a row still holding the removed value fails the cast, naming its column; a default
+naming a removed value fails the `SET DEFAULT`; and a dependent view dbd does not manage fails the
+`ALTER … TYPE`. (This is distinct from an *orphaned* enum, i.e. the whole type gone from the
 design, which is only ever warned about.)
+
+A *materialized view* in the database that reads the column — directly or through views — blocks
+the swap, and dbd never drops one. So the run refuses, before anything is written and under
+`--dry-run` too, with a non-zero exit, naming each one and the way through:
+
+```
+reconcile cannot remove enum value 'archived' from app.mood: materialized view app.people_stats reads a column of that type. dbd never drops a materialized view, so nothing was changed. To go on:
+  1. drop it by hand: DROP MATERIALIZED VIEW "app"."people_stats";
+  2. re-run `dbd reconcile --allow-destructive`: it removes the value and re-creates, from the design, the materialized views it declares
+```
+
+The question is asked of the database, not the design: once the matview is dropped, the re-run
+removes the value and re-creates the matview from its DDL. Before 0.25 reconcile decided from the
+design, planned nothing for the enum, warned, and exited 0 "Reconciled" — and following its advice,
+the re-run re-created the matview and declined again.
 
 **Primary keys and unique constraints** are matched by their **columns**, never by their name, so the
 design's unnamed `primary key (a, b)` and the live DB's auto-named `t_pkey` over the same columns
@@ -1058,7 +1229,8 @@ The desired schema is parsed from your DDL; the live schema is introspected. dbd
 representation noise so only real drift is reported: type aliases and array/date-time
 spellings (`int4` → `integer`, `text[3]` → `text[]`, `time` → `time without time zone`),
 default casts (so a `nextval('s')` default matches the `nextval('s'::regclass)` Postgres
-reports), enum qualification, PK/UNIQUE-backing indexes, FK `NO ACTION` defaults and
+reports), enum qualification, PK/UNIQUE-backing indexes (matched by the constraint's name, so a
+dropped index over a key's columns is still drift), FK `NO ACTION` defaults and
 auto-generated FK names, and CHECK-expression *spelling* via the Postgres parser — parens
 and case, `IN` ↔ `= ANY (ARRAY[…])`, casts on literals, `BETWEEN` ↔ the `>=`/`<=` pair
 Postgres stores in its place, casts on `ARRAY[…]` constructors, and `AND`/`OR` nesting.
@@ -1066,7 +1238,9 @@ A CHECK expression that can't be parsed is still shown, flagged `advisory` so yo
 by hand.
 
 Under `--scope`, `diff` compares the scope's working set and refuses on a dependency
-gap, like `apply`.
+gap, like `apply`. A database [pinned](#scope-guard) to another scope is noted, not
+refused — what that scope does not build would otherwise read as missing with no word
+of why. Objects an extension owns are left out on both sides.
 
 **Coverage:** diff covers **tables and enums** (their columns, keys, constraints,
 indexes, column comments and values) plus **materialized-view drift** — each
@@ -1125,6 +1299,7 @@ dbd export --name config.lookups        # One table — it must be in export:, w
 dbd export --format tsv                 # TSV format
 dbd export --format jsonl               # JSONL format
 dbd export -n activity.hook_events -f jsonl -o import   # → import/activity/hook_events.jsonl
+dbd export -n core.accounts -o import/staging            # → import/staging/accounts.csv
 dbd export --scope hub                  # Only what the 'hub' scope builds
 ```
 
@@ -1136,6 +1311,21 @@ same-named tables apart: before 0.25 `-o` wrote every file flat, and the second 
 overwrote the first. Generated columns are left out of every export, as an import refuses a file
 that sets one. `-f`/`--format` stays the format (`csv`/`tsv`/`jsonl`, default `csv`; any other is
 refused rather than written as CSV); a per-table `format` under `export:` wins over it.
+
+**Into an import schema folder.** When `-o` names a schema folder of the project's own `import/`
+tree — `import/<schema>`, or `import/<env>/<schema>` — each file is written there as
+`<table>.<format>`, the way that import reads it: `export -n core.accounts -o import/staging`
+writes `import/staging/accounts.csv`, which the next import loads into `staging.accounts`. That is
+how a long-running system's data moves to a new database (see
+[import and export](10-data.md)). Written under a schema folder of its own instead —
+`import/staging/core/accounts.csv` — the file would sit where no import reads. Two exported tables
+that would share one file there (`core.accounts` and `audit.accounts`) are refused before anything
+is written; export them one at a time with `-n`, or to `-o import` to keep each under its schema.
+
+A JSONL file writes every column's key; `null` is SQL NULL, and a json/jsonb column holding the
+JSON value `null` is written `{"$json": null}`, which an import reads back as that value. A SQLite
+BLOB is written as `\x` and its bytes in hex, as PostgreSQL writes a `bytea`, in every format, and
+read back into a BLOB column on import.
 
 With no `export:` list, every table is exported. With one, only what it lists — tables, and
 views or materialized views, which export the rows their query returns. A `-n` that selects
@@ -1202,9 +1392,11 @@ routine (`ddl/role/<name>.ddl` too, with `--roles`). Extensions and schemas get 
 dbd reads neither from `ddl/`: the extensions go in the target's `extensions:` list with their
 `schema:`, the schemas under `schemas:`, and a table a foreign key reaches outside what was
 captured is declared `external:`, so the reference resolves. The DDL is re-runnable
-(`IF NOT EXISTS`, `OR REPLACE`), so the brownfield path — reverse, then `dbd apply` to the same
-database — records the version and changes nothing, and the `dbd diff` after it is empty; applied
-to a fresh database, the project builds the same schema.
+(`IF NOT EXISTS`, `OR REPLACE`; an enum inside a `DO … EXCEPTION WHEN duplicate_object` block),
+so the brownfield path — reverse, then `dbd apply` to the same database — records the version and
+changes nothing, and the `dbd diff` after it is empty; applied to a fresh database, the project
+builds the same schema. A capture narrowed by `--schema` does too, on a database that has what the
+run names as needed (below).
 
 ```sh
 dbd init --from-db postgres://user:pass@host/db   # new project from a live Postgres DB
@@ -1267,6 +1459,21 @@ an extension installed in one; a foreign key into one makes its table `external:
   external: auth.users — a foreign key references it, outside the captured schemas
 ```
 
+A schema nothing was captured in — an empty `public`, say — is left out of `schemas:` unless
+`--schema` named it (`left out: schema `public` — nothing in it to capture`): listed, it would
+claim a schema the project holds nothing in, which `reset --clean` would drop.
+
+**A capture of some schemas says what it needs from the rest.** Under `--schema`, an extension the
+captured objects use is declared in `extensions:` when it is installed in `public` or in a
+captured schema. Anything else they need from a schema left out — a type, a function, a table a
+view reads, an extension installed there — is printed as a `needs:` line naming what uses it,
+since a database without it cannot take the project (Supabase's platform schemas aside, which a
+Supabase database provides):
+
+```
+  needs: type `util.mood`, in schema `util`, which is left out — used by app.child; a database without it cannot take this project (capture it with --schema util, or create it first)
+```
+
 **Secrets stay out of the repo.** The generated `design.yaml` target URL is written as the
 literal `$DATABASE_URL` env reference — never the connection string you passed.
 
@@ -1288,7 +1495,32 @@ constraints, indexes incl. `USING gin/gist/brin/hash`, partial (`… WHERE …`)
 **materialized views** (definition + indexes from `pg_matviews`, written to
 `ddl/materialized_view/<schema>/<name>.ddl`),
 and **functions & procedures** (full bodies, captured verbatim via `pg_get_functiondef`;
-overloads of the same name share one file; extension-provided routines are excluded).
+overloads of the same name share one file).
+
+**Triggers** are written into their table's file after the table — `CREATE OR REPLACE TRIGGER`,
+or `DROP TRIGGER IF EXISTS` then `CREATE CONSTRAINT TRIGGER` for a constraint trigger, which
+PostgreSQL will not replace — and a view's `INSTEAD OF` triggers into the view's file, which is
+then applied after the function they fire. A trigger that is disabled, or enabled for replica
+sessions only or always, is named, since the file creates it plainly enabled. **EXCLUDE constraints**, a column's **collation** (`COLLATE "C"`), and a foreign key's
+`DEFERRABLE`, `INITIALLY DEFERRED` and `MATCH FULL` are captured as written, and `diff` and
+`reconcile` compare and converge them.
+
+**Everything an extension owns is left out** — tables, views, materialized views, sequences,
+enums, functions and schemas — since the extension creates it; captured, a `reset` would fail on
+it. `diff` and `reconcile` leave the same objects out.
+
+**What the model cannot hold is named, not weakened in silence.** A partitioned table is captured
+as one plain table holding every row, its partitions folded into it, with a warning naming its
+partition key and each partition's bounds — partitions are not created, and anything defined on a
+partition alone is not captured. A constraint that is `NOT VALID`, `NOT ENFORCED` or `NO INHERIT`
+is captured as an ordinary one, and named; so are a deferrable primary key or UNIQUE, an
+`UNLOGGED` table (captured logged) and a table that inherits another (captured as a plain table
+with every column it has):
+
+```
+  warning: table app.scratch is UNLOGGED in the database — dbd's table model has no persistence, so it is captured as an ordinary, logged table: …
+  warning: constraint booking_room_ck on app.booking is NOT VALID in the database — the rows already there were never checked against it. …
+```
 A view's or materialized view's own comment is written as `COMMENT ON VIEW` /
 `COMMENT ON MATERIALIZED VIEW` — except a drift stamp an earlier dbd left as a matview's
 comment, which is dbd's and not yours. Every key is written with its name —
@@ -1296,8 +1528,9 @@ comment, which is dbd's and not yours. Every key is written with its name —
 CHECKs, the names Postgres generated (`users_pkey`) too — so the rebuilt design matches the
 database name for name. An enum's comment is kept, as `COMMENT ON TYPE`.
 
-The reversed DDL is fully qualified and opens with no `SET search_path`, so `dbd inspect` notes
-that on every file; the note is harmless here, since no name in the file depends on the path.
+The reversed DDL is fully qualified and opens with no `SET search_path`, so `dbd inspect`,
+`apply` and `deploy` note that on every file; the note is harmless here, since no name in the file
+depends on the path.
 
 **Roles** are captured only with the opt-in **`--roles`** flag (they are cluster-global, not
 owned by the database). System/platform roles are always filtered out — superusers, `pg_*`,
@@ -1318,10 +1551,13 @@ of those appear. What `dbd dbml` writes comes back: CHECK constraints (from `che
 their names, identity columns with `ALWAYS` kept apart from `BY DEFAULT`, `serial` columns,
 generated columns, a column's `UNIQUE`, partial and expression indexes and their key order, an
 enum column's schema-qualified type, a SQL value keyword default (`current_date`), and a column
-comment's line breaks. A table-level UNIQUE comes back as its named constraint. An enum's comment
-is lost — DBML cannot express one. Every unnamed index comes back named `<table>_idx`, so a second unnamed index
-on one table collides on `apply`: name them in the DBML. dbd's reader takes a hand-written note as
-written, without the dedent @dbml/core applies.
+comment's line breaks. A table-level UNIQUE comes back as its named constraint, and so do a named
+primary key and a named foreign key; an index keeps its method, `INCLUDE` columns, operator classes
+and storage parameters. An enum's comment is lost — DBML cannot express one — and so are a foreign
+key's deferral and `MATCH FULL`, `EXCLUDE` constraints and collations. Every unnamed index comes
+back named `<table>_idx`, so a second unnamed index on one table collides on `apply`: name them in
+the DBML. A hand-written document is read as @dbml/core reads it, notes dedented included — see
+[reading DBML](#dbd-dbml).
 
 A stub table — one the document carries only because a foreign key lands on it, marked by the
 note `dbd dbml` gives it ("External entity — managed outside this project", "Defined in this
@@ -1336,7 +1572,7 @@ is a no-op since DBML has no roles.
 
 Not yet captured from a database:
 
-- **Triggers**, aggregates, operators, domains, composite types.
+- Aggregates, operators, domains, composite types; on SQLite, triggers.
 - dbd's own bookkeeping — the `dbd` schema (`dbd.meta`, `dbd.migrations`, `dbd.matview_stamps`)
   — is always excluded.
 
@@ -1416,17 +1652,25 @@ version that *would* be created, writing nothing.
 `merge` requires an existing project (it refuses if there's no `design.yaml`; use
 `init --from-db`). Because it edits nothing in the config but the version, it **warns** about
 what the database holds that `design.yaml` should declare and does not — a schema it wrote files
-for that is not under `schemas:`, an extension the target's `extensions:` does not list, and a
-table a foreign key reaches outside the captured schemas — so you can add each yourself:
+for that is not under `schemas:` (only those: a schema holding nothing it wrote draws no warning),
+an extension the target's `extensions:` does not list, and a table a foreign key reaches outside
+the captured schemas, unless the project builds that table itself — so you can add each
+yourself:
 
 ```
   warning: a foreign key references `billing.acct`, outside the captured schemas; declare it under external: in design.yaml
   warning: extension `pg_trgm` is installed in the database but not declared; add `{ name: pg_trgm, schema: ext }` to the target's extensions: list in design.yaml
 ```
 
-What `design.yaml` already declares draws no warning. On a Supabase database — or in a project
-whose target is `supabase` — Supabase's platform schemas are left out, as `init --from-db` leaves
-them out.
+What `design.yaml` already declares draws no warning. A table declared `external:` is never
+captured — it is somebody else's, and written as a project file `reset` would drop it — and is
+named instead (`left out: table `auth.users` — declared under external:`). A table's triggers are
+written into its file, as `init --from-db` writes them, so a merge no longer deletes the triggers
+from the table files it overwrites. What a file cannot carry — partitioning, `UNLOGGED`, a
+`NOT VALID` constraint — is warned about as `init --from-db` warns, and extension-owned objects
+are left out. On a Supabase database — or in a project whose target is `supabase` — Supabase's
+platform schemas are left out, as `init --from-db` leaves them out. Unlike `init --from-db`, a
+merge narrowed by `--schema` prints no `needs:` lines.
 
 **Managed databases & version safety.** When the target is a **dbd-managed** database (`dbd.meta`
 exists, or a legacy `_dbd_meta` in any schema), `merge` compares the database's applied version
@@ -1463,7 +1707,9 @@ format:
   gutter: 10                 # river keyword-gutter width (fits "inner join")
 ```
 
-Handles CREATE TABLE (full formatting), CREATE INDEX, SET, COMMENT ON. Inline column comments (`-- …` / `/* … */`) survive a CREATE TABLE reformat — they're recovered from the source and re-attached to the column they documented (trailing comments end-of-line, standalone comments on their own line above the column). Function/procedure `$$` bodies are preserved verbatim. SQLite `CREATE TRIGGER … BEGIN … END;` blocks are kept atomic (the inner statements aren't split or reformatted). A round-trip guard keeps the original text untouched for any statement the reformatter can't reproduce faithfully (same parsed AST, every comment retained), so formatting never changes what your SQL means or drops a comment.
+Handles CREATE TABLE (full formatting), CREATE INDEX, SET, COMMENT ON. Inline column comments (`-- …` / `/* … */`) survive a CREATE TABLE reformat — they're recovered from the source and re-attached to the column they documented (trailing comments end-of-line, standalone comments on their own line above the column).
+
+**Formatting changes layout and keyword case, and nothing else.** The file is read with PostgreSQL's own scanner and parser, through libpg_query: statement boundaries are the parser's (a `BEGIN ATOMIC … END` body is one statement; for a file it cannot parse whole — another engine's DDL — a `;` inside parentheses or inside a `CREATE TRIGGER`/`FUNCTION`/`PROCEDURE` `BEGIN … END` body, as SQLite writes triggers, ends nothing), and keywords are recased token by token. Every string literal of any kind (`E'…'`, `U&'…'`, `$$` and `$tag$` bodies), quoted identifier and comment is a single token, never split or recased. A statement's new layout is used only if it parses to the same tree — libpg_query's, deparsed; sqlparser's for SQL libpg_query cannot read — and every literal, body, quoted name and comment in it is byte-for-byte the same; failing that the statement is only recased, and failing that left exactly as written. A file the scanner cannot read at all (an unterminated string or comment) is left unchanged. Before 0.25 the hand-rolled splitter closed `E'it\'s; tricky'` at `\'`, broke the default across three lines, and split a `$tag$` body at its own `;`s. One tradeoff remains: a table holding a literal the layout engine would re-spell (`U&'…'`) is recased but not laid out.
 
 All three `keyword_case` modes do what they say, for every keyword in every statement: `preserve` leaves each keyword as written (it used to uppercase a lowercase file), and `upper` and `lower` reach `SET` and the column types of a table with a `serial` or `inet` column. Comments, string literals, quoted identifiers and `$$` bodies keep their case. `keyword_case` reaches every keyword the formatter writes, not only the statement's head: `GENERATED`, `ALWAYS`, `IDENTITY`, `STORED`, `MATCH`, `RESTRICT`, `ACTION`, `VALID`, `DATA`, index methods (`btree`, `hash`, `gin`, `gist`, `spgist`, `brin`) and built-in type names (`bool`, `int2`/`int4`/`int8`, `float4`/`float8`, `bytea`, `timestamptz`, `timetz`, `json`, `jsonb`, `inet`, `cidr`, `money`) are cased with their neighbours, so a column reads `generated by default as identity`, never `GENERATED by default as IDENTITY`.
 

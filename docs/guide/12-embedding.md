@@ -96,10 +96,19 @@ PostgreSQL, SQLite or Convex — and refuses MySQL and SQL Server URLs by name
 pass `&*adapter`. The concrete adapters are public too —
 `adapter::postgres::PostgresAdapter::new(url, project)` and so on.
 
+The PostgreSQL adapter makes one probe connection first, bounded at 5 seconds,
+so a server that cannot be reached fails fast with the reason and the
+`host:port` it tried — never the URL, which may hold a password. A SQLite URL
+creates its database file on connect; `connect_existing(url, project)` returns
+`None` instead when the file is not there, which is how a caller that must
+write nothing — a preview — asks a database without making one. Every other
+URL connects as `connect` does.
+
 An adapter of your own implements `DatabaseAdapter`. 0.25 adds one method you
 must write: `forget_project_meta()` deletes the database's record of the
-project — its env, version and scope pin — which a full `reset` now does, so
-the next apply records the database afresh. The rest arrive with defaults:
+project — its env, version and scope pin — which a `reset` of everything the
+database was built with now does (see [Reset](#reset)), so the next apply
+records the database afresh. The rest arrive with defaults:
 
 - `stamp_matview(qualified, stamp)` records a materialized view's drift stamp,
   and `forget_matview_stamps(qualified)` deletes the stamps of views the caller
@@ -107,9 +116,14 @@ the next apply records the database afresh. The rest arrive with defaults:
   (Postgres keeps them in `dbd.matview_stamps`). `live_matviews()` returns the
   deployed materialized views with their definition and indexes, which is how
   `apply` recognises one a brownfield database already has; none by default.
-- `truncate_table(table)` is the import's truncate step — `TRUNCATE TABLE`
-  unless overridden; SQLite runs `DELETE FROM`, Convex nothing, since its
-  import replaces the table.
+- `truncate_table(table)` empties one table — `TRUNCATE TABLE` unless
+  overridden; SQLite runs `DELETE FROM`, Convex nothing, since its import
+  replaces the table. `truncate_tables(tables)` is the import's truncate step,
+  given the staging tables in load order: by default one at a time through
+  `truncate_table`, referencing table first, naming the one that failed.
+  PostgreSQL overrides it with a single `TRUNCATE` of them all, since tables
+  linked by a foreign key cannot be emptied one by one, and names any table
+  outside the list that holds a key to one of them.
 - `existing_objects(objects)` says which of a list of `(kind, name)` exist.
   `reset` asks before and after it drops, so it reports what it dropped rather
   than what it ran — every drop is `IF EXISTS`. The default answers for tables
@@ -118,6 +132,20 @@ the next apply records the database afresh. The rest arrive with defaults:
   server where it holds anything, so `reset` can keep a role another database
   still uses. Roles are server-wide; the default, for a target without them, is
   none.
+- `other_projects_meta()` returns every other project's record in the
+  database — what the guards read for a renamed `project.name` (see
+  [Apply](#apply)). None by default: a store with a single record, Convex's,
+  reads it as this project's already.
+- `execute_project_script(sql, search_path)` runs a migration or hook script,
+  which may name tables bare, on a search path. The default runs it as written;
+  PostgreSQL opens it with `script::runnable_script`.
+- `matviews_reading_columns(columns)` lists the live materialized views that
+  read any of the given columns, directly or through views — what blocks
+  `reconcile`'s enum type swap. None by default.
+- `dependencies()` returns what objects need from other objects across schemas
+  and from extensions (`adapter::Dependency`, from `pg_depend` on PostgreSQL) —
+  what `init --from-db --schema` reads to declare extensions and print its
+  `needs:` lines. Nothing by default.
 
 ## Scope
 
@@ -169,35 +197,64 @@ println!("grants: {grants:?}");
 ```
 
 `apply(adapter, name, dry_run, scope, progress)` applies schemas, entities and
-pending migrations — on PostgreSQL in one transaction — then stamps new
-materialized views, syncs pg_cron refresh jobs and runs `apply.after`. `name`
-limits the run to one entity, and is refused when it names nothing the scope
-builds, as `resolve_name` says. `entities_to_apply(name, scope)` is what it
-would act on, behind the same gates and without a database — the list
-`dbd apply --dry-run` prints.
+pending migrations — on PostgreSQL in one transaction, with one exception below
+— then stamps new materialized views, syncs pg_cron refresh jobs and runs
+`apply.after`. `name` limits the run to one entity, and is refused when it
+names nothing the scope builds, as `resolve_name` says — and while migrations
+are pending, since a named run cannot run them and would record them as
+applied. `entities_to_apply(name, scope)` is what it would act on, behind the
+same gates and without a database — the list `dbd apply --dry-run` prints.
+`search_path_warnings(name, scope)` names each file in that list that states no
+`SET search_path`, with the path its names were resolved against — what
+`dbd apply` and `deploy` print before they run.
+
+Pending migrations run version by version, each whole before the next: a
+version's creates and `.sql` alters in dependency order (`ExecutionStep::
+CreateEntity`, `MigrateEntity`), then its `.data.sql` scripts (`MigrateData`),
+then its drops (`DropEntity`), then its record (`RecordMigration`); after the
+last version, every entity no version just created from its DDL re-applies it. A migration or data script that states no path runs on
+the path its entity's DDL file runs on, through `execute_project_script`. The
+exception to the one transaction is a version that adds enum values: its
+`ALTER TYPE … ADD VALUE` statements run first, as `IF NOT EXISTS`
+(`AddEnumValues`), and the batch commits after them — Postgres will not use a
+value inside the transaction that added it — with the earlier versions
+recorded. A failure after that leaves the values and records the version
+before; the next run adds them again as no-ops.
 
 Before its first hook or write, `apply` asks the database two questions, and
 refuses on either answer — under `dry_run` too, since the database is there to
-ask:
+ask. Both read `Design::database_marks(adapter)`, a `DatabaseMarks`: this
+project's record or, when it has none and the database holds any of the
+design's tables, views, materialized views, enums or sequences, every other
+project's record — the mark a renamed `project.name` left, since the record is
+keyed on the name. A refusal over another project's record names it.
+`check_apply_guards(&marks)` runs both:
 
-- **Is this run's env allowed here?** `Design::check_env_guard(meta, env)`
+- **Is this run's env allowed here?** `Design::check_env_guard(&marks, env)`
   refuses a run whose env is not prod against a database marked prod. A dev run
   would re-mark it dev — lifting `reset`'s prod guard — and its import would
   load `import/dev/` data into production. It is one-way: a dev database may be
-  promoted to prod. `deploy`, `reconcile` and `import_data` check it too.
+  promoted to prod. `deploy`, `reconcile` and `import_data` check it too, and
+  `guard_env(adapter)` checks it alone — for a load outside `import_data`.
+  `design.env()` is the env the design was loaded for.
 - **Is the project at least as new as the database?**
-  `Design::check_version_guard(db_version, design_version)` refuses a design
-  whose `project.version` is behind the version the database records (an
+  `Design::check_version_guard(&marks, design_version)` refuses a design whose
+  `project.version` is behind the version the database records (an
   unversioned design counts as 0). The plan would otherwise come out current
   and re-apply the older DDL over the newer schema. Neither guard has an
   override.
 
 `pending_migration_preview(adapter, name, scope)` lists the migration steps the
 run would take against that database, from the version it records, under the
-same gates and scope — a `MigrationPreview` of steps, each with the statements
-its files run and a `drops` flag on the destructive ones; a drop of a table the
-database does not have is marked as one the run skips. It writes nothing; it is
-what `dbd apply --dry-run` lists when it has a database.
+same gates and scope, in the order the run takes them — a `MigrationPreview` of
+steps (`MigrationAction::Create`, `EnumValues`, `Migrate`, `Data` or `Drop`),
+each with the statements its files run and a `drops` flag on the destructive
+ones; a drop of a table the database does not have is marked as one the run
+skips. `recorded` lists the versions the run records — not empty with `steps`
+empty for a scoped run that none of the pending migrations touch. It refuses
+where the run does: a named run over pending migrations, a `data.sql` TODO. It
+writes nothing; it is what `dbd apply --dry-run` lists when it has a
+database.
 
 The three callbacks travel together in one `Progress` value; they are not three
 arguments. `Progress::none()` is a silent run. `ApplyComplete` carries
@@ -337,9 +394,19 @@ with the design's `apply.before` and `apply.after` hooks around the writes,
 scoped as `apply` scopes them, so a reconciled database is the one an apply
 builds. `ReconcileComplete` counts them in `before_scripts` and
 `after_scripts`. Like `apply`, it does not apply the configured grants: call
-`apply_grants` after it, as `dbd reconcile` does. It checks the env guard, not
-the version guard — a reconcile records the project's version even over a newer
-one.
+`apply_grants` after it, as `dbd reconcile` does. `apply_hooks_to_run(scope)`
+and `grants_to_apply(scope)` are the hooks and grant lines a run would apply —
+what `dbd reconcile --dry-run` lists after the plan. It checks the env guard,
+`dry_run` included, not the version guard — a reconcile records the project's
+version even over a newer one.
+
+The plan names what makes it destructive in `destructive_changes`, one line per
+drop by entity, and the enum type swaps a value removal needs in `enum_swaps`
+(`EnumSwap`: the enum, the values removed, the `(table, column)` pairs typed
+with it). Before any write, `dry_run` included, `reconcile` asks the database
+which materialized views read those columns (`matviews_reading_columns`) and
+refuses, naming them and the `DROP MATERIALIZED VIEW` to run by hand: dbd never
+drops one, and an `ALTER COLUMN … TYPE` under it fails.
 
 Both refuse a project whose reader builds no structured model (T-SQL, MySQL,
 SQLite) and a Convex adapter. **`reconcile` does not check `project.released`**
@@ -374,13 +441,15 @@ nothing — with `count(kind)` to tally them, as `dbd reset` prints; and
 `roles_kept`, a `KeptRole` (`role`, `databases`) for each role it left in place
 because another database on the server holds something of it.
 
-A full reset — one whose scope resolves to `all` — also forgets the database's
-record of the project — env, version and scope pin — so the next apply records
-it afresh; a scoped reset leaves that record, and the rest of the project, in
-place. (Through `resolve_scope(None, None)`, a design that defines a `default:`
-scope resolves to it, so that reset is a scoped one.) A scoped reset drops without
-`CASCADE`, so it fails, naming the dependent, rather than reach outside its
-scope.
+A reset of everything the database was built with also forgets the
+database's record of the project — env, version and scope pin — so the next
+apply records it afresh. That is a reset under the `all` scope, or under the
+scope the database is pinned to: through `resolve_scope(None, None)`, a design
+that defines a `default:` scope resolves to it, and builds and resets under it.
+A narrower scope leaves that record, and the rest of the project, in place. A
+forced reset forgets only this project's record — a renamed project's old
+record stays. A scoped reset drops without `CASCADE`, so it fails, naming the
+dependent, rather than reach outside its scope.
 
 `reset_script(target, drop_schemas, drop_extensions, scope)` is the SQL alone,
 with no database and no guard. `roles_kept_by_reset(adapter, target, scope)` asks
@@ -413,8 +482,13 @@ std::fs::write("schema.json", serde_json::to_string_pretty(&model)?)?;
 is that DDL: the file's own text, with
 `SET search_path TO <source.search_path>, public` ahead of it when the file
 states no path of its own (one that does keeps its own, which wins). The file's
-text is never rewritten — the path is a statement in front of it — so the script
-`combine` writes creates each object where `apply` would.
+text is never rewritten — the path is a statement in front of it — and a file's
+own top-level `SET search_path` that leaves `public` out gets a statement of its
+own after it, adding `public`, found in libpg_query's parse tree so a function's
+`SET` clause, a body or a literal is never touched. So the script `combine`
+writes creates each object where `apply` would. `script::runnable_script(sql,
+path)` is the same for a migration or hook script: opened with `path` when it
+states none, or `RESET search_path` when there is no path.
 
 `schema_model::build(design, scope)` is the model `dbd diagram` encodes (see
 [The schema viewer](11-schema-viewer.md#the-model)). It returns
@@ -504,6 +578,20 @@ project declares in `design.yaml` rather than as DDL files:
   an existing project, each with the name and schema its `CREATE` statement
   gives and whether `design.yaml` already declares it — what `dbd doctor`
   reports.
+- `outside_needs(deps, selected, platform, &mut declared)` reads the adapter's
+  `dependencies()` for a capture of some schemas: it adds to `declared` the
+  extensions the captured objects use (installed in `public` or a captured
+  schema) and returns a `needs:` line for every other type, function or table
+  they need from outside — what `init --from-db --schema` prints.
+
+An introspected table carries what dbd 0.25 models beyond 0.24: its triggers
+(`Entity.triggers`, each a statement runnable twice, written by
+`emit::emit_table` after the table), a column's collation
+(`ColumnDef.collation`), a foreign key's `match_full`, `deferrable` and
+`initially_deferred`, and `TableConstraint::Exclude`. What the model cannot
+hold — `NOT VALID`, `UNLOGGED`, inheritance, partitioning — is in the entity's
+`warnings`, which `init --from-db` prints. Objects an extension owns are not
+introspected at all.
 
 ## Parse SQL without a project
 
@@ -580,12 +668,21 @@ embedder that wants them makes them itself:
   and neither do `Design::reset`, `import_data` or `design::apply_policies`.
   (The env guard and the version guard are the library's own; see
   [Apply](#apply).)
-- **The dry runs' questions.** Given a database, `dbd apply --dry-run` and
-  `deploy --dry-run` check the scope pin and `check_version_guard`, and list
-  `pending_migration_preview`; `policies --dry-run` checks the pin.
+- **The dry runs' questions.** Given a database — opened with
+  `connect_existing`, so a missing SQLite file is not created —
+  `dbd apply --dry-run` and `deploy --dry-run` check the scope pin and
+  `check_apply_guards`, and list `pending_migration_preview`;
+  `import --dry-run` checks the pin and `guard_env`; `policies --dry-run`
+  checks the pin. The ad-hoc `dbd import -n -f`, which loads through the adapter
+  rather than `import_data`, calls `guard_env` itself.
+- **The pin, noted.** `dbd diff` and `migrate --status` write nothing, so they
+  note a database pinned to another scope (`Design::conflicting_pin(&marks,
+  scope)`) instead of refusing.
+- **The reset target.** `dbd reset` refuses a `--target` that is not the kind
+  of database the connection reaches, before connecting.
 - **Reset's preview.** `Design::reset` checks its own guard (a database marked
-  prod, or with applied migrations) unless forced; `dbd reset --dry-run` checks
-  it too, given a database, through the public
+  prod, or versioned) unless forced; `dbd reset --dry-run` checks it too, given
+  a database, through the public
   `Design::check_reset_guard(&marks)` (`marks` from `Design::database_marks`),
   so a preview refuses where the reset would.
   `reset_script` alone checks nothing.
@@ -616,8 +713,8 @@ if design.config().project.released {
 ## Errors
 
 Almost every fallible call returns `dbd_core::Result<T>`, whose error is
-`DbdError`: `Config`, `Parse { file, message }`, `SafetyGuard` (the `reset`
-guards and `check_scope_guard`), `GitHubSource`, `Migration`, and wrapped `Io`,
+`DbdError`: `Config`, `Parse { file, message }`, `SafetyGuard` (the `reset`,
+env, version and scope guards), `GitHubSource`, `Migration`, and wrapped `Io`,
 `Yaml` and `Json` errors. (`diagram::encode_payload` and `diagram::fragment_url`
 return `serde_json`'s error directly.)
 

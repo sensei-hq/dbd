@@ -32,7 +32,7 @@ so is anything outside `import/`: data under `data/` or `seeds/` is never
 scanned.
 
 On PostgreSQL, CSV and TSV stream through `COPY`. JSON and JSON Lines records
-are staged one at a time as bound `jsonb` values in `dbd.import_tmp` and moved
+are staged one at a time as bound `json` values in `dbd.import_tmp` and moved
 into the table by `dbd.import_jsonb_to_table` — a procedure the load installs
 itself, in dbd's own `dbd` schema beside the bookkeeping, so a JSON import works
 on a database no import has touched and creates no schema your design does not
@@ -78,10 +78,15 @@ happened to it before 0.25:
 the key 'nick' (record 1) names no column of app.items — its columns are id, name, qty, doubled, meta. A JSON record's keys name the columns its values load into
 ```
 
-- A key some records carry and another lacks loads SQL NULL in the record that
-  lacks it; a key no record carries leaves the column to its default.
-- In a `json` or `jsonb` column, a JSON `null` stays the JSON value `null`; it is
-  not SQL NULL.
+- A key no record carries leaves the column to its default. A key some records
+  carry and another lacks loads SQL NULL, on PostgreSQL, in the record that
+  lacks it; SQLite inserts record by record, so there the record that lacks it
+  gets the default.
+- `null` is SQL NULL, in every column. To load the JSON value `null` into a
+  `json` or `jsonb` column, write `{"$json": null}`: a one-key `{"$json": …}`
+  object is unwrapped one level, so a value that is itself such an object is
+  written `{"$json": {"$json": …}}`. This is how `dbd export` writes them (see
+  [export](#export)).
 
 ### What a data file cannot set
 
@@ -122,9 +127,19 @@ file directly in `import/dev/` loads only under `-e dev`, on every engine. That
 is where a project without schemas — SQLite's — keeps its environment-only
 data, beside the shared files directly in `import/`; before 0.25 such a file
 loaded in prod. It follows that a schema named `dev` or `prod` cannot keep its
-files directly there. Any other folder nested inside a schema's folder
-(`import/staging/old/…`) is read as an environment of that name, which `-e` can
-never select, so its files never load.
+files directly there.
+
+Those are the only layouts an import reads. A file in a folder deeper than
+them — `import/staging/old/x.csv`, `import/dev/staging/old/y.csv` — never
+loads, under any env, and an import names it:
+
+```
+⚠ import/staging/old/x.csv not loaded — an import reads import/<schema>/<table>.<ext>, or import/<env>/<schema>/<table>.<ext> for env dev or prod, and no folder deeper
+```
+
+Before 0.25 such a file was taken for an environment's: the first was reported
+as skipped for env `staging`, as though some `-e` could load it, and the second
+loaded into `staging.y` under `-e dev`, its `old` folder ignored.
 
 **A dev import into a production database is refused.** The database records
 the env it was built for, and `dbd import -e dev` against one marked prod stops
@@ -137,8 +152,11 @@ Error: Safety guard: environment guard: this database is marked prod, but this r
 
 The rest of that message says how to rebuild a database that is not production
 but was marked prod by a run without `-e` — see
-[the environment](04-commands.md#global-options). `dbd import -n X -f file` loads
-one file you name, not an environment's folder, and is not checked.
+[the environment](04-commands.md#global-options). `dbd import -n X -f file`, which
+loads one file you name rather than an environment's folder, is refused the
+same way: it still loads data into production. A project whose `project.name`
+was renamed is held to the mark its old name left, as every guard holds it
+(see [the scope guard](07-scopes.md#the-scope-guard)).
 
 ## What a run does
 
@@ -155,9 +173,13 @@ dbd import --dry-run
 In order:
 
 1. **Truncate** every staging table in the plan (unless `truncate: false`) —
-   `TRUNCATE` on PostgreSQL, `DELETE FROM` on SQLite. On Convex the load itself
-   replaces the table.
-2. **Load** each data file into its table.
+   on PostgreSQL in one `TRUNCATE`, since it empties tables linked by a foreign
+   key only together; on SQLite with `DELETE FROM`, one table at a time, a
+   table that references another first. A table outside the import that holds
+   a key to one of them fails the run, named, before anything is emptied. On
+   Convex the load itself replaces the table.
+2. **Load** each data file into its table — a staging table another one
+   references before the table that references it.
 3. **Call the import procedures** — each staging table's one loader, once (see
    below). The plan is ordered by dependencies, so a procedure that fills
    `config.lookups` runs before one that fills `config.lookup_values`.
@@ -165,7 +187,8 @@ In order:
 
 Before step 1, the run refuses what it cannot do safely, so nothing is
 truncated by a run that was going to fail: a `-n` that selects no data file, a
-data file outside [`import.staging`](#options), a staging table whose loader
+data file outside [`import.staging`](#options), a data file whose target is a
+view, a materialized view or a sequence, a staging table whose loader
 cannot be decided, and — under `--scope` — a staging table the scope keeps whose
 loader procedure it leaves out (see [below](#nothing-is-skipped-silently)).
 
@@ -183,7 +206,8 @@ Importing under another scope would load tables this database was not built with
 such a database used to fail partway, with staging already truncated and some
 loaders called. `import` never re-pins a database, so it has no
 `--allow-scope-change`; `import -n X -f file` is checked the same way.
-`import --dry-run` reads no database, so it checks neither.
+`import --dry-run` checks both whenever a database is configured, so the
+preview refuses where the run would; with none it stays offline.
 
 ### Which procedure loads a table
 
@@ -313,6 +337,7 @@ reason for anything left out:
 | --- | --- |
 | No `import/` directory | `no import/ directory — nothing to import` |
 | File belongs to another environment | `N data file(s) under import/<env>/ skipped — this run's env is '<env>'` |
+| File in a folder no import reads | `F not loaded — an import reads import/<schema>/<table>.<ext>, …, and no folder deeper` |
 | A file failed to parse | `staging table X not imported — data file failed to parse` |
 | Entry cut by `--scope` | `X not imported — T is outside scope '<name>'` |
 | A function reads a staging table no procedure loads | `X has no loader procedure — function F reads it but is not run` |
@@ -348,6 +373,7 @@ dbd export                                # every table, or what export: lists
 dbd export -f jsonl                       # another format: csv (default), tsv, jsonl
 dbd export -n config.lookups -f tsv       # one table
 dbd export -o import                      # into the import tree: import/<schema>/<table>.<fmt>
+dbd export -n core.accounts -o import/staging  # into one schema folder: import/staging/accounts.csv
 dbd export --scope hub                    # only what the scope builds
 ```
 
@@ -391,11 +417,30 @@ the schema folder is what keeps two same-named tables apart: before 0.25 `-o`
 wrote every file flat into `<dir>`, and the second of two `lookups` tables
 overwrote the first while the summary counted both.
 
+The exception is a `<dir>` that is itself a schema folder of the project's
+import tree — `import/<schema>`, or `import/<env>/<schema>`. There each file is
+written `<table>.<fmt>`, as that import loads it: `-n core.accounts -o
+import/staging` writes `import/staging/accounts.csv`, which an import loads
+into `staging.accounts`. Under the usual layout it would have landed in
+`import/staging/core/`, a folder no import reads. Two tables that would be the
+same file there — `core.accounts` and `staging.accounts` — are refused before
+anything is written; export them one at a time with `-n`.
+
 Generated columns are left out of every export: the import recomputes them, and
 refuses a file that sets one. CSV and TSV carry a header row — on SQLite even for
 a table with no rows — and are written as PostgreSQL's `COPY` writes them, on
 SQLite too: NULL is an empty field, `''` is `""`, and a value holding the
-delimiter, a quote or a line break is quoted with its quotes doubled.
+delimiter, a quote or a line break is quoted with its quotes doubled. A SQLite
+BLOB is written as `\x` and its bytes in hex, as PostgreSQL writes a `bytea`,
+in every format — so it loads into a `bytea` column, and back into a BLOB
+column; before 0.25 every BLOB was exported as NULL.
+
+A JSON Lines export writes every column's key in every record. `null` is SQL
+NULL, whatever the column's type, and a `json` or `jsonb` column holding the
+JSON value `null` is written `{"$json": null}` — the spelling the import
+unwraps (see [JSON and JSON Lines](#json-and-json-lines)) — so SQL NULL and the
+JSON value `null` both come back as they left, and no column is left to its
+default because its key went missing.
 
 `export` refuses a database [pinned](07-scopes.md#the-scope-guard) to a scope
 other than the run's, before it writes a file — `Exporting under another scope
@@ -420,9 +465,9 @@ dbd export -n staging.lookups -o import
 # writes import/staging/lookups.csv — the file staging.lookups is loaded from
 ```
 
-`-o` keeps the schema folder, so point it at `import/` itself. A file one folder
-deeper — where `-o import/staging` would put it, `import/staging/staging/…` — is
-read as another environment's and never loads.
+Point `-o` at `import/` itself and each table lands in its own schema's folder;
+point it at one schema's folder, `import/staging`, and every table exported
+lands there, as the files that schema's tables load from.
 
 The values come back as they left. A CSV or TSV export keeps NULL and the empty
 string apart and quotes what needs quoting, and the import reads it by its
@@ -430,9 +475,9 @@ header — so a file exported from PostgreSQL loads into SQLite, and one exporte
 from SQLite into PostgreSQL. A JSON Lines export round-trips too: each row is
 written as the JSON Postgres renders for it, so a value holding a quote, a
 backslash or a newline loads back as it was; a `json` column keeps its exact
-text, a JSON string scalar stays a string, and a JSON `null` stays apart from
-SQL NULL, which is written as an absent key. Ids, `GENERATED ALWAYS` identities
-included, import as given, and generated columns are recomputed.
+text, a JSON string scalar stays a string, and the JSON value `null` stays apart
+from SQL NULL. Ids, `GENERATED ALWAYS` identities included, import as given,
+and generated columns are recomputed.
 
 ### Moving a long-lived system to a new database
 
@@ -449,11 +494,11 @@ each row carries the lookup's *name* rather than its id — listed under
 staging tables column for column. Importing those files into the new database
 then runs the same procedures a fresh seed does.
 
-The export writes each view under its own schema's folder, and an import loads
-a file into the table its folder and name give — so the view files are moved
-under the staging schema's folder before the import. Name each view after the
-staging table it feeds, and its columns after that table's columns: the import
-loads a CSV by its header, so the names must match, though the order need not.
+An import loads a file into the table its folder and name give, so export the
+views straight into the staging schema's folder: `-o import/staging` writes
+each one there as `<view>.<fmt>`. Name each view after the staging table it
+feeds, and its columns after that table's columns: the import loads a CSV by
+its header, so the names must match, though the order need not.
 
 ```yaml
 export:
@@ -462,15 +507,14 @@ export:
 ```
 
 ```sh
-dbd export -d $OLD_DATABASE_URL                 # export/staging_export/lookups.csv, lookup_values.csv
-mv export/staging_export/*.csv import/staging/  # the files staging.lookups and staging.lookup_values load from
-dbd deploy -d $NEW_DATABASE_URL
+dbd export -d $OLD_DATABASE_URL -o import/staging   # import/staging/lookups.csv, lookup_values.csv
+dbd deploy -d $NEW_DATABASE_URL                     # staging.lookups and staging.lookup_values load from them
 ```
 
-Keep the views' files out of the import tree: `-o import` would put them under
-`import/staging_export/`, which loads into the views themselves and fails.
-Listing `import.staging: [staging]` turns such a file into a refusal before
-anything is truncated.
+Not `-o import`: that keeps each view under its own schema's folder,
+`import/staging_export/`, and an import refuses a file whose target is a view
+before it truncates anything. Listing `import.staging: [staging]` refuses it
+too.
 
 None of this is needed when the import files are the well-managed source of
 truth — when every change to reference data goes through them.
