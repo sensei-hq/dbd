@@ -1350,9 +1350,13 @@ pub fn plan_enum_recreation(
             } else {
                 (format!("{}::text", c.column), qname.clone())
             };
-            lines.push(format!(
-                "ALTER TABLE {} ALTER COLUMN {} TYPE {to} USING {via}::{to};",
-                c.table, c.column
+            lines.push(column_type_swap(
+                &format!(
+                    "ALTER TABLE {} ALTER COLUMN {} TYPE {to} USING {via}::{to};",
+                    c.table, c.column
+                ),
+                &format!("{}.{}", c.table, c.column),
+                &qname,
             ));
         }
 
@@ -1405,6 +1409,27 @@ pub fn plan_enum_recreation(
             plan.mark_destructive(change);
         }
     }
+}
+
+/// `alter` — one column's `ALTER … TYPE … USING` in an enum swap — wrapped so
+/// a row holding a removed value fails naming the column.
+///
+/// The cast fails with `invalid input value for enum app.mood: "meh"`, which
+/// names neither table nor column, and the step reporting it is the enum's —
+/// one swap moves columns in every table using the type. The wrapper adds the
+/// column and what to do, and keeps the SQLSTATE; it runs inside the same
+/// implicit transaction, so the failure still leaves nothing half-applied.
+fn column_type_swap(alter: &str, column: &str, enum_name: &str) -> String {
+    // The message is a RAISE format string inside a `$$` body: `%` is its
+    // placeholder and `'` closes it.
+    let escape = |s: &str| s.replace('\'', "''").replace('%', "%%");
+    format!(
+        "DO $$ BEGIN\n  {alter}\nEXCEPTION WHEN invalid_text_representation THEN\n  \
+         RAISE EXCEPTION '{} holds a value {} no longer has (%) — update those rows first', SQLERRM \
+         USING ERRCODE = 'invalid_text_representation';\nEND $$;",
+        escape(column),
+        escape(enum_name),
+    )
 }
 
 /// Copy the comment of `old_type` — the enum renamed aside by a type swap — to
