@@ -1209,7 +1209,7 @@ mod tests {
                     ref_columns: vec!["id".into()],
                     on_delete: None,
                     on_update: None,
-                    ref_schema_source: Default::default(),
+                    ..Default::default()
                 })]
             })
             .unwrap_or_default();
