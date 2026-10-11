@@ -6750,3 +6750,93 @@ async fn a_columns_collation_survives_reverse_diff_and_reconcile() {
     let d = rev.diff_live(&*adapter, None).await.expect("diff_live");
     assert!(!columns_changed(&d), "converged: {:?}", d.changes);
 }
+
+// ── What dbd's table model cannot hold is named, and partitions fold in ───────
+
+/// A partition is storage of its partitioned table, not a table of the
+/// project's: introspection flattened each into a table of its own beside a
+/// plain copy of its parent — so an export of both put every row in twice,
+/// and `reconcile --prune` read each partition of a declared table as an
+/// orphan to drop. A partitioned table is captured as one plain table that
+/// holds every row, and named with its partition key and partitions, as is
+/// what else the model has no field for: a deferrable primary key or unique
+/// constraint, inheritance, and `UNLOGGED`.
+#[tokio::test]
+async fn what_the_table_model_cannot_hold_is_named_and_partitions_fold_into_their_table() {
+    use dbd_core::diff::DiffAction;
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "unmodeled").await.unwrap();
+    adapter
+        .execute_script(
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.events (id int, at date NOT NULL, PRIMARY KEY (id, at)) PARTITION BY RANGE (at); \
+             CREATE TABLE app.events_2025 PARTITION OF app.events FOR VALUES FROM ('2025-01-01') TO ('2026-01-01'); \
+             CREATE TABLE app.events_2026 PARTITION OF app.events FOR VALUES FROM ('2026-01-01') TO ('2027-01-01'); \
+             CREATE TABLE app.base (id int PRIMARY KEY, kind text); \
+             CREATE TABLE app.special (extra text) INHERITS (app.base); \
+             CREATE UNLOGGED TABLE app.scratch (id int PRIMARY KEY); \
+             CREATE TABLE app.slots (id int, pos int, \
+               CONSTRAINT slots_pkey PRIMARY KEY (id) DEFERRABLE, \
+               CONSTRAINT slots_pos_key UNIQUE (pos) DEFERRABLE INITIALLY DEFERRED);",
+        )
+        .await
+        .unwrap();
+
+    let entities = adapter.introspect().await.expect("introspect");
+    let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+    for partition in ["app.events_2025", "app.events_2026"] {
+        assert!(
+            !names.contains(&partition),
+            "{partition} is storage, not a table: {names:?}"
+        );
+    }
+    let warned = |table: &str, words: &[&str]| {
+        let e = entities
+            .iter()
+            .find(|e| e.name == table)
+            .unwrap_or_else(|| panic!("{table}"));
+        assert!(
+            e.warnings.iter().any(|w| words.iter().all(|word| w.contains(word))),
+            "{table} is named with {words:?}: {:?}",
+            e.warnings
+        );
+    };
+    warned(
+        "app.events",
+        &[
+            "PARTITION BY RANGE (at)",
+            "app.events_2025",
+            "app.events_2026",
+            "FOR VALUES FROM",
+        ],
+    );
+    warned("app.special", &["inherits", "app.base"]);
+    warned("app.scratch", &["UNLOGGED"]);
+    warned("app.slots", &["slots_pkey", "DEFERRABLE"]);
+    warned("app.slots", &["slots_pos_key", "INITIALLY DEFERRED"]);
+
+    // A design that declares the partitioned table has no orphans in its partitions.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: unmodeled\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    let events = entities.iter().find(|e| e.name == "app.events").unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/events.ddl"),
+        dbd_core::emit::emit_entity(events).unwrap(),
+    )
+    .unwrap();
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+    let d = design.diff_live(&*adapter, None).await.expect("diff_live");
+    assert!(
+        !d.changes
+            .iter()
+            .any(|c| c.entity_name.starts_with("app.events_") && matches!(c.action, DiffAction::Drop)),
+        "no partition reads as an orphan: {:?}",
+        d.changes
+    );
+}
