@@ -1298,6 +1298,20 @@ fn column_types(e: &Entity, td: &TableDef, script: &Script) -> Vec<ColumnType> {
         .map(|c| {
             let mut notes = Vec::new();
             let ty = map_type(&c.data_type, script, e, c, &mut notes);
+            // A collation is named, and the names are PostgreSQL's: no target
+            // has `"C"` or an ICU locale under the same name. The column takes
+            // the target's default, which may sort and compare differently.
+            if let Some(collation) = &c.collation {
+                notes.push(Downgrade {
+                    entity: e.name.clone(),
+                    column: Some(c.name.clone()),
+                    from: format!("`COLLATE {collation}`"),
+                    to: "the target's default collation".to_string(),
+                    reason: "the collation is PostgreSQL's, by a name the target does not have, so the \
+                             column's values may sort, compare and match differently"
+                        .to_string(),
+                });
+            }
             ColumnType { ty, notes }
         })
         .collect();
