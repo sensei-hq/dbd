@@ -6348,3 +6348,51 @@ async fn a_reverse_engineered_table_keeps_its_triggers() {
         back.refs
     );
 }
+
+/// An updatable view's `INSTEAD OF` trigger is the view's behaviour: without
+/// it, an insert into the view fails. Its file carries it as a table file
+/// carries a table's, and the view then depends on the function it fires —
+/// functions apply after views by default, so without that edge a fresh apply
+/// would create the trigger before its function existed.
+#[tokio::test]
+async fn a_reverse_engineered_view_keeps_its_instead_of_trigger() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    adapter
+        .execute_script(
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.items (id int PRIMARY KEY, name text); \
+             CREATE VIEW app.items_v AS SELECT id, name FROM app.items; \
+             CREATE FUNCTION app.items_v_insert() RETURNS trigger LANGUAGE plpgsql AS \
+               'BEGIN INSERT INTO app.items VALUES (NEW.id, NEW.name); RETURN NEW; END'; \
+             CREATE TRIGGER items_v_insert INSTEAD OF INSERT ON app.items_v \
+               FOR EACH ROW EXECUTE FUNCTION app.items_v_insert();",
+        )
+        .await
+        .unwrap();
+
+    let entities = adapter.introspect().await.expect("introspect");
+    let view = entities.iter().find(|e| e.name == "app.items_v").expect("app.items_v");
+    let file = dbd_core::formatter::format_ddl(
+        &dbd_core::emit::emit_entity(view).unwrap(),
+        &dbd_core::config::FormatConfig::default(),
+    );
+    assert!(
+        file.to_uppercase()
+            .contains("CREATE OR REPLACE TRIGGER ITEMS_V_INSERT INSTEAD OF INSERT ON APP.ITEMS_V"),
+        "{file}"
+    );
+    for run in 1..=2 {
+        adapter
+            .execute_script(&file)
+            .await
+            .unwrap_or_else(|e| panic!("run {run} of the view file failed: {e}\n{file}"));
+    }
+    let back = dbd_core::parser::parse_entity(std::path::Path::new("ddl/view/app/items_v.ddl"), &file).unwrap();
+    assert!(back.errors.is_empty(), "{:?}\n{file}", back.errors);
+    assert!(
+        back.refers_to("app.items_v_insert"),
+        "the view depends on the function its trigger fires: {:?}",
+        back.refs
+    );
+}
