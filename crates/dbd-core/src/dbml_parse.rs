@@ -2274,4 +2274,174 @@ mod tests {
             assert_eq!(td.comments.table.as_deref(), Some(note), "{name}:\n{dbml}");
         }
     }
+
+    // ── Hand-written DBML, read as @dbml/core reads it ───────────────────────
+    //
+    // Every document below is valid DBML: @dbml/core 10.3.0 parses each, and
+    // the expected values are what it reads — but for the line a closing
+    // `'''` sits on, which is layout here and a trailing line break there.
+
+    /// The foreign keys of `table`, as `(columns, ref_schema.ref_table,
+    /// ref_columns, name, on_delete)`.
+    #[allow(clippy::type_complexity)]
+    fn fks(
+        entities: &[Entity],
+        table: &str,
+    ) -> Vec<(Vec<String>, String, Vec<String>, Option<String>, Option<FkAction>)> {
+        let td = find_table(entities, table).table_def.as_ref().unwrap();
+        td.constraints
+            .iter()
+            .filter_map(|c| match c {
+                TableConstraint::ForeignKey(fk) => Some((
+                    fk.columns.clone(),
+                    format!("{}.{}", fk.ref_schema.as_deref().unwrap_or("public"), fk.ref_table),
+                    fk.ref_columns.clone(),
+                    fk.name.clone(),
+                    fk.on_delete,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn strings(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `Table app.users as U` was read as a table named `users as U`, and a
+    /// Ref to `U.id` as one to a table `public.U`.
+    #[test]
+    fn a_table_alias_names_the_table_it_stands_for() {
+        let dbml = "Table app.users as U {\n  id int [pk]\n}\nTable app.posts {\n  id int [pk]\n  author_id int [ref: > U.id]\n  editor_id int\n}\nRef: app.posts.editor_id > U.id [delete: cascade]\n";
+        let entities = parse_dbml(dbml).unwrap();
+        assert!(
+            entities
+                .iter()
+                .any(|e| e.entity_type == EntityType::Table && e.name == "app.users")
+        );
+        assert!(!entities.iter().any(|e| e.name.contains(" as ")), "{entities:#?}");
+        let mut found = fks(&entities, "app.posts");
+        found.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            found,
+            vec![
+                (
+                    strings(&["author_id"]),
+                    "app.users".into(),
+                    strings(&["id"]),
+                    None,
+                    None
+                ),
+                (
+                    strings(&["editor_id"]),
+                    "app.users".into(),
+                    strings(&["id"]),
+                    None,
+                    Some(FkAction::Cascade)
+                ),
+            ]
+        );
+    }
+
+    /// An inline `[ref: …]` was ignored as an unknown setting, so the key was
+    /// silently missing. `>` and `-` both put the key on the column; a
+    /// one-to-one `Ref: a - b` puts it on `b`, as @dbml/core's SQL does.
+    #[test]
+    fn an_inline_ref_is_a_foreign_key_and_one_to_one_keys_the_right_side() {
+        let dbml = "Table app.users {\n  id int [pk]\n}\nTable app.posts {\n  id int [pk]\n  user_id int [ref: > app.users.id, not null]\n  buddy int [ref: - app.users.id]\n  solo int\n}\nRef: app.users.id - app.posts.solo\n";
+        let entities = parse_dbml(dbml).unwrap();
+        let mut found = fks(&entities, "app.posts");
+        found.sort_by(|a, b| a.0.cmp(&b.0));
+        let key = |col: &str| (strings(&[col]), "app.users".to_string(), strings(&["id"]), None, None);
+        assert_eq!(found, vec![key("buddy"), key("solo"), key("user_id")]);
+        assert!(fks(&entities, "app.users").is_empty(), "nothing keys the users table");
+        let td = find_table(&entities, "app.posts").table_def.as_ref().unwrap();
+        assert!(!td.columns[1].nullable, "the other settings still apply");
+    }
+
+    /// A many-to-many Ref has no foreign key to build — @dbml/core makes a
+    /// junction table of it. Reading it as a key from one side to the other
+    /// built a constraint the document never described.
+    #[test]
+    fn a_many_to_many_ref_is_refused_with_why() {
+        let dbml = "Table app.a {\n  id int [pk]\n}\nTable app.b {\n  id int [pk]\n}\nRef: app.a.id <> app.b.id\n";
+        let err = parse_dbml(dbml).unwrap_err().to_string();
+        assert!(err.contains("<>") && err.contains("junction"), "{err}");
+    }
+
+    /// A multi-line note in a column's settings broke the column into
+    /// several, a table's `Note { … }` block failed to parse, and an indented
+    /// note kept its indentation. Each reads as @dbml/core reads it: its
+    /// common indentation removed, settings may span lines.
+    #[test]
+    fn multi_line_notes_and_settings_read_as_dbml_reads_them() {
+        let dbml = "Table app.t {\n  id int [pk]\n  email text [note: '''\n    The address we write to.\n    Never shared.\n  ''']\n  code text [\n    not null,\n    note: 'x'\n  ]\n  Note {\n    '''\n    Blog posts.\n      Indented line.\n    '''\n  }\n}\nEnum app.mood {\n  happy [note: '''\n    very\n    happy\n  ''']\n  sad\n}\n";
+        let entities = parse_dbml(dbml).unwrap();
+        let td = find_table(&entities, "app.t").table_def.as_ref().unwrap();
+        let names: Vec<&str> = td.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["id", "email", "code"]);
+        assert_eq!(
+            td.columns[1].comment.as_deref(),
+            Some("The address we write to.\nNever shared.")
+        );
+        assert_eq!(td.columns[2].comment.as_deref(), Some("x"));
+        assert!(!td.columns[2].nullable);
+        assert_eq!(td.comments.table.as_deref(), Some("Blog posts.\n  Indented line."));
+        let mood = find_enum(&entities, "app.mood");
+        assert_eq!(mood.enum_values[0].note.as_deref(), Some("very\nhappy"));
+        assert_eq!(mood.enum_values.len(), 2);
+    }
+
+    /// An index entry marked `pk` is the table's primary key — DBML's way of
+    /// writing a composite one, and the only way to name one. It was read as
+    /// a plain index, and the table had no key.
+    #[test]
+    fn a_pk_index_is_the_primary_key() {
+        let dbml = "Table app.t {\n  a int\n  b int\n  indexes {\n    (a, b) [pk, name: 't_pk']\n  }\n}\n";
+        let entities = parse_dbml(dbml).unwrap();
+        let td = find_table(&entities, "app.t").table_def.as_ref().unwrap();
+        assert!(td.indexes.is_empty(), "{:?}", td.indexes);
+        assert_eq!(
+            td.constraints,
+            vec![TableConstraint::PrimaryKey {
+                name: Some("t_pk".into()),
+                columns: strings(&["a", "b"]),
+            }]
+        );
+        assert!(td.columns.iter().all(|c| c.is_pk && !c.nullable));
+    }
+
+    /// A Ref's name — `Ref name:` or the long form `Ref name { … }` — is the
+    /// foreign key's name, and an index's `type:` its access method. A table
+    /// may sit on one line.
+    #[test]
+    fn ref_names_index_types_and_one_line_tables_are_read() {
+        let dbml = "Table app.a { id int [pk] }\nTable app.b {\n  id int [pk]\n  a_id int\n  c_id int\n  data jsonb\n  indexes {\n    data [type: gin, name: 'b_data_idx']\n  }\n}\nRef b_a_fk: app.b.a_id > app.a.id [delete: cascade]\nRef \"b c fk\" {\n  app.b.c_id > app.a.id\n}\n";
+        let entities = parse_dbml(dbml).unwrap();
+        let a = find_table(&entities, "app.a").table_def.as_ref().unwrap();
+        assert_eq!(a.columns.len(), 1);
+        let mut found = fks(&entities, "app.b");
+        found.sort_by(|x, y| x.0.cmp(&y.0));
+        assert_eq!(
+            found,
+            vec![
+                (
+                    strings(&["a_id"]),
+                    "app.a".into(),
+                    strings(&["id"]),
+                    Some("b_a_fk".into()),
+                    Some(FkAction::Cascade)
+                ),
+                (
+                    strings(&["c_id"]),
+                    "app.a".into(),
+                    strings(&["id"]),
+                    Some("b c fk".into()),
+                    None
+                ),
+            ]
+        );
+        let b = find_table(&entities, "app.b").table_def.as_ref().unwrap();
+        assert_eq!(b.indexes[0].index_type, Some(crate::entity::IndexType::Gin));
+    }
 }
