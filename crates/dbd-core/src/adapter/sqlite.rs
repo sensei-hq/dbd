@@ -915,6 +915,13 @@ impl JsonBindable {
                 }
             }
             serde_json::Value::String(s) => Self::String(s.clone()),
+            // `{"$json": X}` is how a Postgres export writes a json column's
+            // JSON value when it is `null` or itself such an object (see
+            // `import_jsonb_to_table`): unwrapped one level, to X's text, as
+            // any other JSON value lands here.
+            serde_json::Value::Object(map) if map.len() == 1 && map.contains_key("$json") => {
+                Self::Other(map["$json"].to_string())
+            }
             other => Self::Other(other.to_string()),
         }
     }
