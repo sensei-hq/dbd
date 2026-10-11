@@ -791,6 +791,28 @@ mod tests {
         assert!(emit_entity(&p).unwrap().ends_with("$$;"));
     }
 
+    /// A quote in a name is doubled, as SQL writes it. Wrapped as it was,
+    /// `"we"ird"` ended the name early and the table file did not parse —
+    /// reached through `init --from-dbml` from a DBML name `"we\"ird"`.
+    #[test]
+    fn a_quote_in_a_name_is_doubled_and_reads_back() {
+        let ddl = "create table app.t (\"we\"\"ird\" int primary key, \"back\\slash\" text);\n\
+                   create index t_w on app.t (\"we\"\"ird\");";
+        let path = std::path::Path::new("ddl/table/app/t.ddl");
+        let entity = crate::parser::parse_entity(path, ddl).unwrap();
+        let emitted = emit_table(&entity);
+        let reparsed = crate::parser::parse_entity(path, &emitted).unwrap_or_else(|e| panic!("{e}\n{emitted}"));
+        assert!(
+            reparsed.errors.is_empty(),
+            "the emitted DDL parses: {:?}\n{emitted}",
+            reparsed.errors
+        );
+        let def = reparsed.table_def.unwrap();
+        let columns: Vec<&str> = def.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(columns, ["we\"ird", "back\\slash"], "{emitted}");
+        assert_eq!(def.indexes[0].columns[0].name, "we\"ird", "{emitted}");
+    }
+
     /// A CHECK keeps the name it was given. Written unnamed, `init --from-dbml`
     /// and `init --from-db` rebuilt `qty_positive` as Postgres's own
     /// `t_qty_check` — a different constraint to anything that names it.
