@@ -572,12 +572,31 @@ impl PostgresAdapter {
         //    tables (`_dbd_meta`, `_dbd_migrations`) — they are created/managed by
         //    `dbd apply`, not authored DDL, so they must never be reverse-engineered
         //    into the project (mirrors the sqlite adapter's exclusion).
-        let owned = Self::not_extension_member("pg_class", "format('%I.%I', c.table_schema, c.table_name)::regclass");
+        let owned = Self::not_extension_member("pg_class", "cls.oid");
+        // A partition is storage of its partitioned table, not a table of its
+        // own: left out here, and named in its table's note. Flattened into a
+        // table beside a plain copy of its parent, an export of both put every
+        // row in twice, and `reconcile --prune` read the partitions of a
+        // declared table as orphans to drop.
         let tables_sql = format!(
-            "SELECT c.table_schema, c.table_name \
+            "SELECT c.table_schema, c.table_name, cls.relpersistence::text AS persistence, \
+                    pg_get_partkeydef(cls.oid) AS partition_key, \
+                    (SELECT array_agg(pn.nspname || '.' || pc.relname \
+                              || coalesce(' (' || pg_get_expr(pc.relpartbound, pc.oid) || ')', '') \
+                              || CASE WHEN pc.relkind = 'p' THEN ', itself partitioned' ELSE '' END \
+                              ORDER BY pn.nspname, pc.relname) \
+                     FROM pg_inherits i JOIN pg_class pc ON pc.oid = i.inhrelid \
+                     JOIN pg_namespace pn ON pn.oid = pc.relnamespace \
+                     WHERE i.inhparent = cls.oid) AS children, \
+                    (SELECT array_agg(pn.nspname || '.' || pc.relname ORDER BY i.inhseqno) \
+                     FROM pg_inherits i JOIN pg_class pc ON pc.oid = i.inhparent \
+                     JOIN pg_namespace pn ON pn.oid = pc.relnamespace \
+                     WHERE i.inhrelid = cls.oid) AS parents \
              FROM information_schema.tables c \
+             JOIN pg_class cls ON cls.oid = format('%I.%I', c.table_schema, c.table_name)::regclass \
              WHERE c.table_type = 'BASE TABLE' AND {ns_filter} \
              AND c.table_name NOT IN ('_dbd_meta', '_dbd_migrations') \
+             AND NOT cls.relispartition \
              AND {owned} \
              ORDER BY c.table_schema, c.table_name"
         );
@@ -591,6 +610,7 @@ impl PostgresAdapter {
         for trow in &table_rows {
             let schema: String = trow.get("table_schema");
             let table: String = trow.get("table_name");
+            let table_notes = Self::unmodeled_table_notes(&format!("{schema}.{table}"), trow);
 
             let columns = self.introspect_columns(&schema, &table).await?;
             let (constraints, constraint_index_oids, constraint_warnings) =
@@ -620,7 +640,8 @@ impl PostgresAdapter {
 
             let mut entity = Entity::new(EntityType::Table, &format!("{schema}.{table}"));
             entity.table_def = Some(table_def);
-            entity.warnings = constraint_warnings;
+            entity.warnings = table_notes;
+            entity.warnings.extend(constraint_warnings);
             entities.push(entity);
         }
 
@@ -697,6 +718,58 @@ impl PostgresAdapter {
                 (format!("{schema}.{table}"), statement, warning)
             })
             .collect())
+    }
+
+    /// What a table row from `introspect_tables` says that dbd's table model
+    /// has no field for — partitioning, inheritance, `UNLOGGED` — each named
+    /// with what capturing the table without it means.
+    fn unmodeled_table_notes(table: &str, row: &sqlx::postgres::PgRow) -> Vec<String> {
+        let mut notes = Vec::new();
+        let partition_key: Option<String> = row.try_get("partition_key").unwrap_or(None);
+        let children: Vec<String> = row
+            .try_get::<Option<Vec<String>>, _>("children")
+            .unwrap_or(None)
+            .unwrap_or_default();
+        let parents: Vec<String> = row
+            .try_get::<Option<Vec<String>>, _>("parents")
+            .unwrap_or(None)
+            .unwrap_or_default();
+        if let Some(key) = partition_key {
+            let partitions = if children.is_empty() {
+                "no partitions yet".to_string()
+            } else {
+                format!("partitions {}", children.join(", "))
+            };
+            notes.push(format!(
+                "table {table} is partitioned in the database (PARTITION BY {key}; {partitions}) — dbd has no \
+                 partitioning, so it is captured as one plain table that holds every row: its partitions are \
+                 not created, and anything defined on a partition alone (an index, a constraint, a trigger) \
+                 is not captured"
+            ));
+        } else if !children.is_empty() {
+            notes.push(format!(
+                "tables inherit from {table} in the database ({}) — dbd has no inheritance, so each is captured \
+                 as a plain table; an export of {table} also holds the rows of the tables that inherit from it",
+                children.join(", ")
+            ));
+        }
+        if !parents.is_empty() {
+            notes.push(format!(
+                "table {table} inherits {} in the database — dbd has no inheritance, so it is captured as a \
+                 plain table with every column it has, and queries on {} no longer see its rows",
+                parents.join(", "),
+                parents.join(" or ")
+            ));
+        }
+        let persistence: String = row.try_get("persistence").unwrap_or_default();
+        if persistence == "u" {
+            notes.push(format!(
+                "table {table} is UNLOGGED in the database — dbd's table model has no persistence, so it is \
+                 captured as an ordinary, logged table: no row or rule is lost, but writes are slower, and it \
+                 survives a crash and is replicated where the source table was neither"
+            ));
+        }
+        notes
     }
 
     /// Introspect a table's columns.
@@ -930,6 +1003,18 @@ impl PostgresAdapter {
                     "constraint {conname} on {schema}.{table} is NOT ENFORCED in the database — it checks \
                      nothing there. It is captured enforced (the SQL dbd reads has no NOT ENFORCED), so a new \
                      database refuses rows this one accepts"
+                ));
+            }
+            // A deferrable foreign key is modelled (`ForeignKey::deferrable`); a
+            // primary key or unique constraint's deferral has no field.
+            let deferrable: bool = con.try_get("condeferrable").unwrap_or(false);
+            if deferrable && (contype == "p" || contype == "u") {
+                let deferred: bool = con.try_get("condeferred").unwrap_or(false);
+                warnings.push(format!(
+                    "constraint {conname} on {schema}.{table} is DEFERRABLE{} in the database — dbd's model of a \
+                     primary key or unique constraint has no deferral, so it is captured checked at once: a \
+                     transaction that briefly holds two equal keys (swapping two rows' positions) fails there",
+                    if deferred { " INITIALLY DEFERRED" } else { "" }
                 ));
             }
             // Only a CHECK can be inherited; Postgres marks every other kind
