@@ -1212,9 +1212,16 @@ impl Design {
     /// subgraph; `scope` filters to that scope's working set (`None` ⇒ full set).
     pub fn graph(&self, name: Option<&str>, scope: Option<&ResolvedScope>) -> Result<dependency::GraphResult> {
         // An unknown or out-of-scope name produced an empty graph — a valid
-        // document, indistinguishable from an entity with no dependencies.
-        if let Some(n) = name {
-            self.resolve_name(n, scope)?;
+        // document, indistinguishable from an entity with no dependencies. So
+        // did an `external:` one: dbd has no DDL for it, so it is no node of
+        // the graph, and `inspect -n` and `apply -n` refuse it alike.
+        if let Some(n) = name
+            && self.resolve_name(n, scope)?.entity_type == EntityType::External
+        {
+            return Err(DbdError::Config(format!(
+                "{n} is declared `external:` — dbd has no DDL for it, so it has no place in the dependency \
+                 graph; it only resolves references to it"
+            )));
         }
         let graphable = crate::scope::is_scopable;
         let non_meta: Vec<Entity> = match scope {
