@@ -1231,6 +1231,39 @@ mod tests {
         }
     }
 
+    /// Every database has a `public` schema, and `init --from-db` listed it
+    /// under `schemas:` even when nothing in it was captured — so the
+    /// project claimed a schema it holds nothing in, and `reset --clean`
+    /// would drop it. A schema with nothing captured in it is left out, and
+    /// said so; one the user named with `--schema` is kept, empty or not.
+    #[test]
+    fn init_lists_no_schema_it_captured_nothing_in_unless_asked_for() {
+        let entities = || {
+            vec![
+                dbd_core::Entity::schema("public"),
+                dbd_core::Entity::schema("app"),
+                table("app.t", None),
+            ]
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        init_into(tmp.path(), entities(), SchemaSelect::default(), "postgres");
+        let config = dbd_core::config::read(&tmp.path().join("design.yaml")).unwrap();
+        assert_eq!(config.schema_names(), ["app"], "public holds nothing captured");
+
+        let asked = tempfile::tempdir().unwrap();
+        init_into(
+            asked.path(),
+            entities(),
+            SchemaSelect {
+                only: vec!["public".into(), "app".into()],
+                ..Default::default()
+            },
+            "postgres",
+        );
+        let config = dbd_core::config::read(&asked.path().join("design.yaml")).unwrap();
+        assert_eq!(config.schema_names(), ["app", "public"], "--schema public asked for it");
+    }
+
     /// `init --from-dbml` on an empty dir scaffolds design.yaml + a baseline snapshot.
     #[test]
     fn init_from_dbml_creates_project() {
