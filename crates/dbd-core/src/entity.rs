@@ -421,6 +421,25 @@ pub struct ForeignKey {
     pub ref_columns: Vec<String>,
     pub on_delete: Option<FkAction>,
     pub on_update: Option<FkAction>,
+    /// `MATCH FULL`: a key with some columns NULL and others not is refused,
+    /// where the default `MATCH SIMPLE` lets it through unchecked. Postgres
+    /// implements no other (`MATCH PARTIAL` is refused).
+    ///
+    /// Each of these three is part of what the key enforces, so each is part
+    /// of its identity: a reversed file that dropped them wrote a key that
+    /// accepts rows this one refuses, and `diff` could not see the difference.
+    /// Skipped when false, so snapshots of ordinary keys are unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub match_full: bool,
+    /// `DEFERRABLE`: the check can be put off to the end of the transaction
+    /// (`SET CONSTRAINTS … DEFERRED`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deferrable: bool,
+    /// `INITIALLY DEFERRED`: the check is put off to commit unless a
+    /// transaction says otherwise — so a child row may be inserted before its
+    /// parent. Implies [`Self::deferrable`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub initially_deferred: bool,
     /// Where [`Self::ref_schema`] came from. See [`SchemaSource`], and the note
     /// on this struct for why it is outside `PartialEq`.
     ///
@@ -454,6 +473,9 @@ impl PartialEq for ForeignKey {
             ref_columns,
             on_delete,
             on_update,
+            match_full,
+            deferrable,
+            initially_deferred,
             ref_schema_source: _,
         } = self;
         *name == other.name
@@ -463,6 +485,9 @@ impl PartialEq for ForeignKey {
             && *ref_columns == other.ref_columns
             && *on_delete == other.on_delete
             && *on_update == other.on_update
+            && *match_full == other.match_full
+            && *deferrable == other.deferrable
+            && *initially_deferred == other.initially_deferred
     }
 }
 

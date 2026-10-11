@@ -552,6 +552,14 @@ fn extract_foreign_key(
         ref_columns: string_list(&c.pk_attrs),
         on_delete: fk_action(&c.fk_del_action),
         on_update: fk_action(&c.fk_upd_action),
+        // `f` is MATCH FULL; `s` (SIMPLE) is the default and what an omitted
+        // clause parses to.
+        match_full: c.fk_matchtype == "f",
+        // A table-level key carries its `DEFERRABLE` / `INITIALLY DEFERRED`
+        // here. A column-level `REFERENCES` gets them as constraint nodes of
+        // their own that follow it — see `extract_column`.
+        deferrable: c.deferrable || c.initdeferred,
+        initially_deferred: c.initdeferred,
     })
 }
 

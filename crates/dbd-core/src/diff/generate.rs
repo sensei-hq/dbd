@@ -514,18 +514,6 @@ fn identity_kind_sql(kind: &crate::entity::IdentityKind) -> &'static str {
     }
 }
 
-/// Convert an FkAction to its SQL keyword.
-fn fk_action_to_sql(action: &crate::entity::FkAction) -> &'static str {
-    use crate::entity::FkAction;
-    match action {
-        FkAction::Cascade => "CASCADE",
-        FkAction::Restrict => "RESTRICT",
-        FkAction::SetNull => "SET NULL",
-        FkAction::SetDefault => "SET DEFAULT",
-        FkAction::NoAction => "NO ACTION",
-    }
-}
-
 /// Generate ADD CONSTRAINT SQL for a table constraint.
 fn constraint_add_sql(entity_name: &str, con: &TableConstraint) -> String {
     match con {
@@ -575,12 +563,7 @@ fn constraint_add_sql(entity_name: &str, con: &TableConstraint) -> String {
                 fk.ref_table,
                 fk.ref_columns.join(", ")
             );
-            if let Some(ref action) = fk.on_delete {
-                sql.push_str(&format!(" ON DELETE {}", fk_action_to_sql(action)));
-            }
-            if let Some(ref action) = fk.on_update {
-                sql.push_str(&format!(" ON UPDATE {}", fk_action_to_sql(action)));
-            }
+            crate::emit::push_fk_clauses(&mut sql, fk);
             sql.push(';');
             sql
         }

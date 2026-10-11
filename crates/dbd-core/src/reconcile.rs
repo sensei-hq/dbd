@@ -794,6 +794,9 @@ struct FkShape {
     ref_columns: Vec<String>,
     on_delete: Option<FkAction>,
     on_update: Option<FkAction>,
+    match_full: bool,
+    deferrable: bool,
+    initially_deferred: bool,
 }
 
 /// The name-agnostic shape of an FK for cross-representation matching.
@@ -813,6 +816,11 @@ fn fk_shape(fk: &ForeignKey) -> FkShape {
         ref_columns: fk.ref_columns.clone(),
         on_delete: norm_action(fk.on_delete),
         on_update: norm_action(fk.on_update),
+        match_full: fk.match_full,
+        // `INITIALLY DEFERRED` implies `DEFERRABLE`; one spelled without the
+        // other is the same key.
+        deferrable: fk.deferrable || fk.initially_deferred,
+        initially_deferred: fk.initially_deferred,
     }
 }
 

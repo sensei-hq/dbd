@@ -433,6 +433,10 @@ impl<'a> Parser<'a> {
                 ref_columns: r.tgt_columns,
                 on_delete: r.on_delete,
                 on_update: r.on_update,
+                // DBML has no words for these; a `Ref` is a plain key.
+                match_full: false,
+                deferrable: false,
+                initially_deferred: false,
                 // A DBML `Ref` always names both sides' schemas, so nothing
                 // here was inferred.
                 ref_schema_source: crate::entity::SchemaSource::Stated,

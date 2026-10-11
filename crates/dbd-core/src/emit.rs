@@ -258,12 +258,7 @@ fn emit_table_constraint_line(con: &crate::entity::TableConstraint, schema: &str
                 q(&fk.ref_table),
                 quote_cols(&fk.ref_columns),
             );
-            if let Some(a) = fk.on_delete {
-                s.push_str(&format!(" ON DELETE {}", fk_action_sql(a)));
-            }
-            if let Some(a) = fk.on_update {
-                s.push_str(&format!(" ON UPDATE {}", fk_action_sql(a)));
-            }
+            push_fk_clauses(&mut s, fk);
             s
         }
         TableConstraint::Check { name, expression } => format!("  {}CHECK ({expression})", named(name)),
@@ -376,6 +371,27 @@ fn quote_cols(cols: &[String]) -> String {
 
 fn esc(s: &str) -> String {
     s.replace('\'', "''")
+}
+
+/// Everything a foreign key says after its referenced columns, in the order
+/// Postgres's grammar takes it: `MATCH FULL`, the referential actions, then
+/// `DEFERRABLE [INITIALLY DEFERRED]`. Shared with the migration and reconcile
+/// SQL, so a key is written the same wherever dbd writes one.
+pub(crate) fn push_fk_clauses(sql: &mut String, fk: &crate::entity::ForeignKey) {
+    if fk.match_full {
+        sql.push_str(" MATCH FULL");
+    }
+    if let Some(a) = fk.on_delete {
+        sql.push_str(&format!(" ON DELETE {}", fk_action_sql(a)));
+    }
+    if let Some(a) = fk.on_update {
+        sql.push_str(&format!(" ON UPDATE {}", fk_action_sql(a)));
+    }
+    if fk.initially_deferred {
+        sql.push_str(" DEFERRABLE INITIALLY DEFERRED");
+    } else if fk.deferrable {
+        sql.push_str(" DEFERRABLE");
+    }
 }
 
 fn fk_action_sql(a: crate::entity::FkAction) -> &'static str {

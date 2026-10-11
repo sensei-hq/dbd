@@ -857,6 +857,7 @@ impl PostgresAdapter {
         // It only exists on PG 15+; reading it through `to_jsonb` yields NULL
         // instead of erroring on older servers, matching `introspect_indexes`.
         let cons_sql = "SELECT c.conname, c.contype::text, c.confdeltype::text, c.confupdtype::text, \
+                    c.confmatchtype::text, c.condeferrable, c.condeferred, \
                     c.conindid::int8 AS conindid, \
                     coalesce((to_jsonb(ix) ->> 'indnullsnotdistinct')::boolean, false) \
                         AS nulls_not_distinct, \
@@ -970,6 +971,9 @@ impl PostgresAdapter {
                         ref_columns: ref_col_names,
                         on_delete,
                         on_update,
+                        match_full: con.try_get::<String, _>("confmatchtype").is_ok_and(|m| m == "f"),
+                        deferrable: con.try_get("condeferrable").unwrap_or(false),
+                        initially_deferred: con.try_get("condeferred").unwrap_or(false),
                         // Read from the live catalog, which always states the
                         // schema. Nothing was guessed.
                         ref_schema_source: crate::entity::SchemaSource::Stated,
