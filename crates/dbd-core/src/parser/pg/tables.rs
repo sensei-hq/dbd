@@ -1476,14 +1476,11 @@ mod tests {
     /// dbd cannot read is absent from the desired snapshot, reads as an orphan,
     /// and `--prune` DROPs it. Anything unextractable therefore has to error.
     #[test]
-    fn a_constraint_dbd_cannot_represent_errors_rather_than_dropping_silently() {
-        let e = parse(
-            "create table t (id int primary key, r int4range,\
-             exclude using gist (r with &&));",
-        );
+    fn a_clause_dbd_cannot_represent_errors_rather_than_dropping_silently() {
+        let e = parse("create table t (id int primary key, like other_table including defaults);");
         assert!(
             !e.errors.is_empty(),
-            "an EXCLUDE constraint must not be dropped silently"
+            "the columns a LIKE clause copies must not be dropped silently"
         );
         assert!(
             e.table_def.is_none(),
