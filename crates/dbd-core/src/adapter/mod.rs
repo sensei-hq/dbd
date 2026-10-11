@@ -150,6 +150,15 @@ pub trait DatabaseAdapter: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// The live materialized views that read any of `columns` — `(table,
+    /// column)` pairs, the table as `schema.name` — directly or through views,
+    /// as `schema.name`, deepest first. What blocks `ALTER COLUMN … TYPE` on
+    /// those columns and that dbd never drops. Default: none (targets without
+    /// materialized views).
+    async fn matviews_reading_columns(&self, _columns: &[(String, String)]) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
     /// Record `stamp` — a `dbd:hash` sentinel — as the drift stamp of
     /// materialized view `qualified` (`schema.name`). Kept apart from the view's
     /// own comment, which belongs to its author. Default: no-op (targets without

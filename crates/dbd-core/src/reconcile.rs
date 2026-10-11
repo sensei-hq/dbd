@@ -60,6 +60,19 @@ pub struct ReconcilePlan {
     /// (see [`plan_index_convergence`]). Whole-table drops are separate — see
     /// [`Self::dropped`] — and gated by pruning, not by this flag.
     pub destructive: bool,
+    /// The enum type swaps the plan makes (see [`plan_enum_recreation`]), with
+    /// the columns each moves — what the caller checks against the live
+    /// database for a materialized view that would block one.
+    pub enum_swaps: Vec<EnumSwap>,
+}
+
+/// One enum's type swap: the values it loses and the `(table, column)` pairs
+/// (`schema.table`) moved onto the new type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumSwap {
+    pub enum_name: String,
+    pub removed: Vec<String>,
+    pub columns: Vec<(String, String)>,
 }
 
 impl ReconcilePlan {
@@ -1190,9 +1203,18 @@ pub(crate) const ENUM_RECREATE_SUFFIX: &str = "__dbd_old";
 /// routines that merely *reference* the enum's table are never dropped: only a
 /// view over the column stands in the way of the swap.
 ///
-/// The one case it declines is a dependent **materialized view**: dbd never
-/// auto-drops one (a `DROP … CASCADE` would repopulate it and take its dependents
-/// with it), so recreation is reported as blocked rather than attempted.
+/// A dependent **materialized view** is the one blocker it does not clear:
+/// dbd never drops one (a `DROP … CASCADE` would repopulate it and take its
+/// dependents with it). Whether one blocks is a fact about the database — one
+/// dropped by hand blocks nothing, one the design does not declare still does —
+/// so the swap is recorded in [`ReconcilePlan::enum_swaps`] with the columns it
+/// moves, and the caller asks the database before any write (see
+/// `Design::reconcile`). Deciding from the design meant a matview declared
+/// there blocked forever: dropped by hand as told, it was re-created by the
+/// same run, and the next declined again.
+///
+/// The type's comment is carried from the type renamed aside to its
+/// replacement ([`enum_comment_carry`]); it used to go with the old type.
 ///
 /// Dropped views are not re-created here — reconcile re-applies every managed
 /// view on every run, after the enum and tables it depends on, which is exactly
@@ -1233,30 +1255,18 @@ pub fn plan_enum_recreation(
 
         let columns = enum_columns(live, &qname);
         let roots: HashSet<String> = columns.iter().map(|c| c.table.clone()).collect();
-
-        // A matview over an affected table blocks the swap and dbd will not drop
-        // it. Say so, and plan nothing — a partial script would fail mid-batch
-        // with a Postgres message that names the view but not the cause.
-        let dependents = dependent_views(desired_entities, &roots);
-        let blocking: Vec<&str> = dependents
-            .iter()
-            .filter(|(_, e)| e.entity_type == EntityType::MaterializedView)
-            .map(|(_, e)| e.name.as_str())
+        // The views over the columns' tables, which the swap drops and the
+        // write pass re-creates. Materialized views are left to the caller's
+        // live check: `DROP VIEW` fails on one that exists.
+        let dependents: Vec<(usize, &Entity)> = dependent_views(desired_entities, &roots)
+            .into_iter()
+            .filter(|(_, e)| e.entity_type == EntityType::View)
             .collect();
-        if !blocking.is_empty() {
-            plan.warnings.push(format!(
-                "{qname}: cannot drop enum value{} {} — materialized view{} {} depend{} on a column of this type, \
-                 and dbd never drops a materialized view. Drop {} by hand, re-run reconcile, then re-create {}",
-                if removed.len() == 1 { "" } else { "s" },
-                removed.join(", "),
-                if blocking.len() == 1 { "" } else { "s" },
-                blocking.join(", "),
-                if blocking.len() == 1 { "s" } else { "" },
-                blocking.join(", "),
-                if blocking.len() == 1 { "it" } else { "them" },
-            ));
-            continue;
-        }
+        plan.enum_swaps.push(EnumSwap {
+            enum_name: qname.clone(),
+            removed: removed.iter().map(|v| v.to_string()).collect(),
+            columns: columns.iter().map(|c| (c.table.clone(), c.column.clone())).collect(),
+        });
 
         let old_type = format!("{qname}{ENUM_RECREATE_SUFFIX}");
         let mut lines: Vec<String> = vec![format!(
@@ -1266,8 +1276,8 @@ pub fn plan_enum_recreation(
         )];
 
         // Deepest dependents first: a view over a view has to go before the view
-        // it selects from. A matview would have returned above, so every
-        // dependent left is a plain view and `DROP VIEW` is the right keyword.
+        // it selects from. Every dependent left is a plain view, so `DROP VIEW`
+        // is the right keyword.
         for (_, e) in &dependents {
             lines.push(format!("DROP VIEW IF EXISTS {};", qualified_entity_name(e)));
         }
@@ -1298,6 +1308,7 @@ pub fn plan_enum_recreation(
             "CREATE TYPE {qname} AS ENUM ({});",
             de.values.iter().map(|v| literal(v)).collect::<Vec<_>>().join(", ")
         ));
+        lines.push(enum_comment_carry(&qname, &old_type));
 
         for c in &columns {
             // An array column cannot cast element-wise through the scalar text
@@ -1358,6 +1369,24 @@ pub fn plan_enum_recreation(
         // gated behind `--allow-destructive` like any other data-losing change.
         plan.destructive = true;
     }
+}
+
+/// Copy the comment of `old_type` — the enum renamed aside by a type swap — to
+/// `qname`, its replacement, so the swap does not lose it.
+///
+/// Read from the database rather than the design: an enum's comment is not
+/// part of any snapshot or diff, so the one it had is the one to keep. A type
+/// with no comment copies `NULL`, which sets none.
+pub(crate) fn enum_comment_carry(qname: &str, old_type: &str) -> String {
+    use crate::sql_quote::literal;
+    let (schema, name) = crate::entity::split_qualified_name(qname);
+    format!(
+        "DO $$ BEGIN\n  EXECUTE format('COMMENT ON TYPE %I.%I IS %L', {}, {}, \
+         obj_description(to_regtype({}), 'pg_type'));\nEND $$;",
+        literal(schema.as_deref().unwrap_or(DEFAULT_SCHEMA)),
+        literal(&name),
+        literal(old_type),
+    )
 }
 
 /// The live indexes an enum swap over `columns` has to drop and create again —

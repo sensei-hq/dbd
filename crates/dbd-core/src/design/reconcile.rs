@@ -1,5 +1,78 @@
 use super::*;
 
+/// Refuse a plan whose enum value removal a live materialized view blocks,
+/// naming each one and the steps that let the removal through.
+///
+/// Reconcile used to decide this from the design and plan nothing for the
+/// enum, with a warning — and the run exited 0, "Reconciled", having not
+/// converged. Its instruction did not work either: the matview, dropped by
+/// hand, was re-created by the very run that re-checked the design, which
+/// declined again. Asked of the database, a dropped matview blocks nothing, and
+/// the re-run removes the value and re-creates the matview from its DDL.
+async fn refuse_enum_swaps_a_matview_blocks(
+    adapter: &dyn DatabaseAdapter,
+    plan: &crate::reconcile::ReconcilePlan,
+    desired_entities: &[&Entity],
+) -> Result<()> {
+    let mut blocks: Vec<String> = Vec::new();
+    let mut drops: Vec<String> = Vec::new();
+    let mut undeclared: Vec<String> = Vec::new();
+    for swap in &plan.enum_swaps {
+        let matviews = adapter.matviews_reading_columns(&swap.columns).await?;
+        if matviews.is_empty() {
+            continue;
+        }
+        let values: Vec<String> = swap.removed.iter().map(|v| crate::sql_quote::literal(v)).collect();
+        blocks.push(format!(
+            "{} from {}: materialized view{} {} read{} a column of that type",
+            values.join(", "),
+            swap.enum_name,
+            if matviews.len() == 1 { "" } else { "s" },
+            matviews.join(", "),
+            if matviews.len() == 1 { "s" } else { "" },
+        ));
+        for mv in matviews {
+            if !desired_entities
+                .iter()
+                .any(|e| e.entity_type == EntityType::MaterializedView && e.name == mv)
+                && !undeclared.contains(&mv)
+            {
+                undeclared.push(mv.clone());
+            }
+            let drop = format!("DROP MATERIALIZED VIEW {};", crate::sql_quote::qualified(&mv));
+            if !drops.contains(&drop) {
+                drops.push(drop);
+            }
+        }
+    }
+    if blocks.is_empty() {
+        return Ok(());
+    }
+    let mut steps = vec![
+        format!(
+            "  1. drop {} by hand: {}",
+            if drops.len() == 1 { "it" } else { "them" },
+            drops.join(" ")
+        ),
+        "  2. re-run `dbd reconcile --allow-destructive`: it removes the value and re-creates, from the \
+         design, the materialized views it declares"
+            .to_string(),
+    ];
+    if !undeclared.is_empty() {
+        steps.push(format!(
+            "  3. re-create {} yourself — the design does not declare {}",
+            undeclared.join(", "),
+            if undeclared.len() == 1 { "it" } else { "them" },
+        ));
+    }
+    Err(DbdError::Config(format!(
+        "reconcile cannot remove enum value {}. dbd never drops a materialized view, so nothing was changed. \
+         To go on:\n{}",
+        blocks.join("; and "),
+        steps.join("\n")
+    )))
+}
+
 impl Design {
     /// Read-only materialized-view detection for `reconcile`: for each design
     /// matview, decide create/skip/restamp/warn against the live `dbd:hash`
@@ -375,6 +448,11 @@ impl Design {
         let (mv_to_create, mv_to_restamp) = self
             .detect_reconcile_matviews(adapter, &desired_entities, &mut plan)
             .await?;
+
+        // A materialized view reading a column an enum swap moves blocks the
+        // swap, and dbd never drops one: refused here, before any write and
+        // under `dry_run`, against what the database has.
+        refuse_enum_swaps_a_matview_blocks(adapter, &plan, &desired_entities).await?;
 
         if dry_run {
             // Checked as the run checks them, executing none: a hook file that
