@@ -5,8 +5,11 @@
 use crate::entity::Entity;
 
 /// Quote a SQL identifier.
+/// A quoted identifier, its quotes doubled — through the one quoting rule.
+/// Wrapped without doubling, a name holding `"` ended early and the file
+/// did not parse.
 fn q(ident: &str) -> String {
-    format!("\"{ident}\"")
+    crate::sql_quote::ident(ident)
 }
 
 /// Bare (unqualified) name from a possibly-qualified entity name (`schema.name` → `name`).
