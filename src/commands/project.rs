@@ -540,6 +540,7 @@ pub async fn cmd_deploy(
         spinner.finish();
         result.context("Deploy failed")?;
     }
+    super::note_promotion(&marks, design.env());
 
     let summary = summary.unwrap_or_default();
     // Non-fatal diagnostics — skipped imports and failed policy files — are
@@ -674,6 +675,7 @@ pub(crate) async fn reconcile_with_adapter(
         spinner.finish();
         result.context("Reconcile failed")?
     };
+    super::note_promotion(&marks, design.env());
 
     for w in &plan.warnings {
         output::always(&format!("⚠ {w}"));

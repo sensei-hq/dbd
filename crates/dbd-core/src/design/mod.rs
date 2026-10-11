@@ -646,6 +646,12 @@ fn warn_if_no_search_path(entity: &mut Entity, relative: &std::path::Path) {
 }
 
 impl Design {
+    /// The environment this design was loaded for (`-e`): what a run records
+    /// in the database, and what picks its `import/<env>/` data.
+    pub fn env(&self) -> &str {
+        &self.env
+    }
+
     /// Every DDL file a run under `scope` — narrowed to the entity `name`
     /// selects, if any — executes that states no `SET search_path`, as a
     /// warning naming the path its unqualified names were resolved against:

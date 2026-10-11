@@ -921,6 +921,7 @@ pub async fn cmd_apply(
         // `s.warnings` are the hook skips, already said before the run.
         output::info(verbosity, &format_apply_summary(&s));
     }
+    super::note_promotion(&marks, design.env());
 
     // pg_cron refresh-job sync + matview hash-stamping now live in core
     // `Design::apply`, so `dbd apply` and `dbd deploy` both schedule refresh

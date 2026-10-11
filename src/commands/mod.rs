@@ -702,6 +702,24 @@ pub(super) async fn other_scope_pin(
     Ok(dbd_core::Design::conflicting_pin(&marks, &resolved.name).map(|(pinned, by)| (pinned.to_string(), by)))
 }
 
+/// Say so when a run that records the environment promoted the database from
+/// dev to prod. `before` are the database's marks read before the run, `env`
+/// the run's.
+///
+/// `-e` defaults to prod, so a run without it promotes a dev database. That is
+/// allowed — it only tightens what `reset` allows — but it was silent, and
+/// every later `-e dev` run is refused with no word of what changed.
+pub(super) fn note_promotion(before: &dbd_core::design::DatabaseMarks, env: &str) {
+    let is = |value: &str, wanted: &str| dbd_core::config::normalize_env(Some(value)).is_ok_and(|e| e == wanted);
+    if before.own.as_ref().is_some_and(|own| is(&own.env, "dev")) && is(env, "prod") {
+        output::warn(
+            "This database was marked dev and is now marked prod: this run is -e prod, the default when -e is \
+             not given. dbd never re-marks a prod database dev, so later -e dev runs are refused — to keep it \
+             dev, rebuild it: `dbd reset --force`, then run with -e dev.",
+        );
+    }
+}
+
 /// Print the pending migrations a run would execute: each step under its
 /// version, then the statements it runs, a destructive one marked `⚠`.
 pub(super) fn print_migration_preview(verbosity: Verbosity, preview: &dbd_core::design::MigrationPreview) {
