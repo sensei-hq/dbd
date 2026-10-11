@@ -31,7 +31,11 @@ schemas. Two kinds of destruction each need their own opt-in:
 
 - **`--allow-destructive`** — drop a *column* or constraint from a managed table, or remove a
   *value* from an enum (the type is recreated; the managed views over a table with a column of
-  the enum are dropped and re-applied, and nothing else is dropped).
+  the enum are dropped and re-applied, and nothing else is dropped). dbd never drops a
+  materialized view, so a live one reading such a column blocks the removal: reconcile refuses
+  before it writes anything, `--dry-run` included, naming the matview and the way through —
+  `DROP MATERIALIZED VIEW` it by hand, then re-run, which re-creates the matviews the design
+  declares. Without the flag, the refusal lists each drop by the entity it belongs to.
 - **`--prune`** — drop a whole *table* that is still in a managed schema but no longer in the
   design (an orphan). Without `--prune`, orphans are reported and left in place. Under
   `--scope`, a table the design declares outside the scope is not an orphan — a scope narrows
@@ -44,7 +48,8 @@ schemas. Two kinds of destruction each need their own opt-in:
 Orphaned *enums* are only warned about, never auto-dropped (columns may still reference them).
 
 Reconcile runs the design's `apply.before` and `apply.after` hooks and its `grants:` too, scoped
-as `apply` scopes them, so a dev loop on reconcile builds the database `apply` would.
+as `apply` scopes them, so a dev loop on reconcile builds the database `apply` would;
+`reconcile --dry-run` lists them after the schema changes.
 
 Reconcile is not one transaction: it writes in the dependency order `apply` uses, each step
 committing as it runs, so a step that fails stops the run with the earlier steps applied. Fix the
@@ -81,10 +86,24 @@ use `dbd merge` for that. From here it's an ordinary project: edit DDL → snaps
 The reversed project applies cleanly back to the database it came from — the DDL is re-runnable
 (`IF NOT EXISTS`, `OR REPLACE`), so the first `dbd apply` records the version and changes nothing,
 and `dbd diff` afterwards is empty — and to a fresh one. Its extensions are in the target's
-`extensions:`, its schemas under `schemas:`, and a table a foreign key reaches outside what was
-captured under `external:`; every schema left out is named as it is left out. The DDL is fully
-qualified and states no `SET search_path`, so `dbd inspect` notes that on every file; nothing in the
+`extensions:`, its schemas under `schemas:` (only those something was captured in, or that
+`--schema` named), and a table a foreign key reaches outside what was captured under `external:`;
+every schema left out is named as it is left out. The DDL is fully qualified and states no
+`SET search_path`, so `dbd inspect`, `apply` and `deploy` note that on every file; nothing in the
 files depends on the path, so the note is harmless.
+
+What dbd's model cannot hold is named as it is captured, rather than written weaker in silence:
+a partitioned table becomes one plain table holding every row, its partitions folded into it; an
+`UNLOGGED` table, inheritance, a primary key's or UNIQUE's deferral, and a constraint's
+`NOT VALID`, `NOT ENFORCED` or `NO INHERIT` are each named for the object that has them. What an
+extension owns — its tables, views, functions, types — is left out entirely, as it is by `diff`
+and `reconcile`.
+
+A capture narrowed by `--schema` declares the extensions its objects use, when they are installed
+in `public` or a captured schema, and prints a `needs:` line for each type, function or table the
+captured objects use from a schema it left out, naming who uses it. A new database needs those
+first, so the project applies with an empty `diff` to a database that has what the `needs:`
+lines name.
 
 Adopting a Supabase database? `init --from-db` recognises it by Supabase's `auth` and `storage`
 schemas, names the target `supabase`, so Supabase's own schemas are protected (see
@@ -124,8 +143,10 @@ dbd apply --scope billing -d $BILLING_URL   # deploy just that module to its own
 
 `merge` edits nothing in `design.yaml` but `project.version`, and never deletes files (orphans are
 reported, not removed; an extension, an external table or a schema the config should declare is
-warned about, for you to add), and
-it **refuses** if the source database is behind your project version (see Version safety below).
+warned about, for you to add — only a schema it wrote files into). A table the design declares
+`external:` is never captured, only named, and a table the project builds is never called
+external. It **refuses** if the source database is behind your project version (see Version
+safety below).
 
 ### Start from a dbdiagram.io / dbdocs design
 
@@ -150,9 +171,9 @@ dbd merge -d $DATABASE_URL               # overwrite DDL + auto-snapshot the dif
 
 | Source | Captured |
 |--------|----------|
-| **Postgres / Supabase** (`--from-db postgres://…`) | schemas (under `schemas:`), extensions (in the target's `extensions:`), enums with their comments, tables (columns, defaults, identity, PK/FK/unique/check with their names, indexes incl. `gin/gist/brin/hash`, partial and expression indexes, comments, `serial`/identity columns), views and materialized views with their comments (definition + indexes), functions & procedures (verbatim), standalone sequences, and roles (opt-in `--roles`); a table a foreign key reaches outside the project is declared `external:`. **Not** captured: triggers. A database with Supabase's `auth` and `storage` schemas gets a `supabase` target, and only there are its platform schemas left out. |
+| **Postgres / Supabase** (`--from-db postgres://…`) | schemas (under `schemas:`), extensions (in the target's `extensions:`), enums with their comments, tables (columns with their collations, defaults, identity, PK/FK/unique/check/EXCLUDE with their names, a foreign key's `DEFERRABLE`, `INITIALLY DEFERRED` and `MATCH FULL`, indexes incl. `gin/gist/brin/hash`, partial and expression indexes, comments, `serial`/identity columns, and triggers, in the table's file), views and materialized views with their comments (definition + indexes; a view's `INSTEAD OF` triggers), functions & procedures (verbatim), standalone sequences, and roles (opt-in `--roles`); a table a foreign key reaches outside the project is declared `external:`. **Not** captured, and named: partitions (folded into their table), `UNLOGGED`, inheritance, PK/UNIQUE deferral, `NOT VALID`/`NOT ENFORCED`/`NO INHERIT`. Left out: whatever an extension owns. A database with Supabase's `auth` and `storage` schemas gets a `supabase` target, and only there are its platform schemas left out. |
 | **SQLite** (`--from-db sqlite://…`) | tables, user indexes, and views — captured **verbatim** from `sqlite_master` (CHECK constraints, type affinity, `AUTOINCREMENT`, `WITHOUT ROWID` all survive). No schemas/enums/functions/sequences/roles; triggers skipped. Files land flat (`ddl/table/<name>.ddl`); `design.yaml` carries `schemas: []`. |
-| **DBML** (`--from-dbml <file>`) | schemas, enums, tables and foreign keys — DBML can't express functions, procedures, views, standalone sequences or roles. From dbd's own DBML, CHECKs, identity (`ALWAYS` kept apart from `BY DEFAULT`), `serial`, generated columns, column `UNIQUE`, partial and expression indexes and key order survive; a table-level UNIQUE comes back as its named constraint, and a stub table as an `external:` entry; enum comments are lost. |
+| **DBML** (`--from-dbml <file>`) | schemas, enums, tables and foreign keys — DBML can't express functions, procedures, views, standalone sequences or roles. From dbd's own DBML, CHECKs, identity (`ALWAYS` kept apart from `BY DEFAULT`), `serial`, generated columns, column `UNIQUE`, partial and expression indexes, key order, an index's method, `INCLUDE` columns, operator classes and storage parameters, and primary-key and foreign-key names other than PostgreSQL's defaults survive; a table-level UNIQUE comes back as its named constraint, and a stub table as an `external:` entry; enum comments, EXCLUDE constraints, collations and a foreign key's deferral and `MATCH FULL` are lost. A hand-written document is read as @dbml/core reads it — aliases, inline `ref:`, multi-line notes, a `pk` index; a one-to-one `-` Ref keys its right-hand side, and a many-to-many `<>` Ref or a `TablePartial` is refused, saying why. |
 
 The generated `design.yaml` target comes from the source: the connection URL scheme
 (`postgres://` → `postgres`, `sqlite://`/`file:` → `sqlite`), `supabase` for a PostgreSQL database
