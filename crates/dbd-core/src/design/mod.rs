@@ -277,14 +277,16 @@ fn ensure_reconcile_not_destructive(plan: &crate::reconcile::ReconcilePlan, allo
     if !plan.destructive || allow_destructive {
         return Ok(());
     }
+    // What is destructive, and only that: listing every altered table named
+    // ones that merely gained a column.
     let details: String = plan
-        .altered
+        .destructive_changes
         .iter()
-        .map(|s| format!("  {}", s.entity_name))
+        .map(|change| format!("  {change}"))
         .collect::<Vec<_>>()
         .join("\n");
     Err(DbdError::Config(format!(
-        "reconcile would make destructive changes (dropped columns, constraints, or indexes) on:\n{details}\n\
+        "reconcile would make destructive changes:\n{details}\n\
          Re-run with --allow-destructive to proceed."
     )))
 }

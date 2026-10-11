@@ -60,6 +60,11 @@ pub struct ReconcilePlan {
     /// (see [`plan_index_convergence`]). Whole-table drops are separate — see
     /// [`Self::dropped`] — and gated by pruning, not by this flag.
     pub destructive: bool,
+    /// What makes the plan [`Self::destructive`], one line each —
+    /// `"app.a: drops column gone"` — for a refusal to name. Only those: the
+    /// refusal used to list every altered table, a column added as much as one
+    /// dropped.
+    pub destructive_changes: Vec<String>,
     /// The enum type swaps the plan makes (see [`plan_enum_recreation`]), with
     /// the columns each moves — what the caller checks against the live
     /// database for a materialized view that would block one.
@@ -76,6 +81,14 @@ pub struct EnumSwap {
 }
 
 impl ReconcilePlan {
+    /// Record a change gated behind `--allow-destructive`, once.
+    fn mark_destructive(&mut self, change: String) {
+        self.destructive = true;
+        if !self.destructive_changes.contains(&change) {
+            self.destructive_changes.push(change);
+        }
+    }
+
     /// No structural changes to make.
     pub fn is_empty(&self) -> bool {
         self.added.is_empty()
@@ -746,13 +759,13 @@ pub fn qualified_entity_name(entity: &Entity) -> String {
 pub fn plan_reconcile(live: &Snapshot, desired: &Snapshot) -> ReconcilePlan {
     let diffs = diff::diff(live, desired);
     let warnings = diff::migration_warnings(&diffs);
-    let destructive = diffs.iter().any(has_column_drop);
-
     let mut plan = ReconcilePlan {
         warnings,
-        destructive,
         ..Default::default()
     };
+    for change in diffs.iter().flat_map(dropped_fields) {
+        plan.mark_destructive(change);
+    }
 
     for d in &diffs {
         match &d.action {
@@ -784,12 +797,28 @@ pub fn plan_reconcile(live: &Snapshot, desired: &Snapshot) -> ReconcilePlan {
     plan
 }
 
-/// Whether a diff drops a column or constraint from an existing table — the
-/// data-loss case gated by `allow_destructive`. Whole-object drops are handled
-/// separately via pruning.
-fn has_column_drop(d: &MigrationDiff) -> bool {
-    matches!(&d.action, DiffAction::Change(changes)
-        if changes.iter().any(|c| matches!(c.action, ChangeAction::Drop(_))))
+/// What a diff drops from an existing table or enum — a column, a constraint,
+/// an enum value: the data-loss cases gated by `allow_destructive` — one line
+/// each, for [`ReconcilePlan::destructive_changes`]. Whole-object drops are
+/// handled separately via pruning.
+fn dropped_fields(d: &MigrationDiff) -> Vec<String> {
+    use crate::diff::FieldType;
+    let DiffAction::Change(changes) = &d.action else {
+        return Vec::new();
+    };
+    changes
+        .iter()
+        .filter(|c| matches!(c.action, ChangeAction::Drop(_)))
+        .map(|c| {
+            let kind = match c.field_type {
+                FieldType::Column => "column",
+                FieldType::Constraint => "constraint",
+                FieldType::Index => "index",
+                FieldType::EnumValue => "enum value",
+            };
+            format!("{}: drops {kind} {}", d.entity_name, c.field_name)
+        })
+        .collect()
 }
 
 // ── Foreign-key convergence (issue #8) ──────────────────────
@@ -894,7 +923,7 @@ pub fn plan_fk_convergence(plan: &mut ReconcilePlan, live: &Snapshot, desired: &
                     fk.clone(),
                 )))),
             });
-            plan.destructive = true;
+            plan.mark_destructive(format!("{qname}: drops foreign key ({})", fk.columns.join(", ")));
         }
 
         // Adds: a design FK missing from the live DB (unnamed → Postgres auto-names).
@@ -1047,7 +1076,10 @@ pub fn plan_check_convergence(plan: &mut ReconcilePlan, live: &Snapshot, desired
                 field_type: FieldType::Constraint,
                 action: ChangeAction::Drop(Box::new(FieldDetail::Constraint((*con).clone()))),
             });
-            plan.destructive = true;
+            plan.mark_destructive(format!(
+                "{qname}: drops CHECK constraint {}",
+                name.as_deref().unwrap_or_default()
+            ));
         }
 
         // Adds: a design CHECK the live DB lacks. An unnamed one is emitted
@@ -1367,7 +1399,11 @@ pub fn plan_enum_recreation(
 
         // Losing a value can reject rows the table already holds, so this is
         // gated behind `--allow-destructive` like any other data-losing change.
-        plan.destructive = true;
+        // `plan_reconcile` named the dropped values already, from the diff.
+        for value in &removed {
+            let change = format!("{qname}: drops enum value {value}");
+            plan.mark_destructive(change);
+        }
     }
 }
 
@@ -1609,7 +1645,7 @@ pub fn plan_index_convergence(plan: &mut ReconcilePlan, live: &Snapshot, desired
         {
             if let Some(name) = &ix.name {
                 lines.push(format!("DROP INDEX IF EXISTS \"{}\".\"{}\";", dt.schema, name));
-                plan.destructive = true;
+                plan.mark_destructive(format!("{}.{}: drops index {name}", dt.schema, dt.name));
             }
         }
 
