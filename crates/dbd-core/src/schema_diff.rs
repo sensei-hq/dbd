@@ -577,6 +577,70 @@ mod tests {
         );
     }
 
+    /// An index the design declares over the primary key's or a unique
+    /// constraint's columns is an index of its own — and was suppressed on
+    /// both sides as if it backed the constraint, so dropping it from the
+    /// database left `diff` empty. Matched by name, as Postgres names a
+    /// backing index after its constraint, it is drift when it is missing.
+    #[test]
+    fn a_dropped_index_over_the_primary_key_or_unique_columns_is_drift() {
+        let columns = || {
+            vec![
+                ColumnDef {
+                    nullable: false,
+                    is_pk: true,
+                    ..col("id", "integer")
+                },
+                ColumnDef {
+                    is_unique: true,
+                    ..col("email", "text")
+                },
+            ]
+        };
+        // As introspection reports it: named constraints, backing indexes left out.
+        let live = || TableSnapshot {
+            table_constraints: vec![
+                TableConstraint::PrimaryKey {
+                    name: Some("users_pkey".into()),
+                    columns: vec!["id".into()],
+                },
+                TableConstraint::Unique {
+                    name: Some("users_email_key".into()),
+                    columns: vec!["email".into()],
+                    nulls_not_distinct: false,
+                },
+            ],
+            ..table(columns())
+        };
+        let desired = || {
+            snap(TableSnapshot {
+                indexes: vec![
+                    idx("users_id_idx", &["id"], false),
+                    idx("users_email_idx", &["email"], false),
+                ],
+                ..table(columns())
+            })
+        };
+
+        let d = SchemaDiff::compute(snap(live()), desired());
+        let sql = crate::diff::generate_migration_sql(&d.changes);
+        assert!(
+            sql.contains("users_id_idx") && sql.contains("users_email_idx"),
+            "both dropped indexes are drift: {sql}"
+        );
+
+        // Present on both sides, they are not.
+        let both = TableSnapshot {
+            indexes: vec![
+                idx("users_id_idx", &["id"], false),
+                idx("users_email_idx", &["email"], false),
+            ],
+            ..live()
+        };
+        let d = SchemaDiff::compute(snap(both), desired());
+        assert!(d.is_empty(), "no drift: {:?}", d.changes);
+    }
+
     /// A genuine secondary index add is still detected.
     #[test]
     fn secondary_index_add_is_detected() {

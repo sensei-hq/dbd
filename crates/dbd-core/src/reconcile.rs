@@ -2963,7 +2963,9 @@ mod tests {
     }
 
     /// The index that genuinely backs a composite PRIMARY KEY is still suppressed —
-    /// introspection reports it, the design never declares it.
+    /// should a live snapshot report it, the design never declares it. A backing
+    /// index carries its constraint's name (Postgres names it so), and a live
+    /// constraint always has one.
     #[test]
     fn index_convergence_still_ignores_composite_pk_backing_index() {
         let mut live_t = table(
@@ -2972,7 +2974,7 @@ mod tests {
             vec![col("parent_id", "uuid"), col("child_id", "uuid")],
         );
         live_t.table_constraints.push(TableConstraint::PrimaryKey {
-            name: None,
+            name: Some("memory_links_pkey".to_string()),
             columns: vec!["parent_id".to_string(), "child_id".to_string()],
         });
         let mut desired_t = live_t.clone();
@@ -2987,6 +2989,33 @@ mod tests {
         assert!(
             plan.is_empty() && !plan.destructive,
             "a PK-backing index must never be dropped as an orphan; got {plan:?}"
+        );
+    }
+
+    /// A design index over the primary key's columns is an index of its own.
+    /// Suppressed as constraint backing on both sides, one dropped from the
+    /// database was never re-created. The live constraint is named, as
+    /// introspection names it; the design's is not.
+    #[test]
+    fn index_convergence_recreates_a_dropped_index_over_the_primary_key_columns() {
+        let mut desired_t = table("app", "t", vec![col("id", "integer")]);
+        desired_t.table_constraints.push(TableConstraint::PrimaryKey {
+            name: None,
+            columns: vec!["id".to_string()],
+        });
+        let mut live_t = desired_t.clone();
+        live_t.table_constraints = vec![TableConstraint::PrimaryKey {
+            name: Some("t_pkey".to_string()),
+            columns: vec!["id".to_string()],
+        }];
+        desired_t.indexes.push(idx("t_id_idx", &["id"], false));
+
+        let mut plan = ReconcilePlan::default();
+        plan_index_convergence(&mut plan, &snap(vec![live_t]), &snap(vec![desired_t]));
+
+        assert!(
+            plan.altered.first().is_some_and(|a| a.sql.contains("\"t_id_idx\"")),
+            "the dropped index is re-created; got {plan:?}"
         );
     }
 
