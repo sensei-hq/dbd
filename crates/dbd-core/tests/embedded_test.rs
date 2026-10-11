@@ -6451,4 +6451,9 @@ async fn a_constraints_state_a_reversed_file_cannot_carry_is_named() {
             "{constraint} is named as {state}: {said}"
         );
     }
+    // And nothing else: Postgres marks every primary key, unique and foreign
+    // key `connoinherit`, which says nothing a table file loses.
+    assert_eq!(loose.warnings.len(), 5, "one note per lost state, no more: {said}");
+    let parent = entities.iter().find(|e| e.name == "app.parent").expect("app.parent");
+    assert!(parent.warnings.is_empty(), "{:?}", parent.warnings);
 }
