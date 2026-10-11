@@ -1448,6 +1448,31 @@ mod tests {
         }
     }
 
+    /// An import names its tables in load order — a referenced table before
+    /// one that references it — and SQLite enforces foreign keys on dbd's
+    /// connections, so emptying them in that order deleted the parent's rows
+    /// out from under the child's key and failed. They are emptied the other
+    /// way round, the referencing table first.
+    #[tokio::test]
+    async fn tables_linked_by_a_foreign_key_are_emptied_referencing_table_first() {
+        let a = mem().await;
+        a.execute_script(
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY); \
+             CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent (id)); \
+             INSERT INTO parent VALUES (1); INSERT INTO child VALUES (1, 1);",
+        )
+        .await
+        .unwrap();
+        a.truncate_tables(&["parent".to_string(), "child".to_string()])
+            .await
+            .expect("both empty");
+        let left: i64 = sqlx::query_scalar("SELECT (SELECT count(*) FROM parent) + (SELECT count(*) FROM child)")
+            .fetch_one(&a.pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0);
+    }
+
     /// A BLOB has no text, and the export's cell readers knew only text and
     /// numbers, so every BLOB was written as NULL — the file imported back
     /// without its binary data, in every format. A BLOB is written as `\x`
