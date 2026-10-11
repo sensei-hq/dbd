@@ -438,7 +438,13 @@ fn a_foreign_keys_deferral_and_match_are_carried_or_reported() {
     );
     for dialect in [Dialect::MySql, Dialect::TSql] {
         let (sql, report) = emit_schema(&design, dialect, None).expect("emits");
-        let upper = sql.to_uppercase();
+        // The statements, not the inline notes that report the loss.
+        let upper: String = sql
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_uppercase();
         assert!(
             !upper.contains("DEFERRABLE") && !upper.contains("MATCH FULL"),
             "{dialect:?} has neither clause: {sql}"
