@@ -191,8 +191,21 @@ impl Bookkeeping {
     /// on a legacy DB that hasn't been healed yet (the guards read before the core
     /// op heals).
     pub(super) async fn get_meta(&self) -> Result<Option<ProjectMeta>> {
+        Ok(self.read_meta("project = $1").await?.into_iter().next())
+    }
+
+    /// Every other project's meta row, by project — what the guards read when
+    /// this project has none (see `DatabaseAdapter::other_projects_meta`).
+    /// Resolved as [`Self::get_meta`] is, so a legacy layout reads too.
+    pub(super) async fn other_projects(&self) -> Result<Vec<ProjectMeta>> {
+        self.read_meta("project <> $1 ORDER BY project").await
+    }
+
+    /// The meta rows `filter` selects — a `WHERE` clause over `project`,
+    /// bound to this project's name as `$1`.
+    async fn read_meta(&self, filter: &str) -> Result<Vec<ProjectMeta>> {
         let Some((schema, rel)) = self.resolve_meta().await? else {
-            return Ok(None); // no bookkeeping anywhere yet
+            return Ok(Vec::new()); // no bookkeeping anywhere yet
         };
         let (sq, rq) = (schema.replace('"', "\"\""), rel.replace('"', "\"\""));
         // Preferred read includes `scope`. On a legacy `_dbd_meta` that predates
@@ -200,21 +213,21 @@ impl Bookkeeping {
         // (scope = None) so env/version — and the prod guard — still work.
         let with_scope = sqlx::query(&format!(
             "SELECT project, env, version, scope, updated_at::text AS applied_at \
-             FROM \"{sq}\".\"{rq}\" WHERE project = $1"
+             FROM \"{sq}\".\"{rq}\" WHERE {filter}"
         ))
         .bind(&self.project)
-        .fetch_optional(&self.pool)
+        .fetch_all(&self.pool)
         .await;
 
+        let read = |row: &sqlx::postgres::PgRow, with_scope: bool| ProjectMeta {
+            project: row.get("project"),
+            env: row.get("env"),
+            version: row.get::<i32, _>("version") as u32,
+            scope: if with_scope { row.try_get("scope").ok() } else { None },
+            applied_at: row.try_get("applied_at").ok(),
+        };
         match with_scope {
-            Ok(Some(row)) => Ok(Some(ProjectMeta {
-                project: row.get("project"),
-                env: row.get("env"),
-                version: row.get::<i32, _>("version") as u32,
-                scope: row.try_get("scope").ok(),
-                applied_at: row.try_get("applied_at").ok(),
-            })),
-            Ok(None) => Ok(None),
+            Ok(rows) => Ok(rows.iter().map(|row| read(row, true)).collect()),
             // A legacy `_dbd_meta` lacking the `scope` column → SQLSTATE 42703
             // (undefined_column): read the legacy shape in that one case. Any
             // OTHER error is real (transient failure, permission, etc.) and must
@@ -225,21 +238,15 @@ impl Bookkeeping {
                 if !undefined_column {
                     return Err(DbdError::Config(format!("read meta failed: {e}")));
                 }
-                let row = sqlx::query(&format!(
+                let rows = sqlx::query(&format!(
                     "SELECT project, env, version, updated_at::text AS applied_at \
-                     FROM \"{sq}\".\"{rq}\" WHERE project = $1"
+                     FROM \"{sq}\".\"{rq}\" WHERE {filter}"
                 ))
                 .bind(&self.project)
-                .fetch_optional(&self.pool)
+                .fetch_all(&self.pool)
                 .await
                 .map_err(|e| DbdError::Config(format!("read meta failed: {e}")))?;
-                Ok(row.map(|row| ProjectMeta {
-                    project: row.get("project"),
-                    env: row.get("env"),
-                    version: row.get::<i32, _>("version") as u32,
-                    scope: None,
-                    applied_at: row.try_get("applied_at").ok(),
-                }))
+                Ok(rows.iter().map(|row| read(row, false)).collect())
             }
         }
     }

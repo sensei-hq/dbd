@@ -430,6 +430,11 @@ pub async fn cmd_deploy(
     // does not happen. Named for the run as for its preview.
     let (kept, total) = design.scope_counts(&resolved)?;
     output::scope_filtered(&resolved, kept, total);
+    // Each file its apply executes on a path it does not state, as `apply`
+    // says it — a forgotten search_path is never silent.
+    for warning in design.search_path_warnings(None, Some(&resolved))? {
+        output::warn(&warning);
+    }
 
     if dry_run {
         // The real deploy's own gate (it runs `Design::apply`): scope gaps and
@@ -437,15 +442,14 @@ pub async fn cmd_deploy(
         // not parse. The preview used to tally "1 errors" and exit 0 over a
         // design the deploy refuses.
         let to_apply = design.entities_to_apply(None, Some(&resolved))?.len();
-        // With a database to ask, refuse where the deploy refuses — the scope pin.
+        // With a database to ask, refuse where the deploy refuses: the scope
+        // pin, then its apply's environment and version guards — the import's
+        // environment guard is the same one.
         let adapter = super::dry_run_adapter(&config_path, database_url).await?;
         if let Some(adapter) = &adapter {
-            let meta = adapter.get_project_meta().await?;
-            Design::check_scope_guard(meta.as_ref(), &resolved.name, allow_scope_change)?;
-            Design::check_version_guard(
-                adapter.get_db_version().await?,
-                design.config().project.version.unwrap_or(0),
-            )?;
+            let marks = design.database_marks(&**adapter).await?;
+            Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
+            design.check_apply_guards(&marks)?;
         }
         // The hooks the run would skip, decided as the run decides them.
         for skip in design.hook_skips(Some(&resolved))? {
@@ -506,8 +510,8 @@ pub async fn cmd_deploy(
     }
 
     let adapter = get_adapter(&config_path, database_url).await?;
-    let meta = adapter.get_project_meta().await?;
-    Design::check_scope_guard(meta.as_ref(), &resolved.name, allow_scope_change)?;
+    let marks = design.database_marks(&*adapter).await?;
+    Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
 
     // Said before the run, not in its summary: a deploy that fails never
     // prints one, and a skipped hook is often why it failed.
@@ -536,6 +540,7 @@ pub async fn cmd_deploy(
         spinner.finish();
         result.context("Deploy failed")?;
     }
+    super::note_promotion(&marks, design.env());
 
     let summary = summary.unwrap_or_default();
     // Non-fatal diagnostics — skipped imports and failed policy files — are
@@ -623,8 +628,8 @@ pub(crate) async fn reconcile_with_adapter(
     // it can see the pin, and a plan for a run the guard will refuse is a
     // preview of something that cannot happen. (`reset --dry-run` is the
     // deliberate exception: it needs no database, so it has no pin to read.)
-    let meta = adapter.get_project_meta().await?;
-    Design::check_scope_guard(meta.as_ref(), &resolved.name, allow_scope_change)?;
+    let marks = design.database_marks(adapter).await?;
+    Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
 
     // The hooks the run skips, said before it — a run that fails prints no
     // summary, and a skipped hook is often why it failed.
@@ -670,6 +675,7 @@ pub(crate) async fn reconcile_with_adapter(
         spinner.finish();
         result.context("Reconcile failed")?
     };
+    super::note_promotion(&marks, design.env());
 
     for w in &plan.warnings {
         output::always(&format!("⚠ {w}"));

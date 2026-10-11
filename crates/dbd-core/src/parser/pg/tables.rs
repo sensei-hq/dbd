@@ -333,7 +333,7 @@ fn process_create_table(
 ///
 /// A composite `PRIMARY KEY (a, b)` therefore lands twice — as a table-level
 /// constraint *and* as `is_pk` on each member — which is the exact shape
-/// `reconcile`'s `lift_pk_unique_keep_others` and `pk_unique_col_sets` read.
+/// `reconcile`'s `lift_pk_unique_keep_others` reads.
 fn mark_pk_columns(columns: &mut [ColumnDef], pk_cols: &[String]) {
     for col in columns {
         if pk_cols.contains(&col.name) {
@@ -1152,8 +1152,8 @@ mod tests {
     // ── 3. Table-level constraints ──────────────────────────────────────────
 
     /// A composite key must produce BOTH the table-level constraint AND `is_pk`
-    /// on each member column: `lift_pk_unique_keep_others` and
-    /// `pk_unique_col_sets` in `reconcile` read exactly that shape.
+    /// on each member column: `lift_pk_unique_keep_others` in `reconcile`
+    /// reads exactly that shape.
     #[test]
     fn a_composite_primary_key_is_both_a_constraint_and_a_per_column_flag() {
         let d = def("create table t (a uuid not null, b uuid not null, c int, primary key (a, b));");

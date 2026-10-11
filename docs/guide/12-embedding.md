@@ -586,7 +586,8 @@ embedder that wants them makes them itself:
 - **Reset's preview.** `Design::reset` checks its own guard (a database marked
   prod, or with applied migrations) unless forced; `dbd reset --dry-run` checks
   it too, given a database, through the public
-  `Design::check_reset_guard(meta)`, so a preview refuses where the reset would.
+  `Design::check_reset_guard(&marks)` (`marks` from `Design::database_marks`),
+  so a preview refuses where the reset would.
   `reset_script` alone checks nothing.
 - **The release check.** `dbd reconcile` refuses on a released project;
   `Design::reconcile` does not.
@@ -602,8 +603,10 @@ let adapter = dbd_core::connect(database_url, &design.config().project.name).awa
 let scope = design.resolve_scope(None, None)?;
 
 // What `dbd apply` checks before it writes. `true` would be --allow-scope-change.
-let meta = adapter.get_project_meta().await?;
-Design::check_scope_guard(meta.as_ref(), &scope.name, false)?;
+// The marks are this project's record — or, after a `project.name` rename, the
+// record of the name the database was built under.
+let marks = design.database_marks(&*adapter).await?;
+Design::check_scope_guard(&marks, &scope.name, false)?;
 
 if design.config().project.released {
     // released: change the schema with snapshots and apply, not reconcile

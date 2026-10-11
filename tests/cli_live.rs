@@ -1088,6 +1088,48 @@ async fn refresh_and_the_dry_runs_refuse_another_scope_on_a_pinned_database() {
     }
 }
 
+/// `diff` and `migrate --status` only read, so a database pinned to another
+/// scope is not refused — but they said nothing of the pin, and an unscoped
+/// diff of a `hub` database listed everything `hub` does not build as missing,
+/// with no word of why. Each names the pin in one line, and stays quiet where
+/// the run's scope is the pinned one. Under `--json` the note goes to stderr,
+/// leaving stdout the document.
+#[tokio::test]
+async fn diff_and_migrate_status_name_the_pin_of_a_database_pinned_to_another_scope() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    scoped_project(dir);
+    let o = dbd(dir, &url, &["apply", "--scope", "hub"]);
+    assert!(o.status.success(), "{}", combined(&o));
+
+    let mut failures: Vec<String> = Vec::new();
+    for args in [&["diff"][..], &["migrate", "--status"]] {
+        let o = dbd(dir, &url, args);
+        let notes = combined(&o)
+            .lines()
+            .filter(|l| l.contains("pinned to scope 'hub'"))
+            .count();
+        if !o.status.success() || notes != 1 {
+            failures.push(format!("{args:?} does not name the pin in one line: {}", combined(&o)));
+        }
+    }
+    let o = dbd(dir, &url, &["diff", "--json"]);
+    if serde_json::from_slice::<serde_json::Value>(&o.stdout).is_err()
+        || !String::from_utf8_lossy(&o.stderr).contains("pinned to scope 'hub'")
+    {
+        failures.push(format!(
+            "diff --json: stdout the document, the note on stderr: {}",
+            combined(&o)
+        ));
+    }
+    let o = dbd(dir, &url, &["diff", "--scope", "hub"]);
+    if !o.status.success() || combined(&o).contains("pinned to scope") {
+        failures.push(format!("diff --scope hub notes its own pin: {}", combined(&o)));
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
 // ── apply --dry-run names the pending migrations ────────────────────────────
 
 /// `dbd <args>` with no database: no `-d`, and no `$DATABASE_URL` to fall back on.
@@ -1252,6 +1294,197 @@ async fn a_dev_run_against_a_database_marked_prod_exits_non_zero_and_reset_stays
     );
     let csv = exported_widgets(dir, &url);
     assert!(!csv.contains("dev-seed"), "no dev seed data in prod: {csv}");
+}
+
+// ── promoting a dev database to prod is said ────────────────────────────────
+
+/// `-e` defaults to prod, so a run without it promotes a dev database to
+/// prod — allowed, since it only tightens what `reset` allows, but silent,
+/// and every later `-e dev` run is refused. Each command that records the
+/// environment says so when it promotes one, and only then.
+#[tokio::test]
+async fn a_run_that_promotes_a_dev_database_to_prod_says_so() {
+    let (pg, _url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir);
+
+    let mut failures: Vec<String> = Vec::new();
+    for command in ["apply", "deploy", "reconcile"] {
+        pg.create_database(command).await.unwrap();
+        let url = pg.settings().url(command);
+        let o = dbd(dir, &url, &["-e", "dev", command]);
+        assert!(o.status.success(), "-e dev {command}: {}", combined(&o));
+
+        let o = dbd(dir, &url, &[command]);
+        let out = combined(&o);
+        if !o.status.success() || !(out.contains("was marked dev") && out.contains("now marked prod")) {
+            failures.push(format!(
+                "{command} without -e does not say it promoted the database: {out}"
+            ));
+        }
+        let o = dbd(dir, &url, &[command]);
+        if combined(&o).contains("was marked dev") {
+            failures.push(format!(
+                "{command} on a prod database speaks of a promotion: {}",
+                combined(&o)
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+// ── a file with no SET search_path is named by the runs that execute it ─────
+
+/// A DDL file that states no `SET search_path` resolves its unqualified names
+/// against a path nobody wrote into it. The design says that is never silent —
+/// `inspect` counts these files and `apply`/`deploy` print them — but only
+/// `inspect` did. The runs that execute the file, and their previews, name it.
+#[tokio::test]
+async fn apply_and_deploy_name_a_file_that_states_no_search_path() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir);
+    std::fs::write(
+        dir.join("ddl/table/app/pathless.ddl"),
+        "create table if not exists app.pathless (id integer primary key);\n",
+    )
+    .unwrap();
+
+    let mut failures: Vec<String> = Vec::new();
+    for args in [
+        &["apply", "--dry-run"][..],
+        &["apply"],
+        &["deploy", "--dry-run"],
+        &["deploy"],
+    ] {
+        let o = dbd(dir, &url, args);
+        let out = combined(&o);
+        if !o.status.success() {
+            failures.push(format!("{args:?} failed: {out}"));
+        } else if !out.contains("pathless.ddl states no `SET search_path`") {
+            failures.push(format!("{args:?} does not name the file: {out}"));
+        } else if out.contains("widgets.ddl states no") {
+            failures.push(format!("{args:?} names a file that states one: {out}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+// ── a dry run checks every guard its real run checks ────────────────────────
+
+/// The audit's repro. With a database to ask, `apply`, `deploy` and `import
+/// --dry-run -e dev` on a database marked prod said "no issues" and exited 0
+/// while the real runs refused; `import --dry-run` ignored the scope pin the
+/// real import refuses; and an ad-hoc `import -n -f` — which loads data into
+/// the database — skipped the environment guard altogether. Each must refuse
+/// where its real run does.
+#[tokio::test]
+async fn a_dry_run_checks_every_guard_its_real_run_checks() {
+    let (pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    scoped_project(dir);
+    for (schema, table) in [("app", "users"), ("hub", "nodes")] {
+        std::fs::create_dir_all(dir.join(format!("import/dev/{schema}"))).unwrap();
+        std::fs::write(dir.join(format!("import/dev/{schema}/{table}.csv")), "id\n7\n").unwrap();
+    }
+    std::fs::write(dir.join("users.csv"), "id\n8\n").unwrap();
+
+    let mut failures: Vec<String> = Vec::new();
+
+    // ── A database marked prod: the environment guard ──
+    let o = dbd(dir, &url, &["apply"]);
+    assert!(o.status.success(), "the prod apply failed: {}", combined(&o));
+    for args in [
+        &["-e", "dev", "apply", "--dry-run"][..],
+        &["-e", "dev", "deploy", "--dry-run"],
+        &["-e", "dev", "import", "--dry-run"],
+        &["-e", "dev", "import", "-n", "app.users", "-f", "users.csv", "--dry-run"],
+        &["-e", "dev", "import", "-n", "app.users", "-f", "users.csv"],
+    ] {
+        // Collected, so one run's failure does not hide another's.
+        let o = dbd(dir, &url, args);
+        if o.status.success() || !(combined(&o).contains("marked prod") && combined(&o).contains("-e prod")) {
+            failures.push(format!(
+                "{args:?} not refused by the environment guard: {}",
+                combined(&o)
+            ));
+        }
+    }
+    let rows = psql(&pg, &url, &["-tA", "-c", "select count(*) from app.users"]);
+    if stdout(&rows).trim() != "0" {
+        failures.push(format!("dev data loaded into the prod database: {}", stdout(&rows)));
+    }
+
+    // ── A database pinned to another scope: the scope pin ──
+    pg.create_database("pinned").await.unwrap();
+    let url = pg.settings().url("pinned");
+    let o = dbd(dir, &url, &["-e", "dev", "apply", "--scope", "hub"]);
+    assert!(o.status.success(), "apply --scope hub failed: {}", combined(&o));
+    for args in [
+        &["-e", "dev", "import", "--dry-run"][..],
+        &["-e", "dev", "import", "-n", "app.users", "-f", "users.csv", "--dry-run"],
+    ] {
+        let o = dbd(dir, &url, args);
+        if o.status.success() || !combined(&o).contains("pinned to scope 'hub'") {
+            failures.push(format!("{args:?} not refused by the scope guard: {}", combined(&o)));
+        }
+    }
+    let o = dbd(dir, &url, &["-e", "dev", "import", "--dry-run", "--scope", "hub"]);
+    if !o.status.success() {
+        failures.push(format!("its own scope does not preview: {}", combined(&o)));
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+// ── a renamed project.name does not lift the guards ─────────────────────────
+
+/// The audit's repro, through the binary: a production database pinned to
+/// `hub`, then `project.name` renamed. Every guard read the record by name, so
+/// `reset` with no `--force` dropped the tables, a dev run passed the env
+/// guard, and an unscoped apply passed the scope pin. Each — and the dry runs
+/// that check the same guards — must be refused, naming the project the
+/// database records and the likely rename. `--force` and
+/// `--allow-scope-change` are honoured as they are on the project's own mark.
+#[tokio::test]
+async fn a_renamed_project_is_refused_where_its_old_name_would_be() {
+    let (pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    scoped_project(dir);
+    let o = dbd(dir, &url, &["apply", "--scope", "hub"]);
+    assert!(o.status.success(), "the prod apply failed: {}", combined(&o));
+
+    let yaml = std::fs::read_to_string(dir.join("design.yaml")).unwrap();
+    std::fs::write(dir.join("design.yaml"), yaml.replace("name: scoped", "name: renamed")).unwrap();
+
+    for args in [
+        &["reset", "--scope", "hub"][..],
+        &["reset", "--scope", "hub", "--dry-run"],
+        &["-e", "dev", "apply", "--scope", "hub"],
+        &["apply"],
+        &["apply", "--dry-run"],
+    ] {
+        let o = dbd(dir, &url, args);
+        assert!(
+            !o.status.success(),
+            "{args:?} must be refused for the renamed project: {}",
+            combined(&o)
+        );
+        assert!(
+            combined(&o).contains("'scoped'") && combined(&o).contains("project.name"),
+            "{args:?} names the project the database records, and the likely rename: {}",
+            combined(&o)
+        );
+    }
+    assert_eq!(schemas_of(&pg, &url, "nodes"), "hub", "the reset dropped nothing");
+
+    let o = dbd(dir, &url, &["reset", "--scope", "hub", "--dry-run", "--force"]);
+    assert!(o.status.success(), "--force is honoured: {}", combined(&o));
+    let o = dbd(dir, &url, &["apply", "--dry-run", "--allow-scope-change"]);
+    assert!(o.status.success(), "--allow-scope-change is honoured: {}", combined(&o));
 }
 
 // ── init --from-db writes a project that applies ────────────────────────────

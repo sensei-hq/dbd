@@ -1679,47 +1679,14 @@ fn index_shape(ix: &crate::entity::IndexDef, cols: &crate::sql_expr::CoercibleCo
     }
 }
 
-/// The column-name sets (ordered, lowercased) that a table's PRIMARY KEY / UNIQUE
-/// constraints cover — from both inline column flags and table-level constraints.
-/// Used to drop PK/UNIQUE-backing indexes from index convergence.
-///
-/// A column's `is_pk` flag only contributes a single-column set when the table has
-/// NO table-level PRIMARY KEY, exactly as [`lift_pk_unique_keep_others`] treats it
-/// and for the same reason: the SQL parser emits a composite `primary key (a, b)`
-/// BOTH as a table constraint AND as an `is_pk` flag on each member column. Taking
-/// those flags at face value invents backing sets `[a]` and `[b]` that no index
-/// backs, which suppressed a declared single-column index on a composite-PK member
-/// (`create index on memory_links(child_id)`) from convergence — so `dbd diff` kept
-/// asking for an index reconcile refused to create.
-fn pk_unique_col_sets(t: &TableSnapshot) -> HashSet<Vec<String>> {
-    let mut sets: HashSet<Vec<String>> = HashSet::new();
-    let has_table_pk = t
-        .table_constraints
-        .iter()
-        .any(|c| matches!(c, TableConstraint::PrimaryKey { .. }));
-    for c in &t.columns {
-        if (c.is_pk && !has_table_pk) || c.is_unique {
-            sets.insert(vec![c.name.to_lowercase()]);
-        }
-    }
-    for con in &t.table_constraints {
-        match con {
-            TableConstraint::PrimaryKey { columns, .. } | TableConstraint::Unique { columns, .. } => {
-                sets.insert(columns.iter().map(|s| s.to_lowercase()).collect());
-            }
-            _ => {}
-        }
-    }
-    sets
-}
-
 /// A table's secondary indexes: every index EXCEPT those merely backing a
-/// PRIMARY KEY / UNIQUE constraint (introspection reports those, the parsed
-/// design does not — matching by covered columns). Mirrors the suppression in
-/// `schema_diff::normalize_for_diff`, including its rule that a partial or
-/// expression index is always a real index, never constraint backing.
+/// PRIMARY KEY / UNIQUE constraint (a live snapshot may carry those, the
+/// parsed design never does — matched by the constraint's name, which its
+/// backing index bears). Mirrors the suppression in
+/// `schema_diff::normalize_for_diff` through the same
+/// [`crate::schema_diff::backs_a_constraint`].
 fn secondary_indexes(t: &TableSnapshot) -> Vec<&crate::entity::IndexDef> {
-    let backing = pk_unique_col_sets(t);
+    let backing = crate::schema_diff::constraint_backing_keys(&t.table_constraints, str::to_lowercase);
     t.indexes
         .iter()
         .filter(|ix| {
@@ -2963,7 +2930,9 @@ mod tests {
     }
 
     /// The index that genuinely backs a composite PRIMARY KEY is still suppressed —
-    /// introspection reports it, the design never declares it.
+    /// should a live snapshot report it, the design never declares it. A backing
+    /// index carries its constraint's name (Postgres names it so), and a live
+    /// constraint always has one.
     #[test]
     fn index_convergence_still_ignores_composite_pk_backing_index() {
         let mut live_t = table(
@@ -2972,7 +2941,7 @@ mod tests {
             vec![col("parent_id", "uuid"), col("child_id", "uuid")],
         );
         live_t.table_constraints.push(TableConstraint::PrimaryKey {
-            name: None,
+            name: Some("memory_links_pkey".to_string()),
             columns: vec!["parent_id".to_string(), "child_id".to_string()],
         });
         let mut desired_t = live_t.clone();
@@ -2987,6 +2956,33 @@ mod tests {
         assert!(
             plan.is_empty() && !plan.destructive,
             "a PK-backing index must never be dropped as an orphan; got {plan:?}"
+        );
+    }
+
+    /// A design index over the primary key's columns is an index of its own.
+    /// Suppressed as constraint backing on both sides, one dropped from the
+    /// database was never re-created. The live constraint is named, as
+    /// introspection names it; the design's is not.
+    #[test]
+    fn index_convergence_recreates_a_dropped_index_over_the_primary_key_columns() {
+        let mut desired_t = table("app", "t", vec![col("id", "integer")]);
+        desired_t.table_constraints.push(TableConstraint::PrimaryKey {
+            name: None,
+            columns: vec!["id".to_string()],
+        });
+        let mut live_t = desired_t.clone();
+        live_t.table_constraints = vec![TableConstraint::PrimaryKey {
+            name: Some("t_pkey".to_string()),
+            columns: vec!["id".to_string()],
+        }];
+        desired_t.indexes.push(idx("t_id_idx", &["id"], false));
+
+        let mut plan = ReconcilePlan::default();
+        plan_index_convergence(&mut plan, &snap(vec![live_t]), &snap(vec![desired_t]));
+
+        assert!(
+            plan.altered.first().is_some_and(|a| a.sql.contains("\"t_id_idx\"")),
+            "the dropped index is re-created; got {plan:?}"
         );
     }
 

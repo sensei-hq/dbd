@@ -183,16 +183,49 @@ pub struct PostgresAdapter {
     bookkeeping: Bookkeeping,
 }
 
+/// How long [`PostgresAdapter::new`] waits for the server to answer.
+///
+/// sqlx's pool retries a failed connection until its acquire timeout — 30 s —
+/// so a dead port or a mistyped host took half a minute to fail, and then said
+/// only `pool timed out while waiting for an open connection`. A server that
+/// is there answers well within this, a cold-starting serverless one included.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 impl PostgresAdapter {
     /// Create a new adapter from a connection URL.
+    ///
+    /// One connection is made first, bounded by [`CONNECT_TIMEOUT`], so a
+    /// database that cannot be reached fails fast with the reason and the
+    /// `host:port` it tried — never the URL, which may hold a password. The
+    /// pool itself keeps sqlx's own timeouts for the run.
     pub async fn new(url: &str, project: &str) -> Result<Self> {
         use sha2::{Digest, Sha256};
+        use sqlx::Connection as _;
+
+        let options: sqlx::postgres::PgConnectOptions = url
+            .parse()
+            .map_err(|e| DbdError::Config(format!("Database connection failed: invalid URL: {e}")))?;
+        let target = format!("{}:{}", options.get_host(), options.get_port());
+        match tokio::time::timeout(CONNECT_TIMEOUT, sqlx::PgConnection::connect_with(&options)).await {
+            Err(_) => {
+                return Err(DbdError::Config(format!(
+                    "Database connection failed: no answer from {target} within {}s — is the server \
+                     running, and are the host and port right?",
+                    CONNECT_TIMEOUT.as_secs()
+                )));
+            }
+            Ok(Err(e)) => return Err(DbdError::Config(format!("Database connection failed: {target}: {e}"))),
+            Ok(Ok(probe)) => {
+                // Only a probe: whether it closes cleanly says nothing more.
+                let _ = probe.close().await;
+            }
+        }
 
         let pool = PgPoolOptions::new()
             .max_connections(5)
-            .connect(url)
+            .connect_with(options)
             .await
-            .map_err(|e| DbdError::Config(format!("Database connection failed: {e}")))?;
+            .map_err(|e| DbdError::Config(format!("Database connection failed: {target}: {e}")))?;
 
         let mut hasher = Sha256::new();
         hasher.update(url.as_bytes());
@@ -1948,6 +1981,10 @@ impl DatabaseAdapter for PostgresAdapter {
         self.bookkeeping.get_meta().await
     }
 
+    async fn other_projects_meta(&self) -> Result<Vec<ProjectMeta>> {
+        self.bookkeeping.other_projects().await
+    }
+
     async fn set_project_meta(&self, env: &str, version: u32, scope: Option<&str>) -> Result<()> {
         let mut guard = self.batch.lock().await;
         self.bookkeeping.set_meta(guard.as_mut(), env, version, scope).await
@@ -2152,6 +2189,39 @@ impl DatabaseAdapter for PostgresAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A port nothing listens on, and one whose listener never answers: each
+    /// waited out sqlx's 30 s pool timeout, then said only `pool timed out
+    /// while waiting for an open connection`. A connection that cannot be made
+    /// fails within a few seconds, naming the host and port it tried.
+    #[tokio::test]
+    async fn a_database_that_cannot_be_reached_fails_fast_naming_its_host_and_port() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_port = closed.local_addr().unwrap().port();
+        drop(closed);
+        // Bound and listening, so the TCP handshake completes — and never read.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let silent_port = silent.local_addr().unwrap().port();
+
+        let mut failures = Vec::new();
+        for port in [closed_port, silent_port] {
+            let started = std::time::Instant::now();
+            let url = format!("postgres://nobody@127.0.0.1:{port}/absent");
+            let err = match PostgresAdapter::new(&url, "p").await {
+                Ok(_) => panic!("{url}: nothing there to connect to"),
+                Err(e) => e.to_string(),
+            };
+            let took = started.elapsed();
+            if took > std::time::Duration::from_secs(15) {
+                failures.push(format!("127.0.0.1:{port} took {took:?}: {err}"));
+            }
+            if !err.contains(&format!("127.0.0.1:{port}")) {
+                failures.push(format!("127.0.0.1:{port} is not named: {err}"));
+            }
+        }
+        drop(silent);
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
 
     // Regression tests for sensei-hq/dbd#6: the dbd-managed jsonb-import
     // machinery must be schema-qualified so it resolves independently of the

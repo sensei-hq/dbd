@@ -66,6 +66,16 @@ async fn assert_catalog(adapter: &dyn dbd_core::DatabaseAdapter, should_exist: b
         .unwrap_or_else(|e| panic!("assert_catalog({subject}) failed: {e}"));
 }
 
+/// Whether `predicate` finds anything — [`assert_catalog`]'s check, as a value.
+async fn catalog_holds(adapter: &dyn dbd_core::DatabaseAdapter, predicate: &str) -> bool {
+    adapter
+        .execute_script(&format!(
+            "DO $$ BEGIN IF NOT EXISTS ( {predicate} ) THEN RAISE EXCEPTION 'absent'; END IF; END $$"
+        ))
+        .await
+        .is_ok()
+}
+
 fn table_predicate(schema: &str, table: &str) -> String {
     format!("SELECT 1 FROM pg_catalog.pg_tables WHERE schemaname = '{schema}' AND tablename = '{table}'")
 }
@@ -5846,7 +5856,7 @@ async fn a_dev_run_against_a_database_marked_prod_is_refused_before_any_write() 
     let meta = adapter.get_project_meta().await.unwrap().expect("meta");
     assert_eq!(meta.env, "prod", "a refused dev run must not re-mark the database");
     assert!(
-        Design::check_reset_guard(Some(&meta)).is_err(),
+        Design::check_reset_guard(&prod.database_marks(&*adapter).await.unwrap()).is_err(),
         "reset must stay blocked on the prod database"
     );
     assert_catalog(
@@ -5893,6 +5903,73 @@ async fn a_forced_full_reset_lets_a_mis_marked_database_be_rebuilt_as_dev() {
     assert_eq!(meta.env, "dev");
 }
 
+/// A design with a `default:` scope: a bare run resolves to it, so the
+/// database is pinned to `default` and a bare `reset --force` is a reset under
+/// `default`. It kept the record — only a reset under the all-scope forgot it —
+/// so the environment guard's own way out (`reset --force`, then `-e dev`)
+/// still refused. A reset under the scope the database was built with leaves
+/// nothing of the project and forgets the record; a narrower one keeps it.
+#[tokio::test]
+async fn a_forced_reset_under_the_scope_the_database_was_built_with_forgets_its_record() {
+    let (pg, _url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(
+        tmp.path(),
+        "project:\n  name: env_guard\nsource:\n  dialect: postgresql\nschemas:\n  - app\n  - core\n\
+         scopes:\n  default:\n    includes: [app, core]\n  narrow:\n    includes: [app]\n",
+        &[
+            (
+                "ddl/table/app/items.ddl",
+                "set search_path to app;\ncreate table if not exists items (id int primary key);\n",
+            ),
+            (
+                "ddl/table/core/regions.ddl",
+                "set search_path to core;\ncreate table if not exists regions (id int primary key);\n",
+            ),
+        ],
+    );
+    let config = tmp.path().join("design.yaml");
+    let prod = Design::from_config_with_dir(&config, "prod", Some(tmp.path())).unwrap();
+    let dev = Design::from_config_with_dir(&config, "dev", Some(tmp.path())).unwrap();
+    let default = prod.resolve_scope(None, None).unwrap();
+    assert_eq!(
+        default.name, "default",
+        "precondition: a bare run resolves to `default`"
+    );
+    let narrow = prod.resolve_scope(Some("narrow"), None).unwrap();
+
+    // The scope the database was built with: the record goes.
+    pg.create_database("built_default").await.unwrap();
+    let adapter = connect(&pg.settings().url("built_default"), "env_guard").await.unwrap();
+    prod.apply(&*adapter, None, false, Some(&default), Progress::none())
+        .await
+        .expect("the prod apply");
+    prod.reset(&*adapter, "postgres", true, false, false, Some(&default))
+        .await
+        .expect("a forced reset under `default`");
+    assert!(
+        adapter.get_project_meta().await.unwrap().is_none(),
+        "a reset under the scope the database was built with forgets its record"
+    );
+    dev.apply(&*adapter, None, false, Some(&default), Progress::none())
+        .await
+        .expect("so the database is rebuilt with -e dev");
+
+    // A narrower scope: the rest of the project stays, and so does its record.
+    pg.create_database("built_narrower").await.unwrap();
+    let adapter = connect(&pg.settings().url("built_narrower"), "env_guard")
+        .await
+        .unwrap();
+    prod.apply(&*adapter, None, false, Some(&default), Progress::none())
+        .await
+        .expect("the prod apply");
+    prod.reset(&*adapter, "postgres", true, false, false, Some(&narrow))
+        .await
+        .expect("a forced reset under the narrower scope");
+    let meta = adapter.get_project_meta().await.unwrap().expect("the record is kept");
+    assert_eq!((meta.env.as_str(), meta.scope.as_deref()), ("prod", Some("default")));
+}
+
 /// The guard is one-way. A database marked dev may be promoted to prod: that
 /// only tightens what `reset` allows.
 #[tokio::test]
@@ -5912,6 +5989,157 @@ async fn a_database_marked_dev_may_be_promoted_to_prod() {
 
     let meta = adapter.get_project_meta().await.unwrap().expect("meta");
     assert_eq!(meta.env, "prod");
+}
+
+// ── A renamed project is held to the record its old name left ────────────────
+
+/// A design named `name` at `version` (0: unversioned) over the one schema
+/// `schema`, with a dev seed file — written into its own directory.
+fn named_design(dir: &std::path::Path, name: &str, version: u32, schema: &str, env: &str) -> Design {
+    let version = match version {
+        0 => String::new(),
+        v => format!("  version: {v}\n"),
+    };
+    write_project(
+        dir,
+        &format!("project:\n  name: {name}\n{version}source:\n  dialect: postgresql\nschemas:\n  - {schema}\n"),
+        &[
+            (
+                &format!("ddl/table/{schema}/items.ddl"),
+                &format!(
+                    "set search_path to {schema};\ncreate table if not exists items (id int primary key, name text);\n"
+                ),
+            ),
+            (&format!("import/dev/{schema}/items.csv"), "id,name\n1,dev-seed\n"),
+        ],
+    );
+    Design::from_config_with_dir(&dir.join("design.yaml"), env, Some(dir)).expect("load design")
+}
+
+/// The audit's repro. Every guard read the database's record by
+/// `project.name` alone, so a renamed design read a production database
+/// another name had built as one dbd had never seen: `reset`, with no
+/// `--force`, dropped every table; a dev run passed the environment guard and
+/// loaded dev seed data; an older revision passed the version guard. The
+/// database still holds the design's objects and the old name's record of
+/// them, so those marks are the guards' marks — refused, naming the project
+/// the database does record and the likely rename — and `--force` still
+/// overrides the reset guard, as it does for the project's own mark.
+#[tokio::test]
+async fn a_renamed_project_is_held_to_the_record_its_old_name_left() {
+    let (pg, _url) = start_pg().await;
+    let (old, new, older) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let alpha = named_design(old.path(), "alpha", 2, "app", "prod");
+    // The same project, renamed — and a revision of it behind the database.
+    let prod = named_design(new.path(), "alpha2", 2, "app", "prod");
+    let dev = named_design(new.path(), "alpha2", 2, "app", "dev");
+    let behind = named_design(older.path(), "alpha2", 1, "app", "prod");
+
+    // Each run against a database of its own, built by `alpha` at v2 and
+    // marked prod, so what one run writes cannot decide another's outcome.
+    let mut failures: Vec<String> = Vec::new();
+    for (i, run) in ["reset", "a dev apply", "a dev import", "an older revision's apply"]
+        .into_iter()
+        .enumerate()
+    {
+        let db = format!("renamed{i}");
+        pg.create_database(&db).await.unwrap();
+        let url = pg.settings().url(&db);
+        let built = connect(&url, "alpha").await.unwrap();
+        alpha
+            .apply(&*built, None, false, None, Progress::none())
+            .await
+            .expect("alpha's prod apply");
+
+        let renamed = connect(&url, "alpha2").await.unwrap();
+        let err = match run {
+            "reset" => prod.reset(&*renamed, "postgres", false, false, false, None).await.err(),
+            "a dev apply" => dev.apply(&*renamed, None, false, None, Progress::none()).await.err(),
+            "a dev import" => dev
+                .import_data(&*renamed, None, false, None, Progress::none())
+                .await
+                .err(),
+            _ => behind.apply(&*renamed, None, false, None, Progress::none()).await.err(),
+        };
+        // Refused, naming the project the database records and the likely
+        // rename. Collected, so one run's failure does not hide another's.
+        match err.map(|e| e.to_string()) {
+            None => failures.push(format!("{run} of the renamed project was not refused")),
+            Some(e) if !(e.contains("'alpha'") && e.contains("project.name")) => {
+                failures.push(format!("{run} did not name 'alpha' and project.name: {e}"))
+            }
+            Some(_) => {}
+        }
+
+        // And nothing written: the tables kept, no dev seed data, no record
+        // made of the renamed project.
+        if !catalog_holds(&*built, &table_predicate("app", "items")).await {
+            failures.push(format!("{run} dropped app.items"));
+        } else if catalog_holds(&*built, "SELECT 1 FROM app.items WHERE name = 'dev-seed'").await {
+            failures.push(format!("{run} loaded dev seed data into the prod database"));
+        }
+        if renamed.get_project_meta().await.unwrap().is_some() {
+            failures.push(format!("{run} recorded the renamed project"));
+        }
+
+        if run == "reset" {
+            prod.reset(&*renamed, "postgres", true, false, false, None)
+                .await
+                .expect("--force overrides the reset guard, as it does on the project's own mark");
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// More than one project may share a database, each with its own record. A
+/// project's guards read its own record, and another project's only when the
+/// database holds this project's objects with no record of it — a rename.
+/// So a second project builds, runs dev, resets and rebuilds beside a
+/// production one at a higher version, and the production one stays guarded.
+#[tokio::test]
+async fn two_projects_in_one_database_are_each_guarded_by_their_own_record() {
+    let (_pg, url) = start_pg().await;
+    let (a_dir, b_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a_prod = named_design(a_dir.path(), "first", 3, "app", "prod");
+    let a_dev = named_design(a_dir.path(), "first", 3, "app", "dev");
+    let b_dev = named_design(b_dir.path(), "second", 0, "bee", "dev");
+    let a = connect(&url, "first").await.unwrap();
+    let b = connect(&url, "second").await.unwrap();
+
+    a_prod
+        .apply(&*a, None, false, None, Progress::none())
+        .await
+        .expect("the first project's prod apply");
+    b_dev
+        .apply(&*b, None, false, None, Progress::none())
+        .await
+        .expect("a second project's first dev apply, below the first's version");
+    b_dev
+        .import_data(&*b, None, false, None, Progress::none())
+        .await
+        .expect("its dev seed data");
+    b_dev
+        .reset(&*b, "postgres", false, false, false, None)
+        .await
+        .expect("its unforced reset: its own record is dev and unversioned");
+    b_dev
+        .apply(&*b, None, false, None, Progress::none())
+        .await
+        .expect("and its dev rebuild");
+
+    assert_table_exists(&*a, "app", "items").await;
+    a_dev
+        .apply(&*a, None, false, None, Progress::none())
+        .await
+        .expect_err("the first project's own prod mark still refuses a dev run");
+    a_prod
+        .reset(&*a, "postgres", false, false, false, None)
+        .await
+        .expect_err("and an unforced reset");
 }
 
 // ── A brownfield matview is adopted only when it is the design's ──────────────

@@ -18,11 +18,13 @@ mod apply;
 mod env_guard;
 mod hooks;
 mod import;
+mod marks;
 mod plan;
 mod reconcile;
 mod reset;
 mod scope;
 
+pub use marks::DatabaseMarks;
 pub use plan::{ApplyStrategy, ExecutionPlan, ExecutionStep, build_execution_plan};
 pub use reset::{KeptRole, ResetComplete};
 
@@ -593,6 +595,11 @@ pub struct Design {
     dialect: String,
 }
 
+/// The phrase [`warn_if_no_search_path`] reports with, so
+/// [`Design::search_path_warnings`] finds its warnings among an entity's
+/// others without a second copy of the rule.
+const NO_SEARCH_PATH: &str = "states no `SET search_path`";
+
 /// Report a DDL file that states no `SET search_path` of its own.
 ///
 /// Every dbd DDL file is expected to open with one — no emitter writes it, so
@@ -633,12 +640,45 @@ fn warn_if_no_search_path(entity: &mut Entity, relative: &std::path::Path) {
         _ => "PostgreSQL's session default (\"$user\", public) — set source.search_path to choose".to_string(),
     };
     entity.warnings.push(format!(
-        "{} states no `SET search_path`; unqualified names resolved against {resolved_against}",
+        "{} {NO_SEARCH_PATH}; unqualified names resolved against {resolved_against}",
         relative.display()
     ));
 }
 
 impl Design {
+    /// The environment this design was loaded for (`-e`): what a run records
+    /// in the database, and what picks its `import/<env>/` data.
+    pub fn env(&self) -> &str {
+        &self.env
+    }
+
+    /// Every DDL file a run under `scope` — narrowed to the entity `name`
+    /// selects, if any — executes that states no `SET search_path`, as a
+    /// warning naming the path its unqualified names were resolved against:
+    /// what `apply` and `deploy` print before they run.
+    ///
+    /// `inspect` counted these and nothing else said them, though the design
+    /// is that a forgotten path is never silent: a file the run executes on a
+    /// path nobody wrote into it is how an object lands in a schema nobody
+    /// chose.
+    pub fn search_path_warnings(&self, name: Option<&str>, scope: Option<&ResolvedScope>) -> Result<Vec<String>> {
+        let entities = match scope {
+            Some(s) => self.scoped_entities(s)?,
+            None => self.entities.clone(),
+        };
+        let named = match name {
+            Some(n) => Some(self.resolve_name(n, scope)?.name.clone()),
+            None => None,
+        };
+        Ok(entities
+            .iter()
+            .filter(|e| named.as_ref().is_none_or(|n| &e.name == n))
+            .flat_map(|e| &e.warnings)
+            .filter(|w| w.contains(NO_SEARCH_PATH))
+            .cloned()
+            .collect())
+    }
+
     /// Which reader this project's DDL was read by.
     ///
     /// Exposed because it decides what a caller may ask for: only a reader
@@ -1172,9 +1212,16 @@ impl Design {
     /// subgraph; `scope` filters to that scope's working set (`None` ⇒ full set).
     pub fn graph(&self, name: Option<&str>, scope: Option<&ResolvedScope>) -> Result<dependency::GraphResult> {
         // An unknown or out-of-scope name produced an empty graph — a valid
-        // document, indistinguishable from an entity with no dependencies.
-        if let Some(n) = name {
-            self.resolve_name(n, scope)?;
+        // document, indistinguishable from an entity with no dependencies. So
+        // did an `external:` one: dbd has no DDL for it, so it is no node of
+        // the graph, and `inspect -n` and `apply -n` refuse it alike.
+        if let Some(n) = name
+            && self.resolve_name(n, scope)?.entity_type == EntityType::External
+        {
+            return Err(DbdError::Config(format!(
+                "{n} is declared `external:` — dbd has no DDL for it, so it has no place in the dependency \
+                 graph; it only resolves references to it"
+            )));
         }
         let graphable = crate::scope::is_scopable;
         let non_meta: Vec<Entity> = match scope {
@@ -1512,16 +1559,21 @@ mod tests {
         }
     }
 
+    /// The marks of a database whose only record is `m`, this project's.
+    fn own(m: &crate::adapter::ProjectMeta) -> DatabaseMarks {
+        DatabaseMarks::of_own("p", Some(m.clone()))
+    }
+
     #[test]
     fn scope_guard_allows_matching_scope() {
         let m = meta_with_scope(Some("public"));
-        assert!(Design::check_scope_guard(Some(&m), "public", false).is_ok());
+        assert!(Design::check_scope_guard(&own(&m), "public", false).is_ok());
     }
 
     #[test]
     fn scope_guard_blocks_mismatch() {
         let m = meta_with_scope(Some("public"));
-        let err = Design::check_scope_guard(Some(&m), "internal", false).unwrap_err();
+        let err = Design::check_scope_guard(&own(&m), "internal", false).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("public") && msg.contains("internal"), "msg was: {msg}");
     }
@@ -1529,14 +1581,14 @@ mod tests {
     #[test]
     fn scope_guard_unpinned_never_blocks() {
         let m = meta_with_scope(None);
-        assert!(Design::check_scope_guard(Some(&m), "internal", false).is_ok());
-        assert!(Design::check_scope_guard(None, "internal", false).is_ok());
+        assert!(Design::check_scope_guard(&own(&m), "internal", false).is_ok());
+        assert!(Design::check_scope_guard(&DatabaseMarks::of_own("p", None), "internal", false).is_ok());
     }
 
     #[test]
     fn scope_guard_allow_scope_change_bypasses() {
         let m = meta_with_scope(Some("public"));
-        assert!(Design::check_scope_guard(Some(&m), "internal", true).is_ok());
+        assert!(Design::check_scope_guard(&own(&m), "internal", true).is_ok());
     }
 
     #[test]

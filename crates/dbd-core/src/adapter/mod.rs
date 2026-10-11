@@ -322,6 +322,19 @@ pub trait DatabaseAdapter: Send + Sync {
 
     async fn get_project_meta(&self) -> Result<Option<ProjectMeta>>;
     async fn set_project_meta(&self, env: &str, version: u32, scope: Option<&str>) -> Result<()>;
+
+    /// The record of every OTHER project the database holds — each row whose
+    /// project is not this adapter's — sorted by project. Read-only, under
+    /// either bookkeeping layout, like [`Self::get_project_meta`].
+    ///
+    /// The record is keyed on `project.name`, and more than one project may
+    /// share a database. The guards read these when this project has none but
+    /// the database holds its objects: the mark of a renamed `project.name`
+    /// (see [`crate::design::DatabaseMarks`]). Default: none — a store with one
+    /// record (Convex's state file) reads it as this project's already.
+    async fn other_projects_meta(&self) -> Result<Vec<ProjectMeta>> {
+        Ok(Vec::new())
+    }
 }
 
 /// The records of a JSON data file, each as its own JSON text.
