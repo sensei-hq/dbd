@@ -6555,3 +6555,105 @@ async fn a_foreign_keys_deferrability_and_match_survive_reverse_diff_and_reconci
     let d = rev.diff_live(&*adapter, None).await.expect("diff_live");
     assert!(!fk_changed(&d), "converged: {:?}", d.changes);
 }
+
+// ── An EXCLUDE constraint is a constraint, end to end ─────────────────────────
+
+/// `EXCLUDE USING gist (room WITH =, during WITH &&)` is what stops two
+/// bookings of one room overlapping. Introspection read only its backing
+/// index, so `init --from-db` wrote a plain gist index — the speed kept, the
+/// rule gone — and `diff` stayed empty; a project could not declare one at all,
+/// because the table parser refused it. It is a constraint now: captured,
+/// emitted, parsed, compared by `diff`, converged by `reconcile`, applied.
+#[tokio::test]
+async fn an_exclusion_constraint_survives_reverse_diff_reconcile_and_apply() {
+    use dbd_core::diff::{DiffAction, FieldType};
+    let (pg, url) = start_pg().await;
+    let adapter = connect(&url, "excl").await.unwrap();
+    adapter
+        .execute_script(
+            "CREATE EXTENSION btree_gist; CREATE SCHEMA app; \
+             CREATE TABLE app.rooms (id int PRIMARY KEY, room int NOT NULL, during tstzrange NOT NULL, \
+               CONSTRAINT no_overlap EXCLUDE USING gist (room WITH =, during WITH &&));",
+        )
+        .await
+        .unwrap();
+
+    let entities = adapter.introspect().await.expect("introspect");
+    let rooms = entities.iter().find(|e| e.name == "app.rooms").expect("app.rooms");
+    let reversed = dbd_core::emit::emit_entity(rooms).unwrap();
+    assert!(
+        reversed.contains("CONSTRAINT \"no_overlap\" EXCLUDE USING gist (room WITH =, during WITH &&)"),
+        "{reversed}"
+    );
+    assert!(
+        !reversed.to_uppercase().contains("CREATE INDEX"),
+        "not a plain index: {reversed}"
+    );
+    let back = dbd_core::parser::parse_entity(std::path::Path::new("ddl/table/app/rooms.ddl"), &reversed).unwrap();
+    assert!(back.errors.is_empty(), "a project can declare one: {:?}", back.errors);
+
+    let project = |rooms: &str| {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: excl\nsource:\n  dialect: postgresql\n\
+             target:\n  postgres:\n    extensions:\n      - btree_gist\nschemas:\n  - app\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("ddl/table/app/rooms.ddl"), rooms).unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        (tmp, design)
+    };
+    let rooms_changed = |d: &dbd_core::SchemaDiff| {
+        d.changes.iter().any(|c| {
+            c.entity_name == "app.rooms"
+                && matches!(&c.action, DiffAction::Change(fcs)
+                    if fcs.iter().any(|f| matches!(f.field_type, FieldType::Constraint | FieldType::Index)))
+        })
+    };
+
+    // Diff: the old capture — a plain gist index — is not this table; the new one is.
+    let (_weak_dir, weak) = project(
+        "set search_path to app;\n\
+         create table if not exists rooms (id int primary key, room int not null, during tstzrange not null);\n\
+         create index if not exists no_overlap on rooms using gist (room, during);\n",
+    );
+    let d = weak.diff_live(&*adapter, None).await.expect("diff_live");
+    assert!(
+        rooms_changed(&d),
+        "a gist index is not an exclusion constraint: {:?}",
+        d.changes
+    );
+    let (_rev_dir, rev) = project(&reversed);
+    let d = rev.diff_live(&*adapter, None).await.expect("diff_live");
+    assert!(!rooms_changed(&d), "the reversed table is this table: {:?}", d.changes);
+
+    // Reconcile puts a missing one back.
+    adapter
+        .execute_script("ALTER TABLE app.rooms DROP CONSTRAINT no_overlap")
+        .await
+        .unwrap();
+    let d = rev.diff_live(&*adapter, None).await.expect("diff_live");
+    assert!(
+        rooms_changed(&d),
+        "a dropped exclusion constraint is drift: {:?}",
+        d.changes
+    );
+    rev.reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("reconcile");
+    let exclusion = "SELECT 1 FROM pg_constraint WHERE conrelid = 'app.rooms'::regclass AND contype = 'x'";
+    assert_catalog(&*adapter, true, exclusion, "the exclusion constraint on app.rooms").await;
+    let d = rev.diff_live(&*adapter, None).await.expect("diff_live");
+    assert!(!rooms_changed(&d), "converged: {:?}", d.changes);
+
+    // And the reversed project builds it on a database that has none of it.
+    pg.create_database("fresh").await.unwrap();
+    let fresh = connect(&pg.settings().url("fresh"), "excl").await.unwrap();
+    rev.apply(&*fresh, None, false, None, Progress::none())
+        .await
+        .expect("apply to a fresh database");
+    assert_catalog(&*fresh, true, exclusion, "the exclusion constraint on a fresh database").await;
+}
