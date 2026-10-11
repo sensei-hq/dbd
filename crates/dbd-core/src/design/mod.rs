@@ -2729,7 +2729,7 @@ import:
 
         let result = design.reset(&mock, "postgres", false, false, false, None).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("migrations"));
+        assert!(result.unwrap_err().to_string().contains("versioned at v1"));
     }
 
     #[tokio::test]

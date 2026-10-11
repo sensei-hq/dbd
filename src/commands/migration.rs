@@ -673,7 +673,7 @@ mod tests {
     /// `--allow-scope-change` is the documented override for the scope guard, so
     /// the same mismatch then proceeds and the reset runs.
     ///
-    /// The pinned version stays 0 on purpose: a database with applied migrations
+    /// The pinned version stays 0 on purpose: a versioned database
     /// trips a *separate* safety guard that only `--force` clears, which would
     /// mask whether the scope override worked.
     #[tokio::test]

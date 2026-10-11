@@ -536,7 +536,7 @@ async fn reset_blocked_after_v1_in_dev() {
     let mock = dbd_core::adapter::mock::MockAdapter::new().with_meta("dev", 1);
     let result = d.reset(&mock, "postgres", false, false, false, None).await;
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("migrations"));
+    assert!(result.unwrap_err().to_string().contains("versioned at v1"));
 }
 
 #[tokio::test]
