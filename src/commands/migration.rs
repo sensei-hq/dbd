@@ -41,6 +41,47 @@ fn check_reset_target(target: &str) -> Result<()> {
     Ok(())
 }
 
+/// Refuse, before connecting, a reset whose target is not the kind of
+/// database `url` reaches. `flagged` is whether the target came from
+/// `--target` rather than the design.
+///
+/// The target picks the dialect of the drops and the schemas reset protects.
+/// `reset --target postgres` on a SQLite project was accepted, connected, and
+/// failed on PostgreSQL's `CASCADE` — after reading the database, and under
+/// `--force` with nothing said of why.
+fn check_target_matches_connection(target: &str, flagged: bool, url: &str) -> Result<()> {
+    let sqlite = url.starts_with("sqlite:") || url.starts_with("file:");
+    let (connection, fits, instead) = if sqlite {
+        ("SQLite", target == "sqlite", "--target sqlite")
+    } else if url.starts_with("convex:") {
+        // Not a reset target at all; `check_reset_target` says so.
+        return Ok(());
+    } else {
+        (
+            "PostgreSQL",
+            matches!(target, "postgres" | "supabase"),
+            "--target postgres or --target supabase",
+        )
+    };
+    if fits {
+        return Ok(());
+    }
+    let named = if flagged {
+        format!("--target {target}")
+    } else {
+        format!("the design's target, {target},")
+    };
+    anyhow::bail!(
+        "reset: {named} does not match the database — the connection is {connection}. The target picks the \
+         dialect of the drops, so it must be the kind of database the connection reaches: pass {instead}{}.",
+        if flagged {
+            ", or drop --target to use the design's"
+        } else {
+            ""
+        }
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn cmd_reset(
     config: &Path,
@@ -64,8 +105,12 @@ pub async fn cmd_reset(
     let resolved = design.resolve_scope(scope, deps)?;
     let (kept, total) = design.scope_counts(&resolved)?;
     output::scope_filtered(&resolved, kept, total);
+    let flagged = target.is_some();
     let target = reset_target(target, &design);
     check_reset_target(target)?;
+    if let Some(url) = super::configured_database_url(config, database_url)? {
+        check_target_matches_connection(target, flagged, &url)?;
+    }
     if target == "sqlite" && (drop_schemas || drop_extensions) {
         output::warn("SQLite has no schemas or extensions: --schemas, --extensions and --clean change nothing here.");
     }
