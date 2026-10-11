@@ -715,6 +715,20 @@ impl SqliteAdapter {
     /// exported could not be imported here. An unquoted field matching
     /// `null_value` is NULL; a quoted one is a value, as in Postgres's COPY,
     /// which writes `''` as `""` and NULL as an empty field.
+    /// The columns of `table` declared `BLOB` — the ones an import decodes a
+    /// `\x…` value into bytes for (see [`blob_from_text`]). Judged by the
+    /// declared type, as SQLite's own affinity rule reads `BLOB`, so a text
+    /// column keeps a text that merely looks like hex.
+    async fn blob_columns(&self, table: &str) -> Result<std::collections::HashSet<String>> {
+        let names: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info(?1) WHERE upper(type) LIKE '%BLOB%'")
+                .bind(table)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| DbdError::Config(format!("reading the columns of {table} failed: {e}")))?;
+        Ok(names.into_iter().collect())
+    }
+
     async fn import_delimited(&self, mut records: super::Delimited<'_>, table: &str, null_value: &str) -> Result<()> {
         let Some(header) = records.next_record()? else {
             return Ok(()); // An empty file: no columns, no rows.
@@ -725,6 +739,8 @@ impl SqliteAdapter {
             .map(|f| crate::sql_quote::ident(&f.value))
             .collect::<Vec<_>>()
             .join(",");
+        let blobs = self.blob_columns(table).await?;
+        let is_blob: Vec<bool> = header.iter().map(|f| blobs.contains(&f.value)).collect();
         let batch_rows = batch_row_size(col_count);
 
         let mut tx = self
@@ -749,12 +765,12 @@ impl SqliteAdapter {
                 .collect();
             batch.push(row);
             if batch.len() >= batch_rows {
-                flush_csv_batch(&mut tx, table, &cols_clause, col_count, &batch).await?;
+                flush_csv_batch(&mut tx, table, &cols_clause, &is_blob, &batch).await?;
                 batch.clear();
             }
         }
         if !batch.is_empty() {
-            flush_csv_batch(&mut tx, table, &cols_clause, col_count, &batch).await?;
+            flush_csv_batch(&mut tx, table, &cols_clause, &is_blob, &batch).await?;
         }
 
         tx.commit()
@@ -775,6 +791,7 @@ impl SqliteAdapter {
         // column set changes, flush whatever we have and start a new batch.
         let mut current_cols: Option<Vec<String>> = None;
         let mut batch: Vec<Vec<JsonBindable>> = Vec::new();
+        let blobs = self.blob_columns(table).await?;
 
         for record in records {
             let value: serde_json::Value =
@@ -784,7 +801,16 @@ impl SqliteAdapter {
                 .ok_or_else(|| DbdError::Config("a json record must be a JSON object".into()))?;
 
             let cols: Vec<String> = obj.keys().cloned().collect();
-            let row: Vec<JsonBindable> = cols.iter().map(|c| JsonBindable::from(&obj[c])).collect();
+            let row: Vec<JsonBindable> = cols
+                .iter()
+                .map(|c| match &obj[c] {
+                    serde_json::Value::String(text) if blobs.contains(c) => match blob_from_text(text) {
+                        Some(bytes) => JsonBindable::Blob(bytes),
+                        None => JsonBindable::String(text.clone()),
+                    },
+                    value => JsonBindable::from(value),
+                })
+                .collect();
 
             let cols_changed = current_cols.as_ref().is_some_and(|cur| cur != &cols);
             if cols_changed {
@@ -837,20 +863,24 @@ async fn flush_csv_batch(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     table: &str,
     cols_clause: &str,
-    col_count: usize,
+    is_blob: &[bool],
     rows: &[Vec<Option<String>>],
 ) -> Result<()> {
-    let placeholders = multi_row_placeholders(col_count, rows.len());
+    let placeholders = multi_row_placeholders(is_blob.len(), rows.len());
     let sql = format!(
         "INSERT INTO {} ({cols_clause}) VALUES {placeholders}",
         crate::sql_quote::ident(table)
     );
     let mut q = sqlx::query(&sql);
     for row in rows {
-        for cell in row {
-            q = match cell {
-                Some(s) => q.bind(s.clone()),
-                None => q.bind(None::<String>),
+        for (cell, blob) in row.iter().zip(is_blob) {
+            q = match (cell, blob) {
+                (Some(s), true) => match blob_from_text(s) {
+                    Some(bytes) => q.bind(bytes),
+                    None => q.bind(s.clone()),
+                },
+                (Some(s), false) => q.bind(s.clone()),
+                (None, _) => q.bind(None::<String>),
             };
         }
     }
@@ -881,6 +911,7 @@ async fn flush_jsonl_batch(
                 JsonBindable::Int(i) => q.bind(*i),
                 JsonBindable::Float(f) => q.bind(*f),
                 JsonBindable::String(s) => q.bind(s.clone()),
+                JsonBindable::Blob(b) => q.bind(b.clone()),
                 JsonBindable::Other(s) => q.bind(s.clone()),
             };
         }
@@ -899,6 +930,8 @@ enum JsonBindable {
     Int(i64),
     Float(f64),
     String(String),
+    /// A `\x…` string bound for a `BLOB` column (see [`blob_from_text`]).
+    Blob(Vec<u8>),
     Other(String),
 }
 
@@ -939,7 +972,37 @@ fn sqlite_cell_to_text(row: &sqlx::sqlite::SqliteRow, idx: usize) -> Option<Stri
     if let Ok(v) = row.try_get::<Option<f64>, _>(idx) {
         return v.map(|n| n.to_string());
     }
+    if let Ok(v) = row.try_get::<Option<Vec<u8>>, _>(idx) {
+        return v.map(|bytes| blob_text(&bytes));
+    }
     None
+}
+
+/// A BLOB as text: `\x` and its bytes in lowercase hex — what PostgreSQL
+/// writes for a `bytea` and reads back, so a SQLite export loads into a
+/// `bytea` column, and [`blob_from_text`] reads it back into a BLOB. A BLOB
+/// has no text of its own; the cell readers knew only text and numbers, and
+/// wrote every one as NULL.
+fn blob_text(bytes: &[u8]) -> String {
+    let mut text = String::with_capacity(2 + bytes.len() * 2);
+    text.push_str("\\x");
+    for byte in bytes {
+        text.push_str(&format!("{byte:02x}"));
+    }
+    text
+}
+
+/// The bytes [`blob_text`] wrote — `\x` then an even number of hex digits —
+/// or `None` for any other text, which then loads as the text it is.
+fn blob_from_text(text: &str) -> Option<Vec<u8>> {
+    let hex = text.strip_prefix("\\x")?;
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+        .collect()
 }
 
 /// One CSV/TSV field as Postgres's `COPY … CSV` writes it, so the RFC 4180
@@ -968,6 +1031,11 @@ fn sqlite_cell_to_json(row: &sqlx::sqlite::SqliteRow, idx: usize) -> serde_json:
         && let Some(jn) = serde_json::Number::from_f64(n)
     {
         return serde_json::Value::Number(jn);
+    }
+    // JSON has no bytes: a BLOB is the same `\x…` string PostgreSQL's
+    // `to_json` writes for a `bytea`.
+    if let Ok(Some(bytes)) = row.try_get::<Option<Vec<u8>>, _>(idx) {
+        return serde_json::Value::String(blob_text(&bytes));
     }
     serde_json::Value::Null
 }
