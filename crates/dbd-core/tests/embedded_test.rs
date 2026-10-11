@@ -6396,3 +6396,59 @@ async fn a_reverse_engineered_view_keeps_its_instead_of_trigger() {
         back.refs
     );
 }
+
+// ── What a constraint's state a reversed file cannot carry is said ────────────
+
+/// A `NOT VALID` CHECK was captured as `CHECK (CHECK (n > 0) NOT VALID)` —
+/// `pg_get_constraintdef`'s text with only its prefix stripped — which no
+/// parser accepts, so the reversed project would not load. The expression is
+/// read on its own. What the state of a constraint means cannot be written in
+/// a table file that runs twice: `NOT VALID` takes `ALTER TABLE … ADD
+/// CONSTRAINT`, which fails the second time (inside `CREATE TABLE` Postgres
+/// validates it anyway), and `NOT ENFORCED` is not in the grammar dbd parses.
+/// So each is captured as an ordinary constraint and named, with what that
+/// means for the rows the database already holds.
+#[tokio::test]
+async fn a_constraints_state_a_reversed_file_cannot_carry_is_named() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    adapter
+        .execute_script(
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.parent (id int PRIMARY KEY); \
+             CREATE TABLE app.loose (id int PRIMARY KEY, n int, pid int, m int, k int); \
+             INSERT INTO app.loose VALUES (1, -5, 99, -1, -1); \
+             ALTER TABLE app.loose ADD CONSTRAINT loose_n_pos CHECK (n > 0) NOT VALID; \
+             ALTER TABLE app.loose ADD CONSTRAINT loose_pid_fk FOREIGN KEY (pid) REFERENCES app.parent (id) NOT VALID; \
+             ALTER TABLE app.loose ADD CONSTRAINT loose_m_pos CHECK (m > 0) NOT ENFORCED; \
+             ALTER TABLE app.loose ADD CONSTRAINT loose_k_pos CHECK (k > 0) NO INHERIT NOT VALID;",
+        )
+        .await
+        .unwrap();
+
+    let entities = adapter.introspect().await.expect("introspect");
+    let loose = entities.iter().find(|e| e.name == "app.loose").expect("app.loose");
+    let file = dbd_core::emit::emit_entity(loose).unwrap();
+    for check in ["CHECK (n > 0)", "CHECK (m > 0)", "CHECK (k > 0)"] {
+        assert!(file.contains(check), "{check} in:\n{file}");
+    }
+    let back = dbd_core::parser::parse_entity(std::path::Path::new("ddl/table/app/loose.ddl"), &file).unwrap();
+    assert!(back.errors.is_empty(), "the file reads back: {:?}\n{file}", back.errors);
+
+    let said = loose.warnings.join("\n");
+    for (constraint, state) in [
+        ("loose_n_pos", "NOT VALID"),
+        ("loose_pid_fk", "NOT VALID"),
+        ("loose_m_pos", "NOT ENFORCED"),
+        ("loose_k_pos", "NO INHERIT"),
+        ("loose_k_pos", "NOT VALID"),
+    ] {
+        assert!(
+            loose
+                .warnings
+                .iter()
+                .any(|w| w.contains(constraint) && w.contains(state)),
+            "{constraint} is named as {state}: {said}"
+        );
+    }
+}
