@@ -266,8 +266,9 @@ impl Design {
         C: FnMut(crate::reconcile::ReconcileComplete),
     {
         use crate::reconcile::{
-            plan_check_convergence, plan_comment_convergence, plan_enum_recreation, plan_fk_convergence,
-            plan_index_convergence, plan_reconcile, raw_snapshot_from_entities, snapshot_from_entities,
+            plan_check_convergence, plan_comment_convergence, plan_enum_recreation, plan_exclusion_convergence,
+            plan_fk_convergence, plan_index_convergence, plan_reconcile, raw_snapshot_from_entities,
+            snapshot_from_entities,
         };
 
         // Batch adapters (e.g. Convex) have no live SQL schema to diff.
@@ -337,6 +338,9 @@ impl Design {
         // snapshots, matching by canonical expression since Postgres auto-names
         // every CHECK.
         plan_check_convergence(&mut plan, &live_raw, &desired_raw);
+        // EXCLUDE constraints, stripped by canonicalize as CHECKs are, and
+        // matched the same way: by definition, since Postgres names them.
+        plan_exclusion_convergence(&mut plan, &live_raw, &desired_raw);
 
         // Column comments: canonicalize clears these as well, so reconcile could
         // never act on the comment drift `dbd diff` kept reporting. Metadata only,

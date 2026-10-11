@@ -537,6 +537,10 @@ fn extract_table_constraint(
                 ..fk
             }))
         }
+        ConstrExclusion => Ok(TableConstraint::Exclude {
+            name: constraint_name(c),
+            definition: exclusion_definition(c, default_schema, functions)?,
+        }),
         other => Err(format!("this table has a {other:?} constraint dbd cannot represent")),
     }
 }
@@ -672,26 +676,12 @@ pub(super) fn extract_index(
         let Some(NodeEnum::IndexElem(elem)) = param.node.as_ref() else {
             return Err(format!("index {label:?} has an unreadable key"));
         };
-        // An empty `name` means the key is an expression, held in `expr`.
-        let (name, is_expression) = if elem.name.is_empty() {
-            let expr = elem
-                .expr
-                .as_ref()
-                .ok_or_else(|| format!("index {label:?} has a key that is neither column nor expression"))?;
-            let rendered = expr_text(expr)
-                .ok_or_else(|| format!("index {label:?}: dbd could not render an expression key back to SQL"))?;
-            collect_function_refs(&rendered, default_schema, functions);
-            (parenthesize_key(expr, rendered), true)
-        } else {
-            (elem.name.clone(), false)
-        };
-        columns.push(IndexColumn {
-            name,
-            is_expression,
-            order: sort_order(elem.ordering),
-            nulls_first: nulls_first(elem.nulls_ordering),
-            opclass: (!elem.opclass.is_empty()).then(|| string_list(&elem.opclass).join(".")),
-        });
+        columns.push(index_column(
+            elem,
+            &format!("index {label:?}"),
+            default_schema,
+            functions,
+        )?);
     }
 
     let mut include = Vec::with_capacity(ix.index_including_params.len());
@@ -751,6 +741,123 @@ pub(super) fn extract_index(
         nulls_not_distinct: ix.nulls_not_distinct,
         with_options,
     })
+}
+
+/// One key of an index or an exclusion constraint: a column, or an expression
+/// over columns, with its operator class, direction and NULLS placement.
+/// `owner` names what it belongs to, for the error when a key cannot be read.
+fn index_column(
+    elem: &protobuf::IndexElem,
+    owner: &str,
+    default_schema: &str,
+    functions: &mut Vec<(String, SchemaSource)>,
+) -> Extract<IndexColumn> {
+    // An empty `name` means the key is an expression, held in `expr`.
+    let (name, is_expression) = if elem.name.is_empty() {
+        let expr = elem
+            .expr
+            .as_ref()
+            .ok_or_else(|| format!("{owner} has a key that is neither column nor expression"))?;
+        let rendered =
+            expr_text(expr).ok_or_else(|| format!("{owner}: dbd could not render an expression key back to SQL"))?;
+        collect_function_refs(&rendered, default_schema, functions);
+        (parenthesize_key(expr, rendered), true)
+    } else {
+        (elem.name.clone(), false)
+    };
+    Ok(IndexColumn {
+        name,
+        is_expression,
+        order: sort_order(elem.ordering),
+        nulls_first: nulls_first(elem.nulls_ordering),
+        opclass: (!elem.opclass.is_empty()).then(|| string_list(&elem.opclass).join(".")),
+    })
+}
+
+/// An `EXCLUDE` constraint's definition — everything after `EXCLUDE` — as
+/// valid SQL, rendered from the statement in the order Postgres's grammar
+/// takes it: `USING <method> (<key> WITH <operator>, …)`, then `INCLUDE`,
+/// `WITH`, `USING INDEX TABLESPACE`, `WHERE`, `DEFERRABLE`.
+///
+/// Rendered piece by piece rather than through libpg_query's deparser, which
+/// writes `WHERE` before `INCLUDE` and `WITH` — SQL Postgres refuses. An
+/// omitted method is written as the `btree` Postgres gives it, as
+/// `pg_get_constraintdef` writes it.
+fn exclusion_definition(
+    c: &protobuf::Constraint,
+    default_schema: &str,
+    functions: &mut Vec<(String, SchemaSource)>,
+) -> Extract<String> {
+    let owner = format!(
+        "exclusion constraint {:?}",
+        constraint_name(c).unwrap_or_else(|| "<unnamed>".to_string())
+    );
+    let unreadable = || format!("{owner} has an element dbd cannot read");
+    let mut elements = Vec::with_capacity(c.exclusions.len());
+    for pair in &c.exclusions {
+        // Each element is a two-item list: the key, then its operator's name.
+        let Some(NodeEnum::List(pair)) = pair.node.as_ref() else {
+            return Err(unreadable());
+        };
+        let [key, operator] = pair.items.as_slice() else {
+            return Err(unreadable());
+        };
+        let (Some(NodeEnum::IndexElem(key)), Some(NodeEnum::List(operator))) =
+            (key.node.as_ref(), operator.node.as_ref())
+        else {
+            return Err(unreadable());
+        };
+        let operator = match string_list(&operator.items).as_slice() {
+            [op] => op.clone(),
+            qualified => format!("OPERATOR({})", qualified.join(".")),
+        };
+        let column = index_column(key, &owner, default_schema, functions)?;
+        elements.push(format!("{} WITH {operator}", crate::emit::emit_index_column(&column)));
+    }
+    let method = if c.access_method.is_empty() {
+        "btree"
+    } else {
+        &c.access_method
+    };
+    let mut sql = format!("USING {method} ({})", elements.join(", "));
+    let include = string_list(&c.including);
+    if !include.is_empty() {
+        let quoted: Vec<String> = include.iter().map(|col| crate::sql_quote::ident(col)).collect();
+        sql.push_str(&format!(" INCLUDE ({})", quoted.join(", ")));
+    }
+    if !c.options.is_empty() {
+        let mut options = Vec::with_capacity(c.options.len());
+        for option in &c.options {
+            let Some(NodeEnum::DefElem(def)) = option.node.as_ref() else {
+                return Err(format!("{owner} has an unreadable storage parameter"));
+            };
+            let value = def
+                .arg
+                .as_ref()
+                .and_then(|a| scalar_text(a))
+                .ok_or_else(|| format!("{owner}: storage parameter {:?} has an unreadable value", def.defname))?;
+            options.push(format!("{} = {value}", def.defname.to_lowercase()));
+        }
+        sql.push_str(&format!(" WITH ({})", options.join(", ")));
+    }
+    if !c.indexspace.is_empty() {
+        sql.push_str(&format!(
+            " USING INDEX TABLESPACE {}",
+            crate::sql_quote::ident(&c.indexspace)
+        ));
+    }
+    if let Some(predicate) = c.where_clause.as_ref() {
+        let rendered =
+            expr_text(predicate).ok_or_else(|| format!("{owner}: dbd could not render its WHERE back to SQL"))?;
+        collect_function_refs(&rendered, default_schema, functions);
+        sql.push_str(&format!(" WHERE ({rendered})"));
+    }
+    if c.initdeferred {
+        sql.push_str(" DEFERRABLE INITIALLY DEFERRED");
+    } else if c.deferrable {
+        sql.push_str(" DEFERRABLE");
+    }
+    Ok(sql)
 }
 
 /// Postgres's grammar requires an index key that is not a bare function call to

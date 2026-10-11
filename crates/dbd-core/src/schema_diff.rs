@@ -144,6 +144,21 @@ pub fn normalize_for_diff(snap: &mut Snapshot, advisories: &mut Vec<String>) {
                 // sides. (advisory above is built first, so it keeps the real name.)
                 *name = None;
             }
+            // An EXCLUDE matches by its definition read back through Postgres's
+            // grammar, not by name — Postgres names an unnamed one — and not by
+            // text, which differs between `pg_get_constraintdef` and an author.
+            if let TableConstraint::Exclude { name, definition } = con {
+                match crate::sql_expr::canonical_exclusion(definition) {
+                    Some(canon) => *definition = canon,
+                    None => advisories.push(format!(
+                        "EXCLUDE {} on {}.{} couldn't be normalized — shown as changed; verify manually",
+                        name.as_deref().unwrap_or("(unnamed)"),
+                        t.schema,
+                        t.name
+                    )),
+                }
+                *name = None;
+            }
         }
     }
 }

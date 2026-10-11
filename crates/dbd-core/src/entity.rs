@@ -554,6 +554,25 @@ pub enum TableConstraint {
         name: Option<String>,
         expression: String,
     },
+    /// `EXCLUDE …` — no two rows may match on every element under its
+    /// operator: `EXCLUDE USING gist (room WITH =, during WITH &&)` stops two
+    /// bookings of one room overlapping.
+    ///
+    /// `definition` is everything after `EXCLUDE`, as valid SQL in Postgres's
+    /// own order: the access method, the elements with their operators, then
+    /// `INCLUDE`, `WITH`, `WHERE` and `DEFERRABLE` — what
+    /// `pg_get_constraintdef` prints, and what the parser renders from the
+    /// statement. Two spellings of one constraint differ in text (quoting, a
+    /// default operator class written out), so they are compared through
+    /// [`crate::sql_expr::canonical_exclusion`], never as written.
+    ///
+    /// Without it, introspection read only the constraint's backing index:
+    /// a reversed table got a plain gist index — the speed kept, the rule gone
+    /// — and the table parser refused a project that declared one.
+    Exclude {
+        name: Option<String>,
+        definition: String,
+    },
 }
 
 /// How an identity column generates its value (`GENERATED … AS IDENTITY`).

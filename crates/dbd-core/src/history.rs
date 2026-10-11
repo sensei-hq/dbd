@@ -597,7 +597,8 @@ fn constraint_definition(tc: &TableConstraint) -> String {
     let name = match tc {
         TableConstraint::PrimaryKey { name, .. }
         | TableConstraint::Unique { name, .. }
-        | TableConstraint::Check { name, .. } => name.clone(),
+        | TableConstraint::Check { name, .. }
+        | TableConstraint::Exclude { name, .. } => name.clone(),
         TableConstraint::ForeignKey(fk) => fk.name.clone(),
     };
     if let Some(n) = name {
@@ -619,6 +620,7 @@ fn constraint_name(tc: &TableConstraint) -> String {
             fk.ref_columns.join(", ")
         ),
         TableConstraint::Check { expression, .. } => format!("check ({expression})"),
+        TableConstraint::Exclude { definition, .. } => format!("exclude {definition}"),
     }
 }
 

@@ -882,7 +882,7 @@ impl PostgresAdapter {
              LEFT JOIN pg_namespace ref_ns ON ref_ns.oid = ref_cls.relnamespace \
              LEFT JOIN pg_index ix ON ix.indexrelid = c.conindid \
              WHERE ns.nspname = $1 AND cls.relname = $2 \
-               AND c.contype IN ('p', 'u', 'f', 'c') \
+               AND c.contype IN ('p', 'u', 'f', 'c', 'x') \
              ORDER BY c.contype, c.conname";
 
         let con_rows = sqlx::query(cons_sql)
@@ -978,6 +978,21 @@ impl PostgresAdapter {
                         // schema. Nothing was guessed.
                         ref_schema_source: crate::entity::SchemaSource::Stated,
                     }));
+                }
+                // An exclusion constraint, whose backing index is reported
+                // with it rather than as a plain index — read as one, it was
+                // the speed of the rule without the rule.
+                "x" => {
+                    if let Some(oid) = conindid
+                        && oid != 0
+                    {
+                        constraint_index_oids.insert(oid);
+                    }
+                    let condef: String = con.get("condef");
+                    constraints.push(TableConstraint::Exclude {
+                        name: Some(conname),
+                        definition: condef.strip_prefix("EXCLUDE ").unwrap_or(&condef).to_string(),
+                    });
                 }
                 "c" => {
                     let expression: String = match con.try_get::<Option<String>, _>("check_expr") {

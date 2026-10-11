@@ -262,6 +262,7 @@ fn emit_table_constraint_line(con: &crate::entity::TableConstraint, schema: &str
             s
         }
         TableConstraint::Check { name, expression } => format!("  {}CHECK ({expression})", named(name)),
+        TableConstraint::Exclude { name, definition } => format!("  {}EXCLUDE {definition}", named(name)),
     }
 }
 
@@ -828,7 +829,8 @@ mod tests {
             .map(|c| match c {
                 crate::entity::TableConstraint::PrimaryKey { name, .. }
                 | crate::entity::TableConstraint::Unique { name, .. }
-                | crate::entity::TableConstraint::Check { name, .. } => name,
+                | crate::entity::TableConstraint::Check { name, .. }
+                | crate::entity::TableConstraint::Exclude { name, .. } => name,
                 crate::entity::TableConstraint::ForeignKey(fk) => fk.name,
             })
             .collect();

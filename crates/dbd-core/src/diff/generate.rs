@@ -163,7 +163,7 @@ fn constraint_name(con: &TableConstraint) -> Option<&str> {
     match con {
         TableConstraint::PrimaryKey { name, .. } | TableConstraint::Unique { name, .. } => name.as_deref(),
         TableConstraint::ForeignKey(fk) => fk.name.as_deref(),
-        TableConstraint::Check { name, .. } => name.as_deref(),
+        TableConstraint::Check { name, .. } | TableConstraint::Exclude { name, .. } => name.as_deref(),
     }
 }
 
@@ -189,6 +189,7 @@ fn constraint_description(con: &TableConstraint) -> String {
         ),
         TableConstraint::ForeignKey(fk) => format!("FOREIGN KEY ({})", fk.columns.join(", ")),
         TableConstraint::Check { expression, .. } => format!("CHECK ({expression})"),
+        TableConstraint::Exclude { definition, .. } => format!("EXCLUDE {definition}"),
     }
 }
 
@@ -574,6 +575,14 @@ fn constraint_add_sql(entity_name: &str, con: &TableConstraint) -> String {
             // what a shared name would then collide on. Mirrors the FK arm.
             let con_clause = name.as_deref().map(|n| format!("CONSTRAINT {n} ")).unwrap_or_default();
             format!("ALTER TABLE {entity_name} ADD {con_clause}CHECK ({expression});")
+        }
+        // Unnamed, Postgres names it `<table>_<columns>_excl`, as it names a
+        // CHECK — mirrored for the same reason.
+        TableConstraint::Exclude { name, definition } => {
+            format!(
+                "ALTER TABLE {entity_name} ADD {}EXCLUDE {definition};",
+                constraint_clause(name.as_deref())
+            )
         }
     }
 }
