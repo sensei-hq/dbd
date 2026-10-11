@@ -225,11 +225,22 @@ pub(crate) async fn check_reset_guards(
 
 pub async fn cmd_migrate_status(
     config: &Path,
+    env: &str,
     database_url: Option<&str>,
     project_dir: &Path,
     verbosity: Verbosity,
 ) -> Result<()> {
+    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
     let adapter = get_adapter(config, database_url).await?;
+    // The versions are the whole project's; a database pinned to a scope was
+    // built with that scope's entities alone, and said nothing of it.
+    let unscoped = design.resolve_scope(None, None)?;
+    if let Some((pinned, by)) = super::other_scope_pin(&*adapter, &design, &unscoped).await? {
+        output::always(&format!(
+            "note: this database is pinned to scope '{pinned}'{by} — it was built with that scope's \
+             entities, not the whole design."
+        ));
+    }
     migrate_status_with_adapter(&*adapter, project_dir, verbosity).await
 }
 

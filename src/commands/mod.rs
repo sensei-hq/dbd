@@ -247,7 +247,7 @@ pub async fn run(
 
         Commands::Migrate { status } => {
             if *status {
-                migration::cmd_migrate_status(config, database_url, project_dir, verbosity).await
+                migration::cmd_migrate_status(config, env, database_url, project_dir, verbosity).await
             } else {
                 output::info(
                     verbosity,
@@ -682,6 +682,24 @@ pub(super) async fn check_pinned_scope(
         );
     }
     Ok(())
+}
+
+/// The pin of a database pinned to another scope than `resolved` — the
+/// scope, and `" by project 'x'"` when the pin is a renamed project's old
+/// record (see [`dbd_core::design::DatabaseMarks`]) — or `None` when the pin
+/// is the run's own, or there is none.
+///
+/// For the read-only commands, `diff` and `migrate --status`: they write
+/// nothing, so a pin is noted, never refused. They said nothing of it, and an
+/// unscoped diff of a scoped database listed what the scope does not build
+/// as missing with no word of why.
+pub(super) async fn other_scope_pin(
+    adapter: &dyn dbd_core::DatabaseAdapter,
+    design: &dbd_core::Design,
+    resolved: &dbd_core::ResolvedScope,
+) -> Result<Option<(String, String)>> {
+    let marks = design.database_marks(adapter).await?;
+    Ok(dbd_core::Design::conflicting_pin(&marks, &resolved.name).map(|(pinned, by)| (pinned.to_string(), by)))
 }
 
 /// Print the pending migrations a run would execute: each step under its
