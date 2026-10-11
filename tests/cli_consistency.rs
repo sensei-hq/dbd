@@ -1509,3 +1509,32 @@ fn reset_refuses_a_target_the_connection_is_not() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+// ── an external name has no place in the graph ──────────────────────────────
+
+/// `graph -n auth.users` printed an empty graph and exited 0 for a name
+/// declared `external:` — a valid document indistinguishable from an entity
+/// with no dependencies — while `inspect -n` and `apply -n` refuse it: dbd has
+/// no DDL for an external, so it is not a node of the graph.
+#[test]
+fn graph_refuses_an_external_name_as_inspect_and_apply_do() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write(
+        dir,
+        "design.yaml",
+        "project:\n  name: ext\nsource:\n  dialect: postgresql\nschemas:\n  - app\n\
+         external:\n  - name: auth.users\n",
+    );
+    write(
+        dir,
+        "ddl/table/app/t.ddl",
+        "set search_path to app;\ncreate table if not exists t (id integer primary key);\n",
+    );
+
+    let out = dbd(dir, &["graph", "-n", "auth.users"]);
+    assert!(!out.status.success(), "graph refuses it: {}", stdout(&out));
+    assert!(stderr(&out).contains("external"), "saying why: {}", stderr(&out));
+    let out = dbd(dir, &["graph", "-n", "app.t"]);
+    assert!(out.status.success(), "a managed name still graphs: {}", stderr(&out));
+}
