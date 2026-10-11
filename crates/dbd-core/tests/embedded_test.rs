@@ -869,8 +869,8 @@ async fn a_json_record_mentioning_set_search_path_imports_unchanged() {
 /// - `GENERATED ALWAYS` identity ids were renumbered, breaking every foreign
 ///   key pointing at them.
 ///
-/// A JSON null stays the JSON value; an SQL NULL is exported as an absent key
-/// and imports as NULL. Ids import as-is, and the identity then continues past
+/// A JSON null stays the JSON value (exported as `{"$json": null}`); an SQL
+/// NULL is exported as `null` and imports as NULL. Ids import as-is, and the identity then continues past
 /// them, so the next insert does not collide — after a CSV import too, whose
 /// COPY kept the ids and left the sequence behind.
 #[tokio::test]
@@ -6839,4 +6839,75 @@ async fn what_the_table_model_cannot_hold_is_named_and_partitions_fold_into_thei
         "no partition reads as an orphan: {:?}",
         d.changes
     );
+}
+
+// ── JSONL: SQL NULL, JSON null and an omitted key each mean one thing ─────────
+
+/// The JSONL export wrote a json/jsonb column's SQL NULL as an absent key —
+/// to keep it apart from the JSON value `null` — and an import gives a column
+/// absent from every record its DEFAULT, so a json column NULL in every row
+/// came back as `'{"d": 1}'`. Now every column's key is written, `null` is SQL
+/// NULL for every type (as Postgres's own `json_populate_record` reads it),
+/// and the JSON value `null` is `{"$json": null}`. A hand-written seed keeps
+/// its meanings: `null` is NULL, and a key left out takes the DEFAULT.
+#[tokio::test]
+async fn sql_null_json_null_and_an_omitted_key_each_survive_a_jsonl_round_trip() {
+    const TABLE: &str = "CREATE TABLE app.docs (id int PRIMARY KEY, \
+        j jsonb DEFAULT '{\"d\": 1}', k json DEFAULT '[1]', t text DEFAULT 'dflt');";
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "embedded_test").await.unwrap();
+    adapter
+        .execute_script(&format!(
+            "CREATE SCHEMA app; {TABLE} \
+             INSERT INTO app.docs VALUES (1, NULL, NULL, NULL), (2, NULL, NULL, 'x'); \
+             CREATE TABLE app.expected AS SELECT id, j, k::text AS k, k IS NULL AS k_null, t FROM app.docs;"
+        ))
+        .await
+        .unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let mut entity = Entity::new(EntityType::Table, "app.docs");
+    entity.format = Some("jsonl".to_string());
+    adapter.export_data(&entity, Some(out.path())).await.expect("export");
+    adapter
+        .execute_script(&format!("DROP TABLE app.docs; {TABLE}"))
+        .await
+        .unwrap();
+    entity.file = Some(out.path().join("docs.jsonl"));
+    adapter.import_data(&entity, "", false).await.expect("import");
+    assert_catalog(
+        &*adapter,
+        false,
+        "(SELECT id, j, k::text, k IS NULL, t FROM app.docs EXCEPT ALL SELECT * FROM app.expected) \
+         UNION ALL (SELECT * FROM app.expected EXCEPT ALL SELECT id, j, k::text, k IS NULL, t FROM app.docs)",
+        "a row that differs after the round trip (a NULL json column read back as its DEFAULT)",
+    )
+    .await;
+
+    // A hand-written seed: `null` is NULL, a key left out is the DEFAULT, and
+    // `{"$json": null}` is the JSON value null.
+    adapter.execute_script("TRUNCATE app.docs").await.unwrap();
+    let seed = out.path().join("seed.jsonl");
+    std::fs::write(
+        &seed,
+        "{\"id\": 10, \"j\": null, \"t\": null}\n{\"id\": 11, \"t\": \"y\"}\n{\"id\": 12, \"j\": {\"$json\": null}, \"t\": \"z\"}\n",
+    )
+    .unwrap();
+    let mut seeded = Entity::new(EntityType::Table, "app.docs");
+    seeded.format = Some("jsonl".to_string());
+    seeded.file = Some(seed);
+    adapter.import_data(&seeded, "", false).await.expect("import the seed");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.docs WHERE id = 10 AND j IS NULL AND t IS NULL AND k::text = '[1]'",
+        "id 10: null is NULL, and k, left out of every record, takes its DEFAULT",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.docs WHERE id = 12 AND j IS NOT NULL AND jsonb_typeof(j) = 'null'",
+        "id 12: {\"$json\": null} is the JSON value null",
+    )
+    .await;
 }
