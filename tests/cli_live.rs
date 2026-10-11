@@ -1296,6 +1296,44 @@ async fn a_dev_run_against_a_database_marked_prod_exits_non_zero_and_reset_stays
     assert!(!csv.contains("dev-seed"), "no dev seed data in prod: {csv}");
 }
 
+// ── promoting a dev database to prod is said ────────────────────────────────
+
+/// `-e` defaults to prod, so a run without it promotes a dev database to
+/// prod — allowed, since it only tightens what `reset` allows, but silent,
+/// and every later `-e dev` run is refused. Each command that records the
+/// environment says so when it promotes one, and only then.
+#[tokio::test]
+async fn a_run_that_promotes_a_dev_database_to_prod_says_so() {
+    let (pg, _url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir);
+
+    let mut failures: Vec<String> = Vec::new();
+    for command in ["apply", "deploy", "reconcile"] {
+        pg.create_database(command).await.unwrap();
+        let url = pg.settings().url(command);
+        let o = dbd(dir, &url, &["-e", "dev", command]);
+        assert!(o.status.success(), "-e dev {command}: {}", combined(&o));
+
+        let o = dbd(dir, &url, &[command]);
+        let out = combined(&o);
+        if !o.status.success() || !(out.contains("was marked dev") && out.contains("now marked prod")) {
+            failures.push(format!(
+                "{command} without -e does not say it promoted the database: {out}"
+            ));
+        }
+        let o = dbd(dir, &url, &[command]);
+        if combined(&o).contains("was marked dev") {
+            failures.push(format!(
+                "{command} on a prod database speaks of a promotion: {}",
+                combined(&o)
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
 // ── a file with no SET search_path is named by the runs that execute it ─────
 
 /// A DDL file that states no `SET search_path` resolves its unqualified names
