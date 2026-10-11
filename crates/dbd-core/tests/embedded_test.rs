@@ -7143,3 +7143,50 @@ async fn removing_an_enum_value_keeps_the_enums_comment() {
         assert_catalog(&**db, true, comment, "the comment on app.mood").await;
     }
 }
+
+/// `dbd snapshot` writes a column's type as the DDL file wrote it — `mood`,
+/// resolved by the file's own `set search_path to app`. Run on the session's
+/// default path, the generated `ALTER TABLE app.people ADD COLUMN was mood`
+/// failed with `type "mood" does not exist`; it had worked only when an
+/// earlier file in the run happened to leave the connection on `app`. A
+/// migration file runs on the path its entity's DDL file runs on — and so does
+/// a hand-written `data.sql` naming the table bare.
+#[tokio::test]
+async fn a_migration_runs_on_the_path_its_entitys_ddl_file_states() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "enum_add_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    cut_mood_version(dir, "'ok', 'bad'", ", mood mood not null default 'ok'", "v1");
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    adapter
+        .execute_script("INSERT INTO app.people (id, mood) VALUES (1, 'bad'); RESET search_path;")
+        .await
+        .expect("seed a row");
+
+    cut_mood_version(
+        dir,
+        "'ok', 'bad'",
+        ", mood mood not null default 'ok', was mood",
+        "v2 adds was",
+    );
+    std::fs::write(
+        dir.join("migrations/002/app/people.data.sql"),
+        "update people set was = mood;\n",
+    )
+    .unwrap();
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 → v2 applies");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.people WHERE id = 1 AND was = 'bad'",
+        "the row the data script filled",
+    )
+    .await;
+}
