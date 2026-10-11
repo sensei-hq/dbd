@@ -919,6 +919,67 @@ async fn an_import_refuses_a_data_file_outside_the_staging_schemas_and_keeps_the
     assert!(!csv.contains("replaced"), "and nothing may replace it: {csv}");
 }
 
+// ── staging tables linked by a foreign key import together ──────────────────
+
+/// Two staging tables, one referencing the other, each with a data file. The
+/// import emptied them one `TRUNCATE` at a time, and Postgres refuses to
+/// truncate a table another references — so the import failed on every run,
+/// saying "cannot truncate a table referenced in a foreign key constraint"
+/// without naming either table. Truncated together, with the referenced table
+/// loaded first, they import; a table outside the import that still holds a
+/// key to one is named, and nothing is emptied.
+#[tokio::test]
+async fn staging_tables_linked_by_a_foreign_key_import_together_and_a_blocker_is_named() {
+    let (pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: clilive\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - staging\n  - app\n\n\
+         import:\n  staging: [staging]\n",
+    )
+    .unwrap();
+    let write = |rel: &str, body: &str| {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    };
+    write(
+        "ddl/table/staging/parent.ddl",
+        "set search_path to staging;\ncreate table if not exists parent (id int primary key);\n",
+    );
+    write(
+        "ddl/table/staging/child.ddl",
+        "set search_path to staging;\ncreate table if not exists child (id int primary key, pid int references parent (id));\n",
+    );
+    write("import/staging/parent.csv", "id\n1\n");
+    write("import/staging/child.csv", "id,pid\n1,1\n");
+    let o = dbd(dir, &url, &["-e", "dev", "apply"]);
+    assert!(o.status.success(), "apply failed: {}", combined(&o));
+
+    for run in 1..=2 {
+        let o = dbd(dir, &url, &["-e", "dev", "import"]);
+        assert!(o.status.success(), "import run {run} failed: {}", combined(&o));
+    }
+
+    // A live table outside the import holding a key to a staging table.
+    write(
+        "ddl/table/app/orders.ddl",
+        "set search_path to app;\ncreate table if not exists orders (id int primary key, pid int references staging.parent (id));\n",
+    );
+    let o = dbd(dir, &url, &["-e", "dev", "apply"]);
+    assert!(o.status.success(), "apply failed: {}", combined(&o));
+    let o = dbd(dir, &url, &["-e", "dev", "import"]);
+    assert!(!o.status.success(), "a truncate the database refuses fails the import");
+    let said = combined(&o);
+    assert!(
+        said.contains("staging.parent") && said.contains("app.orders"),
+        "naming the table it empties and the one whose key blocks it: {said}"
+    );
+    let o = psql(&pg, &url, &["-Atc", "SELECT count(*) FROM staging.child"]);
+    assert_eq!(stdout(&o).trim(), "1", "and nothing was emptied: {said}");
+}
+
 // ── a skipped hook is named even when the run fails ─────────────────────────
 
 /// A scope skips a hook whose tables it leaves out, and said so only in the
