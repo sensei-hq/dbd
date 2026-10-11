@@ -2157,6 +2157,39 @@ impl DatabaseAdapter for PostgresAdapter {
 mod tests {
     use super::*;
 
+    /// A port nothing listens on, and one whose listener never answers: each
+    /// waited out sqlx's 30 s pool timeout, then said only `pool timed out
+    /// while waiting for an open connection`. A connection that cannot be made
+    /// fails within a few seconds, naming the host and port it tried.
+    #[tokio::test]
+    async fn a_database_that_cannot_be_reached_fails_fast_naming_its_host_and_port() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_port = closed.local_addr().unwrap().port();
+        drop(closed);
+        // Bound and listening, so the TCP handshake completes — and never read.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let silent_port = silent.local_addr().unwrap().port();
+
+        let mut failures = Vec::new();
+        for port in [closed_port, silent_port] {
+            let started = std::time::Instant::now();
+            let url = format!("postgres://nobody@127.0.0.1:{port}/absent");
+            let err = match PostgresAdapter::new(&url, "p").await {
+                Ok(_) => panic!("{url}: nothing there to connect to"),
+                Err(e) => e.to_string(),
+            };
+            let took = started.elapsed();
+            if took > std::time::Duration::from_secs(15) {
+                failures.push(format!("127.0.0.1:{port} took {took:?}: {err}"));
+            }
+            if !err.contains(&format!("127.0.0.1:{port}")) {
+                failures.push(format!("127.0.0.1:{port} is not named: {err}"));
+            }
+        }
+        drop(silent);
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
     // Regression tests for sensei-hq/dbd#6: the dbd-managed jsonb-import
     // machinery must be schema-qualified so it resolves independently of the
     // session `search_path` (which pooled connections don't share).
