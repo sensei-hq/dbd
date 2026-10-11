@@ -111,12 +111,20 @@ source:
 ```
 
 A file that states its own path still wins. One that states none runs on this
-path: `apply`, `deploy`, `reconcile`, migrations and `combine` run
+path: `apply`, `deploy`, `reconcile` and `combine` run
 `SET search_path TO <list>, public` ahead of it — a statement in front of the
 file, which is never rewritten — so a table lands where the parser resolved it,
 and `diff` agrees. Before 0.25 only the parser read the key, so the table landed
 in `public` while `diff` wanted to create it in `app`, and reconcile never
 converged.
+
+Scripts follow the same rule. A migration file that states no path runs on the
+path its table's DDL file runs on — the one that file states, else this list —
+so a `data.sql` can name its table bare, as the DDL does. A hook script runs on
+this list, and its bare table names are read on it when a scope decides whether
+to skip the hook. With no list, both run on the session default (`RESET
+search_path`); before 0.25 they ran on whatever path the last DDL file had left
+on the connection.
 
 Omit the key and the file runs as written, on PostgreSQL's own default
 (`"$user", public`), which depends on the connecting role and can be moved by
@@ -124,9 +132,23 @@ Omit the key and the file runs as written, on PostgreSQL's own default
 your files, and a pathless file under `ddl/table/app/` creates its table in
 `public`.
 
+**A file's own path keeps `public`.** DDL files often set the path to their own
+schemas (`SET search_path TO app, extensions;`) and leave `public` off, which
+hides the extensions installed there. So after each top-level
+`SET search_path` (or `SET LOCAL search_path`) whose path leaves `public` out,
+`apply` and `combine` add a statement of their own setting the same path with
+`public` on the end. The file's text is never edited: the statements are found
+in libpg_query's parse tree, so a function's `SET search_path TO ''` clause, a
+body, a string literal or a comment that mentions the statement is never taken
+for one. Before 0.25 a text rewrite edited every `set search_path to …;` up to
+the next `;` — breaking Supabase-style `SECURITY DEFINER` functions and
+altering string literals.
+
 **Either way it is reported, not silent.** `dbd inspect` names every DDL file
 that states no path, with what its names were resolved against instead, and
-counts them. An empty list is refused rather than treated as "no schemas".
+counts them; `apply` and `deploy` name each one their run executes, before the
+run and in its preview. An empty list is refused rather than treated as "no
+schemas".
 
 `dialect` picks the reader; `parser` overrides that choice and you should not
 normally need it.
@@ -391,7 +413,7 @@ guide is [import and export](10-data.md).
 
 | Field     | Type   | Description |
 |-----------|--------|-------------|
-| `options` | object | `truncate` (default `true`: empty each table before loading it — `TRUNCATE` on PostgreSQL, `DELETE FROM` on SQLite; a Convex import always replaces) and `null_value` (default `''`) |
+| `options` | object | `truncate` (default `true`: empty the tables before any is loaded — on PostgreSQL in one `TRUNCATE`, so tables linked by a foreign key empty together; on SQLite with `DELETE FROM`, a referencing table first; a Convex import always replaces) and `null_value` (default `''`) |
 | `tables`  | list   | Per-table overrides of `truncate`, `format` and `null_value` (`{name: options}`). Not a list of what to load — it does not filter which files load |
 | `after`   | list   | SQL scripts run after the data is loaded and the import procedures have run — on `dbd import` and `dbd deploy`. See [Hook scripts](#hook-scripts) |
 | `staging` | list   | The schemas an import may load into. Empty or absent: no restriction |
@@ -450,6 +472,8 @@ Scripts run in the order written. A path dbd cannot find is an error, not a skip
 ```
 
 An `apply.before` or `apply.after` skip is named before `apply`, `deploy` or `reconcile` starts — so a run that then fails because of it still says so — and in their dry runs, which make the same decision without running anything (`Design::hook_skips` for an embedder). An `import.after` skip is named in `import --dry-run` and `deploy --dry-run`, as the real run names it; before 0.25 `import --dry-run` had the rule backwards. A hook file that is missing is an error in the preview as in the run. The run continues past a skip; a scoped run is a normal workflow, not an error. This exists so a loader doing `INSERT INTO target SELECT … FROM staging_a JOIN staging_b` does not run against half-loaded data when `staging_b` was scoped out. (Before 0.25 a hook ran only when every table it named was in the working set, so a hook touching an `external:` table was skipped under every named scope, and the skip was said only in the summary of a run that succeeded.)
+
+**Where a hook's bare names resolve.** A hook runs on `source.search_path` (else the session default, `RESET search_path`) unless it states its own `SET search_path`, and its unqualified table names are judged on that same path — so `update notes …` in a project whose path is `[app]` depends on `app.notes`. Before 0.25 the analysis assumed `public` while the hook ran on whatever path the last DDL file left, so under a narrow scope a hook was judged on one table and run against another.
 
 **Where `writes:` is needed.** dbd derives a script's tables by parsing it, which works when they appear as SQL identifiers. It cannot work when they are *data* — inside a `format()` string or an `array[…]` literal, as a realtime-publication hook typically is. No parser can recover those, so declare them with `writes:`.
 
