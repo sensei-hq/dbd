@@ -61,6 +61,18 @@ pub trait DatabaseAdapter: Send + Sync {
 
     async fn execute_script(&self, sql: &str) -> Result<()>;
 
+    /// Run a project script — a migration file, a hook — that may name tables
+    /// without their schema, on `search_path`: `source.search_path`, or `None`
+    /// when the project sets none.
+    ///
+    /// The default runs it as written, for a target with no search path.
+    /// PostgreSQL opens it with the path a DDL file stating none runs on (see
+    /// [`crate::script::runnable_script`]).
+    async fn execute_project_script(&self, sql: &str, search_path: Option<&[crate::entity::PathEntry]>) -> Result<()> {
+        let _ = search_path;
+        self.execute_script(sql).await
+    }
+
     async fn apply_entity(&self, entity: &Entity) -> Result<()>;
 
     async fn apply_entities(&self, entities: &[Entity]) -> Result<()> {
@@ -135,6 +147,15 @@ pub trait DatabaseAdapter: Send + Sync {
     /// returns for them, without the rest. Default: none (targets without
     /// materialized views).
     async fn live_matviews(&self) -> Result<Vec<Entity>> {
+        Ok(Vec::new())
+    }
+
+    /// The live materialized views that read any of `columns` — `(table,
+    /// column)` pairs, the table as `schema.name` — directly or through views,
+    /// as `schema.name`, deepest first. What blocks `ALTER COLUMN … TYPE` on
+    /// those columns and that dbd never drops. Default: none (targets without
+    /// materialized views).
+    async fn matviews_reading_columns(&self, _columns: &[(String, String)]) -> Result<Vec<String>> {
         Ok(Vec::new())
     }
 

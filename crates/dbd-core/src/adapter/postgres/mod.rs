@@ -1395,6 +1395,52 @@ impl DatabaseAdapter for PostgresAdapter {
         self.exec_raw(&sql).await
     }
 
+    async fn matviews_reading_columns(&self, columns: &[(String, String)]) -> Result<Vec<String>> {
+        if columns.is_empty() {
+            return Ok(Vec::new());
+        }
+        // A view or matview reading a column depends on it through its rewrite
+        // rule (`pg_depend.refobjsubid` is the column's number): that is what
+        // makes Postgres refuse `ALTER COLUMN … TYPE`. A matview over the table
+        // that reads other columns has no such row and blocks nothing. Walked
+        // through views, since a matview over a view over the column blocks the
+        // view's drop.
+        let tables: Vec<String> = columns.iter().map(|(t, _)| crate::sql_quote::qualified(t)).collect();
+        let names: Vec<String> = columns.iter().map(|(_, c)| c.clone()).collect();
+        let rows = sqlx::query(
+            "WITH RECURSIVE hit(oid, depth) AS ( \
+                 SELECT r.ev_class, 1 \
+                 FROM unnest($1::text[], $2::text[]) AS a(tbl, col) \
+                 JOIN pg_attribute att ON att.attrelid = to_regclass(a.tbl) AND att.attname = a.col \
+                 JOIN pg_depend d ON d.refclassid = 'pg_class'::regclass AND d.refobjid = att.attrelid \
+                                 AND d.refobjsubid = att.attnum AND d.classid = 'pg_rewrite'::regclass \
+                 JOIN pg_rewrite r ON r.oid = d.objid \
+                 WHERE r.ev_class <> att.attrelid \
+               UNION \
+                 SELECT r.ev_class, hit.depth + 1 FROM hit \
+                 JOIN pg_depend d ON d.refclassid = 'pg_class'::regclass AND d.refobjid = hit.oid \
+                                 AND d.classid = 'pg_rewrite'::regclass \
+                 JOIN pg_rewrite r ON r.oid = d.objid \
+                 WHERE r.ev_class <> hit.oid AND hit.depth < 64 \
+             ) \
+             SELECT n.nspname || '.' || c.relname AS name \
+             FROM hit JOIN pg_class c ON c.oid = hit.oid JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relkind = 'm' \
+             GROUP BY n.nspname, c.relname \
+             ORDER BY max(hit.depth) DESC, 1",
+        )
+        .bind(&tables)
+        .bind(&names)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbdError::Config(format!("finding the materialized views over a column failed: {e}")))?;
+        Ok(rows.iter().map(|r| r.get::<String, _>("name")).collect())
+    }
+
+    async fn execute_project_script(&self, sql: &str, search_path: Option<&[crate::entity::PathEntry]>) -> Result<()> {
+        self.execute_script(&script::runnable_script(sql, search_path)).await
+    }
+
     async fn apply_entity(&self, entity: &Entity) -> Result<()> {
         // `runnable_ddl`, not the bare file: a file that states no search path
         // runs on the one its names were resolved against (`source.search_path`).

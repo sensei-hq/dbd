@@ -102,10 +102,10 @@ impl Design {
     }
 
     /// The guard [`Design::reset`] checks unless forced: a database marked prod,
-    /// or one with applied migrations, is not reset. `marks` are what the
-    /// database records (one dbd has never written to passes): this project's
-    /// record or, after a rename, the one its old `project.name` left (see
-    /// [`DatabaseMarks`]) — `--force` overrides either alike.
+    /// or one versioned by a released project, is not reset. `marks` are what
+    /// the database records (one dbd has never written to passes): this
+    /// project's record or, after a rename, the one its old `project.name` left
+    /// (see [`DatabaseMarks`]) — `--force` overrides either alike.
     ///
     /// Public so a preview refuses exactly where the real run does: `reset
     /// --dry-run` printed the whole plan for a prod database, and exited 0,
@@ -116,13 +116,23 @@ impl Design {
         let is_prod = |m: &&crate::adapter::ProjectMeta| {
             crate::config::normalize_env(Some(&m.env)).is_ok_and(|env| env == "prod")
         };
-        // (the row, why — as this project's mark, as another project's)
+        // (the row, why — as this project's mark, as another project's). A
+        // recorded version is what is known: a fresh install of a released
+        // project records its version with no migration ever run, and this
+        // said "has applied migrations" of it.
         let (row, own, other) = match (marks.rows().find(is_prod), marks.rows().find(|m| m.version >= 1)) {
-            (Some(row), _) => (row, "database is marked as prod", "marked this database prod"),
+            (Some(row), _) => (
+                row,
+                "database is marked as prod".to_string(),
+                "marked this database prod".to_string(),
+            ),
             (None, Some(row)) => (
                 row,
-                "database has applied migrations",
-                "applied migrations to this database",
+                format!(
+                    "the database is versioned at v{} (a released project's database)",
+                    row.version
+                ),
+                format!("versioned this database at v{}", row.version),
             ),
             (None, None) => return Ok(()),
         };

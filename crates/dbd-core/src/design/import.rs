@@ -263,7 +263,7 @@ impl Design {
         let working_set = self.scope_working_set(scope)?;
         let hook_scope = self.hook_scope(scope, working_set.as_ref());
         let plan = hooks::plan_hooks(
-            &self.project_dir,
+            self.hook_source(),
             &self.config.import.after,
             hooks::HookKind::After,
             hook_scope.as_ref().map(|(name, outside)| (*name, outside)),
@@ -663,7 +663,7 @@ impl Design {
         let hook_scope = self.hook_scope(scope, working_set.as_ref());
         let after = hooks::run_hooks(
             adapter,
-            &self.project_dir,
+            self.hook_source(),
             &self.config.import.after,
             hooks::HookKind::After,
             hook_scope.as_ref().map(|(name, outside)| (*name, outside)),

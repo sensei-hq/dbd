@@ -4339,8 +4339,15 @@ async fn removing_an_enum_value_still_in_use_fails_without_half_applying() {
     write_enum("'red', 'green'");
     let failed = load()
         .reconcile(&*adapter, false, true, false, None, Progress::none())
-        .await;
-    assert!(failed.is_err(), "a row holding the removed value must fail the run");
+        .await
+        .expect_err("a row holding the removed value must fail the run")
+        .to_string();
+    // The cast failure named the enum and the value, never the table: the
+    // step is the enum's, and a swap can move columns in many tables.
+    assert!(
+        failed.contains("app.t.c"),
+        "the failure names the column holding the value: {failed}"
+    );
 
     // Nothing half-applied: the type, the row and the view are all as they were.
     assert_catalog(
@@ -6378,4 +6385,1036 @@ async fn a_reset_keeps_a_role_another_database_on_the_server_holds() {
         .expect("the first database resets");
     assert_catalog(&*first, false, &role_predicate("app_writer"), "role app_writer").await;
     assert_catalog(&*first, false, &role_predicate("app_reader"), "role app_reader").await;
+}
+
+// ── Migrations run version by version ────────────────────────────────────────
+
+/// Write `files`, remove `gone`, and cut a snapshot of the result — one
+/// version of a released project, as `dbd snapshot` writes it.
+fn cut_version(dir: &std::path::Path, yaml: &str, files: &[(&str, &str)], gone: &[&str], description: &str) {
+    for rel in gone {
+        std::fs::remove_file(dir.join(rel)).unwrap();
+    }
+    let design = write_project(dir, yaml, files);
+    dbd_core::snapshot::create_snapshot(design.entities(), dir, &dir.join("design.yaml"), description).unwrap();
+}
+
+/// The project as its last snapshot left it.
+fn released(dir: &std::path::Path) -> Design {
+    Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design")
+}
+
+/// v2 drops `app.counters` and v5 adds it back with another shape. Applied to
+/// a v1 database, the run created v5's table — a no-op over the old one — and
+/// only then ran v2's drop: it reported success at v5 with no table at all.
+/// Each version now runs whole, in order, so the drop comes first.
+#[tokio::test]
+async fn a_table_dropped_and_later_re_added_ends_in_its_re_added_shape() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "readd_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let yaml = "project:\n  name: readd_test\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+    let counters = "ddl/table/app/counters.ddl";
+    let notes = "ddl/table/app/notes.ddl";
+    let notes_with = |columns: &str| {
+        format!("set search_path to app;\ncreate table if not exists notes (id integer primary key{columns});\n")
+    };
+
+    let (n1, n3, n4) = (notes_with(""), notes_with(", a text"), notes_with(", a text, b text"));
+    cut_version(
+        dir,
+        yaml,
+        &[
+            (
+                counters,
+                "set search_path to app;\ncreate table if not exists counters (id integer primary key, n integer);\n",
+            ),
+            (notes, &n1),
+        ],
+        &[],
+        "v1",
+    );
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+
+    cut_version(dir, yaml, &[], &[counters], "v2 drops counters");
+    cut_version(dir, yaml, &[(notes, &n3)], &[], "v3");
+    cut_version(dir, yaml, &[(notes, &n4)], &[], "v4");
+    cut_version(
+        dir,
+        yaml,
+        &[(
+            counters,
+            "set search_path to app;\ncreate table if not exists counters (id integer primary key, label text not null);\n",
+        )],
+        &[],
+        "v5 re-adds counters",
+    );
+
+    let design = released(dir);
+    assert_eq!(design.config().project.version, Some(5));
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 → v5 applies");
+
+    assert_column_exists(&*adapter, "app", "counters", "label").await;
+    assert_column_absent(&*adapter, "app", "counters", "n").await;
+    assert_column_exists(&*adapter, "app", "notes", "b").await;
+    let diff = design.diff_live(&*adapter, None).await.expect("diff");
+    assert!(diff.is_empty(), "the database is the design: {:?}", diff.changes);
+}
+
+/// v2 adds `s.u.b`; v3 adds `s.t.cnt` with a `data.sql` that counts `u` rows
+/// by `b`. Run one version at a time it works. Jumping v1 → v3 ran every
+/// pending migration of `t` before any of `u` (`u` references `t`), so v3's
+/// script ran before v2 had added the column it reads: `column u.b does not
+/// exist`. Each version now runs whole before the next, so the jump and the
+/// stepwise run end in the same database.
+#[tokio::test]
+async fn a_jump_across_versions_ends_where_running_them_one_at_a_time_does() {
+    let (pg, url) = start_pg().await;
+    pg.create_database("jump").await.unwrap();
+    let stepwise = connect(&url, "jump_test").await.unwrap();
+    let jump = connect(&pg.settings().url("jump"), "jump_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let yaml = "project:\n  name: jump_test\nsource:\n  dialect: postgresql\nschemas:\n  - s\n";
+    let t = "ddl/table/s/t.ddl";
+    let u = "ddl/table/s/u.ddl";
+
+    cut_version(
+        dir,
+        yaml,
+        &[
+            (
+                t,
+                "set search_path to s;\ncreate table if not exists t (id integer primary key);\n",
+            ),
+            (
+                u,
+                "set search_path to s;\ncreate table if not exists u (id integer primary key, t_id integer references t (id));\n",
+            ),
+        ],
+        &[],
+        "v1",
+    );
+    for db in [&stepwise, &jump] {
+        released(dir)
+            .apply(&**db, None, false, None, Progress::none())
+            .await
+            .expect("v1 applies");
+        db.execute_script("INSERT INTO s.t VALUES (1), (2); INSERT INTO s.u VALUES (10, 1), (11, 1), (12, 2);")
+            .await
+            .expect("seed rows");
+    }
+
+    cut_version(
+        dir,
+        yaml,
+        &[(
+            u,
+            "set search_path to s;\n\
+             create table if not exists u (id integer primary key, t_id integer references t (id), b boolean not null default true);\n",
+        )],
+        &[],
+        "v2 adds u.b",
+    );
+    released(dir)
+        .apply(&*stepwise, None, false, None, Progress::none())
+        .await
+        .expect("v1 → v2 applies");
+
+    cut_version(
+        dir,
+        yaml,
+        &[(
+            t,
+            "set search_path to s;\ncreate table if not exists t (id integer primary key, cnt integer);\n",
+        )],
+        &[],
+        "v3 adds t.cnt",
+    );
+    std::fs::write(
+        dir.join("migrations/003/s/t.data.sql"),
+        "update s.t set cnt = (select count(*) from s.u where u.t_id = t.id and u.b);\n",
+    )
+    .unwrap();
+
+    let design = released(dir);
+    design
+        .apply(&*stepwise, None, false, None, Progress::none())
+        .await
+        .expect("v2 → v3 applies");
+    design
+        .apply(&*jump, None, false, None, Progress::none())
+        .await
+        .expect("v1 → v3 applies in one run");
+
+    for db in [&stepwise, &jump] {
+        assert_catalog(
+            &**db,
+            true,
+            "SELECT 1 WHERE (SELECT string_agg(id || ':' || cnt, ',' ORDER BY id) FROM s.t) = '1:2,2:1'",
+            "the counts the v3 data script wrote",
+        )
+        .await;
+        let diff = design.diff_live(&**db, None).await.expect("diff");
+        assert!(diff.is_empty(), "the database is the design: {:?}", diff.changes);
+    }
+    let shape = |entities: Vec<Entity>| {
+        serde_json::to_string_pretty(&dbd_core::reconcile::raw_snapshot_from_entities(&entities)).unwrap()
+    };
+    assert_eq!(
+        shape(stepwise.introspect().await.unwrap()),
+        shape(jump.introspect().await.unwrap()),
+        "the jump and the stepwise run end in the same schema"
+    );
+}
+
+/// Within one version the same holds: `t`'s `data.sql` reads `u.b`, which the
+/// same version adds. Each table ran its `.sql` and then its `.data.sql` before
+/// the next table's `.sql`, so `t`'s script ran before `u` had the column. A
+/// version's data scripts now run after all of its schema changes.
+#[tokio::test]
+async fn a_versions_data_script_runs_after_every_schema_change_of_that_version() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "data_order_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let yaml = "project:\n  name: data_order_test\nsource:\n  dialect: postgresql\nschemas:\n  - s\n";
+    let t = "ddl/table/s/t.ddl";
+    let u = "ddl/table/s/u.ddl";
+    cut_version(
+        dir,
+        yaml,
+        &[
+            (
+                t,
+                "set search_path to s;\ncreate table if not exists t (id integer primary key);\n",
+            ),
+            (
+                u,
+                "set search_path to s;\ncreate table if not exists u (id integer primary key, t_id integer references t (id));\n",
+            ),
+        ],
+        &[],
+        "v1",
+    );
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    adapter
+        .execute_script("INSERT INTO s.t VALUES (1); INSERT INTO s.u VALUES (10, 1), (11, 1);")
+        .await
+        .expect("seed rows");
+
+    cut_version(
+        dir,
+        yaml,
+        &[
+            (
+                t,
+                "set search_path to s;\ncreate table if not exists t (id integer primary key, cnt integer);\n",
+            ),
+            (
+                u,
+                "set search_path to s;\n\
+                 create table if not exists u (id integer primary key, t_id integer references t (id), b boolean not null default true);\n",
+            ),
+        ],
+        &[],
+        "v2 adds t.cnt and u.b",
+    );
+    std::fs::write(
+        dir.join("migrations/002/s/t.data.sql"),
+        "update s.t set cnt = (select count(*) from s.u where u.t_id = t.id and u.b);\n",
+    )
+    .unwrap();
+
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 → v2 applies");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM s.t WHERE id = 1 AND cnt = 2",
+        "the count the v2 data script wrote",
+    )
+    .await;
+}
+
+// ── A named apply never records migrations it did not run ────────────────────
+
+/// `apply -n app.people` on a database with v2 pending ran v2's change to
+/// `app.people` and v2's drop of `app.flags` — a table it was not named for —
+/// skipped v2's change to `core.regions`, and recorded v2 as applied. The next
+/// full apply said "Already up to date (v2)" and `core.regions.iso` was never
+/// added. A named apply now refuses while migrations are pending, before any
+/// write (its `apply.before` hook included), naming them; its preview refuses
+/// alike. With none pending it applies the one entity, as before.
+#[tokio::test]
+async fn a_named_apply_refuses_while_migrations_are_pending() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "named_apply_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let yaml = "project:\n  name: named_apply_test\nsource:\n  dialect: postgresql\nschemas:\n  - app\n  - core\n\
+                apply:\n  before:\n    - sql/mark.sql\n";
+    std::fs::create_dir_all(dir.join("sql")).unwrap();
+    std::fs::write(
+        dir.join("sql/mark.sql"),
+        "create table if not exists public.hook_ran (id integer);\n",
+    )
+    .unwrap();
+    let people = "ddl/table/app/people.ddl";
+    let flags = "ddl/table/app/flags.ddl";
+    let regions = "ddl/table/core/regions.ddl";
+    cut_version(
+        dir,
+        yaml,
+        &[
+            (
+                people,
+                "set search_path to app;\ncreate table if not exists people (id integer primary key);\n",
+            ),
+            (
+                flags,
+                "set search_path to app;\ncreate table if not exists flags (id integer primary key);\n",
+            ),
+            (
+                regions,
+                "set search_path to core;\ncreate table if not exists regions (id integer primary key);\n",
+            ),
+        ],
+        &[],
+        "v1",
+    );
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    adapter
+        .execute_script("DROP TABLE public.hook_ran;")
+        .await
+        .expect("forget the v1 run's hook");
+
+    cut_version(
+        dir,
+        yaml,
+        &[
+            (
+                people,
+                "set search_path to app;\ncreate table if not exists people (id integer primary key, nickname text);\n",
+            ),
+            (
+                regions,
+                "set search_path to core;\ncreate table if not exists regions (id integer primary key, iso text);\n",
+            ),
+        ],
+        &[flags],
+        "v2",
+    );
+    let design = released(dir);
+
+    let err = design
+        .apply(&*adapter, Some("app.people"), false, None, Progress::none())
+        .await
+        .expect_err("a named apply refuses while v2 is pending")
+        .to_string();
+    assert!(err.contains("v2"), "the pending version is named: {err}");
+    assert!(err.contains("dbd apply"), "the way through is named: {err}");
+    assert_column_absent(&*adapter, "app", "people", "nickname").await;
+    assert_column_absent(&*adapter, "core", "regions", "iso").await;
+    assert_table_exists(&*adapter, "app", "flags").await;
+    assert_table_absent(&*adapter, "public", "hook_ran").await;
+    assert_eq!(adapter.get_db_version().await.unwrap(), 1, "nothing is recorded");
+
+    let preview = design
+        .pending_migration_preview(&*adapter, Some("app.people"), None)
+        .await
+        .expect_err("the preview refuses as the run does")
+        .to_string();
+    assert_eq!(preview, err, "the preview says what the run says");
+
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("the full apply runs v2");
+    assert_column_exists(&*adapter, "core", "regions", "iso").await;
+    design
+        .apply(&*adapter, Some("app.people"), false, None, Progress::none())
+        .await
+        .expect("with nothing pending, a named apply applies its entity");
+}
+
+// ── An enum value a version adds can be used in that version ─────────────────
+
+const MOOD_YAML: &str = "project:\n  name: enum_add_test\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+
+/// The enum and table files of a version: `values` for `app.mood`, and the
+/// columns of `app.people` after its key.
+fn mood_files(values: &str, columns: &str) -> [(String, String); 2] {
+    [
+        (
+            "ddl/enum/app/mood.ddl".to_string(),
+            format!("set search_path to app;\ncreate type mood as enum ({values});\n"),
+        ),
+        (
+            "ddl/table/app/people.ddl".to_string(),
+            format!("set search_path to app;\ncreate table if not exists people (id integer primary key{columns});\n"),
+        ),
+    ]
+}
+
+fn cut_mood_version(dir: &std::path::Path, values: &str, columns: &str, description: &str) {
+    let files = mood_files(values, columns);
+    let files: Vec<(&str, &str)> = files.iter().map(|(p, s)| (p.as_str(), s.as_str())).collect();
+    cut_version(dir, MOOD_YAML, &files, &[], description);
+}
+
+/// Adding `'archived'` and making it the default in one version failed with
+/// `unsafe use of new value "archived"`: the migration ran in one transaction,
+/// and Postgres will not use an enum value before the transaction that added
+/// it commits. Reconcile, which commits as it goes, handled the same change.
+/// The value is now committed ahead of the rest of its version — here across
+/// a jump over two such versions.
+#[tokio::test]
+async fn an_enum_value_a_version_adds_can_be_used_in_that_version() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "enum_add_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    cut_mood_version(dir, "'ok', 'bad'", ", mood mood not null default 'ok'", "v1");
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    adapter
+        .execute_script("INSERT INTO app.people (id) VALUES (1);")
+        .await
+        .expect("seed a row");
+
+    cut_mood_version(
+        dir,
+        "'ok', 'bad', 'archived'",
+        ", mood mood not null default 'archived'",
+        "v2 archives by default",
+    );
+    cut_mood_version(
+        dir,
+        "'ok', 'bad', 'archived', 'paused'",
+        ", mood mood not null default 'archived', was mood not null default 'paused'",
+        "v3 adds was",
+    );
+
+    let design = released(dir);
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 → v3 applies");
+
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 WHERE (SELECT enum_range(NULL::app.mood)::text) = '{ok,bad,archived,paused}'",
+        "enum app.mood with archived and paused",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.people WHERE id = 1 AND was = 'paused'",
+        "the row, given the default of the new column",
+    )
+    .await;
+    let diff = design.diff_live(&*adapter, None).await.expect("diff");
+    assert!(diff.is_empty(), "the database is the design: {:?}", diff.changes);
+}
+
+/// What stays atomic. The enum values a version adds commit before the rest of
+/// it runs; everything else of the run is one transaction. So when the rest
+/// fails, the values stay, nothing else of the version does, the database still
+/// records the version before — and the next run, once the script is fixed,
+/// adds nothing twice.
+#[tokio::test]
+async fn a_version_failing_after_its_enum_values_commit_runs_again_once_fixed() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "enum_add_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    cut_mood_version(dir, "'ok', 'bad'", ", mood mood not null default 'ok'", "v1");
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    cut_mood_version(
+        dir,
+        "'ok', 'bad', 'archived'",
+        ", mood mood not null default 'archived'",
+        "v2 archives by default",
+    );
+    let people_sql = dir.join("migrations/002/app/people.sql");
+    let generated = std::fs::read_to_string(&people_sql).unwrap();
+    std::fs::write(&people_sql, format!("{generated}\nSELECT 1 / 0;\n")).unwrap();
+
+    let design = released(dir);
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect_err("the broken script fails the run");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 WHERE (SELECT enum_range(NULL::app.mood)::text) = '{ok,bad,archived}'",
+        "the committed enum value",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM information_schema.columns WHERE table_schema = 'app' AND table_name = 'people' \
+         AND column_name = 'mood' AND column_default LIKE '''ok''%'",
+        "the default the failed run rolled back",
+    )
+    .await;
+    assert_eq!(adapter.get_db_version().await.unwrap(), 1, "v2 is not recorded");
+
+    std::fs::write(&people_sql, generated).unwrap();
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("the fixed version applies over its committed value");
+    assert_eq!(adapter.get_db_version().await.unwrap(), 2);
+    let diff = design.diff_live(&*adapter, None).await.expect("diff");
+    assert!(diff.is_empty(), "the database is the design: {:?}", diff.changes);
+}
+
+// ── A preview refuses and orders as the run does ─────────────────────────────
+
+/// `apply` refuses a pending migration whose `data.sql` still holds a `--
+/// TODO:`, but `apply --dry-run` listed the migration — the TODO's `'???'`
+/// included — and said "no issues". The preview refuses with the run's own
+/// words, and so does `Design::apply` under `dry_run`.
+#[tokio::test]
+async fn a_preview_refuses_a_pending_migration_with_an_unresolved_todo_as_the_run_does() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "enum_add_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    cut_mood_version(dir, "'ok', 'meh', 'bad'", ", mood mood not null default 'ok'", "v1");
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    cut_mood_version(dir, "'ok', 'bad'", ", mood mood not null default 'ok'", "drop meh");
+    let design = released(dir);
+
+    let run = design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect_err("the run refuses the unresolved TODO")
+        .to_string();
+    assert!(run.contains("TODO"), "{run}");
+    let preview = design
+        .pending_migration_preview(&*adapter, None, None)
+        .await
+        .expect_err("the preview refuses it too")
+        .to_string();
+    assert_eq!(preview, run);
+    let dry_run = design
+        .apply(&*adapter, None, true, None, Progress::none())
+        .await
+        .expect_err("and so does a dry run of apply")
+        .to_string();
+    assert_eq!(dry_run, run);
+}
+
+/// The preview listed migration steps grouped by entity — every pending
+/// version of one table, then the next — while the run executes them version
+/// by version. It now lists exactly the steps the run starts, in its order.
+#[tokio::test]
+async fn the_migration_preview_lists_the_steps_in_the_order_the_run_takes_them() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "preview_order_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let yaml = "project:\n  name: preview_order_test\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+    let counters = "ddl/table/app/counters.ddl";
+    let notes = "ddl/table/app/notes.ddl";
+    let notes_with = |columns: &str| {
+        format!("set search_path to app;\ncreate table if not exists notes (id integer primary key{columns});\n")
+    };
+    let (n1, n3, n4) = (notes_with(""), notes_with(", a text"), notes_with(", a text, b text"));
+    cut_version(
+        dir,
+        yaml,
+        &[
+            (
+                counters,
+                "set search_path to app;\ncreate table if not exists counters (id integer primary key);\n",
+            ),
+            (notes, &n1),
+        ],
+        &[],
+        "v1",
+    );
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    cut_version(dir, yaml, &[], &[counters], "v2 drops counters");
+    cut_version(dir, yaml, &[(notes, &n3)], &[], "v3");
+    cut_version(dir, yaml, &[(notes, &n4)], &[], "v4");
+    cut_version(
+        dir,
+        yaml,
+        &[(
+            counters,
+            "set search_path to app;\ncreate table if not exists counters (id integer primary key, label text);\n",
+        )],
+        &[],
+        "v5",
+    );
+    let design = released(dir);
+
+    let preview = design.pending_migration_preview(&*adapter, None, None).await.unwrap();
+    let listed: Vec<(u32, String)> = preview.steps.iter().map(|s| (s.version, s.entity.clone())).collect();
+    assert_eq!(
+        listed,
+        vec![
+            (2, "app.counters".to_string()),
+            (3, "app.notes".to_string()),
+            (4, "app.notes".to_string()),
+            (5, "app.counters".to_string()),
+        ],
+        "{:#?}",
+        preview.steps
+    );
+
+    let mut started: Vec<String> = Vec::new();
+    design
+        .apply(
+            &*adapter,
+            None,
+            false,
+            None,
+            Progress {
+                on_start: |d: &str| started.push(d.to_string()),
+                on_done: |_: &str, _: Option<&str>| {},
+                on_complete: |_| {},
+            },
+        )
+        .await
+        .expect("v1 → v5 applies");
+    let run: Vec<&String> = started
+        .iter()
+        .filter(|d| d.starts_with("drop ") || d.starts_with("migrate ") || d.as_str() == "table:app.counters")
+        .collect();
+    assert_eq!(
+        run,
+        vec![
+            "drop table:app.counters (v2)",
+            "migrate table:app.notes → v3",
+            "migrate table:app.notes → v4",
+            "table:app.counters",
+        ],
+        "the run takes them in the order the preview lists them: {started:#?}"
+    );
+}
+
+// ── Migration and hook scripts run on source.search_path ─────────────────────
+
+/// `source.search_path: [app]`, a `notes` table whose file states no path of
+/// its own, and a `core` table applied after it whose file leaves the session
+/// on `core`. With `hook`, an `apply.after` script naming `notes` bare.
+fn search_path_project(dir: &std::path::Path, hook: bool, notes_columns: &str) -> Design {
+    let mut yaml = "project:\n  name: path_test\nsource:\n  dialect: postgresql\n  search_path: [app]\n\
+                    schemas:\n  - app\n  - core\nscopes:\n  core_only:\n    includes: [core]\n"
+        .to_string();
+    if hook {
+        yaml.push_str("apply:\n  after:\n    - sql/seed.sql\n");
+    }
+    let notes = format!("create table if not exists notes (id integer primary key, body text{notes_columns});\n");
+    write_project(
+        dir,
+        &yaml,
+        &[
+            ("ddl/table/app/notes.ddl", notes.as_str()),
+            (
+                "ddl/table/core/zones.ddl",
+                "set search_path to core;\ncreate table if not exists zones (id integer primary key);\n",
+            ),
+            (
+                "sql/seed.sql",
+                "insert into notes (id, body) values (1, 'seed') on conflict do nothing;\n",
+            ),
+        ],
+    )
+}
+
+/// A hook naming a table bare ran on whatever path the last DDL file left —
+/// here `core` — and failed with `relation "notes" does not exist`, though the
+/// project says bare names resolve on `app`.
+#[tokio::test]
+async fn a_hook_naming_a_table_bare_runs_on_source_search_path() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "path_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    search_path_project(tmp.path(), true, "")
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("the hook finds app.notes");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.notes WHERE id = 1",
+        "the seeded row",
+    )
+    .await;
+}
+
+/// A hand-written `migrations/002/app/notes.data.sql` naming `notes` bare ran
+/// with no path at all and failed with `relation "notes" does not exist`.
+#[tokio::test]
+async fn a_migration_script_naming_a_table_bare_runs_on_source_search_path() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "path_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let config = dir.join("design.yaml");
+    let design = search_path_project(dir, false, "");
+    dbd_core::snapshot::create_snapshot(design.entities(), dir, &config, "v1").unwrap();
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    adapter
+        .execute_script("INSERT INTO app.notes (id, body) VALUES (1, 'a'), (2, 'b');")
+        .await
+        .expect("seed rows");
+
+    let design = search_path_project(dir, false, ", tag text");
+    dbd_core::snapshot::create_snapshot(design.entities(), dir, &config, "v2 tags notes").unwrap();
+    std::fs::write(
+        dir.join("migrations/002/app/notes.data.sql"),
+        "update notes set tag = 'old';\n",
+    )
+    .unwrap();
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("the data script finds app.notes");
+    assert_catalog(
+        &*adapter,
+        false,
+        "SELECT 1 FROM app.notes WHERE tag IS DISTINCT FROM 'old'",
+        "a row the data script missed",
+    )
+    .await;
+}
+
+/// A hook's tables decide whether a scope runs it, and its bare `notes` was
+/// read as `public.notes`: under `core_only`, which leaves `app` out, the hook
+/// was not skipped, ran, and failed the apply. It is read on the path it runs
+/// on — `app.notes` — and skipped, with a warning naming it.
+#[tokio::test]
+async fn a_scope_judges_a_hooks_bare_table_on_source_search_path() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "path_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let design = search_path_project(tmp.path(), true, "");
+    let scope = design.resolve_scope(Some("core_only"), None).unwrap();
+
+    let skips = design.hook_skips(Some(&scope)).unwrap();
+    assert!(
+        skips.len() == 1 && skips[0].contains("app.notes"),
+        "the hook is skipped for app.notes: {skips:?}"
+    );
+    design
+        .apply(&*adapter, None, false, Some(&scope), Progress::none())
+        .await
+        .expect("the scoped apply skips the hook");
+    assert_table_exists(&*adapter, "core", "zones").await;
+}
+
+/// With no `source.search_path`, a hook stating no path is read on the
+/// session's default — that is what its scope analysis assumes — but it ran on
+/// whatever path the last DDL file left: here `zeta`, so `items` meant
+/// `zeta.items`, not the `public.items` the analysis judged.
+#[tokio::test]
+async fn a_hook_stating_no_path_in_a_project_with_none_runs_on_the_session_default() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "path_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let design = write_project(
+        tmp.path(),
+        "project:\n  name: path_test\nsource:\n  dialect: postgresql\nschemas:\n  - public\n  - zeta\n\
+         apply:\n  after:\n    - sql/seed.sql\n",
+        &[
+            (
+                "ddl/table/public/items.ddl",
+                "set search_path to public;\ncreate table if not exists items (id integer primary key);\n",
+            ),
+            (
+                "ddl/table/zeta/items.ddl",
+                "set search_path to zeta;\ncreate table if not exists items (id integer primary key);\n",
+            ),
+            (
+                "sql/seed.sql",
+                "insert into items (id) values (1) on conflict do nothing;\n",
+            ),
+        ],
+    );
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM public.items WHERE id = 1",
+        "the row in public.items",
+    )
+    .await;
+    assert_catalog(&*adapter, false, "SELECT 1 FROM zeta.items", "a row in zeta.items").await;
+}
+
+// ── Enum value removal: a live matview blocks, the type keeps its comment ────
+
+/// The enum, a table using it, a matview reading the column, and one that
+/// reads the table but not the column.
+fn matview_over_enum_files(values: &str) -> [(String, String); 4] {
+    [
+        (
+            "ddl/enum/app/mood.ddl".to_string(),
+            format!("set search_path to app;\ncreate type mood as enum ({values});\ncomment on type mood is 'how they feel';\n"),
+        ),
+        (
+            "ddl/table/app/people.ddl".to_string(),
+            "set search_path to app;\ncreate table if not exists people (id integer primary key, mood mood not null default 'ok');\n"
+                .to_string(),
+        ),
+        (
+            "ddl/materialized_view/app/mood_counts.ddl".to_string(),
+            "set search_path to app;\n\
+             create materialized view if not exists mood_counts as select mood, count(*) as n from people group by mood;\n"
+                .to_string(),
+        ),
+        (
+            "ddl/materialized_view/app/people_count.ddl".to_string(),
+            "set search_path to app;\ncreate materialized view if not exists people_count as select count(*) as n from people;\n"
+                .to_string(),
+        ),
+    ]
+}
+
+fn matview_over_enum_design(dir: &std::path::Path, values: &str) -> Design {
+    let files = matview_over_enum_files(values);
+    let files: Vec<(&str, &str)> = files.iter().map(|(p, s)| (p.as_str(), s.as_str())).collect();
+    write_project(
+        dir,
+        "project:\n  name: matview_block_test\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+        &files,
+    )
+}
+
+/// Reconcile decided whether a materialized view blocked an enum value's
+/// removal from the design, so it could never remove one while the design had
+/// a matview over the table: dropping the matview by hand, as told, and
+/// re-running re-created it and declined again — and every run exited 0,
+/// "Reconciled". It now asks the database which matviews read the column, and
+/// refuses, before any write and with a non-zero exit, naming them and the
+/// steps. A matview that reads the table but not the column blocks nothing.
+#[tokio::test]
+async fn reconcile_refuses_an_enum_value_removal_a_live_matview_blocks_and_goes_on_once_it_is_dropped() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "matview_block_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    matview_over_enum_design(dir, "'ok', 'meh', 'bad'")
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("build");
+
+    let design = matview_over_enum_design(dir, "'ok', 'bad'");
+    let err = design
+        .reconcile(&*adapter, false, true, false, None, Progress::none())
+        .await
+        .expect_err("a live matview over the column blocks the removal")
+        .to_string();
+    for needed in ["app.mood_counts", "DROP MATERIALIZED VIEW", "dbd reconcile", "meh"] {
+        assert!(err.contains(needed), "the refusal names {needed}: {err}");
+    }
+    assert!(
+        !err.contains("people_count"),
+        "a matview not reading the column blocks nothing: {err}"
+    );
+    let dry = design
+        .reconcile(&*adapter, true, true, false, None, Progress::none())
+        .await
+        .expect_err("the dry run refuses as the run does")
+        .to_string();
+    assert_eq!(dry, err);
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 WHERE (SELECT enum_range(NULL::app.mood)::text) = '{ok,meh,bad}'",
+        "the untouched enum",
+    )
+    .await;
+
+    adapter
+        .execute_script("DROP MATERIALIZED VIEW app.mood_counts;")
+        .await
+        .expect("drop it, as told");
+    design
+        .reconcile(&*adapter, false, true, false, None, Progress::none())
+        .await
+        .expect("with the matview gone, the value goes");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 WHERE (SELECT enum_range(NULL::app.mood)::text) = '{ok,bad}'",
+        "enum app.mood without meh",
+    )
+    .await;
+    for matview in ["mood_counts", "people_count"] {
+        assert_catalog(
+            &*adapter,
+            true,
+            &format!("SELECT 1 FROM pg_matviews WHERE schemaname = 'app' AND matviewname = '{matview}'"),
+            &format!("matview app.{matview}"),
+        )
+        .await;
+    }
+}
+
+/// Removing a value renames the type aside and creates it again; its `COMMENT
+/// ON TYPE` stayed on the old one and went with it — in reconcile and in the
+/// migration `dbd snapshot` writes — and `diff` cannot see the loss.
+#[tokio::test]
+async fn removing_an_enum_value_keeps_the_enums_comment() {
+    let (pg, url) = start_pg().await;
+    pg.create_database("migrated").await.unwrap();
+    let reconciled = connect(&url, "enum_comment_test").await.unwrap();
+    let migrated = connect(&pg.settings().url("migrated"), "enum_comment_test")
+        .await
+        .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let yaml = "project:\n  name: enum_comment_test\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+    let files = |values: &str| -> Vec<(String, String)> {
+        vec![
+            (
+                "ddl/enum/app/mood.ddl".to_string(),
+                format!("set search_path to app;\ncreate type mood as enum ({values});\ncomment on type mood is 'how they feel';\n"),
+            ),
+            (
+                "ddl/table/app/people.ddl".to_string(),
+                "set search_path to app;\ncreate table if not exists people (id integer primary key, mood mood not null default 'ok');\n"
+                    .to_string(),
+            ),
+        ]
+    };
+    let version = |values: &str, description: &str| {
+        let f = files(values);
+        let f: Vec<(&str, &str)> = f.iter().map(|(p, s)| (p.as_str(), s.as_str())).collect();
+        cut_version(dir, yaml, &f, &[], description);
+    };
+    let comment = "SELECT 1 WHERE obj_description('app.mood'::regtype, 'pg_type') = 'how they feel'";
+
+    version("'ok', 'meh', 'bad'", "v1");
+    let v1 = released(dir);
+    v1.reconcile(&*reconciled, false, false, false, None, Progress::none())
+        .await
+        .expect("reconcile builds v1");
+    v1.apply(&*migrated, None, false, None, Progress::none())
+        .await
+        .expect("apply builds v1");
+
+    version("'ok', 'bad'", "drop meh");
+    for todo in dbd_core::snapshot::scan_data_sql_todos(dir).unwrap() {
+        let sql = std::fs::read_to_string(&todo.file).unwrap();
+        let resolved: String = sql
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("-- TODO"))
+            .map(|l| format!("{}\n", l.replace("'???'", "'ok'")))
+            .collect();
+        std::fs::write(&todo.file, resolved).unwrap();
+    }
+    let design = released(dir);
+    design
+        .reconcile(&*reconciled, false, true, false, None, Progress::none())
+        .await
+        .expect("reconcile removes meh");
+    design
+        .apply(&*migrated, None, false, None, Progress::none())
+        .await
+        .expect("the migration removes meh");
+
+    for db in [&reconciled, &migrated] {
+        assert_catalog(
+            &**db,
+            true,
+            "SELECT 1 WHERE (SELECT enum_range(NULL::app.mood)::text) = '{ok,bad}'",
+            "enum app.mood without meh",
+        )
+        .await;
+        assert_catalog(&**db, true, comment, "the comment on app.mood").await;
+    }
+}
+
+/// `dbd snapshot` writes a column's type as the DDL file wrote it — `mood`,
+/// resolved by the file's own `set search_path to app`. Run on the session's
+/// default path, the generated `ALTER TABLE app.people ADD COLUMN was mood`
+/// failed with `type "mood" does not exist`; it had worked only when an
+/// earlier file in the run happened to leave the connection on `app`. A
+/// migration file runs on the path its entity's DDL file runs on — and so does
+/// a hand-written `data.sql` naming the table bare.
+#[tokio::test]
+async fn a_migration_runs_on_the_path_its_entitys_ddl_file_states() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "enum_add_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    cut_mood_version(dir, "'ok', 'bad'", ", mood mood not null default 'ok'", "v1");
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    adapter
+        .execute_script("INSERT INTO app.people (id, mood) VALUES (1, 'bad'); RESET search_path;")
+        .await
+        .expect("seed a row");
+
+    cut_mood_version(
+        dir,
+        "'ok', 'bad'",
+        ", mood mood not null default 'ok', was mood",
+        "v2 adds was",
+    );
+    std::fs::write(
+        dir.join("migrations/002/app/people.data.sql"),
+        "update people set was = mood;\n",
+    )
+    .unwrap();
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 → v2 applies");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.people WHERE id = 1 AND was = 'bad'",
+        "the row the data script filled",
+    )
+    .await;
 }

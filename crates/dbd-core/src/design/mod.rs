@@ -69,6 +69,10 @@ pub struct MigrationPreview {
     /// The migration steps the run takes, in the order it takes them. Empty
     /// when the run migrates nothing.
     pub steps: Vec<MigrationStepPreview>,
+    /// The versions the run records as applied. Not empty with `steps` empty
+    /// for a scoped run that none of the pending migrations touch: it runs
+    /// nothing for them, and still records them and moves the database on.
+    pub recorded: Vec<u32>,
 }
 
 /// One migration step of a run, for a preview.
@@ -92,8 +96,14 @@ pub struct MigrationStepPreview {
 pub enum MigrationAction {
     /// A migration added it; its DDL creates it.
     Create,
-    /// A migration altered it; its `.sql` and `.data.sql` run.
+    /// A migration adds values to it (an enum); they run, and commit, before
+    /// the rest of the version.
+    EnumValues,
+    /// A migration altered it; its `.sql` runs.
     Migrate,
+    /// A migration altered it; its `.data.sql` runs, after every schema change
+    /// of the same version.
+    Data,
     /// A migration dropped it; its drop script runs where it still exists.
     Drop,
 }
@@ -273,14 +283,16 @@ fn ensure_reconcile_not_destructive(plan: &crate::reconcile::ReconcilePlan, allo
     if !plan.destructive || allow_destructive {
         return Ok(());
     }
+    // What is destructive, and only that: listing every altered table named
+    // ones that merely gained a column.
     let details: String = plan
-        .altered
+        .destructive_changes
         .iter()
-        .map(|s| format!("  {}", s.entity_name))
+        .map(|change| format!("  {change}"))
         .collect::<Vec<_>>()
         .join("\n");
     Err(DbdError::Config(format!(
-        "reconcile would make destructive changes (dropped columns, constraints, or indexes) on:\n{details}\n\
+        "reconcile would make destructive changes:\n{details}\n\
          Re-run with --allow-destructive to proceed."
     )))
 }
@@ -586,6 +598,9 @@ pub struct Design {
     /// compare structure must refuse rather than compare nothing and report a
     /// match.
     parser: crate::parser::ParserChoice,
+    /// `source.search_path`, resolved: the path a migration or hook script
+    /// that states none of its own runs on, and its bare names are read on.
+    search_path: Option<Vec<crate::entity::PathEntry>>,
     /// `source.dialect` as the project wrote it.
     ///
     /// Kept beside [`Self::parser`] because a refusal has to name what the
@@ -965,8 +980,23 @@ impl Design {
             env: env.to_string(),
             validated: false,
             parser: parser_choice,
+            search_path: project_search_path,
             dialect: dialect_label,
         })
+    }
+
+    /// `source.search_path`, resolved — `None` when the project sets none.
+    /// What a migration or hook script stating no path of its own runs on.
+    pub(crate) fn script_search_path(&self) -> Option<&[crate::entity::PathEntry]> {
+        self.search_path.as_deref()
+    }
+
+    /// Where the hooks are read from, and the path they run on.
+    pub(in crate::design) fn hook_source(&self) -> hooks::HookSource<'_> {
+        hooks::HookSource {
+            dir: &self.project_dir,
+            search_path: self.script_search_path(),
+        }
     }
 
     /// Access the parsed config.
@@ -2757,7 +2787,7 @@ import:
 
         let result = design.reset(&mock, "postgres", false, false, false, None).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("migrations"));
+        assert!(result.unwrap_err().to_string().contains("versioned at v1"));
     }
 
     #[tokio::test]
@@ -3489,6 +3519,129 @@ import:
             })
             .collect();
         assert!(dropped.contains(&("config.legacy", 2)));
+    }
+
+    /// The refusal of a destructive reconcile listed every altered table under
+    /// "dropped columns, constraints, or indexes" — here `app.b`, which only
+    /// gains a column. It lists what is destructive, and what each drops.
+    #[test]
+    fn the_destructive_refusal_lists_only_what_is_destructive() {
+        use crate::snapshot::{Snapshot, TableSnapshot};
+        let column = |name: &str| crate::entity::ColumnDef {
+            name: name.to_string(),
+            data_type: "text".to_string(),
+            nullable: true,
+            default_value: None,
+            is_pk: false,
+            is_unique: false,
+            identity: None,
+            generated: None,
+            comment: None,
+            inline_fk: None,
+        };
+        let table = |name: &str, columns: &[&str]| TableSnapshot {
+            name: name.to_string(),
+            schema: "app".to_string(),
+            columns: columns.iter().map(|c| column(c)).collect(),
+            indexes: vec![],
+            table_constraints: vec![],
+        };
+        let snap = |tables: Vec<TableSnapshot>| Snapshot {
+            version: 0,
+            description: String::new(),
+            timestamp: String::new(),
+            tables,
+            enums: vec![],
+        };
+        let live = snap(vec![table("a", &["id", "gone"]), table("b", &["id"])]);
+        let desired = snap(vec![table("a", &["id"]), table("b", &["id", "added"])]);
+
+        let plan = crate::reconcile::plan_reconcile(&live, &desired);
+        let err = ensure_reconcile_not_destructive(&plan, false).unwrap_err().to_string();
+
+        assert!(err.contains("app.a") && err.contains("gone"), "{err}");
+        assert!(
+            !err.contains("app.b"),
+            "a table only gaining a column is not destructive: {err}"
+        );
+    }
+
+    /// A database versioned at v4 by a fresh install has no migration
+    /// recorded, but `reset` refused it as one with "applied migrations".
+    #[test]
+    fn reset_refuses_a_versioned_database_saying_it_is_versioned() {
+        let meta = crate::adapter::ProjectMeta {
+            project: "p".to_string(),
+            env: "dev".to_string(),
+            version: 4,
+            scope: None,
+            applied_at: None,
+        };
+        let marks = crate::design::DatabaseMarks::of_own("p", Some(meta));
+        let err = Design::check_reset_guard(&marks).unwrap_err().to_string();
+        assert!(err.contains("versioned at v4"), "{err}");
+        assert!(!err.contains("applied migrations"), "{err}");
+    }
+
+    /// The position of the first step `matches` picks out, for asserting order.
+    fn step_at(plan: &ExecutionPlan, matches: impl Fn(&ExecutionStep) -> bool) -> usize {
+        plan.steps
+            .iter()
+            .position(matches)
+            .unwrap_or_else(|| panic!("no such step in {:#?}", plan.steps))
+    }
+
+    /// Migrations ran entity by entity: every pending migration of `t`, then
+    /// every one of `u`, in dependency order. So v3's change to `t` ran before
+    /// v2's change to `u`, and a v3 script reading what v2 adds failed on a
+    /// jump that a stepwise upgrade survived. Each version now runs whole, and
+    /// is recorded, before the next one starts.
+    #[test]
+    fn each_pending_version_runs_whole_before_the_next() {
+        let entities = vec![test_entity("s.t"), test_entity("s.u")];
+        let migrations = vec![
+            test_migration(1, 2, vec![], vec!["s.u"], vec![]),
+            test_migration(2, 3, vec![], vec!["s.t"], vec![]),
+        ];
+
+        let plan = build_execution_plan(&entities, 1, 3, &migrations, None);
+
+        let v2_u = step_at(
+            &plan,
+            |s| matches!(s, ExecutionStep::MigrateEntity { entity_name, migration_version: 2, .. } if entity_name == "s.u"),
+        );
+        let v2_recorded = step_at(&plan, |s| {
+            matches!(s, ExecutionStep::RecordMigration { version: 2, .. })
+        });
+        let v3_t = step_at(
+            &plan,
+            |s| matches!(s, ExecutionStep::MigrateEntity { entity_name, migration_version: 3, .. } if entity_name == "s.t"),
+        );
+        assert!(v2_u < v2_recorded && v2_recorded < v3_t, "{:#?}", plan.steps);
+    }
+
+    /// v2 drops a table and v5 adds it back. The create of v5 ran first — a
+    /// no-op over the old table — and v2's drop after it, so the run ended at
+    /// v5 with no table.
+    #[test]
+    fn a_later_versions_create_runs_after_an_earlier_versions_drop() {
+        let entities = vec![test_entity("app.counters")];
+        let migrations = vec![
+            test_migration(1, 2, vec![], vec![], vec!["app.counters"]),
+            test_migration(4, 5, vec!["app.counters"], vec![], vec![]),
+        ];
+
+        let plan = build_execution_plan(&entities, 1, 5, &migrations, None);
+
+        let dropped = step_at(
+            &plan,
+            |s| matches!(s, ExecutionStep::DropEntity { entity_name, migration_version: 2, .. } if entity_name == "app.counters"),
+        );
+        let created = step_at(
+            &plan,
+            |s| matches!(s, ExecutionStep::CreateEntity(n) if n == "app.counters"),
+        );
+        assert!(dropped < created, "{:#?}", plan.steps);
     }
 
     // ════════════════════════════════════════════════════════

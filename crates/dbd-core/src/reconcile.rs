@@ -60,9 +60,35 @@ pub struct ReconcilePlan {
     /// (see [`plan_index_convergence`]). Whole-table drops are separate — see
     /// [`Self::dropped`] — and gated by pruning, not by this flag.
     pub destructive: bool,
+    /// What makes the plan [`Self::destructive`], one line each —
+    /// `"app.a: drops column gone"` — for a refusal to name. Only those: the
+    /// refusal used to list every altered table, a column added as much as one
+    /// dropped.
+    pub destructive_changes: Vec<String>,
+    /// The enum type swaps the plan makes (see [`plan_enum_recreation`]), with
+    /// the columns each moves — what the caller checks against the live
+    /// database for a materialized view that would block one.
+    pub enum_swaps: Vec<EnumSwap>,
+}
+
+/// One enum's type swap: the values it loses and the `(table, column)` pairs
+/// (`schema.table`) moved onto the new type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumSwap {
+    pub enum_name: String,
+    pub removed: Vec<String>,
+    pub columns: Vec<(String, String)>,
 }
 
 impl ReconcilePlan {
+    /// Record a change gated behind `--allow-destructive`, once.
+    fn mark_destructive(&mut self, change: String) {
+        self.destructive = true;
+        if !self.destructive_changes.contains(&change) {
+            self.destructive_changes.push(change);
+        }
+    }
+
     /// No structural changes to make.
     pub fn is_empty(&self) -> bool {
         self.added.is_empty()
@@ -733,13 +759,13 @@ pub fn qualified_entity_name(entity: &Entity) -> String {
 pub fn plan_reconcile(live: &Snapshot, desired: &Snapshot) -> ReconcilePlan {
     let diffs = diff::diff(live, desired);
     let warnings = diff::migration_warnings(&diffs);
-    let destructive = diffs.iter().any(has_column_drop);
-
     let mut plan = ReconcilePlan {
         warnings,
-        destructive,
         ..Default::default()
     };
+    for change in diffs.iter().flat_map(dropped_fields) {
+        plan.mark_destructive(change);
+    }
 
     for d in &diffs {
         match &d.action {
@@ -771,12 +797,28 @@ pub fn plan_reconcile(live: &Snapshot, desired: &Snapshot) -> ReconcilePlan {
     plan
 }
 
-/// Whether a diff drops a column or constraint from an existing table — the
-/// data-loss case gated by `allow_destructive`. Whole-object drops are handled
-/// separately via pruning.
-fn has_column_drop(d: &MigrationDiff) -> bool {
-    matches!(&d.action, DiffAction::Change(changes)
-        if changes.iter().any(|c| matches!(c.action, ChangeAction::Drop(_))))
+/// What a diff drops from an existing table or enum — a column, a constraint,
+/// an enum value: the data-loss cases gated by `allow_destructive` — one line
+/// each, for [`ReconcilePlan::destructive_changes`]. Whole-object drops are
+/// handled separately via pruning.
+fn dropped_fields(d: &MigrationDiff) -> Vec<String> {
+    use crate::diff::FieldType;
+    let DiffAction::Change(changes) = &d.action else {
+        return Vec::new();
+    };
+    changes
+        .iter()
+        .filter(|c| matches!(c.action, ChangeAction::Drop(_)))
+        .map(|c| {
+            let kind = match c.field_type {
+                FieldType::Column => "column",
+                FieldType::Constraint => "constraint",
+                FieldType::Index => "index",
+                FieldType::EnumValue => "enum value",
+            };
+            format!("{}: drops {kind} {}", d.entity_name, c.field_name)
+        })
+        .collect()
 }
 
 // ── Foreign-key convergence (issue #8) ──────────────────────
@@ -881,7 +923,7 @@ pub fn plan_fk_convergence(plan: &mut ReconcilePlan, live: &Snapshot, desired: &
                     fk.clone(),
                 )))),
             });
-            plan.destructive = true;
+            plan.mark_destructive(format!("{qname}: drops foreign key ({})", fk.columns.join(", ")));
         }
 
         // Adds: a design FK missing from the live DB (unnamed → Postgres auto-names).
@@ -1034,7 +1076,10 @@ pub fn plan_check_convergence(plan: &mut ReconcilePlan, live: &Snapshot, desired
                 field_type: FieldType::Constraint,
                 action: ChangeAction::Drop(Box::new(FieldDetail::Constraint((*con).clone()))),
             });
-            plan.destructive = true;
+            plan.mark_destructive(format!(
+                "{qname}: drops CHECK constraint {}",
+                name.as_deref().unwrap_or_default()
+            ));
         }
 
         // Adds: a design CHECK the live DB lacks. An unnamed one is emitted
@@ -1190,9 +1235,18 @@ pub(crate) const ENUM_RECREATE_SUFFIX: &str = "__dbd_old";
 /// routines that merely *reference* the enum's table are never dropped: only a
 /// view over the column stands in the way of the swap.
 ///
-/// The one case it declines is a dependent **materialized view**: dbd never
-/// auto-drops one (a `DROP … CASCADE` would repopulate it and take its dependents
-/// with it), so recreation is reported as blocked rather than attempted.
+/// A dependent **materialized view** is the one blocker it does not clear:
+/// dbd never drops one (a `DROP … CASCADE` would repopulate it and take its
+/// dependents with it). Whether one blocks is a fact about the database — one
+/// dropped by hand blocks nothing, one the design does not declare still does —
+/// so the swap is recorded in [`ReconcilePlan::enum_swaps`] with the columns it
+/// moves, and the caller asks the database before any write (see
+/// `Design::reconcile`). Deciding from the design meant a matview declared
+/// there blocked forever: dropped by hand as told, it was re-created by the
+/// same run, and the next declined again.
+///
+/// The type's comment is carried from the type renamed aside to its
+/// replacement ([`enum_comment_carry`]); it used to go with the old type.
 ///
 /// Dropped views are not re-created here — reconcile re-applies every managed
 /// view on every run, after the enum and tables it depends on, which is exactly
@@ -1233,30 +1287,18 @@ pub fn plan_enum_recreation(
 
         let columns = enum_columns(live, &qname);
         let roots: HashSet<String> = columns.iter().map(|c| c.table.clone()).collect();
-
-        // A matview over an affected table blocks the swap and dbd will not drop
-        // it. Say so, and plan nothing — a partial script would fail mid-batch
-        // with a Postgres message that names the view but not the cause.
-        let dependents = dependent_views(desired_entities, &roots);
-        let blocking: Vec<&str> = dependents
-            .iter()
-            .filter(|(_, e)| e.entity_type == EntityType::MaterializedView)
-            .map(|(_, e)| e.name.as_str())
+        // The views over the columns' tables, which the swap drops and the
+        // write pass re-creates. Materialized views are left to the caller's
+        // live check: `DROP VIEW` fails on one that exists.
+        let dependents: Vec<(usize, &Entity)> = dependent_views(desired_entities, &roots)
+            .into_iter()
+            .filter(|(_, e)| e.entity_type == EntityType::View)
             .collect();
-        if !blocking.is_empty() {
-            plan.warnings.push(format!(
-                "{qname}: cannot drop enum value{} {} — materialized view{} {} depend{} on a column of this type, \
-                 and dbd never drops a materialized view. Drop {} by hand, re-run reconcile, then re-create {}",
-                if removed.len() == 1 { "" } else { "s" },
-                removed.join(", "),
-                if blocking.len() == 1 { "" } else { "s" },
-                blocking.join(", "),
-                if blocking.len() == 1 { "s" } else { "" },
-                blocking.join(", "),
-                if blocking.len() == 1 { "it" } else { "them" },
-            ));
-            continue;
-        }
+        plan.enum_swaps.push(EnumSwap {
+            enum_name: qname.clone(),
+            removed: removed.iter().map(|v| v.to_string()).collect(),
+            columns: columns.iter().map(|c| (c.table.clone(), c.column.clone())).collect(),
+        });
 
         let old_type = format!("{qname}{ENUM_RECREATE_SUFFIX}");
         let mut lines: Vec<String> = vec![format!(
@@ -1266,8 +1308,8 @@ pub fn plan_enum_recreation(
         )];
 
         // Deepest dependents first: a view over a view has to go before the view
-        // it selects from. A matview would have returned above, so every
-        // dependent left is a plain view and `DROP VIEW` is the right keyword.
+        // it selects from. Every dependent left is a plain view, so `DROP VIEW`
+        // is the right keyword.
         for (_, e) in &dependents {
             lines.push(format!("DROP VIEW IF EXISTS {};", qualified_entity_name(e)));
         }
@@ -1298,6 +1340,7 @@ pub fn plan_enum_recreation(
             "CREATE TYPE {qname} AS ENUM ({});",
             de.values.iter().map(|v| literal(v)).collect::<Vec<_>>().join(", ")
         ));
+        lines.push(enum_comment_carry(&qname, &old_type));
 
         for c in &columns {
             // An array column cannot cast element-wise through the scalar text
@@ -1307,9 +1350,13 @@ pub fn plan_enum_recreation(
             } else {
                 (format!("{}::text", c.column), qname.clone())
             };
-            lines.push(format!(
-                "ALTER TABLE {} ALTER COLUMN {} TYPE {to} USING {via}::{to};",
-                c.table, c.column
+            lines.push(column_type_swap(
+                &format!(
+                    "ALTER TABLE {} ALTER COLUMN {} TYPE {to} USING {via}::{to};",
+                    c.table, c.column
+                ),
+                &format!("{}.{}", c.table, c.column),
+                &qname,
             ));
         }
 
@@ -1356,8 +1403,51 @@ pub fn plan_enum_recreation(
 
         // Losing a value can reject rows the table already holds, so this is
         // gated behind `--allow-destructive` like any other data-losing change.
-        plan.destructive = true;
+        // `plan_reconcile` named the dropped values already, from the diff.
+        for value in &removed {
+            let change = format!("{qname}: drops enum value {value}");
+            plan.mark_destructive(change);
+        }
     }
+}
+
+/// `alter` — one column's `ALTER … TYPE … USING` in an enum swap — wrapped so
+/// a row holding a removed value fails naming the column.
+///
+/// The cast fails with `invalid input value for enum app.mood: "meh"`, which
+/// names neither table nor column, and the step reporting it is the enum's —
+/// one swap moves columns in every table using the type. The wrapper adds the
+/// column and what to do, and keeps the SQLSTATE; it runs inside the same
+/// implicit transaction, so the failure still leaves nothing half-applied.
+fn column_type_swap(alter: &str, column: &str, enum_name: &str) -> String {
+    // The message is a RAISE format string inside a `$$` body: `%` is its
+    // placeholder and `'` closes it.
+    let escape = |s: &str| s.replace('\'', "''").replace('%', "%%");
+    format!(
+        "DO $$ BEGIN\n  {alter}\nEXCEPTION WHEN invalid_text_representation THEN\n  \
+         RAISE EXCEPTION '{} holds a value {} no longer has (%) — update those rows first', SQLERRM \
+         USING ERRCODE = 'invalid_text_representation';\nEND $$;",
+        escape(column),
+        escape(enum_name),
+    )
+}
+
+/// Copy the comment of `old_type` — the enum renamed aside by a type swap — to
+/// `qname`, its replacement, so the swap does not lose it.
+///
+/// Read from the database rather than the design: an enum's comment is not
+/// part of any snapshot or diff, so the one it had is the one to keep. A type
+/// with no comment copies `NULL`, which sets none.
+pub(crate) fn enum_comment_carry(qname: &str, old_type: &str) -> String {
+    use crate::sql_quote::literal;
+    let (schema, name) = crate::entity::split_qualified_name(qname);
+    format!(
+        "DO $$ BEGIN\n  EXECUTE format('COMMENT ON TYPE %I.%I IS %L', {}, {}, \
+         obj_description(to_regtype({}), 'pg_type'));\nEND $$;",
+        literal(schema.as_deref().unwrap_or(DEFAULT_SCHEMA)),
+        literal(&name),
+        literal(old_type),
+    )
 }
 
 /// The live indexes an enum swap over `columns` has to drop and create again —
@@ -1580,7 +1670,7 @@ pub fn plan_index_convergence(plan: &mut ReconcilePlan, live: &Snapshot, desired
         {
             if let Some(name) = &ix.name {
                 lines.push(format!("DROP INDEX IF EXISTS \"{}\".\"{}\";", dt.schema, name));
-                plan.destructive = true;
+                plan.mark_destructive(format!("{}.{}: drops index {name}", dt.schema, dt.name));
             }
         }
 
@@ -4335,12 +4425,15 @@ mod enum_recreation_tests {
         );
     }
 
-    /// dbd never auto-drops a materialized view — a `DROP … CASCADE` would
-    /// repopulate it and take its dependents with it. So a matview over the
-    /// affected table is the one case recreation cannot do, and it must say so
-    /// rather than emit SQL Postgres will reject halfway through.
+    /// Whether a materialized view blocks the swap is a fact about the
+    /// database: one dropped by hand blocks nothing, and one the design does
+    /// not declare still does. The design's matviews decided it, so dropping
+    /// the matview as told and re-running declined again, forever. The planner
+    /// now plans the swap and records the columns it moves, which the caller
+    /// checks against the live database (`Design::reconcile`); and it never
+    /// emits `DROP VIEW` for a matview, which fails on one that exists.
     #[test]
-    fn a_dependent_materialized_view_refuses_loudly_instead_of_half_applying() {
+    fn a_design_matview_over_the_column_is_left_to_the_live_check() {
         let live = snap(
             vec![table("app", "t", vec![col("c", "app.colour", None)])],
             vec![enum_snap("app", "colour", &["red", "green", "blue"])],
@@ -4352,20 +4445,26 @@ mod enum_recreation_tests {
         let entities = vec![
             entity(EntityType::Table, "app.t", &[]),
             entity(EntityType::MaterializedView, "app.mv", &["app.t"]),
+            entity(EntityType::View, "app.v", &["app.t"]),
         ];
         let mut plan = ReconcilePlan::default();
         plan_enum_recreation(&mut plan, &live, &desired, &entities);
 
-        assert!(
-            plan.altered.iter().all(|s| s.entity_name != "app.colour"),
-            "no partial recreation may be planned"
-        );
-        assert!(
-            plan.warnings
-                .iter()
-                .any(|w| w.contains("app.mv") && w.contains("app.colour")),
-            "the blocked recreation must be reported; got {:?}",
-            plan.warnings
+        let sql = &plan
+            .altered
+            .iter()
+            .find(|s| s.entity_name == "app.colour")
+            .expect("the swap is planned")
+            .sql;
+        assert!(sql.contains("DROP VIEW IF EXISTS app.v;"), "{sql}");
+        assert!(!sql.contains("app.mv"), "a matview is never dropped by the swap: {sql}");
+        assert_eq!(
+            plan.enum_swaps,
+            vec![EnumSwap {
+                enum_name: "app.colour".to_string(),
+                removed: vec!["blue".to_string()],
+                columns: vec![("app.t".to_string(), "c".to_string())],
+            }]
         );
     }
 

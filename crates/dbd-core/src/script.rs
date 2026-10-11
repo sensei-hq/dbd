@@ -100,6 +100,33 @@ pub fn runnable_ddl(entity: &Entity) -> Option<String> {
     })
 }
 
+/// The text a migration or hook script runs as on PostgreSQL: the script,
+/// opened with `path` when it states no path of its own.
+///
+/// - A script that states its own path (`SET search_path …`) runs as written.
+/// - Otherwise it runs on `path`, `public` kept on it as [`runnable_ddl`] keeps
+///   it: for a hook, `source.search_path`; for an entity's migration file, the
+///   path that entity's DDL file runs on (the one it states, else
+///   `source.search_path`).
+/// - With no `path`, it runs on the session's default (`RESET search_path`).
+///
+/// Migration and hook scripts were sent bare, so they ran on whatever path the
+/// last DDL file had set on the connection: a `data.sql` naming `notes` failed
+/// with `relation "notes" does not exist` in a project whose bare names
+/// resolve on `app`, and a hook's tables were judged on one path and run on
+/// another. A hook's scope analysis reads its bare names on this same path
+/// (see `design::hooks::derive_dependencies`).
+pub fn runnable_script(sql: &str, path: Option<&[crate::entity::PathEntry]>) -> String {
+    if crate::parser::pg::common::extract_search_paths_via_pg_query(sql).stated() {
+        return sql.to_string();
+    }
+    let set = match path {
+        Some(entries) if !entries.is_empty() => search_path_statement(entries),
+        _ => "RESET search_path;".to_string(),
+    };
+    format!("{set}\n{sql}")
+}
+
 /// `SET search_path TO …;` for an entity whose names were resolved against
 /// `source.search_path`, or `None` when the file stated its own path or the
 /// session default applies. Only a file-backed entity has names to resolve:
@@ -135,6 +162,123 @@ fn search_path_statement(entries: &[crate::entity::PathEntry]) -> String {
         names.push(crate::sql_quote::ident(crate::reconcile::DEFAULT_SCHEMA));
     }
     format!("SET search_path TO {};", names.join(", "))
+}
+
+/// One statement of a migration script, as the enum-value handling sees it.
+enum MigrationStatement {
+    /// `ALTER TYPE … ADD VALUE`, deparsed with `IF NOT EXISTS` — and whether
+    /// the script already said so.
+    AddValue {
+        idempotent: String,
+        as_written: bool,
+    },
+    /// `SET search_path …` or `RESET search_path`: the context of what follows.
+    SearchPath,
+    Other,
+}
+
+/// Classify one statement `piece`, by its parse tree.
+fn migration_statement(piece: &str) -> MigrationStatement {
+    use pg_query::NodeEnum;
+    let Ok(mut parsed) = pg_query::parse(piece) else {
+        return MigrationStatement::Other;
+    };
+    let [stmt] = parsed.protobuf.stmts.as_mut_slice() else {
+        return MigrationStatement::Other;
+    };
+    match stmt.stmt.as_mut().and_then(|n| n.node.as_mut()) {
+        // `RENAME VALUE` is the same node with `old_val` set.
+        Some(NodeEnum::AlterEnumStmt(alter)) if alter.old_val.is_empty() && !alter.new_val.is_empty() => {
+            let as_written = alter.skip_if_new_val_exists;
+            alter.skip_if_new_val_exists = true;
+            match pg_query::deparse(&parsed.protobuf) {
+                Ok(idempotent) => MigrationStatement::AddValue { idempotent, as_written },
+                Err(_) => MigrationStatement::Other,
+            }
+        }
+        Some(NodeEnum::VariableSetStmt(set)) if set.name.eq_ignore_ascii_case("search_path") => {
+            MigrationStatement::SearchPath
+        }
+        _ => MigrationStatement::Other,
+    }
+}
+
+/// The `ALTER TYPE … ADD VALUE` statements of migration script `sql`, each as
+/// `ADD VALUE IF NOT EXISTS`, with the `SET search_path` statements among them
+/// kept in place so each names the type it named in the script. `None` when
+/// the script adds no enum value, or the grammar cannot split it.
+///
+/// What an apply runs and commits ahead of the rest of a version: Postgres
+/// will not use an enum value inside the transaction that added it ("unsafe
+/// use of new value"), and the rest of the version may — a default, a CHECK,
+/// a data script. `IF NOT EXISTS` because a run that fails after this commit
+/// leaves the value in place, and the next run adds it again.
+pub fn enum_value_additions(sql: &str) -> Option<String> {
+    let pieces = pg_query::split_with_parser(sql).ok()?;
+    let mut kept: Vec<String> = Vec::new();
+    let mut adds = false;
+    for piece in pieces {
+        match migration_statement(piece) {
+            MigrationStatement::AddValue { idempotent, .. } => {
+                adds = true;
+                kept.push(idempotent);
+            }
+            MigrationStatement::SearchPath => kept.push(piece.trim().to_string()),
+            MigrationStatement::Other => {}
+        }
+    }
+    adds.then(|| format!("{};\n", kept.join(";\n")))
+}
+
+/// Migration script `sql` with each `ALTER TYPE … ADD VALUE` as `ADD VALUE IF
+/// NOT EXISTS`, and every other byte as written.
+///
+/// What runs as the script itself once [`enum_value_additions`] has committed
+/// its values: the additions are then no-ops, and the script's other
+/// statements run where the script put them. Also what lets a run that
+/// creates an enum from the design's DDL — which already has every value —
+/// go on to a later version's `ADD VALUE` of one of them.
+pub fn idempotent_enum_value_additions(sql: &str) -> String {
+    let Ok(pieces) = pg_query::split_with_parser(sql) else {
+        return sql.to_string();
+    };
+    let mut out = String::with_capacity(sql.len());
+    let mut copied = 0;
+    for piece in pieces {
+        let MigrationStatement::AddValue {
+            idempotent,
+            as_written: false,
+        } = migration_statement(piece)
+        else {
+            continue;
+        };
+        // `split_with_parser` returns slices of `sql`, and a slice opens with
+        // whatever comments precede its statement: those are kept, and the
+        // statement is replaced from its first token on.
+        let start = piece.as_ptr() as usize - sql.as_ptr() as usize + first_token_at(piece);
+        out.push_str(&sql[copied..start]);
+        out.push_str(&idempotent);
+        copied = piece.as_ptr() as usize - sql.as_ptr() as usize + piece.len();
+    }
+    out.push_str(&sql[copied..]);
+    out
+}
+
+/// The byte offset in `piece` of its first token that is not a comment — where
+/// its statement begins. 0 when the scanner cannot read it.
+fn first_token_at(piece: &str) -> usize {
+    use pg_query::protobuf::Token;
+    let comment = |t: i32| t == Token::SqlComment as i32 || t == Token::CComment as i32;
+    pg_query::scan(piece)
+        .ok()
+        .and_then(|scan| scan.tokens.into_iter().find(|t| !comment(t.token)))
+        .and_then(|t| usize::try_from(t.start).ok())
+        .unwrap_or(0)
+}
+
+/// Whether statement `piece` is an `ALTER TYPE … ADD VALUE`.
+pub(crate) fn is_enum_value_addition(piece: &str) -> bool {
+    matches!(migration_statement(piece), MigrationStatement::AddValue { .. })
 }
 
 /// Ensure `public` is included in any SET search_path statement.
@@ -758,6 +902,74 @@ pub fn build_grants_script(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// A migration or hook script that states no path runs on the one the
+    /// project gives bare names — `source.search_path`, with `public` kept on
+    /// it as for a DDL file — and one that states its own runs as written.
+    #[test]
+    fn a_script_stating_no_path_runs_on_the_projects() {
+        let app = [crate::entity::PathEntry::Schema("app".to_string())];
+        let sql = "update notes set tag = 'old';\n";
+        assert_eq!(
+            runnable_script(sql, Some(&app)),
+            format!("SET search_path TO \"app\", \"public\";\n{sql}")
+        );
+        let own = "set search_path to core;\nupdate zones set id = id;\n";
+        assert_eq!(runnable_script(own, Some(&app)), own);
+    }
+
+    /// With no project path, a script stating none runs on the session's
+    /// default — not on whatever path the last DDL file left the connection.
+    #[test]
+    fn a_script_in_a_project_without_a_path_runs_on_the_session_default() {
+        let sql = "insert into items values (1);\n";
+        assert_eq!(runnable_script(sql, None), format!("RESET search_path;\n{sql}"));
+    }
+
+    /// The additions a run commits ahead of a version: each `ADD VALUE`
+    /// made idempotent, with the path that names its type — and nothing else
+    /// of the script, which runs later in the version's own transaction.
+    #[test]
+    fn a_scripts_enum_value_additions_keep_their_search_path_and_nothing_else() {
+        let sql = "set search_path to app;\n\
+                   alter type mood add value 'archived' after 'ok';\n\
+                   alter type mood rename value 'bad' to 'poor';\n\
+                   alter table people alter column mood set default 'archived';\n";
+        let additions = enum_value_additions(sql).expect("the script adds a value");
+        assert!(
+            additions.to_lowercase().contains("set search_path to app"),
+            "{additions}"
+        );
+        assert!(
+            additions.contains("ADD VALUE IF NOT EXISTS 'archived' AFTER 'ok'"),
+            "{additions}"
+        );
+        assert!(!additions.to_lowercase().contains("rename value"), "{additions}");
+        assert!(!additions.to_lowercase().contains("set default"), "{additions}");
+    }
+
+    #[test]
+    fn a_script_adding_no_enum_value_has_no_additions() {
+        assert!(enum_value_additions("alter table t add column c int;").is_none());
+        assert!(enum_value_additions("alter type mood rename value 'a' to 'b';").is_none());
+        assert!(enum_value_additions("not sql at all ;;").is_none());
+    }
+
+    /// Run after its values committed, a script's `ADD VALUE` must be a
+    /// no-op — and the rest of the file must reach the server exactly as
+    /// written, comments and spelling included.
+    #[test]
+    fn only_the_add_value_statements_of_a_script_are_rewritten() {
+        let sql = "-- keep me\nALTER TYPE app.mood ADD VALUE 'archived';\nUPDATE app.t SET c = 'x;y' /* ; */ ;\n";
+        assert_eq!(
+            idempotent_enum_value_additions(sql),
+            "-- keep me\nALTER TYPE app.mood ADD VALUE IF NOT EXISTS 'archived';\nUPDATE app.t SET c = 'x;y' /* ; */ ;\n"
+        );
+        let already = "ALTER TYPE app.mood ADD VALUE IF NOT EXISTS 'archived';\n";
+        assert_eq!(idempotent_enum_value_additions(already), already);
+        let unparsable = "ALTER TYPE app.mood ADD VALUE 'x'; this is not sql";
+        assert_eq!(idempotent_enum_value_additions(unparsable), unparsable);
+    }
 
     #[test]
     fn dbd_schema_is_protected_on_all_targets() {

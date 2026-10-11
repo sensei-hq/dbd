@@ -626,8 +626,9 @@ pub(crate) async fn reconcile_with_adapter(
 ) -> Result<()> {
     // Guarded before the dry run, not after it. The preview connects anyway, so
     // it can see the pin, and a plan for a run the guard will refuse is a
-    // preview of something that cannot happen. (`reset --dry-run` is the
-    // deliberate exception: it needs no database, so it has no pin to read.)
+    // preview of something that cannot happen. (`reset --dry-run` asks the
+    // same of a configured database; with none configured it previews the
+    // plan alone, having no pin to read.)
     let marks = design.database_marks(adapter).await?;
     Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
 
@@ -650,6 +651,21 @@ pub(crate) async fn reconcile_with_adapter(
             .await
             .context("Reconcile planning failed")?;
         print_reconcile_plan(&plan, prune, verbosity);
+        // The run goes on to the apply hooks and the grants; a preview of it
+        // that stops at the schema changes leaves them out.
+        for hook in design.apply_hooks_to_run(Some(resolved))? {
+            output::info(verbosity, &format!("  run {hook}"));
+        }
+        let grants = design.grants_to_apply(Some(resolved))?;
+        if !grants.is_empty() {
+            if adapter.supports_schema_grants() {
+                for line in grants {
+                    output::info(verbosity, &format!("  grant on {line}"));
+                }
+            } else {
+                output::info(verbosity, "  Skipping schema grants (target has no grant model).");
+            }
+        }
         output::info(verbosity, "[dry-run] No changes applied.");
         return Ok(());
     }
@@ -1452,6 +1468,7 @@ mod tests {
             }],
             warnings: vec!["enum value dropped".to_string()],
             destructive: true,
+            ..Default::default()
         };
 
         let pruned = reconcile_plan_lines(&plan, true, Verbosity::Normal).join("\n");

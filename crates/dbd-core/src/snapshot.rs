@@ -1085,6 +1085,8 @@ impl StageBuilder {
                 "CREATE TYPE {enum_name} AS ENUM ({});",
                 values.iter().map(|v| literal(v)).collect::<Vec<_>>().join(", ")
             ),
+            // The comment stays with the type renamed aside, and went with it.
+            crate::reconcile::enum_comment_carry(enum_name, &old_type),
         ];
         if affected_columns.is_empty() {
             enum_sql.push(format!("DROP TYPE {old_type};"));
