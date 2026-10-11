@@ -172,11 +172,16 @@ pub async fn cmd_init_from_db(
     // Decided before `entities` is consumed: the platform schemas that identify
     // Supabase are usually filtered out of what gets written.
     let target = init_target(&conn, &entities);
-    init_with_entities(
+    let deps = adapter
+        .dependencies()
+        .await
+        .context("reading what the database's objects depend on failed")?;
+    init_with_dependencies(
         project_dir,
         config_path,
         env,
         entities,
+        &deps,
         &project_name,
         version,
         sel,
@@ -291,6 +296,38 @@ fn init_with_entities(
     dialect: &str,
     snapshot_label: &str,
 ) -> Result<()> {
+    init_with_dependencies(
+        project_dir,
+        config_path,
+        env,
+        entities,
+        &[],
+        project_name,
+        version,
+        sel,
+        dry_run,
+        dialect,
+        snapshot_label,
+    )
+}
+
+/// [`init_with_entities`], with what the source's objects depend on — a
+/// database knows; a DBML file does not — so a capture of some schemas can
+/// declare the extensions it uses and name what else it needs.
+#[allow(clippy::too_many_arguments)]
+fn init_with_dependencies(
+    project_dir: &Path,
+    config_path: &Path,
+    env: &str,
+    entities: Vec<dbd_core::Entity>,
+    deps: &[dbd_core::adapter::Dependency],
+    project_name: &str,
+    version: u32,
+    sel: SchemaSelect,
+    dry_run: bool,
+    dialect: &str,
+    snapshot_label: &str,
+) -> Result<()> {
     // Only on Supabase are its platform schemas the platform's rather than the
     // project's. The target says which: detected from the database's own
     // schemas, or — DBML names no platform — the caller's `--target`.
@@ -309,6 +346,7 @@ fn init_with_entities(
         true,
         dialect,
         &FormatConfig::default(),
+        deps,
     )?;
 
     // Emit a baseline snapshot at `--version` so the new project is version-tracked
@@ -457,7 +495,7 @@ fn merge_snapshot(
     // Select schemas + keep only entities under a selected schema (same logic as
     // the normal path).
     let (selected, kept) = select_and_keep(entities, &sel);
-    report_left_out(entities, &sel);
+    report_left_out(entities, &sel, &[]);
     // A table the design declares `external:` is somebody else's — the
     // Supabase scaffold's `auth.users` is the usual one. Captured, it became a
     // project file `reset` would then `DROP … CASCADE`.
@@ -650,7 +688,10 @@ fn db_schemas(entities: &[dbd_core::Entity]) -> Vec<String> {
 /// Name every schema `sel` leaves out of `entities`, with why, and every
 /// extension that goes with one. Leaving them out is right — they are the
 /// platform's, or the user asked — but leaving them out silently was not.
-fn report_left_out(entities: &[dbd_core::Entity], sel: &SchemaSelect) {
+///
+/// An extension in `declared` is not left out with its schema: the captured
+/// objects use it, so it is declared (see [`reverse::outside_needs`]).
+fn report_left_out(entities: &[dbd_core::Entity], sel: &SchemaSelect, declared: &[(String, Option<String>)]) {
     let left_out = reverse::left_out_schemas(&db_schemas(entities), sel);
     for (schema, why) in &left_out {
         let why = match why {
@@ -666,6 +707,7 @@ fn report_left_out(entities: &[dbd_core::Entity], sel: &SchemaSelect) {
     {
         if let Some(schema) = ext.schema.as_deref()
             && left_out.iter().any(|(s, _)| s == schema)
+            && !declared.iter().any(|(name, _)| *name == ext.name)
         {
             println!(
                 "  left out: extension `{}` — installed in schema `{schema}`, which is left out",
@@ -706,10 +748,34 @@ fn run_plan(
     write_config: bool,
     dialect: &str,
     format: &FormatConfig,
+    deps: &[dbd_core::adapter::Dependency],
 ) -> Result<Vec<String>> {
     // 1. select schemas + keep only entities under a selected schema
     let (selected, kept) = select_and_keep(&entities, &sel);
-    report_left_out(&entities, &sel);
+    // Extensions go in the target's `extensions:` list — the project format
+    // has no DDL file for one (see `reverse::MANAGED_KINDS`) — and a table a
+    // foreign key reaches outside the captured schemas under `external:`.
+    // What else the captured objects need from outside is named: a database
+    // without it cannot take the project. Named on a dry run too: it is part
+    // of the plan.
+    let platform: Vec<String> = reverse::left_out_schemas(&db_schemas(&entities), &sel)
+        .into_iter()
+        .filter(|(_, why)| *why == reverse::LeftOut::Platform)
+        .map(|(schema, _)| schema)
+        .collect();
+    let mut declared = write_config.then(|| reverse::Declared::from_entities(&kept, &selected));
+    let needs = declared
+        .as_mut()
+        .map(|d| reverse::outside_needs(deps, &selected, &platform, d))
+        .unwrap_or_default();
+    report_left_out(
+        &entities,
+        &sel,
+        declared.as_ref().map(|d| d.extensions.as_slice()).unwrap_or_default(),
+    );
+    for need in &needs {
+        println!("  {need}");
+    }
     // Bail only when there's genuinely nothing to write. A schema-less source
     // (SQLite) yields entities with no schema → `selected` is empty but `kept`
     // is not, so gate on `kept`, not `selected`.
@@ -724,11 +790,6 @@ fn run_plan(
     let plan = reverse::plan_from_entities(project_dir, &kept, &selected, format);
 
     // 3. write design.yaml (init only; only if absent; skip on dry-run)
-    // Extensions go in the target's `extensions:` list — the project format
-    // has no DDL file for one (see `reverse::MANAGED_KINDS`) — and a table a
-    // foreign key reaches outside the captured schemas under `external:`.
-    // Named on a dry run too: it is part of the plan.
-    let declared = write_config.then(|| reverse::Declared::from_entities(&kept, &selected));
     for name in declared.iter().flat_map(|d| &d.externals) {
         println!("  external: {name} — a foreign key references it, outside the captured schemas");
     }

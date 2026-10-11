@@ -2002,6 +2002,79 @@ impl DatabaseAdapter for PostgresAdapter {
         Ok(entities)
     }
 
+    /// `pg_depend`, read at the level of whole objects (see [`super::Dependency`]).
+    ///
+    /// Each side is lifted to the object a user names: a column, default,
+    /// constraint, index, rewrite rule or trigger to its table or view (a
+    /// domain's constraint to the domain), and a referenced column or index to
+    /// its table. Kept: what an object needs from another schema, or from an
+    /// extension other than the server's own (`plpgsql`, in `pg_catalog`).
+    /// What an extension owns is no project's, so it is never the dependent.
+    async fn dependencies(&self) -> Result<Vec<super::Dependency>> {
+        const SQL: &str = r#"WITH dep AS (
+  SELECT DISTINCT own.cls, own.obj, d.refclassid, d.refobjid, d.refobjsubid
+  FROM pg_catalog.pg_depend d
+  CROSS JOIN LATERAL (
+    SELECT 'pg_class'::regclass AS cls, coalesce((SELECT i.indrelid FROM pg_catalog.pg_index i WHERE i.indexrelid = d.objid), d.objid) AS obj
+      WHERE d.classid = 'pg_class'::regclass
+    UNION ALL SELECT 'pg_class'::regclass, a.adrelid FROM pg_catalog.pg_attrdef a
+      WHERE d.classid = 'pg_attrdef'::regclass AND a.oid = d.objid
+    UNION ALL SELECT 'pg_class'::regclass, r.ev_class FROM pg_catalog.pg_rewrite r
+      WHERE d.classid = 'pg_rewrite'::regclass AND r.oid = d.objid
+    UNION ALL SELECT CASE WHEN c.conrelid <> 0 THEN 'pg_class'::regclass ELSE 'pg_type'::regclass END,
+                     CASE WHEN c.conrelid <> 0 THEN c.conrelid ELSE c.contypid END
+      FROM pg_catalog.pg_constraint c WHERE d.classid = 'pg_constraint'::regclass AND c.oid = d.objid
+    UNION ALL SELECT 'pg_class'::regclass, t.tgrelid FROM pg_catalog.pg_trigger t
+      WHERE d.classid = 'pg_trigger'::regclass AND t.oid = d.objid
+    UNION ALL SELECT d.classid, d.objid WHERE d.classid IN ('pg_proc'::regclass, 'pg_type'::regclass)
+  ) own
+  WHERE d.deptype IN ('n', 'a')
+), resolved AS (
+  SELECT dep.cls, dep.obj,
+         CASE WHEN dep.refclassid = 'pg_class'::regclass THEN 'pg_class'::regclass ELSE dep.refclassid END AS rcls,
+         CASE WHEN dep.refclassid = 'pg_class'::regclass
+              THEN coalesce((SELECT i.indrelid FROM pg_catalog.pg_index i WHERE i.indexrelid = dep.refobjid), dep.refobjid)
+              ELSE dep.refobjid END AS robj
+  FROM dep
+)
+SELECT DISTINCT o.schema AS dependent_schema, o.identity AS dependent,
+       r.type AS referenced_kind, r.schema AS referenced_schema, r.identity AS referenced,
+       e.extname AS extension, en.nspname AS extension_schema
+FROM resolved x
+CROSS JOIN LATERAL pg_catalog.pg_identify_object(x.cls, x.obj, 0) o
+CROSS JOIN LATERAL pg_catalog.pg_identify_object(x.rcls, x.robj, 0) r
+LEFT JOIN pg_catalog.pg_depend m ON m.classid = x.rcls AND m.objid = x.robj
+     AND m.refclassid = 'pg_catalog.pg_extension'::regclass AND m.deptype = 'e'
+LEFT JOIN pg_catalog.pg_extension e ON e.oid = m.refobjid
+LEFT JOIN pg_catalog.pg_namespace en ON en.oid = e.extnamespace
+WHERE o.schema IS NOT NULL
+  AND o.schema NOT IN ('pg_catalog', 'information_schema', 'dbd') AND o.schema NOT LIKE 'pg_toast%' AND o.schema NOT LIKE 'pg_temp%'
+  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend x2 WHERE x2.classid = x.cls AND x2.objid = x.obj AND x2.deptype = 'e')
+  AND (CASE WHEN e.extname IS NOT NULL THEN en.nspname <> 'pg_catalog'
+            ELSE r.schema IS NOT NULL AND r.schema <> o.schema
+                 AND r.schema NOT IN ('pg_catalog', 'information_schema') AND r.schema NOT LIKE 'pg_toast%' END)
+ORDER BY 1, 2, 4, 5"#;
+        let rows = sqlx::query(SQL)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("reading what objects depend on failed: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let extension: Option<String> = row.get("extension");
+                let extension_schema: Option<String> = row.get("extension_schema");
+                super::Dependency {
+                    dependent_schema: row.get("dependent_schema"),
+                    dependent: row.get("dependent"),
+                    referenced_kind: row.get("referenced_kind"),
+                    referenced_schema: row.get("referenced_schema"),
+                    referenced: row.get("referenced"),
+                    extension: extension.zip(extension_schema),
+                }
+            })
+            .collect())
+    }
+
     async fn reverse_managed_version(&self) -> Result<Option<u32>> {
         self.bookkeeping.detect_managed_version().await
     }
