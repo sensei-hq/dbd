@@ -593,7 +593,8 @@ impl PostgresAdapter {
             let table: String = trow.get("table_name");
 
             let columns = self.introspect_columns(&schema, &table).await?;
-            let (constraints, constraint_index_oids) = self.introspect_constraints(&schema, &table).await?;
+            let (constraints, constraint_index_oids, constraint_warnings) =
+                self.introspect_constraints(&schema, &table).await?;
             let indexes = self.introspect_indexes(&schema, &table, &constraint_index_oids).await?;
 
             let table_comment = self.introspect_table_comment(&schema, &table).await?;
@@ -619,6 +620,7 @@ impl PostgresAdapter {
 
             let mut entity = Entity::new(EntityType::Table, &format!("{schema}.{table}"));
             entity.table_def = Some(table_def);
+            entity.warnings = constraint_warnings;
             entities.push(entity);
         }
 
@@ -826,12 +828,28 @@ impl PostgresAdapter {
 
     /// Introspect a table's PK/UNIQUE/FK/CHECK constraints. Also returns the set
     /// of index OIDs that back a PK/UNIQUE constraint, so `introspect_indexes`
-    /// can skip re-emitting them as standalone indexes.
+    /// can skip re-emitting them as standalone indexes, and a warning for each
+    /// state of a constraint the captured DDL cannot carry.
+    ///
+    /// A CHECK's expression is `pg_get_expr(conbin)` — the text inside
+    /// `pg_get_constraintdef`'s `CHECK (…)`, with nothing after it. Stripping
+    /// the prefix off the whole definition left a trailing ` NOT VALID` inside
+    /// the parentheses, and the reversed file did not parse.
+    ///
+    /// The states are named rather than written, because no table file that
+    /// runs twice can hold them: `NOT VALID` takes `ALTER TABLE … ADD
+    /// CONSTRAINT`, which fails on the second run (inside `CREATE TABLE`
+    /// Postgres validates the constraint anyway), and the grammar dbd parses
+    /// predates PG 18's `NOT ENFORCED`. `NO INHERIT` has no field in the model.
     async fn introspect_constraints(
         &self,
         schema: &str,
         table: &str,
-    ) -> crate::error::Result<(Vec<crate::entity::TableConstraint>, std::collections::HashSet<i64>)> {
+    ) -> crate::error::Result<(
+        Vec<crate::entity::TableConstraint>,
+        std::collections::HashSet<i64>,
+        Vec<String>,
+    )> {
         use crate::entity::{ForeignKey, TableConstraint};
 
         // `indnullsnotdistinct` decides whether a UNIQUE constraint's NULL rows
@@ -843,6 +861,9 @@ impl PostgresAdapter {
                     coalesce((to_jsonb(ix) ->> 'indnullsnotdistinct')::boolean, false) \
                         AS nulls_not_distinct, \
                     pg_get_constraintdef(c.oid, true) AS condef, \
+                    pg_get_expr(c.conbin, c.conrelid, true) AS check_expr, \
+                    c.convalidated, c.connoinherit, \
+                    coalesce((to_jsonb(c) ->> 'conenforced')::boolean, true) AS enforced, \
                     (SELECT array_agg(a.attname ORDER BY pos.ord) \
                      FROM unnest(c.conkey) WITH ORDINALITY AS pos(attnum, ord) \
                      JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = pos.attnum \
@@ -872,10 +893,38 @@ impl PostgresAdapter {
 
         let mut constraints: Vec<TableConstraint> = Vec::new();
         let mut constraint_index_oids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut warnings: Vec<String> = Vec::new();
 
         for con in &con_rows {
             let conname: String = con.get("conname");
             let contype: String = con.get("contype");
+            let validated: bool = con.try_get("convalidated").unwrap_or(true);
+            let enforced: bool = con.try_get("enforced").unwrap_or(true);
+            let no_inherit: bool = con.try_get("connoinherit").unwrap_or(false);
+            // A NOT ENFORCED constraint is never validated either (PG 18 marks it
+            // `convalidated = false`); its own note says more than NOT VALID would.
+            if !validated && enforced {
+                warnings.push(format!(
+                    "constraint {conname} on {schema}.{table} is NOT VALID in the database — the rows already \
+                     there were never checked against it. It is captured as an ordinary constraint, which a \
+                     new database checks on every row, so rows that break it will not import there"
+                ));
+            }
+            if !enforced {
+                warnings.push(format!(
+                    "constraint {conname} on {schema}.{table} is NOT ENFORCED in the database — it checks \
+                     nothing there. It is captured enforced (the SQL dbd reads has no NOT ENFORCED), so a new \
+                     database refuses rows this one accepts"
+                ));
+            }
+            // Only a CHECK can be inherited; Postgres marks every other kind
+            // `connoinherit`, which says nothing a table file loses.
+            if no_inherit && contype == "c" {
+                warnings.push(format!(
+                    "constraint {conname} on {schema}.{table} is NO INHERIT in the database — it is captured \
+                     without it, so a table that inherits from {schema}.{table} would inherit the check too"
+                ));
+            }
             let col_names: Vec<String> = con.try_get::<Vec<String>, _>("col_names").unwrap_or_default();
             let conindid: Option<i64> = con.try_get("conindid").ok();
 
@@ -927,13 +976,10 @@ impl PostgresAdapter {
                     }));
                 }
                 "c" => {
-                    let condef: String = con.get("condef");
-                    // pg_get_constraintdef returns "CHECK (expr)"
-                    let expression = condef
-                        .strip_prefix("CHECK (")
-                        .and_then(|s| s.strip_suffix(')'))
-                        .unwrap_or(&condef)
-                        .to_string();
+                    let expression: String = match con.try_get::<Option<String>, _>("check_expr") {
+                        Ok(Some(expr)) => expr,
+                        _ => con.get("condef"),
+                    };
                     constraints.push(TableConstraint::Check {
                         name: Some(conname),
                         expression,
@@ -943,7 +989,7 @@ impl PostgresAdapter {
             }
         }
 
-        Ok((constraints, constraint_index_oids))
+        Ok((constraints, constraint_index_oids, warnings))
     }
 
     /// Introspect a table's standalone indexes.
