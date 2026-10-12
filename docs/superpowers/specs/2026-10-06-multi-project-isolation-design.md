@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-06 (rev 3, 2026-10-07)
 **Status:** Proposed — Phase 1 done on `develop` (1a in 0.25.0; 1b, 1c, 1d
-after 0.25.1); Phases 2–4 await the decisions below.
+after 0.25.1); Phases 2–4 next; the decisions below are settled.
 **Scope:** Let several owners share one database safely: independent projects
 from different repositories, and modules of one workspace kept under
 `database/<module>/`. Ownership is per **entity**, recorded in the shared `dbd`
@@ -118,10 +118,11 @@ wins.
 - (b) nobody owns it, and its schema is used by no other owner.
 
 Rule (b) keeps today's drift clean-up for a database with one owner. In a
-schema that another owner also uses, unowned entities are reported and never
-dropped:
+schema that another owner also uses, unowned entities are reported, and
+dropped only when the run confirms it with `--prune-unowned` (decision 4), each
+named as it goes:
 
-`unowned: public.tmp_report — not dropped because public is shared with "billing"`
+`unowned: public.tmp_report — not dropped because public is shared with "billing" (--prune-unowned drops it)`
 
 Entities owned by someone else are never candidates. This replaces
 `managed_schemas` as the prune boundary. `restrict_snapshot_to_schemas` stays
@@ -436,7 +437,10 @@ failing.
 
 ---
 
-## Decisions to confirm
+## Decisions
+
+Settled 2026-10-12: 1, 2, 3 and 5 as recommended; 4 changed — unowned entities
+in a shared schema are pruned after confirming.
 
 1. **No list of what a module offers to others.** What a module protects is
    derived from what other owners actually use. If a restriction is ever
@@ -447,8 +451,10 @@ failing.
    version.
 3. **Owner identity `<project>/<module>`.** Recommended, because two workspaces
    may both have a `shared` module. The alternative is bare module names.
-4. **Unowned entities in a shared schema are reported, never pruned.** An
-   explicit `dbd adopt <entity>` can come later if reports pile up.
+4. **Unowned entities in a shared schema are reported, and pruned only with
+   `--prune-unowned`**, which names each one it drops. (Proposed: reported,
+   never pruned; changed so a shared schema can be cleaned without dropping to
+   SQL.) An explicit `dbd adopt <entity>` can still come later.
 5. **One root manifest**, with module folders holding no configuration.
    Recommended (see section 2). The alternative is a `module.yaml` per module.
 
