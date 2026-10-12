@@ -266,6 +266,33 @@ fn owns(decl: &Declaration, target: &str) -> bool {
     decl.name == target || (decl.schema.is_none() && target.rsplit('.').next() == Some(decl.name.as_str()))
 }
 
+/// The types the statements of `parsed` create that no entity is declared for
+/// — a composite, a domain, a range — as `(kind, schema, schema.name)`, named
+/// as [`declarations`] names an entity. A file may create one beside the
+/// entity it is for: the type a function returns.
+pub(in crate::parser) fn created_types(
+    parsed: &pg_query::ParseResult,
+    default_schema: &str,
+) -> Vec<(&'static str, Option<String>, String)> {
+    parsed
+        .protobuf
+        .stmts
+        .iter()
+        .filter_map(|raw| raw.stmt.as_ref().and_then(|s| s.node.as_ref()))
+        .filter_map(|node| {
+            let (kind, (schema, name)) = match node {
+                NodeEnum::CompositeTypeStmt(c) => {
+                    ("composite type", from_range_var(c.typevar.as_ref()?, default_schema))
+                }
+                NodeEnum::CreateDomainStmt(c) => ("domain", from_parts(&name_parts(&c.domainname), default_schema)?),
+                NodeEnum::CreateRangeStmt(c) => ("range type", from_parts(&name_parts(&c.type_name), default_schema)?),
+                _ => return None,
+            };
+            Some((kind, schema, name))
+        })
+        .collect()
+}
+
 fn from_range_var(rv: &protobuf::RangeVar, default_schema: &str) -> (Option<String>, String) {
     qualify(&rv.schemaname, &rv.relname, default_schema)
 }

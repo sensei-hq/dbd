@@ -63,12 +63,21 @@ impl PgQueryDdl {
     }
 }
 
-/// Every entity the `CREATE` statements in `sql` make — its kind, the schema
+/// What a `CREATE` makes: an entity dbd declares, or a type it declares none
+/// for — a composite, a domain, a range — which a file may create beside one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Created {
+    Entity(EntityType),
+    /// The type's kind: `composite type`, `domain` or `range type`.
+    Type(&'static str),
+}
+
+/// Everything the `CREATE` statements in `sql` make — what it is, the schema
 /// the statement states (`None` where it leaves it to the search path), and
 /// its name as Postgres reads it, an unquoted one folded to lower case. Empty
 /// when `sql` does not parse; an entity declared inside a `DO` block is not
 /// among them.
-pub(crate) fn created_identities(sql: &str) -> Vec<(EntityType, Option<String>, String)> {
+pub(crate) fn created_identities(sql: &str) -> Vec<(Created, Option<String>, String)> {
     // Passed as the default schema, so an unqualified name comes back with it.
     const UNSTATED: &str = "\u{1}";
     let Ok(parsed) = pg_query::parse(sql) else {
@@ -77,16 +86,21 @@ pub(crate) fn created_identities(sql: &str) -> Vec<(EntityType, Option<String>, 
     let (decls, _) = declarations::declarations(&parsed, sql, UNSTATED);
     decls
         .into_iter()
-        .map(|decl| {
-            let name = match &decl.schema {
-                Some(schema) => decl
-                    .name
+        .map(|decl| (Created::Entity(decl.entity_type), decl.schema, decl.name))
+        .chain(
+            declarations::created_types(&parsed, UNSTATED)
+                .into_iter()
+                .map(|(kind, schema, name)| (Created::Type(kind), schema, name)),
+        )
+        .map(|(created, schema, qualified)| {
+            let name = match &schema {
+                Some(schema) => qualified
                     .strip_prefix(&format!("{schema}."))
-                    .unwrap_or(&decl.name)
+                    .unwrap_or(&qualified)
                     .to_string(),
-                None => decl.name.clone(),
+                None => qualified.clone(),
             };
-            (decl.entity_type, decl.schema.filter(|s| s != UNSTATED), name)
+            (created, schema.filter(|s| s != UNSTATED), name)
         })
         .collect()
 }

@@ -10618,6 +10618,7 @@ async fn a_dotted_reference_is_matched_as_dbd_splits_it() {
         kind: "entity".to_string(),
         target: "relation:a.b.c".to_string(),
         via: "view app.v".to_string(),
+        search_path: Vec::new(),
     };
 
     shop.execute_script(&record("a.b", "c")).await.unwrap();

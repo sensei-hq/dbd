@@ -1,6 +1,7 @@
 use super::*;
 use crate::adapter::{HeldObject, OwnedObject, Use};
 use crate::entity::RefKind;
+use crate::parser::pg::Created;
 
 /// What a run does with the database's ownership registry before it does
 /// anything else (#7). Both refuse a design declaring an entity another owner
@@ -42,24 +43,32 @@ impl Design {
     /// entity's file gives a name, folded as Postgres folds an unquoted one, and
     /// the schema it states — else the search path the file runs on, its own
     /// `set search_path` or `source.search_path`. A file may create more than
-    /// its path names, and every one is claimed. Only where no statement can be
-    /// read — a file that does not parse, an enum declared inside a `DO` block,
-    /// another dialect — does the path name the entity.
+    /// its path names — another table, the type a function returns — and
+    /// every one is claimed. Only where no statement can be read — a file that
+    /// does not parse, an enum declared inside a `DO` block, a dialect dbd does
+    /// not read as Postgres — does the path name the entity, folded.
     ///
-    /// Tables, views, materialized views, sequences and enums share one
-    /// namespace: Postgres gives a table a row type, so a table and an enum of
-    /// one name cannot both exist. Routines are owned by name, their overloads
-    /// one entity.
+    /// Everything Postgres names as a relation or a type shares one namespace:
+    /// it gives a table, a view and a materialized view a row type, so none of
+    /// them can share a name with an enum, a composite, a domain or a range.
+    /// Routines are owned by name, their overloads one entity.
     fn entity_keys(&self) -> Vec<(&Entity, Vec<OwnedObject>)> {
-        let postgres = self.config.source.dialect.eq_ignore_ascii_case("postgresql")
-            || self.config.source.dialect.eq_ignore_ascii_case("postgres");
+        // Read as the loader reads the design: `supabase`, and anything else
+        // libpg_query parses, is Postgres.
+        let postgres =
+            crate::parser::ParserChoice::resolve(&self.config.source.dialect, self.config.source.parser.as_deref())
+                .is_ok_and(|parser| parser == crate::parser::ParserChoice::PgQuery);
         self.entities
             .iter()
             .filter(|e| owned_kind(e.entity_type).is_some())
             .map(|e| {
                 let on_path = || e.schema_path.default_schema().map(str::to_string);
-                let key = |entity_type: EntityType, schema: Option<String>, name: String| {
-                    owned_kind(entity_type).map(|(namespace, kind)| OwnedObject {
+                let key = |created: Created, schema: Option<String>, name: String| {
+                    let (namespace, kind) = match created {
+                        Created::Entity(entity_type) => owned_kind(entity_type)?,
+                        Created::Type(kind) => ("relation", kind),
+                    };
+                    Some(OwnedObject {
                         namespace: namespace.to_string(),
                         schema: schema.unwrap_or_else(|| crate::reconcile::DEFAULT_SCHEMA.to_string()),
                         name,
@@ -67,7 +76,7 @@ impl Design {
                     })
                 };
                 let path_name = crate::entity::split_qualified_name(&e.name).1;
-                let created: Vec<(EntityType, Option<String>, String)> = postgres
+                let created: Vec<(Created, Option<String>, String)> = postgres
                     .then_some(e.file.as_ref())
                     .flatten()
                     .and_then(|file| crate::source_text::read_to_string(&self.project_dir.join(file)).ok())
@@ -75,17 +84,27 @@ impl Design {
                     .unwrap_or_default();
                 let mut keys: Vec<OwnedObject> = created
                     .into_iter()
-                    .filter_map(|(entity_type, stated, name)| key(entity_type, stated.or_else(on_path), name))
+                    .filter_map(|(created, stated, name)| key(created, stated.or_else(on_path), name))
                     .collect();
                 if keys.is_empty() {
+                    // A path cannot quote a name, so it names what Postgres
+                    // makes of an unquoted one: folded.
                     keys.extend(key(
-                        e.entity_type,
-                        e.schema.clone().filter(|s| !s.is_empty()).or_else(on_path),
-                        path_name.clone(),
+                        Created::Entity(e.entity_type),
+                        e.schema
+                            .clone()
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.to_ascii_lowercase())
+                            .or_else(on_path),
+                        path_name.to_ascii_lowercase(),
                     ));
                 }
-                // The path's entity first: it is the one a reference is made through.
-                if let Some(i) = keys.iter().position(|k| k.name.eq_ignore_ascii_case(&path_name)) {
+                // The path's entity first, by namespace and name: it is the one
+                // a reference is made through.
+                let path_namespace = owned_kind(e.entity_type).map(|(namespace, _)| namespace);
+                if let Some(i) = keys.iter().position(|k| {
+                    Some(k.namespace.as_str()) == path_namespace && k.name.eq_ignore_ascii_case(&path_name)
+                }) {
                     keys.swap(0, i);
                 }
                 (e, keys)
@@ -105,18 +124,22 @@ impl Design {
     /// entities live in and the ones it declares, its extensions and roles —
     /// shared with any other owner — and each reference any of its entities
     /// makes to an entity it does not declare, which the registry records only
-    /// where another owner holds the target. `via` names the referring entity;
-    /// overloads in several files each record their own references.
+    /// where another owner holds the target. A call is of a routine, anything
+    /// else of a relation. `via` names the referring entity; overloads in
+    /// several files each record their own references. A name written bare
+    /// that dbd could not find carries the search path Postgres looks it up
+    /// along.
     pub(crate) fn declared_uses(&self) -> Vec<Use> {
         let keyed = self.entity_keys();
-        let owned_names: std::collections::HashSet<String> = keyed
+        let owned: std::collections::HashSet<String> = keyed
             .iter()
-            .flat_map(|(_, keys)| keys.iter().map(|o| format!("{}.{}", o.schema, o.name)))
+            .flat_map(|(_, keys)| keys.iter().map(|o| format!("{}:{}.{}", o.namespace, o.schema, o.name)))
             .collect();
         let shared = |kind: &str, target: &str| Use {
             kind: kind.to_string(),
             target: target.to_string(),
             via: String::new(),
+            search_path: Vec::new(),
         };
         let mut uses: std::collections::BTreeSet<Use> = keyed
             .iter()
@@ -140,21 +163,37 @@ impl Design {
             let Some(via) = keys.first() else {
                 continue;
             };
+            // As the resolver walks it: the named schemas, then `public`, which
+            // dbd keeps on every path it applies.
+            let mut search_path: Vec<String> = e.schema_path.schemas().map(str::to_string).collect();
+            if !search_path.iter().any(|s| s == crate::reconcile::DEFAULT_SCHEMA) {
+                search_path.push(crate::reconcile::DEFAULT_SCHEMA.to_string());
+            }
             for r in e.refs.iter().filter(|r| {
                 matches!(
                     r.kind,
                     RefKind::Reads | RefKind::Writes | RefKind::Calls | RefKind::Uses
                 )
             }) {
-                let target = match crate::entity::split_qualified_name(&r.name) {
-                    (Some(schema), name) => format!("{schema}.{name}"),
-                    (None, name) => format!("{}.{name}", crate::reconcile::DEFAULT_SCHEMA),
+                let namespace = if r.kind == RefKind::Calls {
+                    "routine"
+                } else {
+                    "relation"
                 };
-                if !owned_names.contains(&target) {
+                let target = match crate::entity::split_qualified_name(&r.name) {
+                    (Some(schema), name) => format!("{namespace}:{schema}.{name}"),
+                    (None, name) => format!("{namespace}:{}.{name}", crate::reconcile::DEFAULT_SCHEMA),
+                };
+                if !owned.contains(&target) {
                     uses.insert(Use {
                         kind: "entity".to_string(),
                         target,
                         via: format!("{} {}.{}", via.kind, via.schema, via.name),
+                        search_path: if r.unresolved && r.schema_source.is_guess() {
+                            search_path.clone()
+                        } else {
+                            Vec::new()
+                        },
                     });
                 }
             }

@@ -520,10 +520,11 @@ impl Bookkeeping {
     /// open batch, when there is one, else in a transaction of its own; either
     /// waits at most [`HEAL_LOCK_TIMEOUT`] for the registry. A shared use —
     /// schema, extension, role — is recorded as given. An entity use names its
-    /// target as the design refers to it, `schema.name` split at its first dot
-    /// as dbd splits a name, and is recorded once for each namespace another
-    /// owner holds that schema and name in — `relation:app.orders` — and not
-    /// at all when nobody else holds it.
+    /// target `namespace:schema.name`, the name split at its first dot as dbd
+    /// splits one, and is recorded where another owner holds it — and not at
+    /// all when nobody else does. One named bare is looked up along its search
+    /// path as Postgres looks it up: the first schema anyone holds the name in
+    /// is the one it uses.
     pub(super) async fn record_uses(
         &self,
         tx: Option<&mut Transaction<'static, Postgres>>,
@@ -553,13 +554,26 @@ impl Bookkeeping {
         let column = |list: &[&crate::adapter::Use], f: fn(&crate::adapter::Use) -> &str| -> Vec<String> {
             list.iter().map(|u| f(u).to_string()).collect()
         };
-        let (target_schemas, target_names): (Vec<String>, Vec<String>) = entities
-            .iter()
-            .map(|u| {
-                let (schema, name) = crate::entity::split_qualified_name(&u.target);
-                (schema.unwrap_or_default(), name)
-            })
-            .unzip();
+        // Each entity use's candidates, in the order Postgres tries them: the
+        // target's own schema, or each schema on its search path.
+        let mut candidates = Candidates::default();
+        for (i, u) in entities.iter().enumerate() {
+            let (namespace, qualified) = u.target.split_once(':').unwrap_or_default();
+            let (schema, name) = crate::entity::split_qualified_name(qualified);
+            let schemas = if u.search_path.is_empty() {
+                vec![schema.unwrap_or_default()]
+            } else {
+                u.search_path.clone()
+            };
+            for (rank, schema) in schemas.into_iter().enumerate() {
+                candidates.used.push(i as i32);
+                candidates.rank.push(rank as i32);
+                candidates.namespace.push(namespace.to_string());
+                candidates.schema.push(schema);
+                candidates.name.push(name.clone());
+                candidates.via.push(u.via.clone());
+            }
+        }
         bounded_wait(tx, "dbd.uses", true).await?;
         sqlx::query("DELETE FROM dbd.uses WHERE owner = $1")
             .bind(owner)
@@ -581,15 +595,24 @@ impl Bookkeeping {
         .map_err(|e| registry_error(&e, "dbd.uses", "record uses"))?;
         sqlx::query(
             "INSERT INTO dbd.uses (owner, kind, target, via) \
-               SELECT $1, 'entity', o.namespace || ':' || o.schema || '.' || o.name, d.via \
-               FROM unnest($2::text[], $3::text[], $4::text[]) AS d(schema, name, via) \
-               JOIN dbd.objects o ON o.schema = d.schema AND o.name = d.name AND o.owner <> $1 \
+               SELECT $1, 'entity', h.namespace || ':' || h.schema || '.' || h.name, h.via \
+               FROM ( \
+                 SELECT DISTINCT ON (d.used) d.via, o.namespace, o.schema, o.name, o.owner \
+                 FROM unnest($2::int4[], $3::int4[], $4::text[], $5::text[], $6::text[], $7::text[]) \
+                   AS d(used, rank, namespace, schema, name, via) \
+                 JOIN dbd.objects o ON o.namespace = d.namespace AND o.schema = d.schema AND o.name = d.name \
+                 ORDER BY d.used, d.rank \
+               ) h \
+               WHERE h.owner <> $1 \
              ON CONFLICT DO NOTHING",
         )
         .bind(owner)
-        .bind(&target_schemas)
-        .bind(&target_names)
-        .bind(column(&entities, |u| &u.via))
+        .bind(&candidates.used)
+        .bind(&candidates.rank)
+        .bind(&candidates.namespace)
+        .bind(&candidates.schema)
+        .bind(&candidates.name)
+        .bind(&candidates.via)
         .execute(&mut **tx)
         .await
         .map_err(|e| registry_error(&e, "dbd.uses", "record uses"))?;
@@ -940,6 +963,18 @@ async fn held_objects(
 /// Bound how long `tx` waits for a lock on `table` — [`HEAL_LOCK_TIMEOUT`]
 /// while `on`, and back to the transaction's own setting after: a batch's DDL
 /// keeps whatever wait it had.
+/// The rows an entity use is looked up by: one per schema it may be in, `rank`
+/// its place on the search path, `used` the use it stands for.
+#[derive(Default)]
+struct Candidates {
+    used: Vec<i32>,
+    rank: Vec<i32>,
+    namespace: Vec<String>,
+    schema: Vec<String>,
+    name: Vec<String>,
+    via: Vec<String>,
+}
+
 async fn bounded_wait(tx: &mut Transaction<'static, Postgres>, table: &str, on: bool) -> Result<()> {
     use sqlx::Executor as _;
     let sql = if on {

@@ -91,13 +91,20 @@ pub struct OwnedObject {
 pub struct Use {
     /// `schema`, `extension`, `role` or `entity`.
     pub kind: String,
-    /// The schema, extension or role's name; for an `entity`, `schema.name` as
-    /// the design refers to it — recorded as `namespace:schema.name` when
-    /// another owner holds it, and not at all when nobody else does.
+    /// The schema, extension or role's name; for an `entity`,
+    /// `namespace:schema.name` — `relation:app.orders` — with the name split
+    /// at its first dot as dbd splits one. An entity use is recorded only
+    /// where another owner holds the target, and not at all when nobody else
+    /// does.
     pub target: String,
     /// For an `entity`, the owner's own entity that makes the reference —
     /// `view billing.v_invoices`; empty otherwise.
     pub via: String,
+    /// For an `entity` named bare, the schemas Postgres looks the name up in,
+    /// in order: the use is of the first that holds it, the target's own
+    /// schema standing in for none. Empty when the source wrote the schema,
+    /// or dbd found the target.
+    pub search_path: Vec<String>,
 }
 
 /// An entity another owner holds, and that owner.
