@@ -88,6 +88,14 @@ release added. Each was reproduced or read in the code; locations are as of the
   a name with a dot and splits them again throughout
   (`entity::split_qualified_name` and its kin), and `emit.rs` `bare()` (~16)
   cuts at the last dot, so `app."we.ird"` is emitted as `app_ird`.
+- A type in a schema that needs quoting never matches its introspected
+  spelling: `format_type` writes `"Ext".citext`, `reconcile::canonical_type`
+  lowercases inside the quotes (`"ext".citext`), and the enum map and
+  `qualify_extension_types` build `ext.citext` unquoted — so an enum or an
+  extension type in a mixed-case schema reads as drift on every run, and the
+  emitted `TYPE ext.citext` names a schema that does not exist. Needs
+  quote-aware case folding in `canonical_type` and `sql_quote::ident` for the
+  canonical names (found reviewing #41).
 
 **Reverse engineering (`init --from-db`, `merge`)**
 - Domains and composite types are neither captured nor named, so apply on a

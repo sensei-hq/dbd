@@ -18,10 +18,14 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   so every `reconcile` after the first planned an `ALTER … TYPE` that changed
   nothing — and failed, "cannot alter type of a column used by a view or rule",
   once a view read the column. `dbd diff` reported the same false drift. Both
-  now spell an extension's type as the database does, a modifier and an array
-  included, and a real change to one emits `TYPE extensions.citext`, which
-  resolves wherever the session path points. A bare name the project's own
-  enum declares, or that two extensions own, is left as written. ([#41])
+  now spell an extension's type as the database does — a modifier, an array
+  and an extension's domain included, whichever path a pooled connection or
+  the database (Supabase's reaches `extensions`) reads it through — and a real
+  change to one emits `TYPE extensions.citext`, which resolves wherever the
+  session path points. Only a name the extension alone owns is read as its
+  type: a bare `date` stays `pg_catalog.date` on a database with orafce's
+  `oracle.date`, and a name the project's own enum or domain, or a second
+  extension, also has is compared as written, as before. ([#41])
 
 ### Library API
 
