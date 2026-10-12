@@ -3480,6 +3480,58 @@ import:
         );
     }
 
+    /// A version's data scripts ran only for the tables it altered, so a
+    /// `data.sql` seeding a table the same version adds never ran — and was
+    /// not listed in the preview either — while the version was recorded as
+    /// applied. It is the version's own data script: it runs after the
+    /// version's creates, with the rest of its data scripts, and is listed.
+    #[tokio::test]
+    async fn a_data_script_for_a_table_its_version_adds_runs_after_the_create() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        let config = dir.join("design.yaml");
+        std::fs::write(&config, "project:\n  name: t\nschemas:\n  - app\n").unwrap();
+        let table = |t: &str| {
+            std::fs::write(
+                dir.join(format!("ddl/table/app/{t}.ddl")),
+                format!("set search_path to app;\ncreate table if not exists {t} (id integer primary key);\n"),
+            )
+            .unwrap();
+        };
+        let load = || Design::from_config_with_dir(&config, "dev", Some(dir)).unwrap();
+        table("users");
+        crate::snapshot::create_snapshot(load().entities(), dir, &config, "baseline").unwrap();
+        table("kinds");
+        crate::snapshot::create_snapshot(load().entities(), dir, &config, "add kinds").unwrap();
+        std::fs::create_dir_all(dir.join("migrations/002/app")).unwrap();
+        std::fs::write(
+            dir.join("migrations/002/app/kinds.data.sql"),
+            "insert into kinds (id) values (1) on conflict do nothing;\n",
+        )
+        .unwrap();
+
+        let design = load();
+        assert_eq!(design.config().project.version, Some(2), "the second snapshot is v2");
+        let mock = MockAdapter::new().with_meta("dev", 1);
+        let preview = design.pending_migration_preview(&mock, None, None).await.unwrap();
+        assert!(
+            preview
+                .steps
+                .iter()
+                .any(|s| s.entity == "app.kinds" && s.action == MigrationAction::Data && s.version == 2),
+            "the preview lists the data script of app.kinds: {:?}",
+            preview.steps
+        );
+
+        design.apply(&mock, None, false, None, Progress::none()).await.unwrap();
+        let scripts = mock.scripts.lock().unwrap().clone();
+        let at = |needle: &str| scripts.iter().position(|s| s.contains(needle));
+        let created = at("create table if not exists kinds").expect("app.kinds is created");
+        let seeded = at("insert into kinds").unwrap_or_else(|| panic!("its data script runs: {scripts:#?}"));
+        assert!(created < seeded, "after the create: {scripts:#?}");
+    }
+
     /// A migration's drop runs only where the table still exists. Generated
     /// drops are a bare `DROP TABLE … CASCADE`, so a database whose scope never
     /// had the table would fail on it now that a scope runs the drops in its
