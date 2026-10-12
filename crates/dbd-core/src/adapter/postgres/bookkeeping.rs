@@ -712,6 +712,63 @@ impl Bookkeeping {
         }
     }
 
+    /// Other owners' dependences on `guarded`, from the catalog's dependency
+    /// graph — whatever a `CASCADE` would reach, a dependent's own dependents
+    /// included — and from `dbd.uses`, which sees into routine bodies the
+    /// catalog does not. Reads only; a database with no registry has none.
+    pub(super) async fn dependents(
+        &self,
+        owner: &str,
+        guarded: &[crate::adapter::Guarded],
+    ) -> Result<Vec<crate::adapter::Dependence>> {
+        use crate::adapter::GuardedPart;
+        let read = |e: sqlx::Error| DbdError::Config(format!("uses guard read failed: {e}"));
+        let registry: Option<String> = sqlx::query_scalar("SELECT to_regclass('dbd.objects')::text")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(read)?;
+        if registry.is_none() {
+            return Ok(Vec::new());
+        }
+        let mut found = Vec::new();
+        for (i, g) in guarded.iter().enumerate() {
+            let (part, part_name) = match &g.part {
+                GuardedPart::Whole => ("whole", ""),
+                GuardedPart::Column(c) => ("column", c.as_str()),
+                GuardedPart::Constraint(c) => ("constraint", c.as_str()),
+                GuardedPart::Index(n) => ("index", n.as_str()),
+            };
+            let mut seen: std::collections::BTreeSet<(String, String)> = sqlx::query_as(DEPENDENTS_SQL)
+                .bind(&g.object.namespace)
+                .bind(&g.object.schema)
+                .bind(&g.object.name)
+                .bind(part)
+                .bind(part_name)
+                .bind(owner)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(read)?
+                .into_iter()
+                .collect();
+            let uses: Vec<(String, String)> = sqlx::query_as(
+                "SELECT owner, via FROM dbd.uses WHERE kind = 'entity' AND target = $1 AND owner <> $2 \
+                   AND ($3 OR via LIKE 'function %' OR via LIKE 'procedure %')",
+            )
+            .bind(format!("{}:{}.{}", g.object.namespace, g.object.schema, g.object.name))
+            .bind(owner)
+            .bind(part == "whole")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(read)?;
+            seen.extend(uses);
+            found.extend(
+                seen.into_iter()
+                    .map(|(owner, via)| crate::adapter::Dependence { guarded: i, owner, via }),
+            );
+        }
+        Ok(found)
+    }
+
     /// Read the recorded version for this project (authoritative version source).
     /// Catalog-resolved (both-names aware) so a not-yet-healed legacy DB is read
     /// correctly instead of silently missed as version 0. `0` when there is no
@@ -1129,3 +1186,81 @@ async fn release_in(
     .map_err(|e| registry_error(&e, "dbd.objects", "release"))?;
     bounded_wait(tx, "dbd.objects", false).await
 }
+
+/// What depends on one guarded entity, owned by another owner: `$1..$3` the
+/// entity's namespace, schema and name; `$4` what of it goes — `whole`,
+/// `column`, `constraint` or `index` — and `$5` that part's name; `$6` the
+/// owner asking. Walks `pg_depend` from the entity (a table with its row type,
+/// a column, a constraint with the index behind it, an index, every overload of
+/// a routine) through each dependent's owning relation or routine — a view's
+/// rewrite rule stands for the view, a constraint, trigger, default or policy
+/// for its table — so a dependent's own dependents are reached, as a `CASCADE`
+/// reaches them. Rows: the other owner, and the dependent as `kind
+/// schema.name`.
+const DEPENDENTS_SQL: &str = "\
+WITH RECURSIVE \
+rel AS (SELECT c.oid, c.reltype FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+        WHERE $1 = 'relation' AND n.nspname = $2 AND c.relname = $3), \
+typ AS (SELECT t.oid FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
+        WHERE $1 = 'relation' AND n.nspname = $2 AND t.typname = $3 AND t.typrelid = 0), \
+start(classid, objid, objsubid) AS ( \
+  SELECT 'pg_class'::regclass::oid, rel.oid, 0 FROM rel WHERE $4 = 'whole' \
+  UNION ALL SELECT 'pg_type'::regclass::oid, rel.reltype, 0 FROM rel WHERE $4 = 'whole' AND rel.reltype <> 0 \
+  UNION ALL SELECT 'pg_type'::regclass::oid, typ.oid, 0 FROM typ WHERE $4 = 'whole' \
+  UNION ALL SELECT 'pg_class'::regclass::oid, rel.oid, a.attnum FROM rel \
+            JOIN pg_attribute a ON a.attrelid = rel.oid \
+            WHERE $4 = 'column' AND a.attname = $5 AND NOT a.attisdropped \
+  UNION ALL SELECT 'pg_constraint'::regclass::oid, k.oid, 0 FROM rel \
+            JOIN pg_constraint k ON k.conrelid = rel.oid WHERE $4 = 'constraint' AND k.conname = $5 \
+  UNION ALL SELECT 'pg_class'::regclass::oid, k.conindid, 0 FROM rel \
+            JOIN pg_constraint k ON k.conrelid = rel.oid \
+            WHERE $4 = 'constraint' AND k.conname = $5 AND k.conindid <> 0 \
+  UNION ALL SELECT 'pg_class'::regclass::oid, i.oid, 0 FROM pg_class i JOIN pg_namespace n ON n.oid = i.relnamespace \
+            WHERE $4 = 'index' AND $1 = 'relation' AND n.nspname = $2 AND i.relname = $5 AND i.relkind IN ('i', 'I') \
+  UNION ALL SELECT 'pg_proc'::regclass::oid, p.oid, 0 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+            WHERE $1 = 'routine' AND n.nspname = $2 AND p.proname = $3 \
+), \
+walk(classid, objid, objsubid) AS ( \
+  SELECT classid, objid, objsubid FROM start \
+  UNION \
+  SELECT x.classid, x.objid, 0 FROM walk w \
+  JOIN pg_depend d ON d.refclassid = w.classid AND d.refobjid = w.objid \
+                  AND (w.objsubid = 0 OR d.refobjsubid = w.objsubid) AND d.deptype IN ('n', 'a') \
+  CROSS JOIN LATERAL ( \
+    SELECT CASE WHEN d.classid IN ('pg_rewrite'::regclass, 'pg_constraint'::regclass, 'pg_trigger'::regclass, \
+                                   'pg_attrdef'::regclass, 'pg_policy'::regclass) \
+                THEN 'pg_class'::regclass::oid ELSE d.classid END AS classid, \
+           CASE d.classid \
+             WHEN 'pg_rewrite'::regclass THEN (SELECT r.ev_class FROM pg_rewrite r WHERE r.oid = d.objid) \
+             WHEN 'pg_constraint'::regclass THEN (SELECT k.conrelid FROM pg_constraint k WHERE k.oid = d.objid) \
+             WHEN 'pg_trigger'::regclass THEN (SELECT t.tgrelid FROM pg_trigger t WHERE t.oid = d.objid) \
+             WHEN 'pg_attrdef'::regclass THEN (SELECT a.adrelid FROM pg_attrdef a WHERE a.oid = d.objid) \
+             WHEN 'pg_policy'::regclass THEN (SELECT p.polrelid FROM pg_policy p WHERE p.oid = d.objid) \
+             ELSE d.objid END AS objid \
+  ) x \
+  WHERE x.objid IS NOT NULL AND x.objid <> 0 \
+), \
+found(namespace, schema, name, kind) AS ( \
+  SELECT 'relation', n.nspname, c.relname, \
+         CASE c.relkind WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' WHEN 'S' THEN 'sequence' \
+                        WHEN 'f' THEN 'foreign table' WHEN 'c' THEN 'type' ELSE 'table' END \
+  FROM walk w JOIN pg_class c0 ON w.classid = 'pg_class'::regclass AND c0.oid = w.objid \
+  JOIN pg_class c ON c.oid = CASE WHEN c0.relkind IN ('i', 'I') \
+                                  THEN (SELECT x.indrelid FROM pg_index x WHERE x.indexrelid = c0.oid) \
+                                  ELSE c0.oid END \
+  JOIN pg_namespace n ON n.oid = c.relnamespace \
+  UNION \
+  SELECT 'relation', n.nspname, COALESCE(c.relname, t.typname), \
+         CASE WHEN c.oid IS NULL THEN 'type' WHEN c.relkind = 'v' THEN 'view' \
+              WHEN c.relkind = 'm' THEN 'materialized view' ELSE 'table' END \
+  FROM walk w JOIN pg_type t ON w.classid = 'pg_type'::regclass AND t.oid = w.objid \
+  LEFT JOIN pg_class c ON c.oid = t.typrelid \
+  JOIN pg_namespace n ON n.oid = COALESCE(c.relnamespace, t.typnamespace) \
+  UNION \
+  SELECT 'routine', n.nspname, p.proname, CASE p.prokind WHEN 'p' THEN 'procedure' ELSE 'function' END \
+  FROM walk w JOIN pg_proc p ON w.classid = 'pg_proc'::regclass AND p.oid = w.objid \
+  JOIN pg_namespace n ON n.oid = p.pronamespace \
+) \
+SELECT DISTINCT o.owner, f.kind || ' ' || f.schema || '.' || f.name \
+FROM found f JOIN dbd.objects o ON o.namespace = f.namespace AND o.schema = f.schema AND o.name = f.name \
+WHERE o.owner <> $6";

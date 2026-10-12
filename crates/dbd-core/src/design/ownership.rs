@@ -381,46 +381,107 @@ impl Design {
         }
     }
 
-    /// Refuse, before any write and under a dry run, removing an enum value
-    /// when a column of that type is in another owner's table: the swap
-    /// rewrites every such column, and this run has no say over that table —
-    /// left to it, the swap failed on every run with Postgres's word for it
-    /// (#7). `others` is the live snapshot of those tables.
-    pub(crate) fn refuse_enum_swaps_another_owner_holds(
+    /// The uses guard (#7): what another owner depends on is part of the
+    /// contract between them. A prune candidate another owner depends on is
+    /// kept, named — dropped `CASCADE`, it took that owner's dependents with
+    /// it. A part the plan drops — a column, a constraint, an index, an enum's
+    /// value (its whole type is swapped) — that another owner depends on is
+    /// refused, before any write and under a dry run, naming each use. A
+    /// part's dependents are the catalog's, column by column, and the uses
+    /// recorded through routine bodies, which the catalog does not track.
+    pub(crate) async fn guard_uses(
         &self,
-        plan: &crate::reconcile::ReconcilePlan,
-        others: &crate::snapshot::Snapshot,
-        owned: &LiveOwnership,
+        adapter: &dyn DatabaseAdapter,
+        plan: &mut crate::reconcile::ReconcilePlan,
     ) -> Result<()> {
-        let mut held = Vec::new();
-        for swap in &plan.enum_swaps {
-            let columns: Vec<String> = crate::reconcile::enum_columns(others, &swap.enum_name)
-                .into_iter()
-                .map(|c| {
-                    let key = match crate::entity::split_qualified_name(&c.table) {
-                        (Some(schema), name) => (schema, name),
-                        (None, name) => (crate::reconcile::DEFAULT_SCHEMA.to_string(), name),
-                    };
-                    let owner = owned.others.get(&key).map(String::as_str).unwrap_or("another owner");
-                    format!("{}.{} (\"{owner}\")", c.table, c.column)
-                })
-                .collect();
-            if columns.is_empty() {
-                continue;
+        use crate::adapter::{Guarded, GuardedPart};
+        use crate::reconcile::DroppedKind;
+        let key = |entity: &str| {
+            let (schema, name) = crate::entity::split_qualified_name(entity);
+            OwnedObject {
+                namespace: "relation".to_string(),
+                schema: schema.unwrap_or_else(|| crate::reconcile::DEFAULT_SCHEMA.to_string()),
+                name,
+                kind: String::new(),
             }
-            let values: Vec<String> = swap.removed.iter().map(|v| crate::sql_quote::literal(v)).collect();
-            held.push(format!(
-                "removing {} from {} rewrites every column of that type, and {} {} in another owner's table",
-                values.join(", "),
-                swap.enum_name,
-                columns.join(", "),
-                if columns.len() == 1 { "is" } else { "are" },
-            ));
+        };
+        let prunes = plan.dropped.len();
+        let mut guarded: Vec<(Guarded, String)> = plan
+            .dropped
+            .iter()
+            .map(|stmt| {
+                (
+                    Guarded {
+                        object: key(&stmt.entity_name),
+                        part: GuardedPart::Whole,
+                    },
+                    stmt.entity_name.clone(),
+                )
+            })
+            .collect();
+        for part in &plan.dropped_parts {
+            let (part_kind, label) = match part.kind {
+                DroppedKind::Column => (
+                    GuardedPart::Column(part.name.clone()),
+                    format!("{}.{}", part.entity, part.name),
+                ),
+                DroppedKind::Constraint if !part.name.is_empty() => (
+                    GuardedPart::Constraint(part.name.clone()),
+                    format!("{} constraint {}", part.entity, part.name),
+                ),
+                DroppedKind::Index => (
+                    GuardedPart::Index(part.name.clone()),
+                    format!("{} index {}", part.entity, part.name),
+                ),
+                DroppedKind::EnumValue => (GuardedPart::Whole, part.entity.clone()),
+                // A foreign key of this project's own table holds nobody up.
+                DroppedKind::Constraint | DroppedKind::ForeignKey => continue,
+            };
+            let g = Guarded {
+                object: key(&part.entity),
+                part: part_kind,
+            };
+            if !guarded.iter().any(|(seen, _)| *seen == g) {
+                guarded.push((g, label));
+            }
         }
-        if held.is_empty() {
+        if guarded.is_empty() {
             return Ok(());
         }
-        Err(DbdError::Config(format!("{}; remove that use first", held.join("; "))))
+        let objects: Vec<Guarded> = guarded.iter().map(|(g, _)| g.clone()).collect();
+        let found = adapter.dependents(self.owner(), &objects).await?;
+        let uses_of = |i: usize| -> Option<String> {
+            let uses: Vec<String> = found
+                .iter()
+                .filter(|d| d.guarded == i)
+                .map(|d| format!("\"{}\" ({})", d.owner, d.via))
+                .collect();
+            (!uses.is_empty()).then(|| uses.join(", "))
+        };
+        // A prune candidate depended on: kept, named.
+        let mut kept = Vec::new();
+        for (i, (_, label)) in guarded.iter().enumerate().take(prunes) {
+            if let Some(uses) = uses_of(i) {
+                kept.push(label.clone());
+                plan.warnings
+                    .push(format!("{label} is used by {uses} — not pruned; remove that use first"));
+            }
+        }
+        plan.dropped.retain(|stmt| !kept.contains(&stmt.entity_name));
+        // A part depended on: refused.
+        let refused: Vec<String> = guarded
+            .iter()
+            .enumerate()
+            .skip(prunes)
+            .filter_map(|(i, (_, label))| uses_of(i).map(|uses| format!("{label} is used by {uses}")))
+            .collect();
+        if refused.is_empty() {
+            return Ok(());
+        }
+        Err(DbdError::Config(format!(
+            "{}; remove that use first",
+            refused.join("; ")
+        )))
     }
 
     /// Settle what a prune drops by ownership (#7). Another owner's entities

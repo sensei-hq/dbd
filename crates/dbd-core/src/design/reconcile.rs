@@ -448,20 +448,6 @@ impl Design {
             restrict_snapshot_to_schemas(compared_snapshot(&live_entities, &extension_types), &managed_schemas);
         let owned = self.live_ownership(adapter, &live_full).await?;
         hidden.extend(owned.others.keys().cloned());
-        // Kept aside: an enum swap rewrites another owner's column too, which
-        // the run must refuse rather than hide.
-        let others_live = crate::snapshot::Snapshot {
-            tables: live_full
-                .tables
-                .iter()
-                .filter(|t| owned.others.contains_key(&(t.schema.clone(), t.name.clone())))
-                .cloned()
-                .collect(),
-            enums: Vec::new(),
-            version: live_full.version,
-            description: String::new(),
-            timestamp: String::new(),
-        };
         let live = hide_declared(live_full, &hidden);
 
         let mut plan = plan_reconcile(&live, &desired);
@@ -536,7 +522,9 @@ impl Design {
         // swap, and dbd never drops one: refused here, before any write and
         // under `dry_run`, against what the database has.
         refuse_enum_swaps_a_matview_blocks(adapter, &plan, &desired_entities).await?;
-        self.refuse_enum_swaps_another_owner_holds(&plan, &others_live, &owned)?;
+        // What another owner depends on: a prune keeps it, a dropped part is
+        // refused — before any write, dry run included (#7).
+        self.guard_uses(adapter, &mut plan).await?;
 
         if dry_run {
             // Checked as the run checks them, executing none: a hook file that

@@ -2581,6 +2581,10 @@ ORDER BY 1, 2, 4, 5"#;
         self.bookkeeping.release_objects(guard.as_mut(), owner, declared).await
     }
 
+    async fn dependents(&self, owner: &str, guarded: &[super::Guarded]) -> Result<Vec<super::Dependence>> {
+        self.bookkeeping.dependents(owner, guarded).await
+    }
+
     async fn get_db_version(&self) -> Result<u32> {
         self.bookkeeping.version().await
     }
