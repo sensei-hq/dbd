@@ -65,9 +65,15 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   database records has not upgraded dbd — is kept and named: `unowned:
   app.tmp_report — not dropped because app is shared with "billing"
   (--prune-unowned drops it)`. `reconcile --prune-unowned` drops those too,
-  naming each. A successful `apply`, `deploy` or `reconcile` releases what its
+  naming each. A prune claims what it drops before it writes, so a table
+  another project claims meanwhile is kept, naming it; and removing an enum
+  value that a column of another project's table holds is refused, dry run
+  included, naming the column and its owner. A successful `apply`, `deploy`
+  or `reconcile` releases what its
   project no longer declares once it is gone — pruned, or dropped by a
-  migration or by hand; until then it stays the project's.
+  migration or by hand; until then it stays the project's. A prune's `DROP`
+  now quotes the table it names: `app."Report"` written unquoted dropped the
+  `app.report` beside it.
 
 ### Library API
 
