@@ -2247,15 +2247,25 @@ impl DatabaseAdapter for PostgresAdapter {
     async fn extension_types(&self) -> Result<Vec<(String, String)>> {
         // `deptype = 'e'` is what `CREATE EXTENSION` records for each object
         // its script makes. Every schema counts — an extension may live in one
-        // introspection leaves out — and the array types it makes too are
-        // skipped, since a column spells one as its element type plus `[]`.
+        // introspection leaves out. The array types it makes are skipped, since
+        // a column spells one as its element type plus `[]`; a domain over an
+        // array shares their category but is named by its own name, so only a
+        // base type is skipped. So is a name a type outside every extension
+        // also has: a bare `date` is `pg_catalog.date` whatever orafce's
+        // `oracle.date` is, and a project's own domain is the project's.
         let rows = sqlx::query(
             "SELECT n.nspname, t.typname \
              FROM pg_catalog.pg_type t \
              JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace \
-             JOIN pg_catalog.pg_depend d ON d.classid = 'pg_catalog.pg_type'::pg_catalog.regclass \
-               AND d.objid = t.oid AND d.deptype = 'e' \
-             WHERE t.typcategory <> 'A' \
+             WHERE EXISTS (SELECT 1 FROM pg_catalog.pg_depend d \
+                           WHERE d.classid = 'pg_catalog.pg_type'::pg_catalog.regclass \
+                             AND d.objid = t.oid AND d.deptype = 'e') \
+               AND NOT (t.typtype = 'b' AND t.typcategory = 'A') \
+               AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_type o \
+                               WHERE o.typname = t.typname AND o.oid <> t.oid \
+                                 AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d \
+                                                 WHERE d.classid = 'pg_catalog.pg_type'::pg_catalog.regclass \
+                                                   AND d.objid = o.oid AND d.deptype = 'e')) \
              ORDER BY n.nspname, t.typname",
         )
         .fetch_all(&self.pool)
