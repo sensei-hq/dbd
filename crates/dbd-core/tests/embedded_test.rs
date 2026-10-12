@@ -10372,3 +10372,247 @@ async fn a_claim_held_up_by_an_open_registry_write_fails_naming_it() {
         .to_string();
     assert!(err.contains("dbd.objects"), "{err}");
 }
+
+/// A file may create more than the entity its path names — `orders.ddl`
+/// creating `order_status` then `orders`. Keyed by its first `CREATE`, the
+/// path's table went unclaimed, another project took it, and this project's
+/// reset then dropped that project's table. Every entity a file creates is
+/// claimed (#7).
+#[tokio::test]
+async fn a_file_creating_two_tables_owns_both() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let intruder = connect(&url, "intruder").await.unwrap();
+    let (sd, id) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    named_project(
+        sd.path(),
+        "shop",
+        "",
+        &[(
+            "ddl/table/app/orders.ddl",
+            "set search_path to app;\n\
+             create table if not exists order_status (id int primary key);\n\
+             create table if not exists orders (id int primary key, status int references order_status (id));\n",
+        )],
+    )
+    .apply(&*shop, None, false, None, Progress::none())
+    .await
+    .expect("shop's apply");
+
+    let err = named_project(id.path(), "intruder", "", &ORDERS_OWNER_FILES[..1])
+        .apply(&*intruder, None, false, None, Progress::none())
+        .await
+        .expect_err("app.orders is shop's")
+        .to_string();
+    assert!(err.contains("relation app.orders is owned by \"shop\""), "{err}");
+}
+
+/// Two runs of one project at once, one failing: its failure must not take
+/// from the other what the other built. A run claims what it built, when it
+/// has built it — so the failed one claimed nothing to give back (#7).
+#[tokio::test]
+async fn a_failed_run_beside_a_succeeding_one_leaves_the_project_its_claims() {
+    let (_pg, url) = start_pg().await;
+    let (fd, sd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let failing = named_project(
+        fd.path(),
+        "shop",
+        "apply:\n  before:\n    - sql/slow_fail.sql\n",
+        &[
+            ("sql/slow_fail.sql", "select pg_sleep(2); select 1 / 0;\n"),
+            ORDERS_OWNER_FILES[0],
+        ],
+    );
+    let succeeding = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1]);
+    let (a, b) = (
+        connect(&url, "shop").await.unwrap(),
+        connect(&url, "shop").await.unwrap(),
+    );
+
+    let (failed, succeeded) = tokio::join!(failing.apply(&*a, None, false, None, Progress::none()), async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        succeeding.apply(&*b, None, false, None, Progress::none()).await
+    });
+    failed.expect_err("the hook divides by zero");
+    succeeded.expect("the other run");
+    assert_catalog(
+        &*b,
+        true,
+        &owned_by("relation", "app", "orders", "table", "shop"),
+        "shop's app.orders",
+    )
+    .await;
+}
+
+/// The uses are written with the claim, and wait as it does: an open write on
+/// `dbd.uses` gives the run up after a few seconds, naming it (#7).
+#[tokio::test]
+async fn a_run_held_up_by_an_open_uses_write_fails_naming_it() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let holder = connect(&url, "holder").await.unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    let design = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1]);
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's first apply");
+    holder.begin_batch().await.unwrap();
+    holder
+        .execute_script("UPDATE dbd.uses SET via = via WHERE owner = 'shop';")
+        .await
+        .unwrap();
+
+    let applied = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        design.apply(&*shop, None, false, None, Progress::none()),
+    )
+    .await;
+    holder.rollback_batch().await.unwrap();
+    let err = applied
+        .expect("the run must give up, not wait for as long as the write stays open")
+        .expect_err("an open write holds the uses")
+        .to_string();
+    assert!(err.contains("dbd.uses"), "{err}");
+}
+
+/// A run that fails keeps the record of what the project uses as it was: the
+/// uses describe what is built, and a failed run built nothing (#7).
+#[tokio::test]
+async fn a_failed_run_keeps_the_uses_it_had() {
+    let (_pg, url) = start_pg().await;
+    let shop_adapter = connect(&url, "shop").await.unwrap();
+    let billing_adapter = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    write_project(sd.path(), SHOP_YAML, SHOP_FILES)
+        .apply(&*shop_adapter, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    shop_adapter
+        .execute_script("CREATE TABLE public.loose (id int);")
+        .await
+        .unwrap();
+    let view = (
+        "ddl/view/billing/v_orders.ddl",
+        "create or replace view billing.v_orders as select o.id from app.orders o;\n",
+    );
+    write_project(bd.path(), BILLING_USES_YAML, &[view])
+        .apply(&*billing_adapter, None, false, None, Progress::none())
+        .await
+        .expect("billing's apply");
+    let orders_use = used_by("billing", "entity", "relation:app.orders", "view billing.v_orders");
+    assert_catalog(&*billing_adapter, true, &orders_use, "billing's use of app.orders").await;
+
+    // The view stops reading app.orders, and a new table fails to build.
+    std::fs::write(
+        bd.path().join(view.0),
+        "create or replace view billing.v_orders as select 1 as id;\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(bd.path().join("ddl/table/billing")).unwrap();
+    std::fs::write(
+        bd.path().join("ddl/table/billing/broken.ddl"),
+        "create table if not exists billing.broken (id int references billing.nowhere (id));\n",
+    )
+    .unwrap();
+    Design::from_config_with_dir(&bd.path().join("design.yaml"), "dev", Some(bd.path()))
+        .unwrap()
+        .apply(&*billing_adapter, None, false, None, Progress::none())
+        .await
+        .expect_err("billing.nowhere does not exist");
+    assert_catalog(
+        &*billing_adapter,
+        true,
+        &orders_use,
+        "billing's use of app.orders, kept",
+    )
+    .await;
+}
+
+/// Overloads of one routine are one entity, in as many files as the author
+/// likes — and each file's references are the routine's uses (#7).
+#[tokio::test]
+async fn every_overload_records_its_references() {
+    let (_pg, url) = start_pg().await;
+    let billing = connect(&url, "billing").await.unwrap();
+    let shop = connect(&url, "shop").await.unwrap();
+    let (bd, sd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    write_project(
+        bd.path(),
+        "project:\n  name: billing\nsource:\n  dialect: postgresql\nschemas:\n  - bill\n",
+        &[
+            (
+                "ddl/table/bill/invoices.ddl",
+                "create table if not exists bill.invoices (id int primary key);\n",
+            ),
+            (
+                "ddl/table/bill/payments.ddl",
+                "create table if not exists bill.payments (id int primary key);\n",
+            ),
+        ],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+    write_project(
+        sd.path(),
+        "project:\n  name: shop\nsource:\n  dialect: postgresql\nschemas:\n  - app\n\
+         external:\n  - name: bill.invoices\n  - name: bill.payments\n",
+        &[
+            (
+                "ddl/function/app/total.ddl",
+                "create or replace function app.total(n int) returns bigint language sql \
+                 as $$ select count(*) from bill.invoices $$;\n",
+            ),
+            (
+                "ddl/function/app/total_text.ddl",
+                "create or replace function app.total(n text) returns bigint language sql \
+                 as $$ select count(*) from bill.payments $$;\n",
+            ),
+        ],
+    )
+    .apply(&*shop, None, false, None, Progress::none())
+    .await
+    .expect("shop's apply");
+
+    for table in ["invoices", "payments"] {
+        assert_catalog(
+            &*shop,
+            true,
+            &format!("SELECT 1 FROM dbd.uses WHERE owner = 'shop' AND target = 'relation:bill.{table}'"),
+            &format!("shop's use of bill.{table}"),
+        )
+        .await;
+    }
+}
+
+/// A reference to `a.b.c` names, as dbd splits a name at its first dot,
+/// `"a"."b.c"` — not a `"a.b"."c"` another project holds (#7).
+#[tokio::test]
+async fn a_dotted_reference_is_matched_as_dbd_splits_it() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    shop.heal_bookkeeping().await.unwrap();
+    shop.execute_script(
+        "INSERT INTO dbd.objects (namespace, schema, name, kind, owner) VALUES ('relation', 'a.b', 'c', 'table', 'crm');",
+    )
+    .await
+    .unwrap();
+    shop.record_uses(
+        "shop",
+        &[dbd_core::adapter::Use {
+            kind: "entity".to_string(),
+            target: "a.b.c".to_string(),
+            via: "view app.v".to_string(),
+        }],
+    )
+    .await
+    .unwrap();
+    assert_catalog(
+        &*shop,
+        false,
+        "SELECT 1 FROM dbd.uses WHERE owner = 'shop' AND kind = 'entity'",
+        "a use of crm's \"a.b\".\"c\"",
+    )
+    .await;
+}

@@ -2260,3 +2260,47 @@ async fn dry_runs_refuse_a_design_declaring_another_owners_entity() {
         );
     }
 }
+
+/// A run killed part-way — the wrong database, noticed in time — leaves no
+/// claim behind: it claims what it built, once built (#7).
+#[tokio::test]
+async fn an_interrupted_apply_holds_no_claims() {
+    let (pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir);
+    let yaml = std::fs::read_to_string(dir.join("design.yaml")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        format!("{yaml}apply:\n  before:\n    - sql/slow.sql\n"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("sql")).unwrap();
+    std::fs::write(dir.join("sql/slow.sql"), "select pg_sleep(20);\n").unwrap();
+
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("dbd"))
+        .args(["apply", "-c", dir.join("design.yaml").to_str().unwrap(), "-d", &url])
+        .current_dir(dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn dbd");
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    child.kill().expect("kill dbd");
+    let _ = child.wait();
+
+    let registry = psql(
+        &pg,
+        &url,
+        &["-tA", "-c", "select to_regclass('dbd.objects') is not null"],
+    );
+    if stdout(&registry).trim() == "t" {
+        let held = psql(&pg, &url, &["-tA", "-c", "select count(*) from dbd.objects"]);
+        assert_eq!(
+            stdout(&held).trim(),
+            "0",
+            "the killed run's claims: {}",
+            combined(&held)
+        );
+    }
+}
