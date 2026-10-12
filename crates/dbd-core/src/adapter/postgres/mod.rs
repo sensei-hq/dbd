@@ -231,25 +231,31 @@ const REFRESH_COMMAND: &str = r#"^REFRESH MATERIALIZED VIEW (CONCURRENTLY )?"([^
 /// failed every sync. Only a named job whose command is in dbd's form is looked
 /// at, `CASE` keeping the lookup from anything else.
 ///
+/// Names are compared as Postgres reads them, cut at 63 bytes
+/// (`parse_ident(…)::name`): a view named past that is the cut name, and so is
+/// the one its job's `REFRESH` reaches.
+///
 /// Every project's sync goes for the same gone jobs, and pg_cron raises when
 /// asked to unschedule one already gone, so the statement first takes a lock
 /// held to the end of its transaction: syncs take turns, and the next one's
-/// read finds the job gone. Empty lists still yield valid SQL via a typed
-/// empty array (`ARRAY[]::text[]`).
+/// read — `READ COMMITTED`, whatever the database's default, so its snapshot
+/// follows the wait — finds the job gone. Empty lists still yield valid SQL
+/// via a typed empty array (`ARRAY[]::text[]`).
 fn unschedule_stale_sql(owner: &str, keep_job_names: &[String], legacy_job_names: &[String]) -> String {
     let prefix = refresh_job_prefix(owner).replace('\'', "''");
     format!(
-        "SELECT pg_advisory_xact_lock(hashtext('dbd:cron')); \
+        "SET TRANSACTION ISOLATION LEVEL READ COMMITTED; \
+         SELECT pg_advisory_xact_lock(hashtext('dbd:cron')); \
          SELECT cron.unschedule(jobid) FROM cron.job \
          WHERE (left(jobname, length('{prefix}')) = '{prefix}' AND jobname <> ALL({})) \
             OR jobname = ANY({}) \
             OR (jobname IS NOT NULL AND left(jobname, 12) = 'dbd:refresh:' \
                 AND CASE WHEN command ~ '{REFRESH_COMMAND}' THEN NOT EXISTS ( \
                       SELECT 1 FROM pg_catalog.pg_class c \
-                      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-                      WHERE '\"' || replace(n.nspname, '\"', '\"\"') || '\".\"' \
-                            || replace(c.relname, '\"', '\"\"') || '\"' \
-                          = substring(command from '^REFRESH MATERIALIZED VIEW (?:CONCURRENTLY )?(.*)$')) \
+                      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace, \
+                      parse_ident(substring(command from '^REFRESH MATERIALIZED VIEW (?:CONCURRENTLY )?(.*)$')) \
+                        AS v(parts) \
+                      WHERE n.nspname = v.parts[1]::name AND c.relname = v.parts[2]::name) \
                     ELSE false END);",
         text_array(keep_job_names),
         text_array(legacy_job_names),
@@ -2779,8 +2785,14 @@ ORDER BY 1, 2, 4, 5"#;
         // and pg_cron is absent, or errors when scheduling is requested without it.
         let present = self.pg_cron_present().await?;
         let stmts = plan_cron_sync(self.bookkeeping.project(), jobs, present)?;
+        // On the pool, each statement its own transaction — never an open
+        // batch's: the unschedule sets its own isolation, which only a
+        // transaction's first statement may.
         for s in stmts {
-            self.execute_script(&s).await?;
+            sqlx::raw_sql(&s)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| DbdError::Config(format!("SQL execution failed: {e}")))?;
         }
         Ok(())
     }

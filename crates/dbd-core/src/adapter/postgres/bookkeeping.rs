@@ -77,7 +77,7 @@ impl Bookkeeping {
              JOIN pg_namespace n ON n.oid = c.relnamespace \
              WHERE c.relkind = 'r' \
                AND ((c.relname = 'meta' AND n.nspname = 'dbd') OR c.relname = '_dbd_meta') \
-               AND has_table_privilege(c.oid, 'SELECT') \
+               AND has_schema_privilege(n.oid, 'USAGE') AND has_table_privilege(c.oid, 'SELECT') \
              ORDER BY (n.nspname = 'dbd') DESC, (n.nspname = 'public') DESC, n.nspname",
         )
         .fetch_all(&self.pool)
@@ -300,13 +300,19 @@ impl Bookkeeping {
         schema: &str,
         relname: &str,
     ) -> Result<()> {
-        let readable: bool =
-            sqlx::query_scalar("SELECT has_table_privilege(format('%I.%I', $1::text, $2::text), 'SELECT')")
-                .bind(schema)
-                .bind(relname)
-                .fetch_one(&mut **tx)
-                .await
-                .map_err(|e| DbdError::Config(format!("heal: read {schema}.{relname} privileges failed: {e}")))?;
+        // By oid, not by name: looking a name up in a schema the role cannot use
+        // raises, where this must only answer no.
+        let readable: bool = sqlx::query_scalar(
+            "SELECT coalesce(bool_and(has_schema_privilege(n.oid, 'USAGE') \
+                                      AND has_table_privilege(c.oid, 'SELECT')), false) \
+             FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND c.relname = $2",
+        )
+        .bind(schema)
+        .bind(relname)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|e| DbdError::Config(format!("heal: read {schema}.{relname} privileges failed: {e}")))?;
         if !readable {
             return Ok(());
         }
