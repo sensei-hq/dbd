@@ -263,7 +263,7 @@ pub(crate) async fn check_reset_guards(
     let marks = design.database_marks(adapter).await?;
     Design::check_scope_guard(&marks, &resolved.name, force || allow_scope_change)?;
     if !force {
-        Design::check_reset_guard(&marks)?;
+        design.check_reset_guard(&marks)?;
     }
     Ok(())
 }

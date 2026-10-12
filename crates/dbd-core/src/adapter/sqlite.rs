@@ -240,6 +240,38 @@ impl SqliteAdapter {
         }))
     }
 
+    /// The triggers on table or view `name`, as `sqlite_master` holds them and
+    /// each runnable twice — what `introspect` writes after the table or view,
+    /// where an authored file keeps its triggers (see [`Entity::triggers`]).
+    ///
+    /// Left out, `merge` rewrote a table file without the trigger written in
+    /// it, though the database still had it. SQLite stores the text it was
+    /// created with, normalised to open with `CREATE TRIGGER` and with any
+    /// `IF NOT EXISTS` removed; it is put back, so applying the file to the
+    /// database it came from does not fail on the trigger.
+    async fn triggers_on(&self, name: &str) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT sql FROM sqlite_master \
+             WHERE type = 'trigger' AND tbl_name = ?1 AND sql IS NOT NULL \
+             ORDER BY name",
+        )
+        .bind(name)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbdError::Config(format!("introspect triggers for {name} failed: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let sql: String = r.get("sql");
+                let sql = sql.trim();
+                match sql.strip_prefix("CREATE TRIGGER ") {
+                    Some(rest) => format!("CREATE TRIGGER IF NOT EXISTS {rest}"),
+                    None => sql.to_string(),
+                }
+            })
+            .collect())
+    }
+
     /// Strip the leading `schema.` from a Postgres-style entity name.
     /// Returns the original string when no `.` is present.
     fn bare_name(name: &str) -> &str {
@@ -389,6 +421,28 @@ impl DatabaseAdapter for SqliteAdapter {
             crate::sql_quote::ident(Self::bare_name(table))
         ))
         .await
+    }
+
+    async fn foreign_keys(&self) -> Result<Vec<(String, String)>> {
+        // A key names its table as its DDL wrote it, and SQLite matches table
+        // names without regard to case — so the referenced table is looked up
+        // the same way, and reported by its own name. A key to a table that
+        // does not exist orders nothing, and drops out of the join.
+        let rows = sqlx::query(
+            "SELECT DISTINCT m.name AS referencing, p.name AS referenced \
+             FROM sqlite_master m \
+             JOIN pragma_foreign_key_list(m.name) f \
+             JOIN sqlite_master p ON p.type = 'table' AND p.name = f.\"table\" COLLATE NOCASE \
+             WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%' \
+             ORDER BY 1, 2",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbdError::Config(format!("reading the foreign keys failed: {e}")))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<String, _>("referencing"), r.get::<String, _>("referenced")))
+            .collect())
     }
 
     async fn export_data(&self, entity: &Entity, out_dir: Option<&Path>) -> Result<()> {
@@ -562,6 +616,7 @@ impl DatabaseAdapter for SqliteAdapter {
             let mut e = Entity::new(EntityType::Table, &name);
             e.schema = None; // SQLite is schema-less
             e.raw_ddl = Some(parts.join(";\n\n"));
+            e.triggers = self.triggers_on(&name).await?;
             entities.push(e);
         }
 
@@ -578,6 +633,7 @@ impl DatabaseAdapter for SqliteAdapter {
             let mut e = Entity::new(EntityType::View, &name);
             e.schema = None;
             e.raw_ddl = Some(sql.trim().to_string());
+            e.triggers = self.triggers_on(&name).await?;
             entities.push(e);
         }
 

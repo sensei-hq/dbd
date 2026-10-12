@@ -512,7 +512,9 @@ pub fn emit_entity(entity: &Entity) -> Option<String> {
     // emitter entirely. Re-terminate with a single trailing `;`.
     if let Some(raw) = &entity.raw_ddl {
         let body = raw.trim_end().trim_end_matches(';').trim_end();
-        return Some(format!("{body};"));
+        let mut out = format!("{body};");
+        push_triggers(&mut out, entity);
+        return Some(out);
     }
     match entity.entity_type {
         EntityType::Schema | EntityType::Extension | EntityType::Role => crate::script::ddl_from_entity(entity),

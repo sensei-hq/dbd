@@ -458,7 +458,15 @@ pub fn cmd_merge_from_dbml(
         bail!("no design.yaml here — use `dbd init --from-dbml <file>` to start a new project");
     }
     let config = dbd_core::config::read(config_path).context("failed to read design.yaml")?;
-    let entities = parse_dbml_file(dbml_path)?;
+    let mut entities = parse_dbml_file(dbml_path)?;
+    // A DBML document holds no triggers, so each table file it rewrites keeps
+    // the ones written in it — the merge deleted them without a word.
+    for file in reverse::keep_authored_triggers(project_dir, &mut entities) {
+        eprintln!(
+            "  warning: {} does not parse, so a trigger written in it is not kept by the merge",
+            file.display()
+        );
+    }
     // DBML names no platform; the project's target does.
     let sel = SchemaSelect {
         supabase: config.default_target() == Some("supabase"),
