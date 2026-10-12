@@ -2470,3 +2470,73 @@ fn the_emitted_sqlite_script_with_named_keys_applies() {
     .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(names, "app_t,app_u");
 }
+
+// ── A name holding the target's own quote character ─────────────────────────
+
+/// A project whose table and column names hold every target's quote
+/// character: `"` (SQLite), `` ` `` (MySQL) and `]` (SQL Server).
+fn quote_project(dir: &Path) -> Design {
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: quotes\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    let t = dir.join("ddl/table/app");
+    std::fs::create_dir_all(&t).unwrap();
+    std::fs::write(
+        t.join("w\"]x`.ddl"),
+        "create table if not exists app.\"w\"\"]x`\" (\n  \
+           \"i\"\"d\" integer primary key,\n  \
+           \"a]b`c\" text not null\n\
+         );\n\
+         create index \"ix\"\"]`\" on app.\"w\"\"]x`\" (\"a]b`c\");\n",
+    )
+    .unwrap();
+    Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load")
+}
+
+/// Each target escapes its own quote character inside a quoted name: SQLite
+/// and MySQL double it, SQL Server doubles `]`. The emitter wrapped names as
+/// they were, so SQLite got `"app_w"]x`"` — the name ended at its own quote
+/// and the script did not run.
+#[test]
+fn a_name_holding_the_targets_quote_character_is_escaped_as_the_target_escapes_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let design = quote_project(tmp.path());
+    let emitted = |dialect| emit_schema(&design, dialect, None).expect("emits").0;
+
+    let sqlite = emitted(Dialect::Sqlite);
+    for name in ["\"app_w\"\"]x`\"", "\"i\"\"d\"", "\"a]b`c\"", "\"ix\"\"]`\""] {
+        assert!(sqlite.contains(name), "SQLite writes {name}:\n{sqlite}");
+    }
+    let mysql = emitted(Dialect::MySql);
+    for name in ["`app_w\"]x```", "`i\"d`", "`a]b``c`", "`ix\"]```"] {
+        assert!(mysql.contains(name), "MySQL writes {name}:\n{mysql}");
+    }
+    let tsql = emitted(Dialect::TSql);
+    for name in ["[app].[w\"]]x`]", "[i\"d]", "[a]]b`c]", "[ix\"]]`]"] {
+        assert!(tsql.contains(name), "SQL Server writes {name}:\n{tsql}");
+    }
+}
+
+/// And the SQLite script runs: the table and its index exist under their
+/// own names afterwards.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn the_sqlite_script_for_a_name_holding_a_quote_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let design = quote_project(tmp.path());
+    let (sqlite, _) = emit_schema(&design, Dialect::Sqlite, None).expect("emits");
+    let db = dbd_core::connect("sqlite::memory:", "quotes").await.expect("connect");
+    db.execute_script(&sqlite)
+        .await
+        .unwrap_or_else(|e| panic!("the script runs: {e}\n{sqlite}"));
+    let names: Vec<String> = db
+        .introspect()
+        .await
+        .expect("introspect")
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert!(names.iter().any(|n| n == "app_w\"]x`"), "{names:?}");
+}
