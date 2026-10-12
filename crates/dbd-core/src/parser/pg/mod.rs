@@ -63,26 +63,32 @@ impl PgQueryDdl {
     }
 }
 
-/// The schema and name the first `CREATE` of `entity_type` in `sql` makes, as
-/// Postgres reads them: an unquoted name folded to lower case. The schema is
-/// `None` when the statement leaves it to the search path. `None` when no such
-/// statement can be read — a file that does not parse, or one that declares
-/// its entity inside a `DO` block.
-pub(crate) fn created_identity(entity_type: EntityType, sql: &str) -> Option<(Option<String>, String)> {
+/// Every entity the `CREATE` statements in `sql` make — its kind, the schema
+/// the statement states (`None` where it leaves it to the search path), and
+/// its name as Postgres reads it, an unquoted one folded to lower case. Empty
+/// when `sql` does not parse; an entity declared inside a `DO` block is not
+/// among them.
+pub(crate) fn created_identities(sql: &str) -> Vec<(EntityType, Option<String>, String)> {
     // Passed as the default schema, so an unqualified name comes back with it.
     const UNSTATED: &str = "\u{1}";
-    let parsed = pg_query::parse(sql).ok()?;
-    let (decls, _) = declarations::declarations(&parsed, sql, UNSTATED);
-    let decl = decls.into_iter().find(|d| d.entity_type == entity_type)?;
-    let name = match &decl.schema {
-        Some(schema) => decl
-            .name
-            .strip_prefix(&format!("{schema}."))
-            .unwrap_or(&decl.name)
-            .to_string(),
-        None => decl.name.clone(),
+    let Ok(parsed) = pg_query::parse(sql) else {
+        return Vec::new();
     };
-    Some((decl.schema.filter(|s| s != UNSTATED), name))
+    let (decls, _) = declarations::declarations(&parsed, sql, UNSTATED);
+    decls
+        .into_iter()
+        .map(|decl| {
+            let name = match &decl.schema {
+                Some(schema) => decl
+                    .name
+                    .strip_prefix(&format!("{schema}."))
+                    .unwrap_or(&decl.name)
+                    .to_string(),
+                None => decl.name.clone(),
+            };
+            (decl.entity_type, decl.schema.filter(|s| s != UNSTATED), name)
+        })
+        .collect()
 }
 
 /// [`PgQueryDdl::parse`] with the project's fallback schema path.

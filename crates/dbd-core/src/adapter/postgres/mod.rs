@@ -2555,16 +2555,21 @@ ORDER BY 1, 2, 4, 5"#;
         self.bookkeeping.heal().await
     }
 
-    async fn claim_objects(&self, owner: &str, objects: &[super::OwnedObject], write: bool) -> Result<super::Claim> {
-        self.bookkeeping.claim_objects(owner, objects, write).await
-    }
-
-    async fn release_objects(&self, owner: &str, objects: &[super::OwnedObject]) -> Result<()> {
-        self.bookkeeping.release_objects(owner, objects).await
+    async fn claim_objects(
+        &self,
+        owner: &str,
+        objects: &[super::OwnedObject],
+        write: bool,
+    ) -> Result<Vec<super::HeldObject>> {
+        let mut guard = self.batch.lock().await;
+        self.bookkeeping
+            .claim_objects(guard.as_mut(), owner, objects, write)
+            .await
     }
 
     async fn record_uses(&self, owner: &str, uses: &[super::Use]) -> Result<()> {
-        self.bookkeeping.record_uses(owner, uses).await
+        let mut guard = self.batch.lock().await;
+        self.bookkeeping.record_uses(guard.as_mut(), owner, uses).await
     }
 
     async fn get_db_version(&self) -> Result<u32> {

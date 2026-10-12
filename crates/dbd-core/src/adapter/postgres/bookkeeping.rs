@@ -416,190 +416,156 @@ impl Bookkeeping {
     }
 
     /// Claim `objects` for `owner` in `dbd.objects`, or with `write` false only
-    /// read who holds them; the ones another owner holds come back. A claim
-    /// writes all of them or none: when any is held, the transaction rolls back.
-    /// The primary key settles two first runs at once — the second waits on the
-    /// first's uncommitted row and then finds it held. `READ COMMITTED`, so
-    /// that wait ends in a read of what the first committed.
+    /// read who holds them; the ones another owner holds come back, and when
+    /// there are any the caller fails the run. In `tx` — the run's open batch —
+    /// when there is one, so the claim commits with the run's work or rolls
+    /// back with it; else in a transaction of its own, rolled back when any is
+    /// held. Either waits at most [`HEAL_LOCK_TIMEOUT`] for another session's
+    /// write to the registry. The primary key settles two runs at once: the
+    /// second waits on the first's uncommitted rows, then finds them held.
     ///
     /// A read with no registry yet finds nothing held, and writes nothing.
     pub(super) async fn claim_objects(
         &self,
+        tx: Option<&mut Transaction<'static, Postgres>>,
         owner: &str,
         objects: &[crate::adapter::OwnedObject],
         write: bool,
-    ) -> Result<crate::adapter::Claim> {
-        use sqlx::Executor as _;
-        let column = |f: fn(&crate::adapter::OwnedObject) -> &str| -> Vec<String> {
-            objects.iter().map(|o| f(o).to_string()).collect()
-        };
-        let (namespaces, schemas, names, kinds) = (
-            column(|o| &o.namespace),
-            column(|o| &o.schema),
-            column(|o| &o.name),
-            column(|o| &o.kind),
-        );
-        const HELD: &str = "SELECT o.namespace, o.schema, o.name, o.kind, o.owner FROM dbd.objects o \
-             JOIN unnest($1::text[], $2::text[], $3::text[]) AS d(namespace, schema, name) \
-               ON o.namespace = d.namespace AND o.schema = d.schema AND o.name = d.name \
-             WHERE o.owner <> $4 ORDER BY o.namespace, o.schema, o.name";
-        let held = |rows: Vec<sqlx::postgres::PgRow>| -> Vec<crate::adapter::HeldObject> {
-            rows.iter()
-                .map(|r| crate::adapter::HeldObject {
-                    object: crate::adapter::OwnedObject {
-                        namespace: r.get("namespace"),
-                        schema: r.get("schema"),
-                        name: r.get("name"),
-                        kind: r.get("kind"),
-                    },
-                    owner: r.get("owner"),
-                })
-                .collect()
-        };
+    ) -> Result<Vec<crate::adapter::HeldObject>> {
         if !write {
             let exists: Option<String> = sqlx::query_scalar("SELECT to_regclass('dbd.objects')::text")
                 .fetch_one(&self.pool)
                 .await
                 .map_err(|e| DbdError::Config(format!("ownership lookup failed: {e}")))?;
             if exists.is_none() {
-                return Ok(Default::default());
+                return Ok(Vec::new());
             }
-            let rows = sqlx::query(HELD)
-                .bind(&namespaces)
-                .bind(&schemas)
-                .bind(&names)
-                .bind(owner)
-                .fetch_all(&self.pool)
+            let mut conn = self
+                .pool
+                .acquire()
                 .await
                 .map_err(|e| DbdError::Config(format!("ownership read failed: {e}")))?;
-            return Ok(crate::adapter::Claim {
-                held: held(rows),
-                claimed: Vec::new(),
-            });
+            return held_objects(&mut conn, owner, objects).await;
         }
+        match tx {
+            Some(tx) => self.claim_in(tx, owner, objects).await,
+            None => {
+                let mut own = self.registry_tx("claim").await?;
+                let held = self.claim_in(&mut own, owner, objects).await?;
+                if held.is_empty() {
+                    own.commit()
+                        .await
+                        .map_err(|e| DbdError::Config(format!("claim: commit failed: {e}")))?;
+                } else {
+                    own.rollback()
+                        .await
+                        .map_err(|e| DbdError::Config(format!("claim: rollback failed: {e}")))?;
+                }
+                Ok(held)
+            }
+        }
+    }
+
+    /// A transaction of the registry's own, for a write outside any batch:
+    /// `READ COMMITTED`, so a wait ends in a read of what the other session
+    /// committed.
+    async fn registry_tx(&self, what: &str) -> Result<Transaction<'static, Postgres>> {
+        use sqlx::Executor as _;
         let mut tx = self
             .pool
             .begin()
             .await
-            .map_err(|e| DbdError::Config(format!("claim: begin failed: {e}")))?;
+            .map_err(|e| DbdError::Config(format!("{what}: begin failed: {e}")))?;
         (&mut *tx)
-            .execute(
-                format!(
-                    "SET TRANSACTION ISOLATION LEVEL READ COMMITTED; \
-                     SET LOCAL lock_timeout = '{HEAL_LOCK_TIMEOUT}'"
-                )
-                .as_str(),
-            )
+            .execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
             .await
-            .map_err(|e| DbdError::Config(format!("claim: begin failed: {e}")))?;
-        // `xmax = 0` marks a row this statement inserted rather than updated:
-        // the claims this run newly took, which it gives back if it fails.
-        let inserted = sqlx::query(
+            .map_err(|e| DbdError::Config(format!("{what}: begin failed: {e}")))?;
+        Ok(tx)
+    }
+
+    /// The claim's statements, in `tx`, waiting at most [`HEAL_LOCK_TIMEOUT`]
+    /// for the registry and then leaving the batch's own lock timeout as it
+    /// was.
+    async fn claim_in(
+        &self,
+        tx: &mut Transaction<'static, Postgres>,
+        owner: &str,
+        objects: &[crate::adapter::OwnedObject],
+    ) -> Result<Vec<crate::adapter::HeldObject>> {
+        let column = |f: fn(&crate::adapter::OwnedObject) -> &str| -> Vec<String> {
+            objects.iter().map(|o| f(o).to_string()).collect()
+        };
+        bounded_wait(tx, "dbd.objects", true).await?;
+        sqlx::query(
             "INSERT INTO dbd.objects (namespace, schema, name, kind, owner) \
                SELECT d.namespace, d.schema, d.name, d.kind, $5 \
                FROM unnest($1::text[], $2::text[], $3::text[], $4::text[]) AS d(namespace, schema, name, kind) \
              ON CONFLICT (namespace, schema, name) DO UPDATE SET kind = EXCLUDED.kind \
-               WHERE dbd.objects.owner = EXCLUDED.owner \
-             RETURNING namespace, schema, name, kind, (xmax = 0) AS inserted",
+               WHERE dbd.objects.owner = EXCLUDED.owner",
         )
-        .bind(&namespaces)
-        .bind(&schemas)
-        .bind(&names)
-        .bind(&kinds)
-        .bind(owner)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|e| {
-            DbdError::Config(if sqlstate(&e).as_deref() == Some("55P03") {
-                format!(
-                    "claim: dbd.objects is held by another session's open write, which did not finish \
-                     within {HEAL_LOCK_TIMEOUT} — let it finish, or end it, and run again"
-                )
-            } else {
-                format!("claim failed: {e}")
-            })
-        })?;
-        let claimed: Vec<crate::adapter::OwnedObject> = inserted
-            .iter()
-            .filter(|r| r.get::<bool, _>("inserted"))
-            .map(|r| crate::adapter::OwnedObject {
-                namespace: r.get("namespace"),
-                schema: r.get("schema"),
-                name: r.get("name"),
-                kind: r.get("kind"),
-            })
-            .collect();
-        let rows = sqlx::query(HELD)
-            .bind(&namespaces)
-            .bind(&schemas)
-            .bind(&names)
-            .bind(owner)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| DbdError::Config(format!("claim read failed: {e}")))?;
-        let held = held(rows);
-        if held.is_empty() {
-            tx.commit()
-                .await
-                .map_err(|e| DbdError::Config(format!("claim: commit failed: {e}")))?;
-            Ok(crate::adapter::Claim { held, claimed })
-        } else {
-            tx.rollback()
-                .await
-                .map_err(|e| DbdError::Config(format!("claim: rollback failed: {e}")))?;
-            Ok(crate::adapter::Claim {
-                held,
-                claimed: Vec::new(),
-            })
-        }
-    }
-
-    /// Delete `owner`'s rows in `dbd.objects` for `objects`.
-    pub(super) async fn release_objects(&self, owner: &str, objects: &[crate::adapter::OwnedObject]) -> Result<()> {
-        let column = |f: fn(&crate::adapter::OwnedObject) -> &str| -> Vec<String> {
-            objects.iter().map(|o| f(o).to_string()).collect()
-        };
-        sqlx::query(
-            "DELETE FROM dbd.objects o \
-             USING unnest($2::text[], $3::text[], $4::text[]) AS d(namespace, schema, name) \
-             WHERE o.owner = $1 AND o.namespace = d.namespace AND o.schema = d.schema AND o.name = d.name",
-        )
-        .bind(owner)
         .bind(column(|o| &o.namespace))
         .bind(column(|o| &o.schema))
         .bind(column(|o| &o.name))
-        .execute(&self.pool)
+        .bind(column(|o| &o.kind))
+        .bind(owner)
+        .execute(&mut **tx)
         .await
-        .map_err(|e| DbdError::Config(format!("releasing unbuilt claims failed: {e}")))?;
-        Ok(())
+        .map_err(|e| registry_error(&e, "dbd.objects", "claim"))?;
+        let held = held_objects(tx, owner, objects).await?;
+        bounded_wait(tx, "dbd.objects", false).await?;
+        Ok(held)
     }
 
-    /// Replace `owner`'s rows in `dbd.uses` with `uses`, in one transaction. A
-    /// shared use — schema, extension, role — is recorded as given. An entity
-    /// use names its target as the design refers to it, `schema.name`, and is
-    /// recorded once for each namespace another owner holds that name in —
-    /// `relation:app.orders` — and not at all when nobody else holds it.
-    pub(super) async fn record_uses(&self, owner: &str, uses: &[crate::adapter::Use]) -> Result<()> {
-        use sqlx::Executor as _;
+    /// Replace `owner`'s rows in `dbd.uses` with `uses` — in `tx`, the run's
+    /// open batch, when there is one, else in a transaction of its own; either
+    /// waits at most [`HEAL_LOCK_TIMEOUT`] for the registry. A shared use —
+    /// schema, extension, role — is recorded as given. An entity use names its
+    /// target as the design refers to it, `schema.name` split at its first dot
+    /// as dbd splits a name, and is recorded once for each namespace another
+    /// owner holds that schema and name in — `relation:app.orders` — and not
+    /// at all when nobody else holds it.
+    pub(super) async fn record_uses(
+        &self,
+        tx: Option<&mut Transaction<'static, Postgres>>,
+        owner: &str,
+        uses: &[crate::adapter::Use],
+    ) -> Result<()> {
+        match tx {
+            Some(tx) => self.record_uses_in(tx, owner, uses).await,
+            None => {
+                let mut own = self.registry_tx("record uses").await?;
+                self.record_uses_in(&mut own, owner, uses).await?;
+                own.commit()
+                    .await
+                    .map_err(|e| DbdError::Config(format!("record uses: commit failed: {e}")))
+            }
+        }
+    }
+
+    async fn record_uses_in(
+        &self,
+        tx: &mut Transaction<'static, Postgres>,
+        owner: &str,
+        uses: &[crate::adapter::Use],
+    ) -> Result<()> {
         let (shared, entities): (Vec<&crate::adapter::Use>, Vec<&crate::adapter::Use>) =
             uses.iter().partition(|u| u.kind != "entity");
         let column = |list: &[&crate::adapter::Use], f: fn(&crate::adapter::Use) -> &str| -> Vec<String> {
             list.iter().map(|u| f(u).to_string()).collect()
         };
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| DbdError::Config(format!("record uses: begin failed: {e}")))?;
-        (&mut *tx)
-            .execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
-            .await
-            .map_err(|e| DbdError::Config(format!("record uses: begin failed: {e}")))?;
+        let (target_schemas, target_names): (Vec<String>, Vec<String>) = entities
+            .iter()
+            .map(|u| {
+                let (schema, name) = crate::entity::split_qualified_name(&u.target);
+                (schema.unwrap_or_default(), name)
+            })
+            .unzip();
+        bounded_wait(tx, "dbd.uses", true).await?;
         sqlx::query("DELETE FROM dbd.uses WHERE owner = $1")
             .bind(owner)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
-            .map_err(|e| DbdError::Config(format!("record uses failed: {e}")))?;
+            .map_err(|e| registry_error(&e, "dbd.uses", "record uses"))?;
         sqlx::query(
             "INSERT INTO dbd.uses (owner, kind, target, via) \
                SELECT $1, d.kind, d.target, d.via \
@@ -610,26 +576,24 @@ impl Bookkeeping {
         .bind(column(&shared, |u| &u.kind))
         .bind(column(&shared, |u| &u.target))
         .bind(column(&shared, |u| &u.via))
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
-        .map_err(|e| DbdError::Config(format!("record uses failed: {e}")))?;
+        .map_err(|e| registry_error(&e, "dbd.uses", "record uses"))?;
         sqlx::query(
             "INSERT INTO dbd.uses (owner, kind, target, via) \
                SELECT $1, 'entity', o.namespace || ':' || o.schema || '.' || o.name, d.via \
-               FROM unnest($2::text[], $3::text[]) AS d(target, via) \
-               JOIN dbd.objects o ON o.schema || '.' || o.name = d.target AND o.owner <> $1 \
+               FROM unnest($2::text[], $3::text[], $4::text[]) AS d(schema, name, via) \
+               JOIN dbd.objects o ON o.schema = d.schema AND o.name = d.name AND o.owner <> $1 \
              ON CONFLICT DO NOTHING",
         )
         .bind(owner)
-        .bind(column(&entities, |u| &u.target))
+        .bind(&target_schemas)
+        .bind(&target_names)
         .bind(column(&entities, |u| &u.via))
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
-        .map_err(|e| DbdError::Config(format!("record uses failed: {e}")))?;
-        tx.commit()
-            .await
-            .map_err(|e| DbdError::Config(format!("record uses: commit failed: {e}")))?;
-        Ok(())
+        .map_err(|e| registry_error(&e, "dbd.uses", "record uses"))?;
+        bounded_wait(tx, "dbd.uses", false).await
     }
 
     /// Read the recorded version for this project (authoritative version source).
@@ -935,4 +899,70 @@ fn quoted_table(schema: &str, relname: &str) -> String {
 /// The SQLSTATE of a database error, if `e` is one.
 fn sqlstate(e: &sqlx::Error) -> Option<String> {
     e.as_database_error().and_then(|db| db.code()).map(|c| c.into_owned())
+}
+
+/// The ones of `objects` another owner than `owner` holds in `dbd.objects`.
+async fn held_objects(
+    conn: &mut sqlx::PgConnection,
+    owner: &str,
+    objects: &[crate::adapter::OwnedObject],
+) -> Result<Vec<crate::adapter::HeldObject>> {
+    let column = |f: fn(&crate::adapter::OwnedObject) -> &str| -> Vec<String> {
+        objects.iter().map(|o| f(o).to_string()).collect()
+    };
+    let rows = sqlx::query(
+        "SELECT o.namespace, o.schema, o.name, o.kind, o.owner FROM dbd.objects o \
+         JOIN unnest($1::text[], $2::text[], $3::text[]) AS d(namespace, schema, name) \
+           ON o.namespace = d.namespace AND o.schema = d.schema AND o.name = d.name \
+         WHERE o.owner <> $4 ORDER BY o.namespace, o.schema, o.name",
+    )
+    .bind(column(|o| &o.namespace))
+    .bind(column(|o| &o.schema))
+    .bind(column(|o| &o.name))
+    .bind(owner)
+    .fetch_all(conn)
+    .await
+    .map_err(|e| registry_error(&e, "dbd.objects", "ownership read"))?;
+    Ok(rows
+        .iter()
+        .map(|r| crate::adapter::HeldObject {
+            object: crate::adapter::OwnedObject {
+                namespace: r.get("namespace"),
+                schema: r.get("schema"),
+                name: r.get("name"),
+                kind: r.get("kind"),
+            },
+            owner: r.get("owner"),
+        })
+        .collect())
+}
+
+/// Bound how long `tx` waits for a lock on `table` — [`HEAL_LOCK_TIMEOUT`]
+/// while `on`, and back to the transaction's own setting after: a batch's DDL
+/// keeps whatever wait it had.
+async fn bounded_wait(tx: &mut Transaction<'static, Postgres>, table: &str, on: bool) -> Result<()> {
+    use sqlx::Executor as _;
+    let sql = if on {
+        format!("SET LOCAL lock_timeout = '{HEAL_LOCK_TIMEOUT}'")
+    } else {
+        "SET LOCAL lock_timeout TO DEFAULT".to_string()
+    };
+    (&mut **tx)
+        .execute(sql.as_str())
+        .await
+        .map_err(|e| registry_error(&e, table, "registry wait"))?;
+    Ok(())
+}
+
+/// A registry statement's failure: a lock held past [`HEAL_LOCK_TIMEOUT`],
+/// and a write another run made after this transaction's snapshot, say so.
+fn registry_error(e: &sqlx::Error, table: &str, what: &str) -> DbdError {
+    DbdError::Config(match sqlstate(e).as_deref() {
+        Some("55P03") => format!(
+            "{what}: {table} is held by another session's open write, which did not finish \
+             within {HEAL_LOCK_TIMEOUT} — let it finish, or end it, and run again"
+        ),
+        Some("40001") => format!("{what}: another run wrote {table} at the same time; run again"),
+        _ => format!("{what} failed: {e}"),
+    })
 }

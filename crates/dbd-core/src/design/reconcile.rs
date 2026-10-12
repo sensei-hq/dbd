@@ -362,10 +362,10 @@ impl Design {
         // Refuse before planning, `dry_run` included: a plan computed from a
         // partial design reports drift that isn't there and misses drift that is.
         self.ensure_fully_parsed(scope, working_set.as_ref(), None)?;
-        // Check the design's entities before planning: a project declaring
-        // another owner's entity is refused before anything runs (#7). The
-        // claim waits for the last refusal below, so a refused run takes none.
-        self.preflight(adapter, ownership::Preflight::Check).await?;
+        // Before planning: a design declaring an entity another owner holds is
+        // refused before anything runs (#7). It claims what it builds, once
+        // built, below.
+        self.preflight(adapter, ownership::Preflight::Read).await?;
         let desired_entities = self.entities_in_scope(scope, working_set.as_ref(), None);
 
         // A reconciled database is the one an apply builds, so reconcile runs
@@ -486,78 +486,74 @@ impl Design {
         }
 
         ensure_reconcile_not_destructive(&plan, allow_destructive)?;
+        // Past the last refusal, before the first write: heal the bookkeeping,
+        // and check again.
+        self.preflight(adapter, ownership::Preflight::Write).await?;
 
-        // Past the last refusal: heal, and claim the design's entities. What
-        // the claim newly took, a reconcile that then fails gives back (#7).
-        let claimed = self.preflight(adapter, ownership::Preflight::Claim).await?;
-        let result: Result<crate::reconcile::ReconcilePlan> = async {
-            // `apply.before` where apply runs it: after every gate, so a refused
-            // reconcile fires no hook, and before the first write, so a hook can
-            // prepare the ground the DDL lands on.
-            let before = hooks::run_hooks(
+        // `apply.before` where apply runs it: after every gate, so a refused
+        // reconcile fires no hook, and before the first write, so a hook can
+        // prepare the ground the DDL lands on.
+        let before = hooks::run_hooks(
+            adapter,
+            self.hook_source(),
+            &self.config.apply.before,
+            hooks::HookKind::Before,
+            hook_scope,
+            false,
+            &mut progress,
+        )
+        .await?;
+
+        // The writes, in dependency order (see `execute_reconcile_writes`).
+        let mut summary = self
+            .execute_reconcile_writes(
                 adapter,
-                self.hook_source(),
-                &self.config.apply.before,
-                hooks::HookKind::Before,
-                hook_scope,
-                false,
-                &mut progress,
+                &plan,
+                &desired_entities,
+                &managed_schemas,
+                &mv_to_create,
+                &mv_to_restamp,
+                prune,
+                &mut progress.on_start,
+                &mut progress.on_done,
             )
             .await?;
+        // Built: claim it. Reconcile's writes commit as they run, so its claim
+        // has a transaction of its own, after them (#7).
+        self.claim_built(adapter).await?;
 
-            // The writes, in dependency order (see `execute_reconcile_writes`).
-            let mut summary = self
-                .execute_reconcile_writes(
-                    adapter,
-                    &plan,
-                    &desired_entities,
-                    &managed_schemas,
-                    &mv_to_create,
-                    &mv_to_restamp,
-                    prune,
-                    &mut progress.on_start,
-                    &mut progress.on_done,
-                )
-                .await?;
+        // Sync pg_cron refresh jobs, mirroring the apply path. This MUST cover the
+        // whole design, not the scoped `desired_entities`: `sync_refresh_jobs`
+        // unschedules every `dbd:refresh:%` job absent from the set it is given, so
+        // a scoped reconcile fed only its subset would unschedule out-of-scope
+        // matviews' jobs. The adapter guards on pg_cron presence, so it is a safe
+        // no-op on databases (and non-Postgres targets) without the extension.
+        adapter.sync_refresh_jobs(&self.all_matview_jobs()).await?;
 
-            // Sync pg_cron refresh jobs, mirroring the apply path. This MUST cover the
-            // whole design, not the scoped `desired_entities`: `sync_refresh_jobs`
-            // unschedules every `dbd:refresh:%` job absent from the set it is given, so
-            // a scoped reconcile fed only its subset would unschedule out-of-scope
-            // matviews' jobs. The adapter guards on pg_cron presence, so it is a safe
-            // no-op on databases (and non-Postgres targets) without the extension.
-            adapter.sync_refresh_jobs(&self.all_matview_jobs()).await?;
+        // `apply.after`, once everything it may seed or adjust is in place.
+        let after = hooks::run_hooks(
+            adapter,
+            self.hook_source(),
+            &self.config.apply.after,
+            hooks::HookKind::After,
+            hook_scope,
+            false,
+            &mut progress,
+        )
+        .await?;
+        summary.before_scripts = before.ran;
+        summary.after_scripts = after.ran;
 
-            // `apply.after`, once everything it may seed or adjust is in place.
-            let after = hooks::run_hooks(
-                adapter,
-                self.hook_source(),
-                &self.config.apply.after,
-                hooks::HookKind::After,
-                hook_scope,
-                false,
-                &mut progress,
-            )
+        // Stamp the project version so `migrate --status` / `apply` stay consistent.
+        // No `project.version` means no migration applied — 0, as `apply`
+        // records. Recording 1 made a dev `reset` refuse as if migrations ran.
+        let version = self.config.project.version.unwrap_or(0);
+        adapter
+            .set_project_meta(&self.env, version, scope.map(|s| s.name.as_str()))
             .await?;
-            summary.before_scripts = before.ran;
-            summary.after_scripts = after.ran;
 
-            // Stamp the project version so `migrate --status` / `apply` stay consistent.
-            // No `project.version` means no migration applied — 0, as `apply`
-            // records. Recording 1 made a dev `reset` refuse as if migrations ran.
-            let version = self.config.project.version.unwrap_or(0);
-            adapter
-                .set_project_meta(&self.env, version, scope.map(|s| s.name.as_str()))
-                .await?;
-
-            (progress.on_complete)(summary);
-            Ok(plan)
-        }
-        .await;
-        match result {
-            Ok(done) => Ok(done),
-            Err(e) => Err(self.give_back(adapter, &claimed, e).await),
-        }
+        (progress.on_complete)(summary);
+        Ok(plan)
     }
 
     /// Read-only: introspect the live database and return the complete
@@ -647,7 +643,7 @@ impl Design {
         self.ensure_fully_parsed(scope, working_set.as_ref(), None)?;
         // Read-only, and refused as a run would be: a design declaring another
         // owner's entity diffs against something it does not own (#7).
-        self.preflight(adapter, ownership::Preflight::Check).await?;
+        self.preflight(adapter, ownership::Preflight::Read).await?;
         let desired_entities = self.entities_in_scope(scope, working_set.as_ref(), None);
 
         // Desired snapshot (tables + enums, schema-normalized). Raw (un-canonicalized)

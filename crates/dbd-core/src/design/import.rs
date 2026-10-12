@@ -786,7 +786,7 @@ impl Design {
         self.guard_env(adapter).await?;
         // An import claims nothing, but loads into tables; a design declaring
         // another owner's entity is refused before it touches one (#7).
-        self.preflight(adapter, ownership::Preflight::Check).await?;
+        self.preflight(adapter, ownership::Preflight::Read).await?;
 
         let mut warnings = self.import_warnings(name);
 
