@@ -2684,6 +2684,112 @@ async fn an_extension_type_outside_the_search_path_is_not_drift() {
     assert_converged(&url, &load, "citext").await;
 }
 
+/// What an extension owns is spelled as the extension's only where the name is
+/// the extension's alone. orafce installs a domain `oracle.date`: had every
+/// bare `date` been read as it, a column changed to `date` would land on
+/// Oracle's `timestamp(0)`, with `diff` clean afterwards. Postgres resolves a
+/// bare `date` to `pg_catalog.date` first, so a name another type shares —
+/// built in, or the project's own domain — is left as written. And a domain an
+/// extension defines over an array is the extension's type, named by its own
+/// name, not as an array of something (#41).
+#[tokio::test]
+async fn only_a_name_an_extension_alone_owns_is_spelled_as_its_type() {
+    let (_pg, url) = start_pg().await;
+    let fresh = || connect(&url, "ext_names_test");
+    let adapter = fresh().await.unwrap();
+    adapter
+        .execute_script(
+            "CREATE SCHEMA extensions; \
+             CREATE EXTENSION citext SCHEMA extensions; \
+             CREATE DOMAIN extensions.date AS timestamp(0); \
+             ALTER EXTENSION citext ADD DOMAIN extensions.date; \
+             CREATE DOMAIN extensions.tagset AS text[]; \
+             ALTER EXTENSION citext ADD DOMAIN extensions.tagset; \
+             CREATE DOMAIN public.http_method AS text; \
+             CREATE DOMAIN extensions.http_method AS text; \
+             ALTER EXTENSION citext ADD DOMAIN extensions.http_method;",
+        )
+        .await
+        .unwrap();
+    let owned = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+        pairs.iter().map(|(s, n)| (s.to_string(), n.to_string())).collect()
+    };
+    assert_eq!(
+        adapter.extension_types().await.unwrap(),
+        owned(&[("extensions", "citext"), ("extensions", "tagset")]),
+        "date and http_method are also another type's names; tagset is a domain, not an array"
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::create_dir_all(dir.join("ddl/view/app")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: ext_names_test\n  version: 1\n\
+         source:\n  dialect: postgresql\n\
+         target:\n  postgres:\n    url: $DATABASE_URL\n    extensions:\n\
+         \x20     - name: citext\n        schema: extensions\n\
+         schemas:\n  - app\n",
+    )
+    .unwrap();
+    let write_events = |d_type: &str| {
+        std::fs::write(
+            dir.join("ddl/table/app/events.ddl"),
+            format!(
+                "set search_path to app, extensions;\n\
+                 create table if not exists events (\n\
+                   id   integer primary key\n\
+                 , tags tagset\n\
+                 , d    {d_type}\n\
+                 );\n"
+            ),
+        )
+        .unwrap();
+    };
+    std::fs::write(
+        dir.join("ddl/view/app/event_tags.ddl"),
+        "set search_path to app, extensions;\n\
+         create or replace view event_tags as select id, tags from events;\n",
+    )
+    .unwrap();
+    let load = || Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design");
+    let reconcile = || async {
+        load()
+            .reconcile(&*fresh().await.unwrap(), false, false, false, None, Progress::none())
+            .await
+    };
+
+    write_events("text");
+    reconcile()
+        .await
+        .expect("the first reconcile creates the table and the view");
+    let plan = reconcile()
+        .await
+        .expect("reconciling an unchanged design must not fail");
+    assert!(plan.altered.is_empty(), "tagset read as drift: {:?}", plan.altered);
+
+    write_events("date");
+    let plan = reconcile().await.expect("a column changed to date reconciles");
+    assert_eq!(plan.altered.len(), 1, "{:?}", plan.altered);
+    assert_catalog(
+        &*fresh().await.unwrap(),
+        true,
+        "SELECT 1 FROM pg_attribute WHERE attrelid = 'app.events'::regclass \
+           AND attname = 'd' AND atttypid = 'pg_catalog.date'::regtype",
+        "app.events.d typed pg_catalog.date",
+    )
+    .await;
+    let plan = reconcile()
+        .await
+        .expect("reconciling the changed design again must not fail");
+    assert!(
+        plan.altered.is_empty(),
+        "a converged design altered: {:?}",
+        plan.altered
+    );
+}
+
 /// Source-hash drift handling for materialized views, end to end:
 /// 1. First reconcile CREATEs the matview and stamps a `dbd:hash=` comment.
 /// 2. Reconciling the SAME design SKIPs (no warning; oid unchanged).
