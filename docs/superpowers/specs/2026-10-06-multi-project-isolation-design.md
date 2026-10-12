@@ -91,9 +91,12 @@ CREATE TABLE IF NOT EXISTS dbd.uses (
 
 The `relation` namespace covers tables, views, materialized views, sequences
 and foreign tables, which all share `pg_class`. A table and a view of the same
-name cannot both exist, so they cannot have two owners. `type` covers enums,
-domains and composites. `routine` is per name: dbd already drops every overload
-of a name together. Indexes, constraints, triggers, policies and comments
+name cannot both exist, so they cannot have two owners. Enums are keyed in
+`relation` too: Postgres gives every table, view and materialized view a row
+type of its own name, so a table and an enum of one name cannot both exist
+either. `type` is reserved for domains and composites, which dbd does not
+declare yet. `routine` is per name: dbd already drops every overload of a name
+together. Indexes, constraints, triggers, policies and comments
 belong to their table.
 
 **Schemas, extensions and roles are shared containers**, recorded in
