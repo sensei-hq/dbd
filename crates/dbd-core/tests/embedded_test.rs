@@ -1572,6 +1572,98 @@ async fn sync_refresh_jobs_is_noop_without_pg_cron() {
         .expect("sync_refresh_jobs must be a no-op on a DB without pg_cron");
 }
 
+/// What `sync_refresh_jobs` touches of pg_cron, which the embedded server cannot
+/// load: `cron.job`, `cron.schedule` (an upsert by job name) and
+/// `cron.unschedule` by id. Its presence is how dbd detects pg_cron.
+const PG_CRON_STAND_IN: &str = "CREATE SCHEMA cron; \
+    CREATE TABLE cron.job (jobid bigserial PRIMARY KEY, jobname text UNIQUE, schedule text, command text); \
+    CREATE FUNCTION cron.schedule(job_name text, schedule text, command text) RETURNS bigint LANGUAGE sql AS $$ \
+      INSERT INTO cron.job (jobname, schedule, command) VALUES (job_name, schedule, command) \
+      ON CONFLICT (jobname) DO UPDATE SET schedule = EXCLUDED.schedule, command = EXCLUDED.command \
+      RETURNING jobid $$; \
+    CREATE FUNCTION cron.unschedule(job_id bigint) RETURNS boolean LANGUAGE sql AS $$ \
+      DELETE FROM cron.job WHERE jobid = job_id RETURNING true $$;";
+
+fn cron_job_predicate(jobname: &str) -> String {
+    format!("SELECT 1 FROM cron.job WHERE jobname = '{jobname}'")
+}
+
+/// Each project sharing a database owns its refresh jobs (#7, H4). A job is
+/// named for its owner, `dbd:refresh:<owner>:<schema>.<name>`, and a sync
+/// unschedules only its owner's — it unscheduled every `dbd:refresh:%` job it
+/// was not given, so each project's apply took the other's jobs. A legacy
+/// untagged job is unscheduled only for a materialized view this owner
+/// declares, which its tagged job replaces; one for a view nobody here
+/// declares is another owner's, still on an older dbd. An owner's name is its
+/// own even when it holds a `:` — `b` must not reach `b:c`'s jobs.
+#[tokio::test]
+async fn each_project_sharing_a_database_owns_its_refresh_jobs() {
+    use dbd_core::config::ResolvedMatview;
+    let (_pg, url) = start_pg().await;
+    let a = connect(&url, "a").await.unwrap();
+    let b = connect(&url, "b").await.unwrap();
+    let bc = connect(&url, "b:c").await.unwrap();
+    a.execute_script(PG_CRON_STAND_IN).await.unwrap();
+    a.execute_script(
+        "SELECT cron.schedule('dbd:refresh:app.a_daily', '0 1 * * *', 'select 1'); \
+         SELECT cron.schedule('dbd:refresh:app.elsewhere', '0 1 * * *', 'select 1');",
+    )
+    .await
+    .unwrap();
+    let job = |name: &str, refresh: Option<&str>| {
+        (
+            name.to_string(),
+            ResolvedMatview {
+                refresh: refresh.map(str::to_string),
+                concurrently: false,
+            },
+        )
+    };
+
+    a.sync_refresh_jobs(&[job("app.a_daily", Some("0 2 * * *"))])
+        .await
+        .unwrap();
+    bc.sync_refresh_jobs(&[job("app.bc_daily", Some("0 4 * * *"))])
+        .await
+        .unwrap();
+    b.sync_refresh_jobs(&[job("app.b_daily", Some("0 3 * * *"))])
+        .await
+        .unwrap();
+
+    for (jobname, should_exist) in [
+        ("dbd:refresh:a:app.a_daily", true),
+        ("dbd:refresh:b:app.b_daily", true),
+        ("dbd:refresh:b%3Ac:app.bc_daily", true),
+        ("dbd:refresh:app.a_daily", false),
+        ("dbd:refresh:app.elsewhere", true),
+    ] {
+        assert_catalog(
+            &*a,
+            should_exist,
+            &cron_job_predicate(jobname),
+            &format!("cron job {jobname}"),
+        )
+        .await;
+    }
+
+    // `a` drops its schedule: its job goes, nobody else's.
+    a.sync_refresh_jobs(&[job("app.a_daily", None)]).await.unwrap();
+    for (jobname, should_exist) in [
+        ("dbd:refresh:a:app.a_daily", false),
+        ("dbd:refresh:b:app.b_daily", true),
+        ("dbd:refresh:b%3Ac:app.bc_daily", true),
+        ("dbd:refresh:app.elsewhere", true),
+    ] {
+        assert_catalog(
+            &*a,
+            should_exist,
+            &cron_job_predicate(jobname),
+            &format!("cron job {jobname}"),
+        )
+        .await;
+    }
+}
+
 // ── Test 7: Emitted index DDL applies to a real Postgres ──────────────────────
 
 /// Close the emit→apply loop: build a minimal `Entity` with a `text[]` column, a
