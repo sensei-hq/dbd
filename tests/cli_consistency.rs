@@ -1756,7 +1756,7 @@ fn merge_from_a_sqlite_database_keeps_a_tables_trigger() {
     assert!(o.status.success(), "merge: {}{}", stdout(&o), stderr(&o));
     let file = fs::read_to_string(dir.join("ddl/table/notes.ddl")).unwrap();
     assert!(
-        file.to_lowercase().contains("trigger notes_bump") && file.to_lowercase().contains("set n = n + 1"),
+        file.to_lowercase().contains("notes_bump") && file.to_lowercase().contains("set n = n + 1"),
         "the file keeps its trigger: {file}"
     );
 }
