@@ -2834,7 +2834,7 @@ mod tests {
     fn refresh_job_sql_concurrent_contains_expected_parts() {
         let sql = refresh_job_sql("proj", "analytics.daily_sales", "0 2 * * *", true);
         assert!(
-            sql.contains("dbd:refresh:proj:analytics.daily_sales"),
+            sql.contains("dbd-refresh:proj:analytics.daily_sales"),
             "job name: {sql}"
         );
         assert!(
@@ -2859,7 +2859,7 @@ mod tests {
         // Contrived name/schedule carrying single quotes — all literals escaped.
         let sql = refresh_job_sql("o'proj", "analytics.o'brien", "0 2 * * *'; DROP", true);
         assert!(
-            sql.contains("dbd:refresh:o''proj:analytics.o''brien"),
+            sql.contains("dbd-refresh:o''proj:analytics.o''brien"),
             "job name escaped: {sql}"
         );
         assert!(
@@ -2880,14 +2880,14 @@ mod tests {
 
     #[test]
     fn unschedule_stale_sql_with_keep_list_is_valid() {
-        let keep = vec!["dbd:refresh:p:a.one".to_string(), "dbd:refresh:p:b.two".to_string()];
+        let keep = vec!["dbd-refresh:p:a.one".to_string(), "dbd-refresh:p:b.two".to_string()];
         let sql = unschedule_stale_sql("p", &keep, &["dbd:refresh:a.one".to_string()]);
         assert!(
-            sql.contains("left(jobname, 14) = 'dbd:refresh:p:'"),
+            sql.contains("left(jobname, length('dbd-refresh:p:')) = 'dbd-refresh:p:'"),
             "owner prefix filter: {sql}"
         );
-        assert!(sql.contains("'dbd:refresh:p:a.one'"), "keeps a.one: {sql}");
-        assert!(sql.contains("'dbd:refresh:p:b.two'"), "keeps b.two: {sql}");
+        assert!(sql.contains("'dbd-refresh:p:a.one'"), "keeps a.one: {sql}");
+        assert!(sql.contains("'dbd-refresh:p:b.two'"), "keeps b.two: {sql}");
         assert!(sql.contains("<> ALL(ARRAY["), "uses <> ALL(ARRAY[...]): {sql}");
         assert!(sql.contains("= ANY(ARRAY['dbd:refresh:a.one']"), "legacy job: {sql}");
     }
@@ -2895,7 +2895,7 @@ mod tests {
     #[test]
     fn unschedule_stale_sql_empty_keep_list_is_valid() {
         let sql = unschedule_stale_sql("p", &[], &[]);
-        assert!(sql.contains("= 'dbd:refresh:p:'"), "owner prefix filter: {sql}");
+        assert!(sql.contains("= 'dbd-refresh:p:'"), "owner prefix filter: {sql}");
         // Empty list must still produce valid SQL via a typed empty array.
         assert!(sql.contains("ARRAY[]::text[]"), "typed empty array: {sql}");
     }
@@ -2934,13 +2934,13 @@ mod tests {
 
         // Sorted by name: "analytics.abc" before "analytics.daily_sales".
         assert!(
-            plan[0].contains("dbd:refresh:proj:analytics.abc"),
+            plan[0].contains("dbd-refresh:proj:analytics.abc"),
             "first (sorted): {}",
             plan[0]
         );
         assert!(!plan[0].contains("CONCURRENTLY"), "abc is non-concurrent: {}", plan[0]);
         assert!(
-            plan[1].contains("dbd:refresh:proj:analytics.daily_sales"),
+            plan[1].contains("dbd-refresh:proj:analytics.daily_sales"),
             "second (sorted): {}",
             plan[1]
         );
@@ -2958,15 +2958,15 @@ mod tests {
             "last is unschedule: {unschedule}"
         );
         assert!(
-            unschedule.contains("'dbd:refresh:proj:analytics.abc'"),
+            unschedule.contains("'dbd-refresh:proj:analytics.abc'"),
             "keeps abc: {unschedule}"
         );
         assert!(
-            unschedule.contains("'dbd:refresh:proj:analytics.daily_sales'"),
+            unschedule.contains("'dbd-refresh:proj:analytics.daily_sales'"),
             "keeps daily_sales: {unschedule}"
         );
         assert!(
-            !unschedule.contains("'dbd:refresh:proj:analytics.unscheduled'"),
+            !unschedule.contains("'dbd-refresh:proj:analytics.unscheduled'"),
             "must NOT keep the unscheduled matview: {unschedule}"
         );
         assert!(
@@ -2975,16 +2975,22 @@ mod tests {
         );
     }
 
-    /// A legacy name is `dbd:refresh:<schema>.<name>`; a schema holding a `:`
-    /// makes it read as another owner's tagged one — `a` declaring
-    /// `"b:app".daily` would unschedule `b`'s job for `app.daily`. Whose such a
-    /// name is cannot be told, so it is never unscheduled.
+    /// A dbd before owner-named jobs unscheduled every `dbd:refresh:%` job it
+    /// was not given, so an owner-named job inside that namespace would be
+    /// taken by any project sharing the database that has not upgraded — H4
+    /// again. And a legacy name, `dbd:refresh:<schema>.<name>`, with a `:` in
+    /// its schema would read as another owner's. Owner-named jobs live in
+    /// `dbd-refresh:`, which neither ever reaches.
     #[test]
-    fn a_legacy_job_name_holding_a_colon_is_never_unscheduled() {
-        let jobs = vec![("b:app.daily".to_string(), mv(None, false))];
-        let plan = plan_cron_sync("a", &jobs, true).unwrap();
-        let unschedule = plan.last().unwrap();
-        assert!(!unschedule.contains("'dbd:refresh:b:app.daily'"), "{unschedule}");
+    fn a_tagged_job_name_is_outside_the_namespace_an_older_dbd_sweeps() {
+        let long = "x".repeat(60);
+        for owner in ["a", "b", "b:app", long.as_str()] {
+            for view in ["app.daily", "b:app.daily", "a:b.mv"] {
+                let name = refresh_job_name(owner, view);
+                assert!(!name.starts_with("dbd:refresh:"), "{name}");
+                assert!(name.starts_with("dbd-refresh:"), "{name}");
+            }
+        }
     }
 
     /// Every job name fits the 63 bytes pg_cron 1.3 and 1.4 keep, and stays

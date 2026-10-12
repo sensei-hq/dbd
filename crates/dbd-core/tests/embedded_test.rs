@@ -1666,7 +1666,7 @@ fn cron_job_predicate(jobname: &str) -> String {
 }
 
 /// Each project sharing a database owns its refresh jobs (#7, H4). A job is
-/// named for its owner, `dbd:refresh:<owner>:<schema>.<name>`, and a sync
+/// named for its owner, `dbd-refresh:<owner>:<schema>.<name>`, and a sync
 /// unschedules only its owner's — it unscheduled every `dbd:refresh:%` job it
 /// was not given, so each project's apply took the other's jobs. A legacy
 /// untagged job is unscheduled only for a materialized view this owner
@@ -1708,9 +1708,9 @@ async fn each_project_sharing_a_database_owns_its_refresh_jobs() {
         .unwrap();
 
     for (jobname, should_exist) in [
-        ("dbd:refresh:a:app.a_daily", true),
-        ("dbd:refresh:b:app.b_daily", true),
-        ("dbd:refresh:b%3Ac:app.bc_daily", true),
+        ("dbd-refresh:a:app.a_daily", true),
+        ("dbd-refresh:b:app.b_daily", true),
+        ("dbd-refresh:b%3Ac:app.bc_daily", true),
         ("dbd:refresh:app.a_daily", false),
         ("dbd:refresh:app.elsewhere", true),
     ] {
@@ -1726,9 +1726,9 @@ async fn each_project_sharing_a_database_owns_its_refresh_jobs() {
     // `a` drops its schedule: its job goes, nobody else's.
     a.sync_refresh_jobs(&[job("app.a_daily", None)]).await.unwrap();
     for (jobname, should_exist) in [
-        ("dbd:refresh:a:app.a_daily", false),
-        ("dbd:refresh:b:app.b_daily", true),
-        ("dbd:refresh:b%3Ac:app.bc_daily", true),
+        ("dbd-refresh:a:app.a_daily", false),
+        ("dbd-refresh:b:app.b_daily", true),
+        ("dbd-refresh:b%3Ac:app.bc_daily", true),
         ("dbd:refresh:app.elsewhere", true),
     ] {
         assert_catalog(
@@ -1814,6 +1814,73 @@ async fn a_non_ascii_project_unschedules_its_stale_jobs_in_a_sql_ascii_database(
     .await;
     owner.sync_refresh_jobs(&[refresh_job("app.x", None)]).await.unwrap();
     assert_catalog(&*owner, false, "SELECT 1 FROM cron.job", "a stale job").await;
+}
+
+/// A project sharing the database that has not upgraded still unschedules
+/// every `dbd:refresh:%` job it was not given — 0.25.1's sweep, below, word
+/// for word. Owner-named jobs live outside that namespace, so its apply leaves
+/// an upgraded project's jobs alone (#7, H4).
+#[tokio::test]
+async fn an_older_dbd_sharing_the_database_leaves_owner_named_jobs_alone() {
+    let (_pg, url) = start_pg().await;
+    let a = connect(&url, "a").await.unwrap();
+    a.execute_script(PG_CRON_STAND_IN).await.unwrap();
+    a.sync_refresh_jobs(&[refresh_job("app.daily", Some("0 2 * * *"))])
+        .await
+        .unwrap();
+
+    a.execute_script(
+        "SELECT cron.unschedule(jobid) FROM cron.job \
+         WHERE jobname LIKE 'dbd:refresh:%' AND jobname <> ALL(ARRAY['dbd:refresh:app.weekly']);",
+    )
+    .await
+    .unwrap();
+
+    assert_catalog(
+        &*a,
+        true,
+        "SELECT 1 FROM cron.job WHERE command = 'REFRESH MATERIALIZED VIEW \"app\".\"daily\"'",
+        "the refresh job of app.daily",
+    )
+    .await;
+}
+
+/// A refresh job a dbd before owner-named jobs scheduled, for a materialized
+/// view since dropped, refreshes nothing and fails on every tick. Whose it was
+/// its name does not say, but nobody can want it: a legacy job in dbd's own
+/// form whose view no longer exists is unscheduled. One whose view exists is
+/// some owner's, and one not in dbd's form was written by hand; both stay.
+#[tokio::test]
+async fn a_legacy_refresh_job_whose_view_is_gone_is_unscheduled() {
+    let (_pg, url) = start_pg().await;
+    let p = connect(&url, "p").await.unwrap();
+    p.execute_script(PG_CRON_STAND_IN).await.unwrap();
+    p.execute_script(
+        "CREATE SCHEMA app; CREATE MATERIALIZED VIEW app.kept AS SELECT 1 AS x; \
+         SELECT cron.schedule('dbd:refresh:app.gone', '0 1 * * *', 'REFRESH MATERIALIZED VIEW \"app\".\"gone\"'); \
+         SELECT cron.schedule('dbd:refresh:app.gone2', '0 1 * * *', 'REFRESH MATERIALIZED VIEW CONCURRENTLY \"app\".\"gone2\"'); \
+         SELECT cron.schedule('dbd:refresh:app.kept', '0 1 * * *', 'REFRESH MATERIALIZED VIEW \"app\".\"kept\"'); \
+         SELECT cron.schedule('dbd:refresh:app.hand', '0 1 * * *', 'SELECT now()');",
+    )
+    .await
+    .unwrap();
+
+    p.sync_refresh_jobs(&[]).await.unwrap();
+
+    for (jobname, should_exist) in [
+        ("dbd:refresh:app.gone", false),
+        ("dbd:refresh:app.gone2", false),
+        ("dbd:refresh:app.kept", true),
+        ("dbd:refresh:app.hand", true),
+    ] {
+        assert_catalog(
+            &*p,
+            should_exist,
+            &cron_job_predicate(jobname),
+            &format!("cron job {jobname}"),
+        )
+        .await;
+    }
 }
 
 // ── Test 7: Emitted index DDL applies to a real Postgres ──────────────────────
