@@ -35,8 +35,10 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   trigger in its function's file makes the function depend on the table, so
   the function went first while its table still stood. A table's policies, and
   a table's or a view's triggers, now go first, with their table — nothing
-  else is taken; a foreign key's own triggers are left, and a policy or trigger
-  on a table outside the scope still refuses the reset.
+  else is taken. A foreign key's own triggers are left, and so is a partition's
+  clone of its parent's trigger (a table attached with `ATTACH PARTITION`),
+  which goes with the parent's; a policy or trigger on a table outside the
+  scope still refuses the reset.
 
 ### Library API
 
