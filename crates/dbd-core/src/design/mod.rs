@@ -19,6 +19,7 @@ mod env_guard;
 mod hooks;
 mod import;
 mod marks;
+mod ownership;
 mod plan;
 mod reconcile;
 mod reset;

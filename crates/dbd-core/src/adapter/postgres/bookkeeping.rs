@@ -40,7 +40,17 @@ impl Bookkeeping {
             description text, checksum text, PRIMARY KEY (project, version) ); \
          CREATE TABLE IF NOT EXISTS dbd.matview_stamps ( \
             project varchar NOT NULL, matview varchar NOT NULL, stamp text NOT NULL, \
-            stamped_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (project, matview) );";
+            stamped_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (project, matview) ); \
+         CREATE TABLE IF NOT EXISTS dbd.objects ( \
+            namespace varchar NOT NULL CHECK (namespace IN ('relation', 'type', 'routine')), \
+            schema varchar NOT NULL, name varchar NOT NULL, kind varchar NOT NULL, \
+            owner varchar NOT NULL, claimed_at timestamptz NOT NULL DEFAULT now(), \
+            PRIMARY KEY (namespace, schema, name) ); \
+         CREATE TABLE IF NOT EXISTS dbd.uses ( \
+            owner varchar NOT NULL, \
+            kind varchar NOT NULL CHECK (kind IN ('schema', 'extension', 'role', 'entity')), \
+            target varchar NOT NULL, via varchar NOT NULL DEFAULT '', \
+            PRIMARY KEY (owner, kind, target, via) );";
 
     pub(super) fn new(pool: PgPool, project: String) -> Self {
         Self { pool, project }
@@ -403,6 +413,110 @@ impl Bookkeeping {
         .await
         .map_err(|e| DbdError::Config(format!("heal: list legacy {relname} failed: {e}")))?;
         Ok(rows.into_iter().map(|r| r.get::<String, _>("nspname")).collect())
+    }
+
+    /// Claim `objects` for `owner` in `dbd.objects`, or with `write` false only
+    /// read who holds them; the ones another owner holds come back. A claim
+    /// writes all of them or none: when any is held, the transaction rolls back.
+    /// The primary key settles two first runs at once — the second waits on the
+    /// first's uncommitted row and then finds it held. `READ COMMITTED`, so
+    /// that wait ends in a read of what the first committed.
+    ///
+    /// A read with no registry yet finds nothing held, and writes nothing.
+    pub(super) async fn claim_objects(
+        &self,
+        owner: &str,
+        objects: &[crate::adapter::OwnedObject],
+        write: bool,
+    ) -> Result<Vec<crate::adapter::HeldObject>> {
+        use sqlx::Executor as _;
+        let column = |f: fn(&crate::adapter::OwnedObject) -> &str| -> Vec<String> {
+            objects.iter().map(|o| f(o).to_string()).collect()
+        };
+        let (namespaces, schemas, names, kinds) = (
+            column(|o| &o.namespace),
+            column(|o| &o.schema),
+            column(|o| &o.name),
+            column(|o| &o.kind),
+        );
+        const HELD: &str = "SELECT o.namespace, o.schema, o.name, o.kind, o.owner FROM dbd.objects o \
+             JOIN unnest($1::text[], $2::text[], $3::text[]) AS d(namespace, schema, name) \
+               ON o.namespace = d.namespace AND o.schema = d.schema AND o.name = d.name \
+             WHERE o.owner <> $4 ORDER BY o.namespace, o.schema, o.name";
+        let held = |rows: Vec<sqlx::postgres::PgRow>| -> Vec<crate::adapter::HeldObject> {
+            rows.iter()
+                .map(|r| crate::adapter::HeldObject {
+                    object: crate::adapter::OwnedObject {
+                        namespace: r.get("namespace"),
+                        schema: r.get("schema"),
+                        name: r.get("name"),
+                        kind: r.get("kind"),
+                    },
+                    owner: r.get("owner"),
+                })
+                .collect()
+        };
+        if !write {
+            let exists: Option<String> = sqlx::query_scalar("SELECT to_regclass('dbd.objects')::text")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| DbdError::Config(format!("ownership lookup failed: {e}")))?;
+            if exists.is_none() {
+                return Ok(Vec::new());
+            }
+            let rows = sqlx::query(HELD)
+                .bind(&namespaces)
+                .bind(&schemas)
+                .bind(&names)
+                .bind(owner)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| DbdError::Config(format!("ownership read failed: {e}")))?;
+            return Ok(held(rows));
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| DbdError::Config(format!("claim: begin failed: {e}")))?;
+        (&mut *tx)
+            .execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            .await
+            .map_err(|e| DbdError::Config(format!("claim: begin failed: {e}")))?;
+        sqlx::query(
+            "INSERT INTO dbd.objects (namespace, schema, name, kind, owner) \
+               SELECT d.namespace, d.schema, d.name, d.kind, $5 \
+               FROM unnest($1::text[], $2::text[], $3::text[], $4::text[]) AS d(namespace, schema, name, kind) \
+             ON CONFLICT (namespace, schema, name) DO UPDATE SET kind = EXCLUDED.kind \
+               WHERE dbd.objects.owner = EXCLUDED.owner",
+        )
+        .bind(&namespaces)
+        .bind(&schemas)
+        .bind(&names)
+        .bind(&kinds)
+        .bind(owner)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| DbdError::Config(format!("claim failed: {e}")))?;
+        let rows = sqlx::query(HELD)
+            .bind(&namespaces)
+            .bind(&schemas)
+            .bind(&names)
+            .bind(owner)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| DbdError::Config(format!("claim read failed: {e}")))?;
+        let held = held(rows);
+        if held.is_empty() {
+            tx.commit()
+                .await
+                .map_err(|e| DbdError::Config(format!("claim: commit failed: {e}")))?;
+        } else {
+            tx.rollback()
+                .await
+                .map_err(|e| DbdError::Config(format!("claim: rollback failed: {e}")))?;
+        }
+        Ok(held)
     }
 
     /// Read the recorded version for this project (authoritative version source).

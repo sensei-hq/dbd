@@ -2555,6 +2555,15 @@ ORDER BY 1, 2, 4, 5"#;
         self.bookkeeping.heal().await
     }
 
+    async fn claim_objects(
+        &self,
+        owner: &str,
+        objects: &[super::OwnedObject],
+        write: bool,
+    ) -> Result<Vec<super::HeldObject>> {
+        self.bookkeeping.claim_objects(owner, objects, write).await
+    }
+
     async fn get_db_version(&self) -> Result<u32> {
         self.bookkeeping.version().await
     }

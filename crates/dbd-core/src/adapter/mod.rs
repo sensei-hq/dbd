@@ -69,6 +69,28 @@ pub struct CatalogData {
     pub extension_schemas: HashSet<String>,
 }
 
+/// An entity in a database's ownership registry, `dbd.objects` (#7): each has
+/// one owner. The key — `namespace`, `schema`, `name` — mirrors Postgres's own
+/// namespaces, so two owners can never hold things that could collide.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct OwnedObject {
+    /// `relation` (tables, views, materialized views, sequences), `type`
+    /// (enums) or `routine` (functions and procedures, by name).
+    pub namespace: String,
+    pub schema: String,
+    pub name: String,
+    /// `table`, `view`, `materialized view`, `sequence`, `enum`, `function`
+    /// or `procedure`.
+    pub kind: String,
+}
+
+/// An entity another owner holds, and that owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldObject {
+    pub object: OwnedObject,
+    pub owner: String,
+}
+
 /// The database adapter trait — each target implements this.
 ///
 /// Adapters handle:
@@ -408,6 +430,16 @@ pub trait DatabaseAdapter: Send + Sync {
     /// of every ownership operation (apply/deploy/reconcile/reset/migrate). Runs
     /// before any version/guard read so those reads see consistent state.
     async fn heal_bookkeeping(&self) -> Result<()>;
+
+    /// Claim `objects` for `owner` — every entity its whole design declares —
+    /// in the database's ownership registry, or, with `write` false, only look.
+    /// Returns those another owner holds; when there are any, nothing is
+    /// claimed (#7). Adapters without a registry claim nothing and find nothing
+    /// held.
+    async fn claim_objects(&self, owner: &str, objects: &[OwnedObject], write: bool) -> Result<Vec<HeldObject>> {
+        let _ = (owner, objects, write);
+        Ok(Vec::new())
+    }
     async fn get_db_version(&self) -> Result<u32>;
     async fn apply_migration(&self, version: u32, sql: &str, description: &str, checksum: &str) -> Result<()>;
     async fn clear_project_migrations(&self) -> Result<()>;

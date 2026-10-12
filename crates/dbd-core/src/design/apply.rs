@@ -289,6 +289,18 @@ impl Design {
         if !adapter.prefers_batch_apply() {
             ensure_no_pending_todos(&pending)?;
         }
+        // The last gate, before the first hook: claim the design's entities —
+        // or, for a dry run, check them — refusing when another owner holds
+        // any (#7). A claim heals the bookkeeping first.
+        self.preflight(
+            adapter,
+            if dry_run {
+                ownership::Preflight::Check
+            } else {
+                ownership::Preflight::Claim
+            },
+        )
+        .await?;
 
         // A hook is filtered against the same working set the entities were.
         // `None` — unscoped or the all-scope — runs every hook, and skips the
@@ -327,11 +339,6 @@ impl Design {
             .await?;
             return Ok(());
         }
-
-        // Heal-first: ensure bookkeeping storage exists (and is at the current
-        // layout, healing any legacy layout in place) before anything else reads
-        // or writes it — every ownership operation calls this up front.
-        adapter.heal_bookkeeping().await?;
 
         // Batch adapters (e.g. Convex) short-circuit — no execution plan needed
         if adapter.prefers_batch_apply() {

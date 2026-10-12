@@ -362,6 +362,18 @@ impl Design {
         // Refuse before planning, `dry_run` included: a plan computed from a
         // partial design reports drift that isn't there and misses drift that is.
         self.ensure_fully_parsed(scope, working_set.as_ref(), None)?;
+        // Claim the design's entities — or, for a dry run, check them —
+        // before planning: a project declaring another owner's entity is
+        // refused before anything runs (#7). A claim heals the bookkeeping.
+        self.preflight(
+            adapter,
+            if dry_run {
+                ownership::Preflight::Check
+            } else {
+                ownership::Preflight::Claim
+            },
+        )
+        .await?;
         let desired_entities = self.entities_in_scope(scope, working_set.as_ref(), None);
 
         // A reconciled database is the one an apply builds, so reconcile runs
@@ -480,12 +492,6 @@ impl Design {
             }
             return Ok(plan);
         }
-
-        // Heal-first: ensure bookkeeping storage exists (and is at the current
-        // layout, healing any legacy layout in place) before any meta read/write
-        // below — every ownership operation calls this up front. Runs after the
-        // dry-run return above so `--dry-run` stays read-only.
-        adapter.heal_bookkeeping().await?;
 
         ensure_reconcile_not_destructive(&plan, allow_destructive)?;
 
@@ -637,6 +643,9 @@ impl Design {
         // Read-only, but the same refusal applies: "in sync with the design" is a
         // false statement when part of the design was never read.
         self.ensure_fully_parsed(scope, working_set.as_ref(), None)?;
+        // Read-only, and refused as a run would be: a design declaring another
+        // owner's entity diffs against something it does not own (#7).
+        self.preflight(adapter, ownership::Preflight::Check).await?;
         let desired_entities = self.entities_in_scope(scope, working_set.as_ref(), None);
 
         // Desired snapshot (tables + enums, schema-normalized). Raw (un-canonicalized)

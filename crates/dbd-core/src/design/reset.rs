@@ -47,15 +47,15 @@ impl Design {
         drop_extensions: bool,
         scope: Option<&ResolvedScope>,
     ) -> Result<ResetComplete> {
-        // Heal-first: ensure bookkeeping storage exists (and is at the current
-        // layout, healing any legacy layout in place) before the meta read below
-        // — every ownership operation calls this up front.
-        adapter.heal_bookkeeping().await?;
-
+        // The guards first, as `apply` runs them — they read the marks without
+        // healing, and a renamed project is best told it was renamed. Then
+        // heal, and claim the design's entities: a reset of a design declaring
+        // another owner's entity is refused before anything is dropped (#7).
         let marks = self.database_marks(adapter).await?;
         if !force {
             self.check_reset_guard(&marks)?;
         }
+        self.preflight(adapter, ownership::Preflight::Claim).await?;
 
         let roles_kept = self.roles_kept_by_reset(adapter, target, scope).await?;
         let keep: Vec<String> = roles_kept.iter().map(|k| k.role.clone()).collect();
