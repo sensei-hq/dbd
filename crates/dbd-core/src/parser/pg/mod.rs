@@ -74,21 +74,51 @@ pub(crate) enum Created {
 
 /// Everything the `CREATE` statements in `sql` make — what it is, the schema
 /// the statement states (`None` where it leaves it to the search path), and
-/// its name as Postgres reads it, an unquoted one folded to lower case. Empty
-/// when `sql` does not parse; an entity declared inside a `DO` block is not
-/// among them.
+/// its name as Postgres reads it, an unquoted one folded to lower case. A
+/// `DO` block's own statements count: they run as the file applies — how dbd
+/// writes an enum, so it can run twice. Empty when `sql` does not parse.
 pub(crate) fn created_identities(sql: &str) -> Vec<(Created, Option<String>, String)> {
-    // Passed as the default schema, so an unqualified name comes back with it.
-    const UNSTATED: &str = "\u{1}";
     let Ok(parsed) = pg_query::parse(sql) else {
         return Vec::new();
     };
-    let (decls, _) = declarations::declarations(&parsed, sql, UNSTATED);
+    let mut created = created_by(&parsed, sql);
+    for raw in &parsed.protobuf.stmts {
+        if !matches!(
+            raw.stmt.as_ref().and_then(|s| s.node.as_ref()),
+            Some(pg_query::NodeEnum::DoStmt(_))
+        ) {
+            continue;
+        }
+        let start = (raw.stmt_location as usize).min(sql.len());
+        let end = if raw.stmt_len == 0 {
+            sql.len()
+        } else {
+            (start + raw.stmt_len as usize).min(sql.len())
+        };
+        let Some(Ok(tree)) = sql.get(start..end).map(pg_query::parse_plpgsql) else {
+            continue;
+        };
+        let mut queries = Vec::new();
+        common::collect_plpgsql_queries(&tree, &mut queries);
+        for query in queries {
+            if let Ok(inner) = pg_query::parse(&query) {
+                created.extend(created_by(&inner, &query));
+            }
+        }
+    }
+    created
+}
+
+/// [`created_identities`] for one parsed script, its `DO` blocks unread.
+fn created_by(parsed: &pg_query::ParseResult, sql: &str) -> Vec<(Created, Option<String>, String)> {
+    // Passed as the default schema, so an unqualified name comes back with it.
+    const UNSTATED: &str = "\u{1}";
+    let (decls, _) = declarations::declarations(parsed, sql, UNSTATED);
     decls
         .into_iter()
         .map(|decl| (Created::Entity(decl.entity_type), decl.schema, decl.name))
         .chain(
-            declarations::created_types(&parsed, UNSTATED)
+            declarations::created_types(parsed, UNSTATED)
                 .into_iter()
                 .map(|(kind, schema, name)| (Created::Type(kind), schema, name)),
         )

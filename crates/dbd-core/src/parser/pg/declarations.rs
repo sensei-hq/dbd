@@ -274,23 +274,70 @@ pub(in crate::parser) fn created_types(
     parsed: &pg_query::ParseResult,
     default_schema: &str,
 ) -> Vec<(&'static str, Option<String>, String)> {
-    parsed
+    let mut types = Vec::new();
+    for node in parsed
         .protobuf
         .stmts
         .iter()
         .filter_map(|raw| raw.stmt.as_ref().and_then(|s| s.node.as_ref()))
-        .filter_map(|node| {
-            let (kind, (schema, name)) = match node {
-                NodeEnum::CompositeTypeStmt(c) => {
-                    ("composite type", from_range_var(c.typevar.as_ref()?, default_schema))
+    {
+        match node {
+            NodeEnum::CompositeTypeStmt(c) => {
+                if let Some(rv) = c.typevar.as_ref() {
+                    let (schema, name) = from_range_var(rv, default_schema);
+                    types.push(("composite type", schema, name));
                 }
-                NodeEnum::CreateDomainStmt(c) => ("domain", from_parts(&name_parts(&c.domainname), default_schema)?),
-                NodeEnum::CreateRangeStmt(c) => ("range type", from_parts(&name_parts(&c.type_name), default_schema)?),
-                _ => return None,
+            }
+            NodeEnum::CreateDomainStmt(c) => {
+                if let Some((schema, name)) = from_parts(&name_parts(&c.domainname), default_schema) {
+                    types.push(("domain", schema, name));
+                }
+            }
+            NodeEnum::CreateRangeStmt(c) => {
+                let parts = name_parts(&c.type_name);
+                if let Some((schema, name)) = from_parts(&parts, default_schema) {
+                    types.push(("range type", schema, name));
+                }
+                if let Some((schema, name)) = from_parts(&multirange_parts(c, &parts), default_schema) {
+                    types.push(("multirange type", schema, name));
+                }
+            }
+            _ => {}
+        }
+    }
+    types
+}
+
+/// The name of the multirange Postgres makes beside a range: its
+/// `multirange_type_name`, in the range's schema unless it states one; else
+/// the range's name with its first `range` made `multirange`, else with
+/// `_multirange` added.
+fn multirange_parts(stmt: &protobuf::CreateRangeStmt, range_parts: &[String]) -> Vec<String> {
+    let given = stmt.params.iter().find_map(|p| match p.node.as_ref()? {
+        NodeEnum::DefElem(d) if d.defname.eq_ignore_ascii_case("multirange_type_name") => {
+            match d.arg.as_ref()?.node.as_ref()? {
+                NodeEnum::TypeName(t) => Some(name_parts(&t.names)),
+                _ => None,
+            }
+        }
+        _ => None,
+    });
+    let schema_parts = &range_parts[..range_parts.len().saturating_sub(1)];
+    match given {
+        Some(given) if given.len() > 1 => given,
+        Some(given) => [schema_parts, &given[..]].concat(),
+        None => {
+            let Some(range) = range_parts.last() else {
+                return Vec::new();
             };
-            Some((kind, schema, name))
-        })
-        .collect()
+            let multirange = if range.contains("range") {
+                range.replacen("range", "multirange", 1)
+            } else {
+                format!("{range}_multirange")
+            };
+            [schema_parts, &[multirange]].concat()
+        }
+    }
 }
 
 fn from_range_var(rv: &protobuf::RangeVar, default_schema: &str) -> (Option<String>, String) {

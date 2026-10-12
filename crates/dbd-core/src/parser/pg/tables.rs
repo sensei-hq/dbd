@@ -475,6 +475,8 @@ fn extract_column(
                 let rendered = constraint_expr(c, &name, "DEFAULT")?;
                 collect_function_refs(&rendered, default_schema, functions);
                 if let Some(sequence) = c.raw_expr.as_deref().and_then(common::nextval_sequence) {
+                    // As Postgres reads the string: `'App.Seq'` is `app.seq`.
+                    let sequence = common::regclass_name(&sequence).unwrap_or(sequence);
                     references.extend(uses_ref(&sequence, default_schema));
                 }
                 default_value = Some(rendered);

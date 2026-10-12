@@ -523,8 +523,8 @@ impl Bookkeeping {
     /// target `namespace:schema.name`, the name split at its first dot as dbd
     /// splits one, and is recorded where another owner holds it — and not at
     /// all when nobody else does. One named bare is looked up along its search
-    /// path as Postgres looks it up: the first schema anyone holds the name in
-    /// is the one it uses.
+    /// path as Postgres looks it up: the first schema the object exists in is
+    /// the one it uses, owned or not.
     pub(super) async fn record_uses(
         &self,
         tx: Option<&mut Transaction<'static, Postgres>>,
@@ -560,12 +560,14 @@ impl Bookkeeping {
         for (i, u) in entities.iter().enumerate() {
             let (namespace, qualified) = u.target.split_once(':').unwrap_or_default();
             let (schema, name) = crate::entity::split_qualified_name(qualified);
-            let schemas = if u.search_path.is_empty() {
-                vec![schema.unwrap_or_default()]
-            } else {
+            let bare = !u.search_path.is_empty();
+            let schemas = if bare {
                 u.search_path.clone()
+            } else {
+                vec![schema.unwrap_or_default()]
             };
             for (rank, schema) in schemas.into_iter().enumerate() {
+                candidates.bare.push(bare);
                 candidates.used.push(i as i32);
                 candidates.rank.push(rank as i32);
                 candidates.namespace.push(namespace.to_string());
@@ -593,17 +595,29 @@ impl Bookkeeping {
         .execute(&mut **tx)
         .await
         .map_err(|e| registry_error(&e, "dbd.uses", "record uses"))?;
+        // A bare name's candidates are those that exist, as Postgres finds
+        // them: a routine in `pg_proc`, anything else in `pg_class` or
+        // `pg_type`. The first is the one used — recorded when another owner
+        // holds it.
         sqlx::query(
             "INSERT INTO dbd.uses (owner, kind, target, via) \
-               SELECT $1, 'entity', h.namespace || ':' || h.schema || '.' || h.name, h.via \
+               SELECT $1, 'entity', o.namespace || ':' || o.schema || '.' || o.name, f.via \
                FROM ( \
-                 SELECT DISTINCT ON (d.used) d.via, o.namespace, o.schema, o.name, o.owner \
-                 FROM unnest($2::int4[], $3::int4[], $4::text[], $5::text[], $6::text[], $7::text[]) \
-                   AS d(used, rank, namespace, schema, name, via) \
-                 JOIN dbd.objects o ON o.namespace = d.namespace AND o.schema = d.schema AND o.name = d.name \
+                 SELECT DISTINCT ON (d.used) d.via, d.namespace, d.schema, d.name \
+                 FROM unnest($2::int4[], $3::int4[], $4::text[], $5::text[], $6::text[], $7::text[], $8::bool[]) \
+                   AS d(used, rank, namespace, schema, name, via, bare) \
+                 WHERE NOT d.bare OR CASE d.namespace \
+                   WHEN 'routine' THEN EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+                                               WHERE n.nspname = d.schema AND p.proname = d.name) \
+                   ELSE EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                                WHERE n.nspname = d.schema AND c.relname = d.name) \
+                     OR EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
+                                WHERE n.nspname = d.schema AND t.typname = d.name) \
+                 END \
                  ORDER BY d.used, d.rank \
-               ) h \
-               WHERE h.owner <> $1 \
+               ) f \
+               JOIN dbd.objects o ON o.namespace = f.namespace AND o.schema = f.schema AND o.name = f.name \
+                 AND o.owner <> $1 \
              ON CONFLICT DO NOTHING",
         )
         .bind(owner)
@@ -613,6 +627,7 @@ impl Bookkeeping {
         .bind(&candidates.schema)
         .bind(&candidates.name)
         .bind(&candidates.via)
+        .bind(&candidates.bare)
         .execute(&mut **tx)
         .await
         .map_err(|e| registry_error(&e, "dbd.uses", "record uses"))?;
@@ -960,11 +975,9 @@ async fn held_objects(
         .collect())
 }
 
-/// Bound how long `tx` waits for a lock on `table` — [`HEAL_LOCK_TIMEOUT`]
-/// while `on`, and back to the transaction's own setting after: a batch's DDL
-/// keeps whatever wait it had.
 /// The rows an entity use is looked up by: one per schema it may be in, `rank`
-/// its place on the search path, `used` the use it stands for.
+/// its place on the search path, `used` the use it stands for, `bare` whether
+/// it was named without a schema.
 #[derive(Default)]
 struct Candidates {
     used: Vec<i32>,
@@ -973,8 +986,12 @@ struct Candidates {
     schema: Vec<String>,
     name: Vec<String>,
     via: Vec<String>,
+    bare: Vec<bool>,
 }
 
+/// Bound how long `tx` waits for a lock on `table` — [`HEAL_LOCK_TIMEOUT`]
+/// while `on`, and back to the transaction's own setting after: a batch's DDL
+/// keeps whatever wait it had.
 async fn bounded_wait(tx: &mut Transaction<'static, Postgres>, table: &str, on: bool) -> Result<()> {
     use sqlx::Executor as _;
     let sql = if on {

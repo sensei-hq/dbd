@@ -219,6 +219,48 @@ pub(crate) fn nextval_sequence(expr: &pg_query::protobuf::Node) -> Option<String
     }
 }
 
+/// The name a `regclass` string names, as Postgres reads one — `nextval`'s
+/// argument: dot-separated parts, each double-quoted as written (`""` a
+/// quote) or folded to lower case. `None` for a string that is not a name.
+pub(crate) fn regclass_name(text: &str) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut chars = text.trim().chars().peekable();
+    loop {
+        let mut part = String::new();
+        if chars.peek() == Some(&'"') {
+            chars.next();
+            loop {
+                match chars.next()? {
+                    '"' if chars.peek() == Some(&'"') => {
+                        chars.next();
+                        part.push('"');
+                    }
+                    '"' => break,
+                    c => part.push(c),
+                }
+            }
+        } else {
+            while let Some(&c) = chars.peek() {
+                if c == '.' {
+                    break;
+                }
+                part.push(c.to_ascii_lowercase());
+                chars.next();
+            }
+            part = part.trim().to_string();
+            if part.is_empty() {
+                return None;
+            }
+        }
+        parts.push(part);
+        match chars.next() {
+            None => return Some(parts.join(".")),
+            Some('.') => {}
+            Some(_) => return None,
+        }
+    }
+}
+
 /// [`nextval_sequence`] for an expression held as text — a column default as
 /// the parser rendered it or as introspection reported it.
 pub(crate) fn nextval_sequence_of(expr: &str) -> Option<String> {
@@ -326,7 +368,7 @@ pub(in crate::parser) fn extract_proc_refs_via_pg_query(
 
 /// Recursively collect every embedded SQL `query` string from a parsed PL/pgSQL
 /// JSON tree (libpg_query stores each statement's SQL under a `"query"` key).
-fn collect_plpgsql_queries(value: &serde_json::Value, out: &mut Vec<String>) {
+pub(in crate::parser) fn collect_plpgsql_queries(value: &serde_json::Value, out: &mut Vec<String>) {
     match value {
         serde_json::Value::Object(map) => {
             for (key, val) in map {

@@ -44,9 +44,10 @@ impl Design {
     /// the schema it states — else the search path the file runs on, its own
     /// `set search_path` or `source.search_path`. A file may create more than
     /// its path names — another table, the type a function returns — and
-    /// every one is claimed. Only where no statement can be read — a file that
-    /// does not parse, an enum declared inside a `DO` block, a dialect dbd does
-    /// not read as Postgres — does the path name the entity, folded.
+    /// every one is claimed; a `DO` block's statements count. Where no
+    /// statement read names the path's own entity — a file that does not
+    /// parse, a name built in dynamic SQL, a dialect dbd does not read as
+    /// Postgres — the path names it, folded.
     ///
     /// Everything Postgres names as a relation or a type shares one namespace:
     /// it gives a table, a view and a materialized view a row type, so none of
@@ -86,7 +87,11 @@ impl Design {
                     .into_iter()
                     .filter_map(|(created, stated, name)| key(created, stated.or_else(on_path), name))
                     .collect();
-                if keys.is_empty() {
+                let path_namespace = owned_kind(e.entity_type).map(|(namespace, _)| namespace);
+                let is_path = |k: &OwnedObject| {
+                    Some(k.namespace.as_str()) == path_namespace && k.name.eq_ignore_ascii_case(&path_name)
+                };
+                if !keys.iter().any(is_path) {
                     // A path cannot quote a name, so it names what Postgres
                     // makes of an unquoted one: folded.
                     keys.extend(key(
@@ -99,12 +104,9 @@ impl Design {
                         path_name.to_ascii_lowercase(),
                     ));
                 }
-                // The path's entity first, by namespace and name: it is the one
-                // a reference is made through.
-                let path_namespace = owned_kind(e.entity_type).map(|(namespace, _)| namespace);
-                if let Some(i) = keys.iter().position(|k| {
-                    Some(k.namespace.as_str()) == path_namespace && k.name.eq_ignore_ascii_case(&path_name)
-                }) {
+                // The path's entity first: it is the one a reference is made
+                // through.
+                if let Some(i) = keys.iter().position(is_path) {
                     keys.swap(0, i);
                 }
                 (e, keys)
