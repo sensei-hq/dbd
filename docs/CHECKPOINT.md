@@ -13,8 +13,9 @@ unreleased.
   part-way commit; reconcile, reset and a DBD_NO_TX apply claim past their
   last refusal (before-hooks planned first) and before the first write.
 - Rounds 3–5 fixed test-first; latest red `fba2b27e`, fixes `20515ad4`,
-  `871ad944`. CI runs `cli_live` (libossp-uuid installed for `uuid-ossp`).
-- Embedded 196/196, `cli_live` 47/47, workspace 2002/0, clippy and fmt clean.
+  `871ad944`; its regression (built-in types bound to a `"Text"` table) red
+  `f383fb12`, fix `b042039d`. CI runs `cli_live` (libossp-uuid for `uuid-ossp`).
+- Embedded 198/198, `cli_live` 47/47, workspace 2002/0, clippy and fmt clean.
 
 ## Next
 
