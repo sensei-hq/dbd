@@ -1883,6 +1883,79 @@ async fn a_legacy_refresh_job_whose_view_is_gone_is_unscheduled() {
     }
 }
 
+/// A legacy job may refresh a view in a schema the syncing role cannot use.
+/// Asked of such a name, `to_regclass` raises rather than answer, and that one
+/// job failed every sync, after the apply had committed. A job with no name at
+/// all is no dbd job, and is not looked at either. Whether the view exists is
+/// read from the catalog, which any role may read.
+#[tokio::test]
+async fn a_legacy_job_in_a_schema_the_role_cannot_use_does_not_fail_the_sync() {
+    let (pg, url) = start_pg().await;
+    connect(&url, "admin")
+        .await
+        .unwrap()
+        .execute_script(&format!(
+            "{PG_CRON_STAND_IN} \
+             CREATE ROLE role_app LOGIN PASSWORD 'secret'; \
+             GRANT USAGE ON SCHEMA cron TO role_app; GRANT ALL ON cron.job TO role_app; \
+             GRANT USAGE ON SEQUENCE cron.job_jobid_seq TO role_app; \
+             GRANT CREATE ON DATABASE testdb TO role_app; \
+             CREATE SCHEMA hidden; CREATE MATERIALIZED VIEW hidden.mv AS SELECT 1 AS x; \
+             SELECT cron.schedule('dbd:refresh:hidden.mv', '0 1 * * *', 'REFRESH MATERIALIZED VIEW \"hidden\".\"mv\"'); \
+             INSERT INTO cron.job (jobname, schedule, command) \
+               VALUES (NULL, '0 1 * * *', 'REFRESH MATERIALIZED VIEW \"hidden\".\"mv\"');"
+        ))
+        .await
+        .unwrap();
+    let settings = pg.settings();
+    let app = connect(
+        &format!(
+            "postgresql://role_app:secret@{}:{}/testdb",
+            settings.host, settings.port
+        ),
+        "app",
+    )
+    .await
+    .unwrap();
+
+    app.sync_refresh_jobs(&[]).await.expect("sync");
+    assert_catalog(
+        &*app,
+        true,
+        &cron_job_predicate("dbd:refresh:hidden.mv"),
+        "cron job dbd:refresh:hidden.mv",
+    )
+    .await;
+}
+
+/// Every project's sync unschedules a legacy job whose view is gone, so two
+/// syncs at once went for the same jobs — and pg_cron raises when the job it
+/// is asked to unschedule is already gone. One sync failed, after its apply
+/// had committed. The syncs take turns.
+#[tokio::test]
+async fn two_syncs_at_once_unschedule_a_gone_job_once() {
+    let (_pg, url) = start_pg().await;
+    let p = connect(&url, "p").await.unwrap();
+    let q = connect(&url, "q").await.unwrap();
+    p.execute_script(&format!(
+        "{} \
+         CREATE OR REPLACE FUNCTION cron.unschedule(job_id bigint) RETURNS boolean LANGUAGE plpgsql AS $$ \
+           BEGIN PERFORM pg_sleep(0.01); DELETE FROM cron.job WHERE jobid = job_id; \
+             IF NOT FOUND THEN RAISE EXCEPTION 'could not find valid entry for job %', job_id; END IF; \
+             RETURN true; END $$; \
+         SELECT cron.schedule('dbd:refresh:app.gone' || i, '0 1 * * *', \
+           'REFRESH MATERIALIZED VIEW \"app\".\"gone' || i || '\"') FROM generate_series(1, 40) AS i;",
+        PG_CRON_STAND_IN
+    ))
+    .await
+    .unwrap();
+
+    let (rp, rq) = tokio::join!(p.sync_refresh_jobs(&[]), q.sync_refresh_jobs(&[]));
+    rp.expect("p's sync");
+    rq.expect("q's sync");
+    assert_catalog(&*p, false, "SELECT 1 FROM cron.job", "a gone job left").await;
+}
+
 // ── Test 7: Emitted index DDL applies to a real Postgres ──────────────────────
 
 /// Close the emit→apply loop: build a minimal `Entity` with a `text[]` column, a
