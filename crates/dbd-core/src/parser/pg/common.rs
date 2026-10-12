@@ -220,39 +220,38 @@ pub(crate) fn nextval_sequence(expr: &pg_query::protobuf::Node) -> Option<String
 }
 
 /// The name a `regclass` string names, as Postgres reads one — `nextval`'s
-/// argument: dot-separated parts, each double-quoted as written (`""` a
-/// quote) or folded to lower case. `None` for a string that is not a name.
+/// argument: dot-separated parts, whitespace around each skipped, each
+/// double-quoted as written (`""` a quote) or folded to lower case. `None`
+/// for a string that is not a name — a number is an OID.
 pub(crate) fn regclass_name(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let space = |c: &char| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c');
     let mut parts: Vec<String> = Vec::new();
-    let mut chars = text.trim().chars().peekable();
+    let mut chars = text.chars().peekable();
     loop {
+        while chars.next_if(space).is_some() {}
         let mut part = String::new();
-        if chars.peek() == Some(&'"') {
-            chars.next();
+        if chars.next_if_eq(&'"').is_some() {
             loop {
                 match chars.next()? {
-                    '"' if chars.peek() == Some(&'"') => {
-                        chars.next();
-                        part.push('"');
-                    }
+                    '"' if chars.next_if_eq(&'"').is_some() => part.push('"'),
                     '"' => break,
                     c => part.push(c),
                 }
             }
         } else {
-            while let Some(&c) = chars.peek() {
-                if c == '.' {
-                    break;
-                }
+            while let Some(c) = chars.next_if(|c| *c != '.' && !space(c)) {
                 part.push(c.to_ascii_lowercase());
-                chars.next();
-            }
-            part = part.trim().to_string();
-            if part.is_empty() {
-                return None;
             }
         }
+        if part.is_empty() {
+            return None;
+        }
         parts.push(part);
+        while chars.next_if(space).is_some() {}
         match chars.next() {
             None => return Some(parts.join(".")),
             Some('.') => {}

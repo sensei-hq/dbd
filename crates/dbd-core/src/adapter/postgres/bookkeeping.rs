@@ -523,8 +523,9 @@ impl Bookkeeping {
     /// target `namespace:schema.name`, the name split at its first dot as dbd
     /// splits one, and is recorded where another owner holds it — and not at
     /// all when nobody else does. One named bare is looked up along its search
-    /// path as Postgres looks it up: the first schema the object exists in is
-    /// the one it uses, owned or not.
+    /// path as Postgres looks it up: a read is of the first relation on the
+    /// path, owned or not; a call, of any routine on it that could be the one
+    /// its arguments reach.
     pub(super) async fn record_uses(
         &self,
         tx: Option<&mut Transaction<'static, Postgres>>,
@@ -596,26 +597,29 @@ impl Bookkeeping {
         .await
         .map_err(|e| registry_error(&e, "dbd.uses", "record uses"))?;
         // A bare name's candidates are those that exist, as Postgres finds
-        // them: a routine in `pg_proc`, anything else in `pg_class` or
-        // `pg_type`. The first is the one used — recorded when another owner
-        // holds it.
+        // them. A read is of the first relation on the path; a call is
+        // resolved by its arguments too, which dbd does not weigh, so it is a
+        // use of every routine on the path it could reach. Recorded where
+        // another owner holds it.
         sqlx::query(
-            "INSERT INTO dbd.uses (owner, kind, target, via) \
+            "WITH d AS ( \
+               SELECT * FROM unnest($2::int4[], $3::int4[], $4::text[], $5::text[], $6::text[], $7::text[], $8::bool[]) \
+                 AS d(used, rank, namespace, schema, name, via, bare) \
+             ), relations AS ( \
+               SELECT DISTINCT ON (d.used) d.via, d.namespace, d.schema, d.name FROM d \
+               WHERE d.namespace <> 'routine' AND (NOT d.bare OR EXISTS ( \
+                 SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = d.schema AND c.relname = d.name AND c.relkind IN ('r', 'v', 'm', 'f', 'p', 'S'))) \
+               ORDER BY d.used, d.rank \
+             ), routines AS ( \
+               SELECT d.via, d.namespace, d.schema, d.name FROM d \
+               WHERE d.namespace = 'routine' AND (NOT d.bare OR EXISTS ( \
+                 SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+                 WHERE n.nspname = d.schema AND p.proname = d.name)) \
+             ) \
+             INSERT INTO dbd.uses (owner, kind, target, via) \
                SELECT $1, 'entity', o.namespace || ':' || o.schema || '.' || o.name, f.via \
-               FROM ( \
-                 SELECT DISTINCT ON (d.used) d.via, d.namespace, d.schema, d.name \
-                 FROM unnest($2::int4[], $3::int4[], $4::text[], $5::text[], $6::text[], $7::text[], $8::bool[]) \
-                   AS d(used, rank, namespace, schema, name, via, bare) \
-                 WHERE NOT d.bare OR CASE d.namespace \
-                   WHEN 'routine' THEN EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
-                                               WHERE n.nspname = d.schema AND p.proname = d.name) \
-                   ELSE EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
-                                WHERE n.nspname = d.schema AND c.relname = d.name) \
-                     OR EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
-                                WHERE n.nspname = d.schema AND t.typname = d.name) \
-                 END \
-                 ORDER BY d.used, d.rank \
-               ) f \
+               FROM (SELECT * FROM relations UNION ALL SELECT * FROM routines) f \
                JOIN dbd.objects o ON o.namespace = f.namespace AND o.schema = f.schema AND o.name = f.name \
                  AND o.owner <> $1 \
              ON CONFLICT DO NOTHING",

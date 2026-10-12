@@ -114,6 +114,7 @@ fn created_by(parsed: &pg_query::ParseResult, sql: &str) -> Vec<(Created, Option
     // Passed as the default schema, so an unqualified name comes back with it.
     const UNSTATED: &str = "\u{1}";
     let (decls, _) = declarations::declarations(parsed, sql, UNSTATED);
+    let temporary = declarations::temporary_relations(parsed);
     decls
         .into_iter()
         .map(|decl| (Created::Entity(decl.entity_type), decl.schema, decl.name))
@@ -131,6 +132,16 @@ fn created_by(parsed: &pg_query::ParseResult, sql: &str) -> Vec<(Created, Option
                 None => qualified.clone(),
             };
             (created, schema.filter(|s| s != UNSTATED), name)
+        })
+        // A temporary relation is the session's, and nobody's to own.
+        .filter(|(created, schema, name)| {
+            let relation = matches!(
+                created,
+                Created::Entity(
+                    EntityType::Table | EntityType::View | EntityType::MaterializedView | EntityType::Sequence
+                )
+            );
+            !(relation && schema.as_deref().is_none_or(|s| s.starts_with("pg_temp")) && temporary.contains(name))
         })
         .collect()
 }

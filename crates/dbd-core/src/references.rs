@@ -135,6 +135,19 @@ fn resolve_entity_refers(
             resolved.push(r);
             continue;
         }
+        // A path cannot quote, so it names what Postgres folds: `Order_No.ddl`
+        // declares `app.Order_No`, which `nextval('app.Order_No')` reaches as
+        // `app.order_no`. A type or sequence matches it so.
+        if r.kind == crate::entity::RefKind::Uses
+            && let Some(name) = known.iter().find(|k| k.eq_ignore_ascii_case(&r.name))
+        {
+            r.name = name.clone();
+            if r.schema_source.is_guess() {
+                r.schema_source = SchemaSource::Resolved;
+            }
+            resolved.push(r);
+            continue;
+        }
         // A type or sequence written bare that resolves to nothing is a
         // built-in; unlike an unresolved call it is not kept at all. One the
         // source qualified is kept, marked, unwarned — see `RefKind::Uses`.
