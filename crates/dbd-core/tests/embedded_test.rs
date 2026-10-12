@@ -4460,6 +4460,188 @@ async fn a_legacy_table_the_role_cannot_read_is_passed_over() {
     .await;
 }
 
+const LEGACY_MIGRATIONS_ONLY_A: &str = "CREATE TABLE public._dbd_migrations ( \
+    project varchar NOT NULL, version integer NOT NULL, applied_at timestamptz NOT NULL DEFAULT now(), \
+    description text, checksum text, PRIMARY KEY (project, version) ); \
+    INSERT INTO public._dbd_migrations (project, version) VALUES ('a', 1);";
+
+/// The heal's lock waits for a writer in flight, and its read must then see
+/// what that writer committed — which only `READ COMMITTED` gives. Under a
+/// database's default of `REPEATABLE READ` the heal's snapshot was taken
+/// before the wait, and it dropped the table with the other project's row.
+#[tokio::test]
+async fn a_heal_under_repeatable_read_keeps_a_row_committed_meanwhile() {
+    let (_pg, url) = start_pg().await;
+    connect(&url, "setup")
+        .await
+        .unwrap()
+        .execute_script(&format!(
+            "ALTER DATABASE testdb SET default_transaction_isolation = 'repeatable read'; {LEGACY_META_ONLY_A}"
+        ))
+        .await
+        .unwrap();
+    let a = connect(&url, "a").await.unwrap();
+    let c = connect(&url, "c").await.unwrap();
+
+    c.begin_batch().await.unwrap();
+    c.execute_script("INSERT INTO public._dbd_meta (project, env, version) VALUES ('c', 'prod', 1);")
+        .await
+        .unwrap();
+    let heal = tokio::spawn(async move { a.heal_bookkeeping().await.map(|()| a) });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    c.commit_batch().await.unwrap();
+    let a = heal.await.unwrap().expect("a's heal");
+
+    assert_dbd_meta_version(&*a, "a", 4).await;
+    assert_catalog(
+        &*a,
+        true,
+        "SELECT 1 FROM public._dbd_meta WHERE project = 'c' AND version = 1",
+        "c in public._dbd_meta",
+    )
+    .await;
+}
+
+/// A legacy table holding this project's row, which its role can read but not
+/// take — no right to delete from it — was passed over as another project's:
+/// the heal succeeded, and the row went on being read back after a reset had
+/// forgotten the project. The heal refuses instead, naming the table.
+#[tokio::test]
+async fn a_heal_refuses_a_legacy_table_holding_its_row_it_cannot_take() {
+    let (pg, url) = start_pg().await;
+    connect(&url, "admin")
+        .await
+        .unwrap()
+        .execute_script(
+            "CREATE ROLE role_p LOGIN PASSWORD 'secret'; \
+             GRANT CREATE ON DATABASE testdb TO role_p; GRANT USAGE, CREATE ON SCHEMA public TO role_p; \
+             CREATE TABLE public._dbd_meta ( \
+               project varchar NOT NULL PRIMARY KEY, env varchar NOT NULL DEFAULT 'dev', \
+               version integer NOT NULL DEFAULT 0, \
+               created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now() ); \
+             INSERT INTO public._dbd_meta (project, env, version) VALUES ('p', 'prod', 5); \
+             REVOKE ALL ON public._dbd_meta FROM PUBLIC; GRANT SELECT ON public._dbd_meta TO role_p;",
+        )
+        .await
+        .unwrap();
+    let settings = pg.settings();
+    let p = connect(
+        &format!("postgresql://role_p:secret@{}:{}/testdb", settings.host, settings.port),
+        "p",
+    )
+    .await
+    .unwrap();
+
+    let err = p
+        .heal_bookkeeping()
+        .await
+        .expect_err("p's row is in a table p cannot take")
+        .to_string();
+    assert!(err.contains("_dbd_meta"), "{err}");
+}
+
+/// A dbd before the `dbd` schema writes `_dbd_migrations` and then `_dbd_meta`
+/// in one batch. A heal locking them the other way round held `_dbd_meta` while
+/// it waited for `_dbd_migrations`, and the batch then waited for `_dbd_meta`:
+/// Postgres broke the deadlock by aborting one of them. The heal locks them in
+/// the batch's order.
+#[tokio::test]
+async fn a_heal_beside_an_older_batch_does_not_deadlock() {
+    let (_pg, url) = start_pg().await;
+    let a = connect(&url, "a").await.unwrap();
+    let h = connect(&url, "h").await.unwrap();
+    a.execute_script(&format!("{LEGACY_META_ONLY_A} {LEGACY_MIGRATIONS_ONLY_A}"))
+        .await
+        .unwrap();
+
+    h.begin_batch().await.unwrap();
+    h.execute_script("INSERT INTO public._dbd_migrations (project, version) VALUES ('h', 1);")
+        .await
+        .unwrap();
+    let heal = tokio::spawn(async move { a.heal_bookkeeping().await.map(|()| a) });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let batch = tokio::spawn(async move {
+        h.execute_script(
+            "INSERT INTO public._dbd_meta (project, env, version) VALUES ('h', 'dev', 1) \
+             ON CONFLICT (project) DO UPDATE SET version = EXCLUDED.version;",
+        )
+        .await?;
+        h.commit_batch().await
+    });
+    batch.await.unwrap().expect("the older batch");
+    let a = heal.await.unwrap().expect("a's heal");
+    assert_dbd_meta_version(&*a, "a", 4).await;
+    assert_catalog(
+        &*a,
+        true,
+        "SELECT 1 FROM public._dbd_meta WHERE project = 'h'",
+        "h in public._dbd_meta",
+    )
+    .await;
+}
+
+/// The heal waits for writers on a legacy table — but a transaction left open
+/// after writing one held every heal, silently, for as long as it stayed open.
+/// It gives up after a few seconds instead, naming the table.
+#[tokio::test]
+async fn a_heal_held_up_by_an_open_write_fails_naming_the_table() {
+    let (_pg, url) = start_pg().await;
+    let a = connect(&url, "a").await.unwrap();
+    let holder = connect(&url, "holder").await.unwrap();
+    a.execute_script(LEGACY_MIGRATIONS_ONLY_A).await.unwrap();
+    holder.begin_batch().await.unwrap();
+    holder
+        .execute_script("INSERT INTO public._dbd_migrations (project, version) VALUES ('holder', 1);")
+        .await
+        .unwrap();
+
+    let healed = tokio::time::timeout(std::time::Duration::from_secs(30), a.heal_bookkeeping()).await;
+    holder.rollback_batch().await.unwrap();
+    let err = healed
+        .expect("the heal must give up, not wait for as long as the write stays open")
+        .expect_err("an open write holds the legacy table")
+        .to_string();
+    assert!(err.contains("_dbd_migrations"), "{err}");
+}
+
+/// With `standard_conforming_strings` off, a `\` in a string literal is an
+/// escape, so a schema name holding one, written into the privilege check's
+/// literal, named another schema — and every heal failed.
+#[tokio::test]
+async fn a_heal_reads_a_legacy_schema_whose_name_holds_a_backslash() {
+    let (_pg, url) = start_pg().await;
+    connect(&url, "setup")
+        .await
+        .unwrap()
+        .execute_script(
+            "CREATE SCHEMA \"a\\\"; \
+             CREATE TABLE \"a\\\"._dbd_meta ( \
+               project varchar NOT NULL PRIMARY KEY, env varchar NOT NULL DEFAULT 'dev', \
+               version integer NOT NULL DEFAULT 0, \
+               created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now() ); \
+             INSERT INTO \"a\\\"._dbd_meta (project, env, version) VALUES ('a', 'prod', 4); \
+             ALTER DATABASE testdb SET standard_conforming_strings = off;",
+        )
+        .await
+        .unwrap();
+    let a = connect(&url, "a").await.unwrap();
+    a.heal_bookkeeping().await.expect("heal");
+    assert_dbd_meta_version(&*a, "a", 4).await;
+}
+
+/// Two projects' first runs on a database without the `dbd` schema: each heal
+/// creates it, and the second one's `CREATE SCHEMA IF NOT EXISTS`, waiting on
+/// the first's uncommitted schema, failed on its duplicate key.
+#[tokio::test]
+async fn two_first_heals_at_once_both_succeed() {
+    let (_pg, url) = start_pg().await;
+    let a = connect(&url, "a").await.unwrap();
+    let b = connect(&url, "b").await.unwrap();
+    let (ra, rb) = tokio::join!(a.heal_bookkeeping(), b.heal_bookkeeping());
+    ra.expect("a's heal");
+    rb.expect("b's heal");
+}
+
 // ── heal_bookkeeping: move to `dbd` schema + fold legacy `public._dbd_*` ───────
 
 #[tokio::test]
