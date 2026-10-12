@@ -2372,6 +2372,45 @@ async fn an_apply_outside_a_transaction_claims_before_its_hooks() {
     assert!(out.status.success(), "{}", combined(&out));
 }
 
+/// A before-hook that cannot run — its file missing — refuses the run, and
+/// an apply outside one transaction claims only past its last refusal: the
+/// CLI's own run claims nothing (#7).
+#[tokio::test]
+async fn an_apply_outside_a_transaction_refused_its_hook_claims_nothing() {
+    let (pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir);
+    let yaml = std::fs::read_to_string(dir.join("design.yaml")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        format!("{yaml}apply:\n  before:\n    - sql/missing.sql\n"),
+    )
+    .unwrap();
+
+    let out = std::process::Command::new(assert_cmd::cargo::cargo_bin("dbd"))
+        .args(["apply", "-c", dir.join("design.yaml").to_str().unwrap(), "-d", &url])
+        .env("DBD_NO_TX", "1")
+        .current_dir(dir)
+        .output()
+        .expect("run dbd");
+    assert!(!out.status.success(), "the hook file is missing: {}", combined(&out));
+    assert!(combined(&out).contains("missing.sql"), "{}", combined(&out));
+
+    // The CLI refuses before it heals, so there may be no registry at all.
+    let unclaimed = psql(
+        &pg,
+        &url,
+        &[
+            "-c",
+            "do $$ begin if to_regclass('dbd.objects') is not null then \
+             if exists (select 1 from dbd.objects where owner = 'clilive') then \
+             raise exception 'clilive holds claims'; end if; end if; end $$;",
+        ],
+    );
+    assert!(unclaimed.status.success(), "{}", combined(&unclaimed));
+}
+
 /// `DBD_NO_TX` runs each statement on its own — what `CREATE INDEX
 /// CONCURRENTLY` needs — so nothing it builds rolls back: it claims before it
 /// builds, and a run that fails part-way keeps its claims (#7).

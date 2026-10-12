@@ -11611,3 +11611,191 @@ async fn a_sequence_named_in_any_spelling_is_a_use_of_its_owners() {
         .await;
     }
 }
+
+/// A bare name read as a table means a table: Postgres passes over an enum
+/// of that name earlier on the path to the table after it. Counted as found
+/// by its type, the enum's owner was recorded as used (#7).
+#[tokio::test]
+async fn a_bare_table_read_is_no_use_of_an_enum_of_its_name() {
+    let (_pg, url) = start_pg().await;
+    let (types, tables, reader) = (
+        connect(&url, "types").await.unwrap(),
+        connect(&url, "tables").await.unwrap(),
+        connect(&url, "reader").await.unwrap(),
+    );
+    let (td, bd, rd) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    named_project(
+        td.path(),
+        "types",
+        "",
+        &[("ddl/enum/app/status.ddl", "create type app.status as enum ('a');\n")],
+    )
+    .apply(&*types, None, false, None, Progress::none())
+    .await
+    .expect("types' apply");
+    let in_public =
+        |name: &str| format!("project:\n  name: {name}\nsource:\n  dialect: postgresql\nschemas:\n  - public\n");
+    write_project(
+        bd.path(),
+        &in_public("tables"),
+        &[(
+            "ddl/table/public/status.ddl",
+            "create table if not exists public.status (id int);\n",
+        )],
+    )
+    .apply(&*tables, None, false, None, Progress::none())
+    .await
+    .expect("tables' apply");
+    write_project(
+        rd.path(),
+        &in_public("reader"),
+        &[(
+            "ddl/view/public/v.ddl",
+            "set search_path to app, public;\ncreate or replace view public.v as select * from status;\n",
+        )],
+    )
+    .apply(&*reader, None, false, None, Progress::none())
+    .await
+    .expect("reader's apply");
+
+    assert_catalog(
+        &*reader,
+        true,
+        &used_by("reader", "entity", "relation:public.status", "view public.v"),
+        "reader's use of the table public.status",
+    )
+    .await;
+    assert_catalog(
+        &*reader,
+        false,
+        "SELECT 1 FROM dbd.uses WHERE owner = 'reader' AND target = 'relation:app.status'",
+        "a use of the enum app.status",
+    )
+    .await;
+}
+
+/// A bare call is resolved by its arguments as well as the path: `f(1)` under
+/// `app, public` calls `public.f(int)`, not `app.f(text)`. dbd does not
+/// resolve overloads, so it records each routine the call could reach — the
+/// one it does reach among them (#7).
+#[tokio::test]
+async fn a_bare_call_is_a_use_of_every_routine_it_could_reach() {
+    let (_pg, url) = start_pg().await;
+    let (fa, fb, reader) = (
+        connect(&url, "fa").await.unwrap(),
+        connect(&url, "fb").await.unwrap(),
+        connect(&url, "reader").await.unwrap(),
+    );
+    let (ad, bd, rd) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    named_project(
+        ad.path(),
+        "fa",
+        "",
+        &[(
+            "ddl/function/app/f.ddl",
+            "create or replace function app.f(x text) returns int language sql as $$ select 1 $$;\n",
+        )],
+    )
+    .apply(&*fa, None, false, None, Progress::none())
+    .await
+    .expect("fa's apply");
+    let in_public =
+        |name: &str| format!("project:\n  name: {name}\nsource:\n  dialect: postgresql\nschemas:\n  - public\n");
+    write_project(
+        bd.path(),
+        &in_public("fb"),
+        &[(
+            "ddl/function/public/f.ddl",
+            "create or replace function public.f(x int) returns int language sql as $$ select 2 $$;\n",
+        )],
+    )
+    .apply(&*fb, None, false, None, Progress::none())
+    .await
+    .expect("fb's apply");
+    write_project(
+        rd.path(),
+        &in_public("reader"),
+        &[(
+            "ddl/view/public/w.ddl",
+            "set search_path to app, public;\ncreate or replace view public.w as select f(1) as n;\n",
+        )],
+    )
+    .apply(&*reader, None, false, None, Progress::none())
+    .await
+    .expect("reader's apply");
+
+    assert_catalog(
+        &*reader,
+        true,
+        &used_by("reader", "entity", "routine:public.f", "view public.w"),
+        "reader's use of public.f(int), the routine its view calls",
+    )
+    .await;
+}
+
+/// A sequence file keeps its stem's case — `Order_No.ddl` declares
+/// `app.Order_No` — and a default reading `nextval('app.Order_No')` names it,
+/// as Postgres folds the string. Folded and matched exactly, the table lost
+/// its dependency on its own sequence (#7).
+#[test]
+fn a_table_depends_on_its_own_sequence_however_nextval_spells_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let design = named_project(
+        tmp.path(),
+        "shop",
+        "",
+        &[
+            (
+                "ddl/sequence/app/Order_No.ddl",
+                "create sequence if not exists app.Order_No;\n",
+            ),
+            (
+                "ddl/table/app/orders.ddl",
+                "create table if not exists app.orders (id int primary key default nextval('app.Order_No'));\n",
+            ),
+        ],
+    );
+    let orders = design
+        .entities()
+        .iter()
+        .find(|e| e.name == "app.orders")
+        .expect("app.orders");
+    let refers: Vec<&str> = orders.refers().collect();
+    assert!(refers.contains(&"app.Order_No"), "{refers:?}");
+}
+
+/// A before-hook that cannot run — its file missing — refuses a reconcile,
+/// which claims only past its last refusal (#7).
+#[tokio::test]
+async fn a_reconcile_refused_its_hook_claims_nothing() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    shop.heal_bookkeeping().await.unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    let err = named_project(
+        sd.path(),
+        "shop",
+        "apply:\n  before:\n    - sql/missing.sql\n",
+        &ORDERS_OWNER_FILES[..1],
+    )
+    .reconcile(&*shop, false, false, false, None, Progress::none())
+    .await
+    .expect_err("the hook file is missing")
+    .to_string();
+    assert!(err.contains("missing.sql"), "{err}");
+    assert_catalog(
+        &*shop,
+        false,
+        "SELECT 1 FROM dbd.objects WHERE owner = 'shop'",
+        "a claim of shop's",
+    )
+    .await;
+}

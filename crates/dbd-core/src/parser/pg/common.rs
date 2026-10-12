@@ -469,4 +469,19 @@ mod tests {
         assert!(extract_enum_values_via_pg_query("do $$ begin perform 1; end $$;").is_empty());
         assert!(extract_enum_values_via_pg_query("NOT SQL AT ALL ;;;").is_empty());
     }
+
+    /// As Postgres's `regclass` input reads a name: whitespace around each
+    /// part is skipped, quoted parts are kept as written, the rest folded; a
+    /// number is an OID, not a name (#7).
+    #[test]
+    fn a_regclass_string_is_read_as_postgres_reads_it() {
+        assert_eq!(regclass_name("App.Order_No").as_deref(), Some("app.order_no"));
+        assert_eq!(regclass_name("\"app\" . \"order_no\"").as_deref(), Some("app.order_no"));
+        assert_eq!(regclass_name("app. \"Seq\"").as_deref(), Some("app.Seq"));
+        assert_eq!(regclass_name(" app . seq ").as_deref(), Some("app.seq"));
+        assert_eq!(regclass_name("\"a\"\"b\"").as_deref(), Some("a\"b"));
+        assert_eq!(regclass_name("12345"), None);
+        assert_eq!(regclass_name("app..seq"), None);
+        assert_eq!(regclass_name("app.seq."), None);
+    }
 }

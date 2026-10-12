@@ -1926,6 +1926,42 @@ import:
         }
     }
 
+    /// A before-hook that cannot run — its file missing — is a refusal, and an
+    /// apply outside one transaction claims only past its last refusal: it
+    /// claimed first, and a misconfigured run left the database claimed for
+    /// entities it never wrote (#7).
+    #[tokio::test]
+    async fn an_apply_outside_a_transaction_refused_its_hook_claims_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: shop\nsource:\n  dialect: postgresql\nschemas:\n  - app\n\
+             apply:\n  before:\n    - sql/missing.sql\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/app/orders.ddl"),
+            "create table if not exists app.orders (id int primary key);\n",
+        )
+        .unwrap();
+        let design = load_project(dir, "dev");
+        let mock = MockAdapter::new();
+        assert!(!mock.supports_txn, "outside a transaction");
+
+        let err = design
+            .apply(&mock, None, false, None, Progress::none())
+            .await
+            .expect_err("the hook file is missing");
+        assert!(err.to_string().contains("missing.sql"), "{err}");
+        assert!(
+            mock.claims.lock().unwrap().is_empty(),
+            "{:?}",
+            mock.claims.lock().unwrap()
+        );
+    }
+
     /// The gap this feature exists to close: `dbd apply` calls `Design::apply`
     /// alone, so an `import.after` hook never runs on it. `apply.after` does.
     #[tokio::test]

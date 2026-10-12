@@ -295,4 +295,51 @@ mod tests {
             );
         }
     }
+
+    fn created(sql: &str) -> Vec<(Created, Option<String>, String)> {
+        created_identities(sql)
+    }
+
+    /// An unqualified `multirange_type_name` lands where any unqualified name
+    /// does — on the search path — not in the range's schema (#7).
+    #[test]
+    fn an_unqualified_multirange_name_is_left_to_the_search_path() {
+        let made = created("create type app.r1 as range (subtype = int4, multirange_type_name = r1_multi);");
+        assert!(
+            made.contains(&(Created::Type("multirange type"), None, "r1_multi".to_string())),
+            "{made:?}"
+        );
+    }
+
+    /// Postgres clips a multirange's name as it makes it: a name with no
+    /// `range` keeps 52 bytes before `_multirange`, and every name is cut to
+    /// 63 bytes (#7).
+    #[test]
+    fn a_multirange_name_is_clipped_as_postgres_clips_it() {
+        let a = "a".repeat(54);
+        let b = "b".repeat(60);
+        let made = created(&format!(
+            "create type app.{a}range as range (subtype = int4); create type app.{b} as range (subtype = int4);"
+        ));
+        let multiranges: Vec<&str> = made
+            .iter()
+            .filter(|(c, _, _)| *c == Created::Type("multirange type"))
+            .map(|(_, _, n)| n.as_str())
+            .collect();
+        assert_eq!(
+            multiranges,
+            vec![format!("{a}multirang"), format!("{}_multirange", "b".repeat(52))],
+        );
+    }
+
+    /// A temporary table is the session's, and nobody's to own — at the top
+    /// of a file or inside a `DO` block (#7).
+    #[test]
+    fn a_temporary_table_is_no_key() {
+        assert!(created("create temp table tmp_map as select 1 as id;").is_empty());
+        assert!(created("create temporary table tmp_ids (id int);").is_empty());
+        assert!(
+            created("do $$ begin create temp table tmp_map as select 1 as id; drop table tmp_map; end $$;").is_empty()
+        );
+    }
 }
