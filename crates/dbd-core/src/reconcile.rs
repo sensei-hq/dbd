@@ -852,14 +852,15 @@ pub fn plan_reconcile(live: &Snapshot, desired: &Snapshot) -> ReconcilePlan {
             // Only a table becomes a prune target: a dropped enum is a warning,
             // already in `warnings`, and never auto-dropped. Named as the live
             // catalog spells it, quoted — unquoted, a mixed-case `"Report"`
-            // dropped the `report` beside it (#7).
+            // dropped the `report` beside it (#7) — and only if still there: a
+            // parent's `CASCADE` drops the tables inheriting from it first.
             DiffAction::Drop if d.entity_type == EntityType::Table => {
                 let (schema, name) = crate::entity::split_qualified_name(&d.entity_name);
                 let schema = schema.unwrap_or_else(|| DEFAULT_SCHEMA.to_string());
                 plan.dropped.push(ReconcileStatement {
                     entity_name: d.entity_name.clone(),
                     sql: format!(
-                        "DROP TABLE {}.{} CASCADE;",
+                        "DROP TABLE IF EXISTS {}.{} CASCADE;",
                         crate::sql_quote::ident(&schema),
                         crate::sql_quote::ident(&name)
                     ),
@@ -869,6 +870,8 @@ pub fn plan_reconcile(live: &Snapshot, desired: &Snapshot) -> ReconcilePlan {
         }
     }
 
+    // In a stable order, whatever order the diff found them in.
+    plan.dropped.sort_by(|a, b| a.entity_name.cmp(&b.entity_name));
     plan
 }
 

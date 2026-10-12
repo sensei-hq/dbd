@@ -312,32 +312,48 @@ impl Design {
         if batch {
             adapter.begin_batch().await?;
         }
-        let result: Result<u32> = async {
+        let mut done: Vec<String> = Vec::new();
+        let result: Result<()> = async {
+            if batch {
+                // Read committed, as the registry's own transactions are: the
+                // claim may wait on a rival's, and must then read what the
+                // rival committed — at REPEATABLE READ the wait ended in a
+                // serialization failure. The batch's first statement.
+                adapter
+                    .execute_script("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                    .await?;
+            }
             self.claim_prune(adapter, plan).await?;
-            let mut dropped = 0;
             for stmt in &plan.dropped {
                 let desc = format!("prune table:{}", stmt.entity_name);
                 on_start(&desc);
                 let result = adapter.execute_script(&stmt.sql).await;
                 report_step_result(&desc, on_done, result)?;
-                dropped += 1;
+                done.push(stmt.entity_name.clone());
             }
-            Ok(dropped)
+            Ok(())
         }
         .await;
         match result {
-            Ok(dropped) => {
+            Ok(()) => {
                 if batch {
                     adapter.commit_batch().await?;
                 }
-                Ok(dropped)
+                Ok(done.len() as u32)
             }
             Err(e) => {
-                if batch {
-                    // Best-effort rollback; surface the original failure.
-                    let _ = adapter.rollback_batch().await;
+                if !batch {
+                    return Err(e);
                 }
-                Err(e)
+                // Best-effort rollback; surface the original failure — and
+                // that the drops reported before it are undone with it.
+                let _ = adapter.rollback_batch().await;
+                let undone = if done.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — the drops of {} are rolled back with it", done.join(", "))
+                };
+                Err(DbdError::Config(format!("{e}; nothing was pruned{undone}")))
             }
         }
     }
