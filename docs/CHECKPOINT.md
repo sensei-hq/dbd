@@ -1,25 +1,22 @@
 # Checkpoint
 
-**Slice:** #7 Phase 2, slice 3 (prune rules, `--prune-unowned`, release) on
-`feat/ownership-prune`, from `feat/ownership` — where slices 1–2 landed as
-PR #50 (`5e6ad4dc`). Phase 1 is on `develop`, unreleased.
+**Slice:** #7 Phase 2, slice 4 (the uses guard) on `feat/ownership-guard`, from
+`feat/ownership` — where slices 1–3 landed as PR #50 (`5e6ad4dc`) and PR #51
+(`6196810c`). Phase 1 is on `develop`, unreleased.
 
 ## Done
 
-- Slices 1–2 merged into `feat/ownership` (PR #50): registry, claim, uses.
-- Slice 3 = PR #51 (`f8c09c35`; fixes `78030d9f`, `63310fa8`, `31e70002`):
-  reconcile and diff hide other owners' entities; `--prune` drops own
-  undeclared (a) and unowned in an unshared schema (b); the rest kept, named,
-  unless `--prune-unowned`; release of what is undeclared and gone. A prune
-  claims and drops in one RC transaction, quotes its DROP, keeps what the
-  design creates; an enum swap another owner's column holds is refused.
+- Slices 1–2 (PR #50): registry, claim, uses. Slice 3 (PR #51): prune by
+  ownership — other owners' entities hidden, rules (a)/(b), `--prune-unowned`,
+  release; prune claims and drops in one READ COMMITTED transaction.
 - Embedded 214/214, `cli_live` 48/48, workspace 2002/0, clippy, fmt, doc clean.
 
 ## Next
 
-    # PR #51: CI green → merge locally into feat/ownership. Then slice 4: the
-    # uses guard (refuse dropping/altering what another uses, by dbd.uses and
-    # pg_depend) — incl. a prune's CASCADE reaching another owner's child/view.
+    # slice 4: before an owner drops or destructively alters an entity, check
+    # dbd.uses and pg_depend; refuse when another owner depends on it, naming
+    # the use — reconcile's prune (incl. CASCADE reaching another owner's
+    # child/view), its destructive alters, apply's migration drops.
 
 ## Open
 
