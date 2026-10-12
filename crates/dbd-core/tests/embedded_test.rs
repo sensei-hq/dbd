@@ -6766,6 +6766,99 @@ async fn a_scoped_reset_drops_its_tables_policies_before_the_functions_they_call
     assert_table_exists(&*adapter, "other", "notes").await;
 }
 
+const TRIGGERS_YAML: &str = "project:\n  name: scoped_reset_triggers\nsource:\n  dialect: postgresql\n\
+    schemas:\n  - app\n  - other\nscopes:\n  app_only:\n    includes: [app]\n";
+
+const TRIGGERS_FILES: &[(&str, &str)] = &[
+    (
+        "ddl/table/app/items.ddl",
+        "set search_path to app;\ncreate table if not exists items (id int primary key, seq int);\n",
+    ),
+    (
+        "ddl/view/app/item_ids.ddl",
+        "set search_path to app;\ncreate or replace view item_ids as select id from items;\n",
+    ),
+    (
+        "ddl/function/app/bump.ddl",
+        "set search_path to app;\n\
+         create or replace function bump() returns trigger language plpgsql as $$\n\
+         begin new.seq := coalesce(new.seq, 0) + 1; return new; end $$;\n\
+         drop trigger if exists items_bump on app.items;\n\
+         create trigger items_bump before update on app.items for each row execute function app.bump();\n",
+    ),
+    (
+        "ddl/function/app/add_id.ddl",
+        "set search_path to app;\n\
+         create or replace function add_id() returns trigger language plpgsql as $$\n\
+         begin insert into app.items (id) values (new.id); return new; end $$;\n\
+         drop trigger if exists item_ids_add on app.item_ids;\n\
+         create trigger item_ids_add instead of insert on app.item_ids for each row execute function app.add_id();\n",
+    ),
+    (
+        "ddl/table/other/logs.ddl",
+        "set search_path to other;\ncreate table if not exists logs (id int primary key, seq int);\n",
+    ),
+];
+
+/// sensei's `dojo` scope again, with the policies out of the way: a trigger
+/// written in its function's file, `create trigger … on dojo.shared_rules`,
+/// makes the function depend on the table, so the reset dropped the function
+/// first and the table's trigger refused it. A table's or a view's triggers go
+/// with it, so a scoped reset drops them first — the ones Postgres makes for a
+/// foreign key excepted; a trigger on a table outside the scope still refuses
+/// it.
+#[tokio::test]
+async fn a_scoped_reset_drops_its_tables_and_views_triggers_before_their_functions() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "scoped_reset_triggers").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let design = write_project(tmp.path(), TRIGGERS_YAML, TRIGGERS_FILES);
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply");
+    adapter
+        .execute_script(
+            "CREATE TRIGGER logs_bump BEFORE UPDATE ON other.logs FOR EACH ROW EXECUTE FUNCTION app.bump();",
+        )
+        .await
+        .unwrap();
+
+    let app_only = design.resolve_scope(Some("app_only"), None).unwrap();
+    let err = design
+        .reset(&*adapter, "postgres", false, false, false, Some(&app_only))
+        .await
+        .expect_err("other.logs's trigger calls app.bump")
+        .to_string();
+    assert!(
+        err.contains("trigger logs_bump on table other.logs"),
+        "the refusal must name the dependent outside the scope: {err}"
+    );
+    assert!(
+        !err.contains("items_bump"),
+        "a trigger on a table the scope drops is not a dependent outside it: {err}"
+    );
+    assert_table_exists(&*adapter, "app", "items").await;
+
+    adapter
+        .execute_script("DROP TRIGGER logs_bump ON other.logs;")
+        .await
+        .unwrap();
+    design
+        .reset(&*adapter, "postgres", false, false, false, Some(&app_only))
+        .await
+        .expect("a trigger on an in-scope table or view must not block the scoped reset");
+    assert_table_absent(&*adapter, "app", "items").await;
+    assert_catalog(
+        &*adapter,
+        false,
+        "SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'app'",
+        "a function in app",
+    )
+    .await;
+    assert_table_exists(&*adapter, "other", "logs").await;
+}
+
 // ── Roles are server-wide: a reset keeps one another database holds ───────────
 
 /// Two databases on one server built from the same design share its roles,
