@@ -1,40 +1,31 @@
 # Checkpoint
 
-**Slice:** 0.25.0 — the verification round (`verify4-report.md`). Both fix
-branches (`fix/followups-4`, `fix/dbml-format-4`) are merged on
-`fix/audit-bugs` (tip `68822e7`); `docs/feature-coverage` merged it and carries
-the CHANGELOG and docs pass 4 on top. `make _check-ci` green at every commit.
+**Slice:** 0.25.0 release candidate — PR #44 (`fix/audit-bugs` → `develop`).
 
 ## Done
 
-- CHANGELOG `[Unreleased]`: every false bullet from verify4 §3 corrected, each
-  checked against the code or the built binary; new bullets (emit quoting,
-  format layout, data.sql of added tables); Library API additions
-  (`foreign_keys`, `live_import_plan`, `keep_authored_triggers`, the
-  `check_reset_guard` method); Known limitations (formatter, `init --from-db`
-  silent drops, dots in names, DBML backtick/line break, diff quoting).
-- Docs: guides, README, both llms files, both SKILL.md copies, both
-  pattern-verifier copies, architecture. Site copies synced; site tests 154/154;
-  `docs_match_code` 5/5, `doc_examples` 3/3.
-- BACKLOG 0.25.1: SQLite (file creation, IF NOT EXISTS, partial truncate,
-  offline dry-run order), quoting sites with line numbers, dots, DBML writer
-  limits, formatter list words, data.sql of untouched tables.
-
-## Remaining
-
-- Merge `docs/feature-coverage` back into `fix/audit-bugs`.
-
-## Decisions (user)
-
-- #22 refuse older project; #25 reconcile grants+hooks; prod guard: no
-  override. Full re-audit run three times; ask before a fourth.
-- Repo identity rewrite after the fixes (backup bundle first; confirm before
-  any force-push).
+- Three full audits plus a focused verification; every confirmed defect fixed
+  test-first and merged into `fix/audit-bugs`. CHANGELOG `[Unreleased]`, guides,
+  README, llms, both SKILL.md, both pattern-verifier copies and the site match
+  the code. Older defects for 0.25.1 are in `docs/BACKLOG.md`.
+- History rewritten (2026-10-12): every author, committer and tagger is
+  Jerry Thomas <me@jerrythomas.name>; branch and tag trees unchanged. Force-
+  pushed with leases: main (incl. the 10 unpulled v0.24.1 release commits,
+  rewritten), develop, fix/audit-bugs, 5 other branches, 84 tags. Backup:
+  `~/Developer/dbd-backup-2026-10-12-pre-author-rewrite.bundle`.
+- CI's `cargo doc` step failed on nine public docs linking private items;
+  fixed (`c04b60f3`); `cargo doc --workspace --no-deps --all-features`, fmt and
+  `cargo audit` clean locally.
 
 ## Next
-    # merge docs/feature-coverage → fix/audit-bugs (all gates) → author rewrite → PR
 
-## Scratch (rm denied)
-- /tmp/dbd-resume/docs4-* (stopped cluster docs4-pg.PDqA), /tmp/dbdfix4, /tmp/dbdV4*-*,
-  /tmp/dbdaudit-*, /tmp/dbdA3*, /tmp/dbdB_*.txt, /tmp/a1, /tmp/a2, /tmp/f1-*,
-  /tmp/f2_mv.*, /tmp/dbddocs3-*, /tmp/dbd-resume/docs3-*
+    gh pr checks 44 --watch    # CI green → human review → merge to develop
+
+## Open (user)
+
+- Review and merge PR #44; then main and the 0.25.0 release (approval needed).
+
+## Known limits
+
+- CHANGELOG Known limitations; `docs/BACKLOG.md` (0.25.1).
+- Local `make _check-ci` does not run `cargo doc`; CI does (once per push).
