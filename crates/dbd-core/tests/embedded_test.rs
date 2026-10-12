@@ -1645,7 +1645,13 @@ async fn sync_refresh_jobs_is_noop_without_pg_cron() {
 
 /// What `sync_refresh_jobs` touches of pg_cron, which the embedded server cannot
 /// load: `cron.job`, `cron.schedule` (an upsert by job name) and
-/// `cron.unschedule` by id. Its presence is how dbd detects pg_cron.
+/// `cron.unschedule` by id. Its presence is how dbd detects pg_cron. Job names
+/// are `text` from pg_cron 1.5; 1.3 and 1.4 keep them as `name`, which
+/// Postgres cuts at 63 bytes.
+fn pg_cron_stand_in(jobname_type: &str) -> String {
+    PG_CRON_STAND_IN.replace("jobname text UNIQUE", &format!("jobname {jobname_type} UNIQUE"))
+}
+
 const PG_CRON_STAND_IN: &str = "CREATE SCHEMA cron; \
     CREATE TABLE cron.job (jobid bigserial PRIMARY KEY, jobname text UNIQUE, schedule text, command text); \
     CREATE FUNCTION cron.schedule(job_name text, schedule text, command text) RETURNS bigint LANGUAGE sql AS $$ \
@@ -1733,6 +1739,81 @@ async fn each_project_sharing_a_database_owns_its_refresh_jobs() {
         )
         .await;
     }
+}
+
+fn refresh_job(name: &str, refresh: Option<&str>) -> (String, dbd_core::config::ResolvedMatview) {
+    (
+        name.to_string(),
+        dbd_core::config::ResolvedMatview {
+            refresh: refresh.map(str::to_string),
+            concurrently: false,
+        },
+    )
+}
+
+/// pg_cron 1.3 and 1.4 keep a job's name as `name`, cut at 63 bytes. An owner's
+/// name made a job's longer than that, so the name stored was not the one the
+/// sync kept, and the sync unscheduled the job it had just made — the view
+/// stopped refreshing while every apply reported success; an owner whose
+/// prefix alone passed 63 bytes had all its jobs collapse into one. A job's
+/// name fits in 63 bytes, a hash ending one that would not.
+#[tokio::test]
+async fn a_refresh_job_name_fits_the_63_bytes_older_pg_cron_keeps() {
+    let (_pg, url) = start_pg().await;
+    let long = connect(&url, "customer-analytics-platform").await.unwrap();
+    let longer = connect(&url, &"x".repeat(52)).await.unwrap();
+    long.execute_script(&pg_cron_stand_in("name")).await.unwrap();
+
+    long.sync_refresh_jobs(&[refresh_job("analytics.daily_sales_mv", Some("0 2 * * *"))])
+        .await
+        .unwrap();
+    longer
+        .sync_refresh_jobs(&[
+            refresh_job("app.one", Some("0 3 * * *")),
+            refresh_job("app.two", Some("0 4 * * *")),
+        ])
+        .await
+        .unwrap();
+
+    for view in ["\"analytics\".\"daily_sales_mv\"", "\"app\".\"one\"", "\"app\".\"two\""] {
+        assert_catalog(
+            &*long,
+            true,
+            &format!("SELECT 1 FROM cron.job WHERE command = 'REFRESH MATERIALIZED VIEW {view}'"),
+            &format!("the refresh job of {}", view.replace('"', "")),
+        )
+        .await;
+    }
+}
+
+/// In a `SQL_ASCII` database Postgres counts a string's length in bytes, so a
+/// prefix measured in characters never matched a non-ASCII owner's own jobs,
+/// and its stale ones were never unscheduled. Postgres measures both sides.
+#[tokio::test]
+async fn a_non_ascii_project_unschedules_its_stale_jobs_in_a_sql_ascii_database() {
+    let (pg, url) = start_pg().await;
+    connect(&url, "setup")
+        .await
+        .unwrap()
+        .execute_script("CREATE DATABASE ascii_db ENCODING 'SQL_ASCII' LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0;")
+        .await
+        .unwrap();
+    let owner = connect(&pg.settings().url("ascii_db"), "é").await.unwrap();
+    owner.execute_script(PG_CRON_STAND_IN).await.unwrap();
+
+    owner
+        .sync_refresh_jobs(&[refresh_job("app.x", Some("0 2 * * *"))])
+        .await
+        .unwrap();
+    assert_catalog(
+        &*owner,
+        true,
+        "SELECT 1 FROM cron.job WHERE command = 'REFRESH MATERIALIZED VIEW \"app\".\"x\"'",
+        "the scheduled job",
+    )
+    .await;
+    owner.sync_refresh_jobs(&[refresh_job("app.x", None)]).await.unwrap();
+    assert_catalog(&*owner, false, "SELECT 1 FROM cron.job", "a stale job").await;
 }
 
 // ── Test 7: Emitted index DDL applies to a real Postgres ──────────────────────

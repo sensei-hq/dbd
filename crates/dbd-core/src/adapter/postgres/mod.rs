@@ -2975,6 +2975,47 @@ mod tests {
         );
     }
 
+    /// A legacy name is `dbd:refresh:<schema>.<name>`; a schema holding a `:`
+    /// makes it read as another owner's tagged one — `a` declaring
+    /// `"b:app".daily` would unschedule `b`'s job for `app.daily`. Whose such a
+    /// name is cannot be told, so it is never unscheduled.
+    #[test]
+    fn a_legacy_job_name_holding_a_colon_is_never_unscheduled() {
+        let jobs = vec![("b:app.daily".to_string(), mv(None, false))];
+        let plan = plan_cron_sync("a", &jobs, true).unwrap();
+        let unschedule = plan.last().unwrap();
+        assert!(!unschedule.contains("'dbd:refresh:b:app.daily'"), "{unschedule}");
+    }
+
+    /// Every job name fits the 63 bytes pg_cron 1.3 and 1.4 keep, and stays
+    /// distinct: two owners, or two views, never share one.
+    #[test]
+    fn a_refresh_job_name_fits_63_bytes_and_stays_distinct() {
+        let owners = [
+            "a".to_string(),
+            "customer-analytics-platform".to_string(),
+            "x".repeat(52),
+            format!("{}1", "x".repeat(52)),
+            "é".repeat(40),
+        ];
+        let views = [
+            "app.one".to_string(),
+            "analytics.daily_sales_mv".to_string(),
+            format!("app.{}", "v".repeat(70)),
+            format!("app.{}w", "v".repeat(70)),
+            format!("app.{}", "ü".repeat(40)),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for owner in &owners {
+            for view in &views {
+                let name = refresh_job_name(owner, view);
+                assert!(name.len() <= 63, "{} bytes: {name}", name.len());
+                assert!(name.starts_with(&refresh_job_prefix(owner)), "{name}");
+                assert!(seen.insert(name.clone()), "shared: {name}");
+            }
+        }
+    }
+
     #[test]
     fn plan_cron_sync_present_but_none_scheduled_emits_only_unschedule() {
         // pg_cron present, nothing scheduled → still emit the cleanup unschedule so
