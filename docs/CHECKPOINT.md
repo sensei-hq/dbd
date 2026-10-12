@@ -7,14 +7,14 @@ PR #50 (`5e6ad4dc`). Phase 1 is on `develop`, unreleased.
 ## Done
 
 - Slices 1–2 merged into `feat/ownership` (PR #50): registry, claim, uses.
-- Slice 3 (red `131689a3`/`6a3543ea`, impl `f8c09c35`/`78030d9f`): reconcile and diff hide
+- Slice 3 (impl `f8c09c35`, fixes `78030d9f`, `63310fa8`): reconcile and diff hide
   other owners' entities; `--prune` drops own undeclared (a) and unowned in an
   unshared schema (b); unowned in a shared schema, or while a recorded owner
   has not upgraded (no `owner` row in dbd.uses), kept and named unless
   `--prune-unowned`; a successful run releases what is undeclared and gone.
-  Review: prune claims candidates first, quotes its DROP, refuses an enum
-  swap another owner's column holds.
-- Embedded 209/209, `cli_live` 48/48, workspace 2002/0, clippy, fmt, doc clean.
+  Review: prune claims and drops in one transaction, quotes its DROP, keeps
+  what the design creates, refuses an enum swap another owner's column holds.
+- Embedded 211/211, `cli_live` 48/48, workspace 2002/0, clippy, fmt, doc clean.
 
 ## Next
 
