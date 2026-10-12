@@ -1,34 +1,38 @@
 # Checkpoint
 
-**Slice:** 0.25.0 release — PR #45 (`develop` → `main`).
+**Slice:** #41 — an extension type outside the `search_path` read as drift
+(`fix/extension-type-reconcile`, off `develop`). #39 closed as its duplicate.
 
 ## Done
 
-- PR #44 merged into `develop` (`6fccb0ff`). Release notes `99edd363`;
-  `make bump minor` → `6d7769d9`, annotated tag `v0.25.0`.
-- `release.yml` run 38253359492 green on the tagged tree (tests, clippy, fmt,
-  `cargo doc`, publish). `dbd-core` and `dbd-cli` 0.25.0 are on crates.io.
-- Shipped artifact verified: `cargo install dbd-cli --version 0.25.0 --locked`
-  refuses `-e staging`; `emit --dialect tsql` puts `CREATE SCHEMA` and
-  `CREATE VIEW` in `GO` batches of their own and keeps key names; MySQL gets
-  `LONGTEXT` and reports the `PRIMARY` rename.
-- History rewritten earlier (2026-10-12): every author, committer and tagger is
-  Jerry Thomas <me@jerrythomas.name>. Backup:
-  `~/Developer/dbd-backup-2026-10-12-pre-author-rewrite.bundle`.
+- Red e2e `4c95bc3b` reproduced #41; fix `213fac6d`
+  (`DatabaseAdapter::extension_types()`, `reconcile::qualify_extension_types`
+  on both snapshots in `reconcile` and `diff_live`). Red units `64e1f0e9`, fix
+  `9b0d505c` (modifier kept; a name an enum or two extensions share left).
+- Review hardening `1d28de74`: both live spellings pinned (fresh connections,
+  then `ALTER DATABASE … SET search_path` reaching `extensions`), the real
+  change's `TYPE extensions.citext` asserted with `extensions` outside the
+  managed schemas. Each surviving mutation now kills a test.
+- Review fix: red `fd06a080`, fix `0d4ea5c3` — only a name an extension alone
+  owns (`date` stays `pg_catalog.date` beside orafce's `oracle.date`), and an
+  extension's domain over an array counts.
+- Docs `18827714` + this commit: CHANGELOG `[Unreleased]`, guide 04,
+  `llms-full.txt`, trait doc; quoted-schema type spelling added to the backlog.
+- Embedded suite 128/128; CLI repro: 0.25.0 fails, the branch reconciles
+  `0 altered` and `diff` is in sync.
 
 ## Next
 
-    gh pr checks 45 --watch    # all green → merge #45 → main CI + Workers production build
+    gh pr create --base develop --head fix/extension-type-reconcile
 
 ## Open
 
-- Cloudflare "Workers Builds: dbd" failed on `6fccb0ff`, `99edd363` and
-  `6d7769d9`. `6fccb0ff`'s tree is identical to `c932b65d`, which built; a
-  clean local `CF_PAGES=1 bun run build` at `6fccb0ff` passes, as does CI's
-  site build. The cause is Cloudflare-side; its log is only in the dashboard
-  (build `df5a6e58-bfdc-4466-9c04-74580ef4437a`).
+- PR #45 (v0.25.0 develop → main) waits on a Cloudflare "Retry build" of
+  `4ae031f1`; every GitHub check is green. The red check is Cloudflare's API
+  returning 504 to `wrangler versions upload`, not the code.
+- Keep #41 off `develop` until #45 merges, so the release PR stays 0.25.0.
 
 ## Known limits
 
-- CHANGELOG Known limitations; `docs/BACKLOG.md` (0.25.1).
-- Local `make _check-ci` does not run `cargo doc`; CI does (once per push).
+- A type in a schema that needs quoting (`"Ext"`) still reads as drift — backlog.
+- Domains and composite types are not dbd entities.
