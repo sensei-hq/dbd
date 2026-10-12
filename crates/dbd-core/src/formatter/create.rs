@@ -111,7 +111,10 @@ pub(in crate::formatter) struct ItemComments {
 /// with the parsed items and otherwise keeps the original text verbatim.
 ///
 /// Within each item, a comment before any code is `leading`; one after code is
-/// `trailing`.
+/// `trailing`. A comment after an item's comma on the comma's own line is
+/// that item's trailing comment too — `id int,  -- the id` documents `id`,
+/// and is how the trailing-comma layout writes one. Read as the next item's,
+/// it moved to a line of its own on every second pass.
 pub(in crate::formatter) fn extract_item_comments(original: &str) -> Option<Vec<ItemComments>> {
     use pg_query::protobuf::Token as Kind;
     let tokens = lex(original)?;
@@ -121,7 +124,12 @@ pub(in crate::formatter) fn extract_item_comments(original: &str) -> Option<Vec<
     let mut cur = ItemComments::default();
     let mut seen_code = false;
     let mut depth = 1usize;
+    // Where the last item-ending comma (or a comment after it on its line)
+    // ended, while nothing but those has followed it on that line.
+    let mut after_comma: Option<usize> = None;
     for token in &tokens[open + 1..] {
+        let on_comma_line = after_comma.is_some_and(|at| !original[at..token.start].contains('\n'));
+        after_comma = None;
         match token.kind {
             Kind::Ascii40 => {
                 depth += 1;
@@ -138,6 +146,7 @@ pub(in crate::formatter) fn extract_item_comments(original: &str) -> Option<Vec<
             Kind::Ascii44 if depth == 1 => {
                 items.push(std::mem::take(&mut cur));
                 seen_code = false;
+                after_comma = Some(token.end);
             }
             Kind::SqlComment | Kind::CComment => {
                 let text = token.text(original);
@@ -148,6 +157,9 @@ pub(in crate::formatter) fn extract_item_comments(original: &str) -> Option<Vec<
                 };
                 if seen_code {
                     cur.trailing.push(text.to_string());
+                } else if on_comma_line && let Some(previous) = items.last_mut() {
+                    previous.trailing.push(text.to_string());
+                    after_comma = Some(token.end);
                 } else {
                     cur.leading.push(text.to_string());
                 }

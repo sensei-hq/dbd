@@ -34,7 +34,21 @@ pub fn format_ddl(input: &str, config: &FormatConfig) -> String {
         if trimmed.is_empty() {
             continue;
         }
-        output_parts.push(format_block(trimmed, config));
+        output_parts.push(match around_statement(trimmed) {
+            // The comments around a statement are text, kept as written and
+            // where they were written — on its line, or on the lines above
+            // it. Only the statement between them is formatted: a layout
+            // carries no comment outside the statement, so one beside or
+            // above it made the guard keep the whole statement as written.
+            Some((leading, statement, trailing)) => {
+                format!(
+                    "{}{}{trailing}",
+                    settle_leading(leading),
+                    format_block(statement, config)
+                )
+            }
+            None => trimmed.to_string(),
+        });
     }
 
     let mut result = output_parts.join("\n\n");
@@ -43,6 +57,21 @@ pub fn format_ddl(input: &str, config: &FormatConfig) -> String {
         result.push('\n');
     }
     result
+}
+
+/// The comments before a statement, with the space after them settled: a
+/// space when they share the statement's line, else the line breaks alone.
+/// A layout may start with indentation of its own (river's `    select`);
+/// kept as written, the gap before it grew by that much on every pass.
+fn settle_leading(leading: &str) -> String {
+    let text = leading.trim_end();
+    if text.is_empty() {
+        return String::new();
+    }
+    match leading[text.len()..].matches('\n').count() {
+        0 => format!("{text} "),
+        breaks => format!("{text}{}", "\n".repeat(breaks)),
+    }
 }
 
 /// One statement, formatted as far as stays faithful to it: laid out with its

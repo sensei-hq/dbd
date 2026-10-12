@@ -112,8 +112,16 @@ pub(in crate::formatter) fn ensure_semicolon(s: &str) -> String {
     }
 }
 
-/// Split a DDL script into statement blocks (each including its trailing `;`;
-/// what lies between two statements goes with the second).
+/// Split a DDL script into statement blocks (each including its trailing `;`
+/// and the comments on the line it ends; what lies after that line and
+/// before the next statement goes with the next one).
+///
+/// A final statement with no `;` ends at its last token of SQL, so what
+/// follows it is cut exactly as it would be after a `;`: the comments on its
+/// line stay with it, the lines after it are a block of their own. Cut at the
+/// end of the file instead, a `-- c` on the next line belonged to the
+/// statement until `format` added the `;`, and to nothing after it — so the
+/// second pass laid the statement out again and moved the comment.
 ///
 /// The boundaries are libpg_query's: when the whole script parses, a `;` ends
 /// a statement unless it lies inside one — a `BEGIN ATOMIC … END` body. When
@@ -129,10 +137,19 @@ pub(in crate::formatter) fn split_statements(input: &str) -> Vec<String> {
     let Some(tokens) = lex(input) else {
         return vec![input.to_string()];
     };
-    let ends = match pg_query::parse(input) {
+    let mut ends = match pg_query::parse(input) {
         Ok(parsed) => parsed_statement_ends(input, &parsed, &tokens),
         Err(_) => scanned_statement_ends(&tokens),
     };
+    if let Some(last) = tokens.iter().rev().find(|t| !t.is_comment())
+        && ends.last().is_none_or(|&end| last.end > end)
+    {
+        ends.push(last.end);
+    }
+    let ends: Vec<usize> = ends
+        .into_iter()
+        .map(|end| with_line_comments(input, &tokens, end))
+        .collect();
     let mut blocks = Vec::with_capacity(ends.len() + 1);
     let mut from = 0;
     for end in ends {
@@ -143,6 +160,34 @@ pub(in crate::formatter) fn split_statements(input: &str) -> Vec<String> {
         blocks.push(input[from..].to_string());
     }
     blocks
+}
+
+/// `end` moved past the comments on the line it is on — when nothing but
+/// comments follows it there. A comment written beside a statement's last
+/// line is that statement's; with SQL after it on the line, it is the next's.
+fn with_line_comments(input: &str, tokens: &[Lexeme], end: usize) -> usize {
+    let mut at = end;
+    for t in tokens.iter().skip_while(|t| t.start < end) {
+        if input[at..t.start].contains('\n') {
+            break;
+        }
+        if !t.is_comment() {
+            return end;
+        }
+        at = t.end;
+    }
+    at
+}
+
+/// A block (see [`split_statements`]) cut around its statement: the comments
+/// before it, the statement from its first token of SQL to its last, and the
+/// comments after it on its line, each as written. `None` for a block that
+/// holds only comments, or that cannot be scanned.
+pub(in crate::formatter) fn around_statement(block: &str) -> Option<(&str, &str, &str)> {
+    let tokens = lex(block)?;
+    let first = tokens.iter().find(|t| !t.is_comment())?;
+    let last = tokens.iter().rev().find(|t| !t.is_comment())?;
+    Some((&block[..first.start], &block[first.start..last.end], &block[last.end..]))
 }
 
 /// The offset just past each `;` that ends a statement, by the parse: every
