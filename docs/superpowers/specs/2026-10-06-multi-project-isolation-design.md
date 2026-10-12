@@ -93,7 +93,7 @@ The `relation` namespace covers tables, views, materialized views, sequences
 and foreign tables, which all share `pg_class`. A table and a view of the same
 name cannot both exist, so they cannot have two owners. Every type a design
 creates is keyed in `relation` too — an enum, and a composite, domain or range
-a file creates beside its entity: Postgres gives every table, view and
+(with the multirange a range makes) a file creates beside its entity: Postgres gives every table, view and
 materialized view a row type of its own name, so none of them can share a
 name with a type. `type` is left unused. `routine` is per name: dbd already
 drops every overload of a name together. Indexes, constraints, triggers, policies and comments
@@ -121,11 +121,18 @@ back:
   the run claims before that commit too, so nothing commits unclaimed.
 - `reconcile`, `reset`, and an `apply` outside one transaction (`DBD_NO_TX`)
   commit as they go. They claim, committed, after their last refusal and
-  before their first write, and keep the claim if they then fail: what the
-  design declares is the owner's, built yet or not. Claimed after its writes,
-  such a run could find an entity unowned while another owner was building
-  it, wait on that owner's lock, then write over — or drop — what that owner
-  had just claimed.
+  before their first write — `apply.before` hooks included — and keep the
+  claim if they then fail: what the design declares is the owner's, built
+  yet or not. Claimed after its writes, such a run could find an entity
+  unowned while another owner was building it, wait on that owner's lock,
+  then write over — or drop — what that owner had just claimed.
+
+`apply.before` hooks are the project's own scripts, and an `apply` in one
+transaction runs them, as it always has, outside it: after the check, before
+its claim. A hook that writes an entity another owner claims in that window is
+not stopped by ownership. Claiming first would close it, at the cost of a
+failed or killed apply keeping its claims — the wrong database, noticed in
+time, would be left claimed.
 
 Uses are recorded once the work is built.
 

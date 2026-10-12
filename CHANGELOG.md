@@ -14,8 +14,9 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 - **Each entity in a shared database has one owner** (#7, phase 2). A
   project's `apply`, `deploy`, `reconcile` and `reset` claim every entity its
   whole design declares — tables, views, materialized views, sequences, enums,
-  functions and procedures, and the composite, domain and range types a file
-  creates beside them; the whole design, not the scope it runs under — in
+  functions and procedures, and the composite, domain and range types (with a
+  range's multirange) a file creates beside them; the whole design, not the
+  scope it runs under — in
   `dbd.objects`. A project declaring an entity another project holds is
   refused before its first hook or statement, naming each: `relation
   app.orders is owned by "shop"; owners sharing a database must not declare
@@ -28,14 +29,17 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   commits with the work or not at all, and a run that fails or is killed
   claims nothing; a version adding enum values commits part-way, and the run
   claims before that commit too. `reconcile`, `reset` and an `apply` under
-  `DBD_NO_TX` commit as they go, so they claim before their first write and
-  keep the claim if they then fail. Of two projects racing to claim one
+  `DBD_NO_TX` commit as they go, so they claim before their first write —
+  an apply's `apply.before` hooks included — and keep the claim if they then
+  fail. Of two projects racing to claim one
   entity, the first owns it and the other is refused before it writes.
 
   An entity is owned as Postgres names it: every `CREATE` in its file names
-  one, in the schema it states, else its search path, an unquoted name folded
-  to lower case. One in a file dbd cannot read is claimed by its path, folded,
-  since a reset still drops it. Everything Postgres names as a relation or a
+  one — a `DO` block's included, so the quoted `"public"."Role"` dbd writes is
+  `Role` — in the schema it states, else its search path, an unquoted name
+  folded to lower case. One no statement names — a file dbd cannot read, a
+  name built in dynamic SQL — is claimed by its path, folded, since a reset
+  still drops it. Everything Postgres names as a relation or a
   type is one namespace, so a table and an enum of one name are one entity.
   Entities a project already has are claimed on its first run; what no design
   declares stays unowned. A claim waits at most 5 seconds for another
@@ -48,8 +52,9 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   — in `dbd.uses`, afresh by every `apply`, `deploy` and `reconcile` that
   succeeds; a run that fails keeps the uses it had. A call is a use of a routine, anything else of a relation.
   A column of another project's enum, or a default drawing on its sequence, is
-  a use without being declared `external`. A name written bare is looked up
-  along the search path, as Postgres looks it up.
+  a use without being declared `external`, however `nextval`'s string spells
+  it. A name written bare is the first object on the search path that exists,
+  as Postgres finds it.
 
 ### Library API
 
@@ -61,7 +66,8 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 - `Entity::refs` keeps a schema-qualified type or sequence reference that
   resolves to nothing — another project's, an extension's — marked
   `unresolved` and unwarned, where it was dropped. A bare one is still dropped
-  as a built-in.
+  as a built-in. A sequence a `nextval` default names is read as Postgres
+  reads the string: `nextval('App.Seq')` refers to `app.seq`.
 
 ### Fixed
 
