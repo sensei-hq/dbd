@@ -122,14 +122,16 @@ handled that another dropped — and fixed both in the code, test first.
   "Already up to date (v3)" and re-applied the older DDL.
 - **Pending migrations run version by version**, each whole before the next,
   as upgrading one release at a time would: a version's creates and schema
-  changes in dependency order, then all its data scripts, then its drops, then
-  the record that it ran; after the last version, every entity's DDL is
-  re-applied. They ran entity by entity — every pending version of one table,
-  then the next table — so a jump across versions ran a later version's change
-  before an earlier version's change to another table, and a data script
-  reading a column an earlier version adds failed on the jump though a
-  stepwise upgrade succeeded. A table one version drops and a later one
-  re-adds ends in its re-added shape.
+  changes in dependency order, then the data scripts of the tables it alters
+  or adds, then its drops, then the record that it ran; after the last
+  version, every entity's DDL is re-applied. They ran entity by entity — every
+  pending version of one table, then the next table — so a jump across
+  versions ran a later version's change before an earlier version's change to
+  another table, and a data script reading a column an earlier version adds
+  failed on the jump though a stepwise upgrade succeeded. A table one version
+  drops and a later one re-adds ends in its re-added shape. A `data.sql` for a
+  table its version adds never ran and was not listed; it now runs after the
+  version's creates and is listed in the previews.
 - **A version that adds enum values can use them.** Postgres refuses a value
   inside the transaction that added it (`unsafe use of new value`), so each
   version's `ALTER TYPE … ADD VALUE` statements — found in the parse tree — run
@@ -160,7 +162,9 @@ handled that another dropped — and fixed both in the code, test first.
   marked. An unreachable configured database fails the preview; with none
   configured it stays offline. A dry run never creates a database: a SQLite
   file that does not exist yet reads as none configured, where the preview
-  used to create it.
+  used to create it — and `reconcile --dry-run`, which needs a database to
+  compare against, previews against an empty in-memory one, which is what its
+  run would create, and refuses where the run refuses.
 - **An unreachable PostgreSQL database fails within 5 seconds**, naming the
   `host:port` it tried — never the URL, which may hold a password. sqlx's pool
   retried for 30 seconds and then said only `pool timed out while waiting for
@@ -182,8 +186,9 @@ handled that another dropped — and fixed both in the code, test first.
   that import loads it, so `export -n core.accounts -o import/staging` writes
   the `import/staging/accounts.csv` a new database loads into
   `staging.accounts`; two tables that would share one file there are refused
-  before anything is written. Generated columns are left out of every export,
-  and an import refuses a file that sets one.
+  before anything is written, and the refusal says to export there, with
+  `-n`, the one table whose rows that file should hold. Generated columns are
+  left out of every export, and an import refuses a file that sets one.
 - **A JSONL export writes every column's key, and `null` is SQL NULL** for
   every type. A json/jsonb column holding the JSON value `null` is written
   `{"$json": null}` — as is any value that is itself a one-key `$json`
@@ -234,18 +239,27 @@ handled that another dropped — and fixed both in the code, test first.
 - **`apply` and `deploy` name each DDL file that states no `SET search_path`**,
   with the path its bare names were resolved against, before the run and in
   its preview. Only `inspect` counted them.
-- **`dbd format` changes layout and keyword case, and nothing else.**
-  Statement boundaries come from libpg_query (a `BEGIN ATOMIC` body is one
-  statement) and keywords are recased token by token. A statement's new
-  layout is used only if it parses to the same tree and every string literal,
-  `$$`/`$tag$` body, quoted name and comment in it is byte-for-byte the same;
-  failing that the statement is only recased, and failing that left as
-  written. A file PostgreSQL's scanner cannot read is left unchanged. It
-  turned `E'it\'s; tricky'` into a three-line default and put an added `;`
-  inside a trailing comment.
+- **`dbd format` changes layout and keyword case, and nothing else — and
+  formatting twice changes nothing.** Statement boundaries come from
+  libpg_query (a `BEGIN ATOMIC` body is one statement). A keyword is recased
+  where PostgreSQL's grammar reads it as one — `ATOMIC` kept its case, and so
+  did `COLLATE`, `BIT` and `PARTITION BY RANGE` in a statement that was not
+  laid out — and a word it reads as a name keeps its case, even a keyword
+  elsewhere (a column named `name`, `value` or `level`); built-in type names
+  are recased with the keywords. A statement's new layout is used only if it
+  parses to the same tree and every string literal, `$$`/`$tag$` body, quoted
+  name and comment in it is byte-for-byte the same; failing that the
+  statement is only recased, and failing that left as written. A file
+  PostgreSQL's scanner cannot read is left unchanged. A comment beside a
+  statement stays beside it, and one above it stays above it. It turned
+  `E'it\'s; tricky'` into a three-line default, put an added `;` inside a
+  trailing comment, dropped a comment after a last statement with no `;`, and
+  moved a comment beside a statement onto a line of its own.
 - **The DBML reader reads a hand-written document as @dbml/core does**: table
   aliases, an inline `ref:`, multi-line notes and settings, `Note { … }`
-  blocks, one-line tables, a `pk` index entry (a named primary key),
+  blocks, one-line tables @dbml/core accepts — anything after a column, an
+  enum value or a header on its line is refused, naming it — a bare `pk` or
+  `unique` after a type, a `pk` index entry (a named primary key),
   `Ref name:` and `Ref name { … }`, an index's `type:` and a table header's
   `[note: …]`. A one-to-one `Ref: a - b` puts the foreign key on `b`, as
   @dbml/core's SQL does (an inline `[ref: - t.c]` puts it on its own column).
@@ -306,11 +320,15 @@ handled that another dropped — and fixed both in the code, test first.
     `forget_matview_stamps`, `truncate_table`, `truncate_tables`,
     `existing_objects`, `roles_held_elsewhere`, `live_matviews`,
     `matviews_reading_columns`, `other_projects_meta`,
-    `execute_project_script` and `dependencies` (with `adapter::Dependency`).
+    `execute_project_script`, `dependencies` (with `adapter::Dependency`) and
+    `foreign_keys` (the keys the database reports, which order a SQLite
+    import).
   - The guards: `DatabaseMarks` and `Design::database_marks` (this project's
-    record, or the one a renamed `project.name` left); `Design::check_env_guard`,
-    `check_reset_guard` and `check_version_guard`, which take `&DatabaseMarks`
-    as `check_scope_guard` does; `Design::conflicting_pin`,
+    record, or the one a renamed `project.name` left); `Design::check_env_guard`
+    and `check_version_guard`, which take `&DatabaseMarks` as
+    `check_scope_guard` does, and the method `design.check_reset_guard(&marks)`,
+    whose refusal calls the database a released project's only when
+    `project.released` is set; `Design::conflicting_pin`,
     `check_apply_guards`, `guard_env` (no longer crate-private) and `env`.
   - `dbd_core::connect_existing` and `SqliteAdapter::open_existing`, for a
     caller that must not create a database.
@@ -318,14 +336,17 @@ handled that another dropped — and fixed both in the code, test first.
     decides them), `unparsed` (what a generated document leaves out),
     `check_import_plan`, `pending_migration_preview` (`MigrationPreview`,
     `MigrationAction`), `roles_kept_by_reset`, `reset_script_keeping`,
-    `search_path_warnings`, `apply_hooks_to_run` and `grants_to_apply`;
-    `DeployComplete::policy_warnings()`; `DesignConfig::effective_schema_grants`
-    (what apply grants and reset revokes).
+    `search_path_warnings`, `apply_hooks_to_run`, `grants_to_apply` and
+    `live_import_plan` (the import plan ordered by the database's foreign keys
+    too); `DeployComplete::policy_warnings()`;
+    `DesignConfig::effective_schema_grants` (what apply grants and reset
+    revokes).
   - `script::runnable_ddl`, `runnable_script`, `enum_value_additions`,
     `idempotent_enum_value_additions`, `build_reset_script_keeping`,
     `build_scoped_reset_script` and `build_sqlite_reset_script`;
     `source_text::read_with_encoding` with `Encoding`; `reverse::Declared`,
-    `design_yaml_with`, `left_out_schemas` and `outside_needs`;
+    `design_yaml_with`, `left_out_schemas`, `outside_needs` and
+    `keep_authored_triggers` (what `merge --from-dbml` keeps of a table file);
     `SchemaSelect.supabase`; `doctor::detect_declared_kind_files`;
     `scanner::is_env_folder`; `sql_expr::canonical_exclusion`;
     `reconcile::plan_exclusion_convergence`; `entity::collation_sql`.
@@ -389,11 +410,13 @@ handled that another dropped — and fixed both in the code, test first.
   (`apply`, `deploy` and `import --dry-run`, `import.after` hooks included);
   it was said only in the summary of a run that succeeded, so a run that failed
   because of it gave no explanation. `import --dry-run` had the rule backwards.
-- **A hook's bare table names are judged on the path it runs on** —
-  `source.search_path`, else the session default — so a scope skips the hook
-  only when what it names really is outside. Its analysis assumed `public`, so
-  under a narrow scope a hook naming another schema's table bare was not
-  skipped and the apply failed.
+- **A hook's bare table names are judged as Postgres resolves them**: along
+  the path each statement runs on (its last `SET search_path`, else
+  `source.search_path`, else the session default, with `public` after it), to
+  the first schema where the design has that table or view. So a scope skips
+  the hook only when what it names really is outside. Its analysis assumed
+  `public`, so under a narrow scope a hook naming another schema's table bare
+  was not skipped and the apply failed.
 - **A scoped migration installs its new roles and extensions**, as a fresh
   scoped install does; a table typed with a new extension's type failed under a
   scope. Its summary counts each entity once.
@@ -419,11 +442,13 @@ handled that another dropped — and fixed both in the code, test first.
   `SET search_path TO <list>, public` ahead of it. Only the parser used it, so
   the table landed in `public`, `diff` wanted to create it in `app`, and
   reconcile never converged. A migration script stating no path runs on the
-  path its entity's DDL file runs on (the one that file states, else
-  `source.search_path`) and a hook on `source.search_path`; with neither set,
-  each runs on the session default (`RESET search_path`). Both ran on whatever
-  path the last DDL file had left on the connection, so a `data.sql` naming
-  its table bare failed with `relation "notes" does not exist`.
+  path its entity's CREATE runs on — the last `SET search_path` its DDL file
+  states before the CREATE, else `source.search_path` — and the entity's
+  references are read on that path too; a hook runs on `source.search_path`.
+  With neither set, each runs on the session default (`RESET search_path`).
+  Both ran on whatever path the last DDL file had left on the connection, so a
+  `data.sql` naming its table bare failed with `relation "notes" does not
+  exist`.
 - **`diff` and `reconcile` see a dropped index over primary-key or unique
   columns.** Any index over a key's columns was taken for the key's own
   backing index, so dropping it from the database left `diff` empty; the
@@ -497,8 +522,9 @@ handled that another dropped — and fixed both in the code, test first.
   only gained a column included.
 - **A row holding a removed enum value fails naming its column**, not only
   the value.
-- **`reset` refuses a released project's database as "versioned at vN"**. It
-  said "has applied migrations" of a fresh install that had run none.
+- **`reset` refuses a versioned database as "versioned at vN"**, calling it a
+  released project's database only when `project.released` is set. It said
+  "has applied migrations" of a fresh install that had run none.
 - **`dbd combine` writes the `search_path` apply runs** — `public` kept on
   the path after each top-level `SET search_path`, by a statement of its own —
   so `psql -f` on its output no longer fails where apply succeeded.
@@ -516,6 +542,12 @@ handled that another dropped — and fixed both in the code, test first.
   `upper` left `SET` and tables with a `serial` or `inet` column lowercase.
   String literals, `$tag$` bodies, quoted names and comments are left alone —
   see Changed.
+- **`dbd format` lays out a table whatever its literals and names**: a
+  `U&'…'` or `$$` default, a quoted table or column name, a column's own
+  CHECK, a named column constraint, and `TEMP`, `WITH (…)`, `PARTITION BY`,
+  `INHERITS` and `TABLESPACE` around the column list. A `U&'…'` default was
+  laid out re-spelled (`U&'dat'`); each of the others kept the table from
+  being laid out.
 - **`dbd reset` prints what it dropped**, counted by kind, or that it found
   nothing; it printed nothing.
 - **`dbd graph` names a file it leaves out because it does not parse**, on
@@ -546,8 +578,8 @@ handled that another dropped — and fixed both in the code, test first.
   real run does, and lists the `apply.before`/`apply.after` hooks and the
   grants the run goes on to apply. It stopped at the schema changes.
 - **`apply` and `deploy --dry-run` refuse a pending migration with an
-  unresolved `data.sql` TODO**, as the run does, and list the migration steps
-  in the order the run takes them.
+  unresolved `data.sql` TODO**, as the run does, before printing any of the
+  plan, and list the migration steps in the order the run takes them.
 - **A scoped dry run whose pending migrations touch nothing in its scope says
   the run records them** and moves the database to the design's version. It
   said "No pending migration to run (database at v4, design at v7)", and the
@@ -607,10 +639,15 @@ handled that another dropped — and fixed both in the code, test first.
 - **Staging tables linked by a foreign key import together.** Postgres empties
   them in one `TRUNCATE` and loads a referenced table before one that
   references it; a table outside the import holding a key to one of them fails
-  the import, named, with nothing emptied. SQLite empties them one at a time,
-  referencing table first. The truncate failed naming no table.
+  the import, named, with nothing emptied. The truncate failed naming no
+  table. SQLite, whose DDL dbd reads verbatim, takes the order from the
+  foreign keys the database reports: it loads a referenced table first and
+  empties them one at a time, referencing table first, so an import, a
+  re-import and `deploy` succeed. `import --dry-run` lists that order when the
+  database exists. They were ordered alphabetically and failed on the key.
 - **A data file whose target is a view, a materialized view or a sequence is
-  refused** before anything is truncated.
+  refused** before anything is truncated, the refusal saying why for each kind
+  it names.
 - **A data file in a folder deeper than an import reads** —
   `import/staging/sub/x.csv`, `import/dev/staging/sub/y.csv` — is never
   loaded, and is named with the layouts an import does read. The first was
@@ -629,6 +666,9 @@ handled that another dropped — and fixed both in the code, test first.
 **`dbd emit`** — what a target cannot take is reported, inline and in
 `--report`.
 
+- A name holding the target's quote character is escaped as the target
+  escapes it: SQLite doubles `"`, MySQL a backtick, SQL Server `]`. A name
+  holding one ended early (`"app_we"ird"`) and the script did not run.
 - Foreign keys, CHECK constraints and indexes are carried. A CHECK expression or
   index predicate goes across untranslated and is reported; an index the target
   would reject is left out and reported.
@@ -691,10 +731,20 @@ handled that another dropped — and fixed both in the code, test first.
   an undefined table.
 - Strings are escaped as DBML's lexer reads them, and the whole document is
   lexed by @dbml/parse's token rules, so a quote or backslash in a note or
-  default survives, and a column comment keeps its line breaks. A name holding
-  a quote or a backslash is escaped when written and read back as itself; a
-  hand-written `"we\"ird"` no longer gives a table file that does not parse,
-  and the DDL dbd writes doubles a quote in any identifier.
+  default survives — an odd number of `"` in a `'…'` note included — and a
+  column comment keeps its line breaks.
+- Every name is written in DBML's quoting and read back as itself — schema,
+  table, column, enum and enum value, index, primary-key, foreign-key
+  (`Ref "name":`), UNIQUE and CHECK names — whatever it holds: a quote, a
+  backslash, a space, a dot, a `'` or non-ASCII text. An enum column's type is
+  DBML's own reference to it, `"app"."mo\"od"`. A quote in a name ended its
+  DBML string, so the document did not parse, and an enum column's type was
+  written in SQL quoting, which @dbml/core refuses. A `"` inside a `'…'`
+  setting no longer ends the settings (the table lost its primary key), and a
+  Ref endpoint, an index tuple and a Ref name read their escapes. The DDL
+  `init --from-dbml` writes doubles a quote in every identifier, `CREATE
+  SCHEMA` included. (A schema, table or enum name also names a file, so a
+  backslash in one is refused; for a dot in one, see Known limitations.)
 - An index's method (`type:`), and its `INCLUDE` columns, operator classes and
   storage parameters (`include:`, `opclass:` and `with:` lines in its note),
   are written and read back, as are a named primary key (a `pk` index entry
@@ -715,10 +765,11 @@ handled that another dropped — and fixed both in the code, test first.
   --from-dbml` wrote one as a one-column managed table and added its schema to
   `schemas:`, so the next apply built a copy of somebody else's table.
 
-**`dbd init --from-db`** — a reversed project inspects clean and applies, to
-its own database and a fresh one, with an empty `diff` — under `--schema`, to
-a database that has what the run names as needed. What dbd's model cannot
-hold is named, never weakened in silence.
+**`dbd init --from-db`** — a reversed project of what dbd models inspects
+clean and applies, to its own database and a fresh one, with an empty `diff`
+— under `--schema`, to a database that has what the run names as needed. Much
+of what dbd's model cannot hold is now named instead of weakened in silence;
+what is still dropped without a word is under Known limitations.
 
 - Extensions go in the target's `extensions:` list and schemas in `schemas:`;
   it wrote `ddl/extension/` and `ddl/schema/` files the scanner refuses, so
@@ -737,7 +788,10 @@ hold is named, never weakened in silence.
   Postgres will not replace — and a view's `INSTEAD OF` triggers into the
   view's, which is then applied after the function they fire. A disabled
   trigger is named. Triggers were not captured, and `merge` deleted them from
-  the table files it overwrote.
+  the table files it overwrote. `merge --from-dbml`, whose document cannot
+  hold a trigger, keeps the triggers written in each table file it rewrites,
+  with the `SET search_path` they were written under. A SQLite table's
+  triggers are captured too.
 - EXCLUDE constraints, column collations (`COLLATE`), and a foreign key's
   `DEFERRABLE`, `INITIALLY DEFERRED` and `MATCH FULL` are modelled —
   introspected, parsed, compared by `diff`, converged by `reconcile`, emitted.
@@ -808,13 +862,20 @@ hold is named, never weakened in silence.
 - A foreign key named on its column (`pid int constraint p_fk references …`)
   loses its name in `emit` and in DBML.
 - `dbd diff` reports permanent drift on a negative default (`-1` against
-  Postgres's `'-1'::integer`) and on `varbit` columns.
+  Postgres's `'-1'::integer`), on a default holding a backslash (it wants
+  `e'a\\b'` where Postgres reports `'a\b'::text`, even right after `init
+  --from-db`) and on `varbit` columns. It prints identifiers unquoted
+  (`ALTER COLUMN my col`), so a statement it shows for a name that needs
+  quotes does not run as printed.
 - `init --from-dbml` names every unnamed index `<table>_idx`, so a second
   unnamed index on one table collides on apply. dbd's DBML reader takes a
   one-line note's leading whitespace off, as @dbml/core does. The DBML
   writer leaves out a foreign key's deferral and `MATCH FULL`, EXCLUDE
   constraints and column collations, which DBML has no syntax for, so they do
-  not survive the round trip.
+  not survive the round trip. An expression default or CHECK holding a
+  backtick is written into a document `init --from-dbml` refuses (DBML has no
+  escape for one), and a line break inside a CHECK's or index predicate's
+  string literal comes back as a space.
 - A snapshot's enum-value-removal migration does not see enum array columns,
   and leaves the renamed old type behind when the same snapshot drops the
   table; a dependent view in a scope the database does not build is dropped
@@ -845,8 +906,24 @@ hold is named, never weakened in silence.
   name's record, which stays; and a renamed design ahead of the old record's
   version is planned as a fresh install, so its pending migrations do not
   run. Set `project.name` back before upgrading.
-- `dbd format` recases a table holding a literal its layout engine would
-  re-spell (`U&'…'`), but does not lay it out.
+- `dbd format` lays out only a table sqlparser 0.62 can read; one it cannot —
+  `UNLOGGED`, `LIKE`, `EXCLUDE`, `USING <method>`, `OF <type>`, `PARTITION
+  OF`, identity options beyond one (`(START WITH 1 INCREMENT BY 1)`), a key's
+  `INCLUDE`/`WITH`/`USING INDEX TABLESPACE`, `NO INHERIT`, `ON DELETE SET
+  NULL (<columns>)`, a column's `STORAGE`/`COMPRESSION`, an `ARRAY` type
+  (`int ARRAY`), `WITHOUT OIDS`, `U&'…' UESCAPE` — is recased, not laid out;
+  so is an enum type with a label holding a `'`. A word on the formatter's own
+  list (`data`, `type`, `key`, `comment` …) is recased even where it names a
+  column.
+- `init --from-db` neither captures nor names a domain or a composite type,
+  so a project using one fails on a fresh database (`type "app.posint" does
+  not exist`). It drops without a word an identity column's `START` and
+  `INCREMENT`, a table's storage parameters (`fillfactor`), a column's
+  `STORAGE`, row-level security and its policies, and comments on
+  constraints, indexes and functions.
+- A dot in a schema, table or enum name is not supported: dbd joins a schema
+  and a name with a dot and splits them apart again, and `emit`, for one,
+  writes a table `app."we.ird"` as `app_ird`.
 - `dbd diff` does not compare table, view or enum comments.
 - `emit` loses an identity column's `START`/`INCREMENT` options; its MySQL and
   SQL Server output is written from documented syntax, not run against a server.
