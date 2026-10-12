@@ -1162,7 +1162,9 @@ counts the hooks:
 Reconcile compares the introspected live schema against the design and
 canonicalizes the two representations first: it lifts inline PK/UNIQUE to
 structural constraints, schema-qualifies bare enum types (`status` →
-`config.status`) to match introspection, and normalizes type aliases (`int4` →
+`config.status`) and the types an extension installs outside `public` (`citext` →
+`extensions.citext`, `vector(384)` → `extensions.vector(384)`) to match
+introspection, and normalizes type aliases (`int4` →
 `integer`, `timestamptz` → `timestamp with time zone`). It reconciles **columns**
 (name/type/collation/nullability/default/identity — a collation change is `ALTER COLUMN …
 TYPE … COLLATE`), **PK/UNIQUE** constraints, **foreign keys** (`MATCH FULL`, `DEFERRABLE` and
@@ -1243,7 +1245,7 @@ dbd diff -d $DATABASE_URL --exit-code  # 0 in sync, 2 on drift, 1 on error
 The desired schema is parsed from DDL, the live schema introspected; dbd
 normalizes representation noise (type aliases plus array and date-time spellings
 — `int4`→`integer`, `text[3]`→`text[]`, `time`→`time without time zone`; default
-casts, enum qualification, PK/UNIQUE-backing indexes (matched by the constraint's name, so
+casts, enum and extension-type qualification (`citext`→`extensions.citext`), PK/UNIQUE-backing indexes (matched by the constraint's name, so
 a declared index over a key's columns that the database lost is drift), FK `NO
 ACTION`/auto-generated names, EXCLUDE spelling, and CHECK-expression spelling via libpg_query — parens/case, `IN` ↔
 `= ANY (ARRAY[…])`, literal casts, `BETWEEN` ↔ its `>=`/`<=` expansion, casts on

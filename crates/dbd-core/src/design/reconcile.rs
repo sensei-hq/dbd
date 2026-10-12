@@ -339,9 +339,9 @@ impl Design {
         C: FnMut(crate::reconcile::ReconcileComplete),
     {
         use crate::reconcile::{
-            plan_check_convergence, plan_comment_convergence, plan_enum_recreation, plan_exclusion_convergence,
-            plan_fk_convergence, plan_index_convergence, plan_reconcile, raw_snapshot_from_entities,
-            snapshot_from_entities,
+            compared_snapshot, plan_check_convergence, plan_comment_convergence, plan_enum_recreation,
+            plan_exclusion_convergence, plan_fk_convergence, plan_index_convergence, plan_reconcile,
+            raw_snapshot_from_entities,
         };
 
         // Batch adapters (e.g. Convex) have no live SQL schema to diff.
@@ -369,9 +369,11 @@ impl Design {
         let hook_scope = self.hook_scope(scope, working_set.as_ref());
         let hook_scope = hook_scope.as_ref().map(|(name, outside)| (*name, outside));
 
-        // Desired snapshot (tables + enums, schema-normalized).
+        // Desired snapshot (tables + enums, schema-normalized), with each
+        // extension's types spelled as the live database spells them (#41).
+        let extension_types = adapter.extension_types().await?;
         let desired_owned: Vec<Entity> = desired_entities.iter().map(|e| (*e).clone()).collect();
-        let desired = snapshot_from_entities(&desired_owned);
+        let desired = compared_snapshot(&desired_owned, &extension_types);
 
         // Schemas the design manages. Reconcile only diffs within these, so it
         // never considers (or prunes) tables in schemas the project doesn't own.
@@ -383,7 +385,7 @@ impl Design {
         // the project's own, not orphans, and a scoped `--prune` dropped them (#40).
         let hidden = self.declared_out_of_scope(&desired_entities);
         let live_entities = adapter.introspect().await?;
-        let live_full = snapshot_from_entities(&live_entities);
+        let live_full = compared_snapshot(&live_entities, &extension_types);
         let live = hide_declared(restrict_snapshot_to_schemas(live_full, &managed_schemas), &hidden);
 
         let mut plan = plan_reconcile(&live, &desired);
@@ -638,9 +640,12 @@ impl Design {
         let desired_entities = self.entities_in_scope(scope, working_set.as_ref(), None);
 
         // Desired snapshot (tables + enums, schema-normalized). Raw (un-canonicalized)
-        // so FK/CHECK/indexes/comments survive for `SchemaDiff` to compare.
+        // so FK/CHECK/indexes/comments survive for `SchemaDiff` to compare; each
+        // extension's types spelled as the live database spells them (#41).
+        let extension_types = adapter.extension_types().await?;
         let desired_owned: Vec<Entity> = desired_entities.iter().map(|e| (*e).clone()).collect();
-        let desired = raw_snapshot_from_entities(&desired_owned);
+        let mut desired = raw_snapshot_from_entities(&desired_owned);
+        crate::reconcile::qualify_extension_types(&mut desired, &extension_types);
 
         // Schemas the design manages. The diff is scoped to these, so it never
         // reports drift for tables in schemas the project doesn't own.
@@ -651,7 +656,8 @@ impl Design {
         // The same hiding as `reconcile`, so the diff shows what reconcile would do (#40).
         let hidden = self.declared_out_of_scope(&desired_entities);
         let live_entities = adapter.introspect().await?;
-        let live_full = raw_snapshot_from_entities(&live_entities);
+        let mut live_full = raw_snapshot_from_entities(&live_entities);
+        crate::reconcile::qualify_extension_types(&mut live_full, &extension_types);
         let live = hide_declared(restrict_snapshot_to_schemas(live_full, &managed_schemas), &hidden);
 
         let mut diff = crate::SchemaDiff::compute(live, desired);

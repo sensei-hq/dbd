@@ -2525,6 +2525,271 @@ async fn reconcile_creates_alters_and_drops_in_place() {
     assert_table_absent(&*adapter, "app", "notes").await;
 }
 
+/// A type an extension installs outside the session `search_path` is the same
+/// type however it is spelled (#41). Introspection reads it through
+/// `format_type`, which qualifies what the session path does not reach —
+/// `extensions.citext`, `extensions.citext[]`, `extensions.cube` — while the
+/// DDL reaches it through its own `set search_path` and writes it bare.
+/// Compared as text the two differed, so every reconcile after the first
+/// planned an `ALTER … TYPE` that changed nothing, and Postgres refused it for
+/// a column a view reads, failing the reconcile. `dbd diff` reported the same
+/// false drift.
+///
+/// Which spelling introspection reads depends on the connection: pooled
+/// connections do not share a session path, and a database whose own path
+/// reaches the schema — Supabase's does — reads every one bare. So each check
+/// runs on a fresh connection, under the default path and then under one that
+/// reaches `extensions`. The schema is the platform's, not the project's, so
+/// the path dbd sets for an ALTER does not reach it either: a real change
+/// applies only if its ALTER names the type qualified.
+#[tokio::test]
+async fn an_extension_type_outside_the_search_path_is_not_drift() {
+    let (_pg, url) = start_pg().await;
+    // A new pool, whose connections have run nothing: introspection reads
+    // through the database's own default path.
+    let fresh = || connect(&url, "ext_types_test");
+    fresh()
+        .await
+        .unwrap()
+        .execute_script(
+            "CREATE SCHEMA extensions; \
+             CREATE EXTENSION citext SCHEMA extensions; \
+             CREATE EXTENSION cube SCHEMA extensions;",
+        )
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::create_dir_all(dir.join("ddl/view/app")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: ext_types_test\n  version: 1\n\
+         source:\n  dialect: postgresql\n\
+         target:\n  postgres:\n    url: $DATABASE_URL\n    extensions:\n\
+         \x20     - name: citext\n        schema: extensions\n\
+         \x20     - name: cube\n        schema: extensions\n\
+         schemas:\n  - app\n",
+    )
+    .unwrap();
+    let write_items = |note_type: &str| {
+        std::fs::write(
+            dir.join("ddl/table/app/items.ddl"),
+            format!(
+                "set search_path to app, extensions;\n\
+                 create table if not exists items (\n\
+                   id    integer primary key\n\
+                 , email citext not null\n\
+                 , tags  citext[]\n\
+                 , box   cube\n\
+                 , code  extensions.citext\n\
+                 , note  {note_type}\n\
+                 );\n"
+            ),
+        )
+        .unwrap();
+    };
+    std::fs::write(
+        dir.join("ddl/view/app/item_emails.ddl"),
+        "set search_path to app, extensions;\n\
+         create or replace view item_emails as select id, email, tags, box, code from items;\n",
+    )
+    .unwrap();
+    let load = || Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design");
+
+    /// What a fresh connection's introspection reads `app.items.email` as.
+    fn reads_email_as(spelling: &str) -> String {
+        format!(
+            "SELECT 1 FROM pg_attribute WHERE attrelid = 'app.items'::regclass \
+               AND attname = 'email' AND format_type(atttypid, atttypmod) = '{spelling}'"
+        )
+    }
+
+    /// Reconcile the unchanged design, then diff it, each on a fresh
+    /// connection: nothing is planned, refused or reported.
+    async fn assert_converged(url: &str, load: &dyn Fn() -> Design, reads: &str) {
+        let adapter = connect(url, "ext_types_test").await.unwrap();
+        assert_catalog(
+            &*adapter,
+            true,
+            &reads_email_as(reads),
+            &format!("email read as {reads}"),
+        )
+        .await;
+        let plan = load()
+            .reconcile(&*adapter, false, false, false, None, Progress::none())
+            .await
+            .unwrap_or_else(|e| panic!("reconciling an unchanged design (read as {reads}) must not fail: {e}"));
+        assert!(
+            plan.altered.is_empty(),
+            "an unchanged design (read as {reads}) altered: {:?}",
+            plan.altered
+        );
+        let type_changes: Vec<&String> = plan.warnings.iter().filter(|w| w.contains("type change")).collect();
+        assert!(type_changes.is_empty(), "read as {reads}: {type_changes:?}");
+
+        let adapter = connect(url, "ext_types_test").await.unwrap();
+        let diff = load().diff_live(&*adapter, None).await.expect("diff_live");
+        assert!(
+            diff.changes.is_empty(),
+            "an unchanged design (read as {reads}) reported drift: {:?}",
+            diff.changes
+        );
+    }
+
+    write_items("text");
+    load()
+        .reconcile(&*fresh().await.unwrap(), false, false, false, None, Progress::none())
+        .await
+        .expect("the first reconcile creates the table and the view");
+    assert_converged(&url, &load, "extensions.citext").await;
+
+    // A real change to an extension type applies under a path that does not
+    // reach the type, so its ALTER names it qualified.
+    write_items("citext");
+    let adapter = fresh().await.unwrap();
+    let plan = load()
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("a column changed to an extension type reconciles");
+    assert_eq!(
+        plan.altered.iter().map(|s| s.entity_name.as_str()).collect::<Vec<_>>(),
+        ["app.items"],
+        "{:?}",
+        plan.altered
+    );
+    assert!(
+        plan.altered[0]
+            .sql
+            .contains("TYPE extensions.citext USING note::extensions.citext"),
+        "{}",
+        plan.altered[0].sql
+    );
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_attribute WHERE attrelid = 'app.items'::regclass \
+           AND attname = 'note' AND atttypid = 'extensions.citext'::regtype",
+        "app.items.note typed extensions.citext",
+    )
+    .await;
+    assert_converged(&url, &load, "extensions.citext").await;
+
+    // A database whose own path reaches `extensions` reads every one bare.
+    adapter
+        .execute_script("ALTER DATABASE testdb SET search_path TO \"$user\", public, extensions;")
+        .await
+        .unwrap();
+    assert_converged(&url, &load, "citext").await;
+}
+
+/// What an extension owns is spelled as the extension's only where the name is
+/// the extension's alone. orafce installs a domain `oracle.date`: had every
+/// bare `date` been read as it, a column changed to `date` would land on
+/// Oracle's `timestamp(0)`, with `diff` clean afterwards. Postgres resolves a
+/// bare `date` to `pg_catalog.date` first, so a name another type shares —
+/// built in, or the project's own domain — is left as written. And a domain an
+/// extension defines over an array is the extension's type, named by its own
+/// name, not as an array of something (#41).
+#[tokio::test]
+async fn only_a_name_an_extension_alone_owns_is_spelled_as_its_type() {
+    let (_pg, url) = start_pg().await;
+    let fresh = || connect(&url, "ext_names_test");
+    let adapter = fresh().await.unwrap();
+    adapter
+        .execute_script(
+            "CREATE SCHEMA extensions; \
+             CREATE EXTENSION citext SCHEMA extensions; \
+             CREATE DOMAIN extensions.date AS timestamp(0); \
+             ALTER EXTENSION citext ADD DOMAIN extensions.date; \
+             CREATE DOMAIN extensions.tagset AS text[]; \
+             ALTER EXTENSION citext ADD DOMAIN extensions.tagset; \
+             CREATE DOMAIN public.http_method AS text; \
+             CREATE DOMAIN extensions.http_method AS text; \
+             ALTER EXTENSION citext ADD DOMAIN extensions.http_method;",
+        )
+        .await
+        .unwrap();
+    let owned = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+        pairs.iter().map(|(s, n)| (s.to_string(), n.to_string())).collect()
+    };
+    assert_eq!(
+        adapter.extension_types().await.unwrap(),
+        owned(&[("extensions", "citext"), ("extensions", "tagset")]),
+        "date and http_method are also another type's names; tagset is a domain, not an array"
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::create_dir_all(dir.join("ddl/view/app")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: ext_names_test\n  version: 1\n\
+         source:\n  dialect: postgresql\n\
+         target:\n  postgres:\n    url: $DATABASE_URL\n    extensions:\n\
+         \x20     - name: citext\n        schema: extensions\n\
+         schemas:\n  - app\n",
+    )
+    .unwrap();
+    let write_events = |d_type: &str| {
+        std::fs::write(
+            dir.join("ddl/table/app/events.ddl"),
+            format!(
+                "set search_path to app, extensions;\n\
+                 create table if not exists events (\n\
+                   id   integer primary key\n\
+                 , tags tagset\n\
+                 , d    {d_type}\n\
+                 );\n"
+            ),
+        )
+        .unwrap();
+    };
+    std::fs::write(
+        dir.join("ddl/view/app/event_tags.ddl"),
+        "set search_path to app, extensions;\n\
+         create or replace view event_tags as select id, tags from events;\n",
+    )
+    .unwrap();
+    let load = || Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design");
+    let reconcile = || async {
+        load()
+            .reconcile(&*fresh().await.unwrap(), false, false, false, None, Progress::none())
+            .await
+    };
+
+    write_events("text");
+    reconcile()
+        .await
+        .expect("the first reconcile creates the table and the view");
+    let plan = reconcile()
+        .await
+        .expect("reconciling an unchanged design must not fail");
+    assert!(plan.altered.is_empty(), "tagset read as drift: {:?}", plan.altered);
+
+    write_events("date");
+    let plan = reconcile().await.expect("a column changed to date reconciles");
+    assert_eq!(plan.altered.len(), 1, "{:?}", plan.altered);
+    assert_catalog(
+        &*fresh().await.unwrap(),
+        true,
+        "SELECT 1 FROM pg_attribute WHERE attrelid = 'app.events'::regclass \
+           AND attname = 'd' AND atttypid = 'pg_catalog.date'::regtype",
+        "app.events.d typed pg_catalog.date",
+    )
+    .await;
+    let plan = reconcile()
+        .await
+        .expect("reconciling the changed design again must not fail");
+    assert!(
+        plan.altered.is_empty(),
+        "a converged design altered: {:?}",
+        plan.altered
+    );
+}
+
 /// Source-hash drift handling for materialized views, end to end:
 /// 1. First reconcile CREATEs the matview and stamps a `dbd:hash=` comment.
 /// 2. Reconciling the SAME design SKIPs (no warning; oid unchanged).
