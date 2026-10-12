@@ -7476,6 +7476,58 @@ async fn a_migration_runs_on_the_path_its_entitys_ddl_file_states() {
     .await;
 }
 
+/// A DDL file that sets the path twice — `public`, then `app` for its
+/// CREATE. Its migration files ran on the first path the file set, so a
+/// `data.sql` naming `people` bare failed with `relation "people" does not
+/// exist`. They run on the path in effect at the table's CREATE.
+#[tokio::test]
+async fn a_migration_runs_on_the_path_in_effect_at_its_entitys_create() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "two_sets").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let yaml = "project:\n  name: two_sets\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+    let people = |columns: &str| {
+        format!(
+            "set search_path to public;\nset search_path to app;\n\
+             create table if not exists people (id integer primary key{columns});\n"
+        )
+    };
+    cut_version(dir, yaml, &[("ddl/table/app/people.ddl", &people(""))], &[], "v1");
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    adapter
+        .execute_script("INSERT INTO app.people (id) VALUES (1), (2);")
+        .await
+        .expect("seed rows");
+
+    cut_version(
+        dir,
+        yaml,
+        &[("ddl/table/app/people.ddl", &people(", tag text"))],
+        &[],
+        "v2 tags people",
+    );
+    std::fs::write(
+        dir.join("migrations/002/app/people.data.sql"),
+        "update people set tag = 'old';\n",
+    )
+    .unwrap();
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("the data script finds app.people");
+    assert_catalog(
+        &*adapter,
+        false,
+        "SELECT 1 FROM app.people WHERE tag IS DISTINCT FROM 'old'",
+        "a row the data script missed",
+    )
+    .await;
+}
+
 // ── `public` on the search path, without rewriting any text ──────────────────
 
 /// The files `search_path_text_survives_apply_and_combine` applies: two
