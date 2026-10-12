@@ -12299,3 +12299,82 @@ async fn a_prune_drops_the_mixed_case_table_it_names() {
     )
     .await;
 }
+
+/// A file may name its table differently from its path — `report.ddl`
+/// creating `app."Report"` — and a prune read that table as undeclared and,
+/// dropping it by its exact name, took the design's own table and its rows.
+/// What the design creates is never pruned (#7).
+#[tokio::test]
+async fn a_prune_keeps_a_table_the_design_creates_under_another_spelling() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    let design = named_project(
+        sd.path(),
+        "shop",
+        "",
+        &[(
+            "ddl/table/app/report.ddl",
+            "create table if not exists app.\"Report\" (id int);\n",
+        )],
+    );
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    shop.execute_script("INSERT INTO app.\"Report\" VALUES (42);")
+        .await
+        .unwrap();
+    let _ = design
+        .reconcile(&*shop, false, false, true, None, Progress::none())
+        .await;
+    assert_catalog(
+        &*shop,
+        true,
+        "SELECT 1 FROM app.\"Report\" WHERE id = 42",
+        "the design's app.\"Report\" and its row",
+    )
+    .await;
+}
+
+/// A prune claims what it drops in the transaction that drops it: a run that
+/// failed before its prune left claims on unowned tables `--prune-unowned`
+/// was going to drop, and a later plain `--prune` dropped them as its own,
+/// saying nothing (#7).
+#[tokio::test]
+async fn a_failed_prune_unowned_run_leaves_no_claim() {
+    let (_pg, url) = start_pg().await;
+    let (shop, sd) = shop_and_billing_share_app(&url).await;
+    shop.execute_script("CREATE TABLE app.tmp_report (id int); INSERT INTO app.tmp_report VALUES (7);")
+        .await
+        .unwrap();
+    named_project(
+        sd.path(),
+        "shop",
+        "apply:\n  before:\n    - sql/fail.sql\n",
+        &[ORDERS_OWNER_FILES[0], ("sql/fail.sql", "select 1 / 0;\n")],
+    )
+    .reconcile(&*shop, false, false, dbd_core::Prune::Unowned, None, Progress::none())
+    .await
+    .expect_err("the hook divides by zero");
+    assert_catalog(
+        &*shop,
+        false,
+        "SELECT 1 FROM dbd.objects WHERE schema = 'app' AND name = 'tmp_report'",
+        "a claim of the unowned app.tmp_report",
+    )
+    .await;
+
+    let plan = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1])
+        .reconcile(&*shop, false, false, true, None, Progress::none())
+        .await
+        .expect("shop's plain prune");
+    assert_table_exists(&*shop, "app", "tmp_report").await;
+    assert!(
+        plan.warnings
+            .iter()
+            .any(|w| w.contains("app.tmp_report") && w.contains("\"billing\"")),
+        "{:?}",
+        plan.warnings
+    );
+}
