@@ -445,23 +445,11 @@ impl Design {
                 guarded.push((g, label));
             }
         }
-        if guarded.is_empty() {
-            return Ok(());
-        }
-        let objects: Vec<Guarded> = guarded.iter().map(|(g, _)| g.clone()).collect();
-        let found = adapter.dependents(self.owner(), &objects).await?;
-        let uses_of = |i: usize| -> Option<String> {
-            let uses: Vec<String> = found
-                .iter()
-                .filter(|d| d.guarded == i)
-                .map(|d| format!("\"{}\" ({})", d.owner, d.via))
-                .collect();
-            (!uses.is_empty()).then(|| uses.join(", "))
-        };
+        let uses = self.uses_of(adapter, &guarded).await?;
         // A prune candidate depended on: kept, named.
         let mut kept = Vec::new();
-        for (i, (_, label)) in guarded.iter().enumerate().take(prunes) {
-            if let Some(uses) = uses_of(i) {
+        for ((_, label), uses) in guarded.iter().zip(&uses).take(prunes) {
+            if let Some(uses) = uses {
                 kept.push(label.clone());
                 plan.warnings
                     .push(format!("{label} is used by {uses} — not pruned; remove that use first"));
@@ -469,19 +457,89 @@ impl Design {
         }
         plan.dropped.retain(|stmt| !kept.contains(&stmt.entity_name));
         // A part depended on: refused.
-        let refused: Vec<String> = guarded
-            .iter()
-            .enumerate()
-            .skip(prunes)
-            .filter_map(|(i, (_, label))| uses_of(i).map(|uses| format!("{label} is used by {uses}")))
-            .collect();
-        if refused.is_empty() {
-            return Ok(());
+        refuse_uses(guarded.iter().zip(&uses).skip(prunes))
+    }
+
+    /// The uses guard for `apply` (#7): what a pending migration the run
+    /// executes drops — a `.drop.sql`'s table, a `.sql`'s `DROP` or `DROP
+    /// COLUMN` — that another owner depends on refuses the run, before
+    /// anything runs and under a dry run, naming each use. `plan` is the run's
+    /// own, built without writing.
+    pub(crate) async fn guard_migration_drops(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        plan: &super::ExecutionPlan,
+    ) -> Result<()> {
+        use crate::adapter::{Guarded, GuardedPart};
+        let mut guarded: Vec<(Guarded, String)> = Vec::new();
+        for step in &plan.steps {
+            let (entity, path) = match step {
+                super::ExecutionStep::DropEntity {
+                    entity_name,
+                    drop_sql_path,
+                    ..
+                } => (entity_name, drop_sql_path),
+                super::ExecutionStep::MigrateEntity {
+                    entity_name,
+                    migration_sql_path,
+                    ..
+                } => (entity_name, migration_sql_path),
+                _ => continue,
+            };
+            let Ok(sql) = crate::source_text::read_to_string(path) else {
+                continue;
+            };
+            let entity_schema = crate::entity::split_qualified_name(entity)
+                .0
+                .unwrap_or_else(|| crate::reconcile::DEFAULT_SCHEMA.to_string());
+            for (namespace, schema, name, part) in crate::script::drops_in(&sql) {
+                let schema = schema.unwrap_or_else(|| entity_schema.clone());
+                let label = match &part {
+                    GuardedPart::Whole => format!("{schema}.{name}"),
+                    GuardedPart::Column(column) => format!("{schema}.{name}.{column}"),
+                    GuardedPart::Constraint(c) => format!("{schema}.{name} constraint {c}"),
+                    GuardedPart::Index(i) => format!("{schema}.{name} index {i}"),
+                };
+                let g = Guarded {
+                    object: OwnedObject {
+                        namespace: namespace.to_string(),
+                        schema,
+                        name,
+                        kind: String::new(),
+                    },
+                    part,
+                };
+                if !guarded.iter().any(|(seen, _)| *seen == g) {
+                    guarded.push((g, label));
+                }
+            }
         }
-        Err(DbdError::Config(format!(
-            "{}; remove that use first",
-            refused.join("; ")
-        )))
+        let uses = self.uses_of(adapter, &guarded).await?;
+        refuse_uses(guarded.iter().zip(&uses))
+    }
+
+    /// The other owners' uses of each of `guarded`, as one phrase each —
+    /// `"billing" (view billing.v_orders)` — or `None` where there are none.
+    async fn uses_of(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        guarded: &[(crate::adapter::Guarded, String)],
+    ) -> Result<Vec<Option<String>>> {
+        if guarded.is_empty() {
+            return Ok(Vec::new());
+        }
+        let objects: Vec<crate::adapter::Guarded> = guarded.iter().map(|(g, _)| g.clone()).collect();
+        let found = adapter.dependents(self.owner(), &objects).await?;
+        Ok((0..guarded.len())
+            .map(|i| {
+                let uses: Vec<String> = found
+                    .iter()
+                    .filter(|d| d.guarded == i)
+                    .map(|d| format!("\"{}\" ({})", d.owner, d.via))
+                    .collect();
+                (!uses.is_empty()).then(|| uses.join(", "))
+            })
+            .collect())
     }
 
     /// Settle what a prune drops by ownership (#7). Another owner's entities
@@ -565,6 +623,24 @@ impl Design {
         }
         plan.warnings.extend(kept);
     }
+}
+
+/// Refuse, naming each, the guarded entities another owner uses —
+/// `app.orders.total is used by "billing" (view billing.v_totals); remove that
+/// use first`.
+fn refuse_uses<'a>(
+    guarded: impl Iterator<Item = (&'a (crate::adapter::Guarded, String), &'a Option<String>)>,
+) -> Result<()> {
+    let refused: Vec<String> = guarded
+        .filter_map(|((_, label), uses)| uses.as_ref().map(|uses| format!("{label} is used by {uses}")))
+        .collect();
+    if refused.is_empty() {
+        return Ok(());
+    }
+    Err(DbdError::Config(format!(
+        "{}; remove that use first",
+        refused.join("; ")
+    )))
 }
 
 /// What the registry says of a run's live tables and enums (#7).

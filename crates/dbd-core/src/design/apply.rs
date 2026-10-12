@@ -303,6 +303,14 @@ impl Design {
             },
         )
         .await?;
+        // What a pending migration drops that another owner depends on is
+        // refused before anything runs, dry run included (#7) — read from the
+        // run's own plan, built here without writing.
+        if !adapter.prefers_batch_apply() && !pending.is_empty() {
+            let owned: Vec<Entity> = valid_entities.iter().map(|e| (*e).clone()).collect();
+            let preview = build_execution_plan(&owned, db_version, latest_version, &pending, working_set.as_ref());
+            self.guard_migration_drops(adapter, &preview).await?;
+        }
 
         // A hook is filtered against the same working set the entities were.
         // `None` — unscoped or the all-scope — runs every hook, and skips the

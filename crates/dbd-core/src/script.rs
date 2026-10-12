@@ -276,6 +276,92 @@ fn first_token_at(piece: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// What script `sql` drops, statement by statement — for the uses guard (#7):
+/// a `DROP` of a table, view, materialized view, sequence, foreign table, type
+/// or domain (`relation`), or of a function, procedure or routine
+/// (`routine`), whole; and an `ALTER TABLE`'s `DROP COLUMN` or `DROP
+/// CONSTRAINT`, a part. Each as `(namespace, schema, name, part)`, the schema
+/// `None` where the statement leaves it to the search path. Empty for a script
+/// that does not parse.
+pub(crate) fn drops_in(sql: &str) -> Vec<(&'static str, Option<String>, String, crate::adapter::GuardedPart)> {
+    use crate::adapter::GuardedPart;
+    use pg_query::NodeEnum;
+    use pg_query::protobuf::{AlterTableType, ObjectType};
+    let Ok(parsed) = pg_query::parse(sql) else {
+        return Vec::new();
+    };
+    let strings = |nodes: &[pg_query::protobuf::Node]| -> Vec<String> {
+        nodes
+            .iter()
+            .filter_map(|n| match n.node.as_ref() {
+                Some(NodeEnum::String(s)) => Some(s.sval.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let named = |parts: Vec<String>| -> Option<(Option<String>, String)> {
+        match parts.as_slice() {
+            [name] => Some((None, name.clone())),
+            [.., schema, name] => Some((Some(schema.clone()), name.clone())),
+            [] => None,
+        }
+    };
+    let mut drops = Vec::new();
+    for node in parsed
+        .protobuf
+        .stmts
+        .iter()
+        .filter_map(|raw| raw.stmt.as_ref().and_then(|s| s.node.as_ref()))
+    {
+        match node {
+            NodeEnum::DropStmt(d) => {
+                let kind = d.remove_type();
+                let namespace = match kind {
+                    ObjectType::ObjectTable
+                    | ObjectType::ObjectView
+                    | ObjectType::ObjectMatview
+                    | ObjectType::ObjectSequence
+                    | ObjectType::ObjectForeignTable
+                    | ObjectType::ObjectType
+                    | ObjectType::ObjectDomain => "relation",
+                    ObjectType::ObjectFunction | ObjectType::ObjectProcedure | ObjectType::ObjectRoutine => "routine",
+                    _ => continue,
+                };
+                for object in &d.objects {
+                    let parts = match object.node.as_ref() {
+                        Some(NodeEnum::List(list)) => strings(&list.items),
+                        Some(NodeEnum::TypeName(t)) => strings(&t.names),
+                        Some(NodeEnum::ObjectWithArgs(f)) => strings(&f.objname),
+                        _ => continue,
+                    };
+                    if let Some((schema, name)) = named(parts) {
+                        drops.push((namespace, schema, name, GuardedPart::Whole));
+                    }
+                }
+            }
+            NodeEnum::AlterTableStmt(a) => {
+                let Some(rv) = a.relation.as_ref() else {
+                    continue;
+                };
+                let schema = (!rv.schemaname.is_empty()).then(|| rv.schemaname.clone());
+                for cmd in &a.cmds {
+                    let Some(NodeEnum::AlterTableCmd(cmd)) = cmd.node.as_ref() else {
+                        continue;
+                    };
+                    let part = match cmd.subtype() {
+                        AlterTableType::AtDropColumn => GuardedPart::Column(cmd.name.clone()),
+                        AlterTableType::AtDropConstraint => GuardedPart::Constraint(cmd.name.clone()),
+                        _ => continue,
+                    };
+                    drops.push(("relation", schema.clone(), rv.relname.clone(), part));
+                }
+            }
+            _ => {}
+        }
+    }
+    drops
+}
+
 /// Whether statement `piece` is an `ALTER TYPE … ADD VALUE`.
 pub(crate) fn is_enum_value_addition(piece: &str) -> bool {
     matches!(migration_statement(piece), MigrationStatement::AddValue { .. })
