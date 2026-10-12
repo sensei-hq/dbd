@@ -394,7 +394,21 @@ impl Design {
         let live_full =
             restrict_snapshot_to_schemas(compared_snapshot(&live_entities, &extension_types), &managed_schemas);
         let owned = self.live_ownership(adapter, &live_full).await?;
-        hidden.extend(owned.others.iter().cloned());
+        hidden.extend(owned.others.keys().cloned());
+        // Kept aside: an enum swap rewrites another owner's column too, which
+        // the run must refuse rather than hide.
+        let others_live = crate::snapshot::Snapshot {
+            tables: live_full
+                .tables
+                .iter()
+                .filter(|t| owned.others.contains_key(&(t.schema.clone(), t.name.clone())))
+                .cloned()
+                .collect(),
+            enums: Vec::new(),
+            version: live_full.version,
+            description: String::new(),
+            timestamp: String::new(),
+        };
         let live = hide_declared(live_full, &hidden);
 
         let mut plan = plan_reconcile(&live, &desired);
@@ -469,6 +483,7 @@ impl Design {
         // swap, and dbd never drops one: refused here, before any write and
         // under `dry_run`, against what the database has.
         refuse_enum_swaps_a_matview_blocks(adapter, &plan, &desired_entities).await?;
+        self.refuse_enum_swaps_another_owner_holds(&plan, &others_live, &owned)?;
 
         if dry_run {
             // Checked as the run checks them, executing none: a hook file that
@@ -504,6 +519,9 @@ impl Design {
         // and claim. Reconcile's writes commit as they run, so it claims first
         // — see `Design::claim_first` (#7).
         self.claim_first(adapter).await?;
+        if prune != ownership::Prune::Off {
+            self.claim_prune(adapter, &mut plan).await?;
+        }
 
         // `apply.before` where apply runs it: after every gate, so a refused
         // reconcile fires no hook, and before the first write, so a hook can
@@ -680,7 +698,7 @@ impl Design {
         let mut live_full = raw_snapshot_from_entities(&live_entities);
         crate::reconcile::qualify_extension_types(&mut live_full, &extension_types);
         let live_full = restrict_snapshot_to_schemas(live_full, &managed_schemas);
-        hidden.extend(self.live_ownership(adapter, &live_full).await?.others);
+        hidden.extend(self.live_ownership(adapter, &live_full).await?.others.into_keys());
         let live = hide_declared(live_full, &hidden);
 
         let mut diff = crate::SchemaDiff::compute(live, desired);

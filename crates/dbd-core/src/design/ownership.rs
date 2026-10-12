@@ -318,10 +318,14 @@ impl Design {
         };
         for (key, owner) in keys.into_iter().zip(found.owners) {
             match owner {
-                Some(owner) if owner == self.owner() => owned.mine.insert(key),
-                Some(_) => owned.others.insert(key),
-                None => false,
-            };
+                Some(owner) if owner == self.owner() => {
+                    owned.mine.insert(key);
+                }
+                Some(owner) => {
+                    owned.others.insert(key, owner);
+                }
+                None => {}
+            }
         }
         owned.not_recording = adapter
             .other_projects_meta()
@@ -333,6 +337,91 @@ impl Design {
             .into_iter()
             .collect();
         Ok(owned)
+    }
+
+    /// Claim what a prune is about to drop, before the first write, as the
+    /// run's other claims: read as this owner's or nobody's while the run
+    /// planned, a table another project has claimed since is kept, naming it
+    /// — dropped, that project's data was gone. What is claimed is released
+    /// once dropped (#7).
+    pub(crate) async fn claim_prune(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        plan: &mut crate::reconcile::ReconcilePlan,
+    ) -> Result<()> {
+        loop {
+            let candidates: Vec<OwnedObject> = plan
+                .dropped
+                .iter()
+                .map(|stmt| {
+                    let (schema, name) = crate::entity::split_qualified_name(&stmt.entity_name);
+                    OwnedObject {
+                        namespace: "relation".to_string(),
+                        schema: schema.unwrap_or_else(|| crate::reconcile::DEFAULT_SCHEMA.to_string()),
+                        name,
+                        kind: "table".to_string(),
+                    }
+                })
+                .collect();
+            if candidates.is_empty() {
+                return Ok(());
+            }
+            // A claim takes all of them or none; the held ones out, again.
+            let held = adapter.claim_objects(self.owner(), &candidates, true).await?;
+            if held.is_empty() {
+                return Ok(());
+            }
+            for h in held {
+                let name = format!("{}.{}", h.object.schema, h.object.name);
+                plan.dropped.retain(|stmt| stmt.entity_name != name);
+                plan.warnings.push(format!(
+                    "{name} is owned by \"{}\", which claimed it while this run planned — not dropped",
+                    h.owner
+                ));
+            }
+        }
+    }
+
+    /// Refuse, before any write and under a dry run, removing an enum value
+    /// when a column of that type is in another owner's table: the swap
+    /// rewrites every such column, and this run has no say over that table —
+    /// left to it, the swap failed on every run with Postgres's word for it
+    /// (#7). `others` is the live snapshot of those tables.
+    pub(crate) fn refuse_enum_swaps_another_owner_holds(
+        &self,
+        plan: &crate::reconcile::ReconcilePlan,
+        others: &crate::snapshot::Snapshot,
+        owned: &LiveOwnership,
+    ) -> Result<()> {
+        let mut held = Vec::new();
+        for swap in &plan.enum_swaps {
+            let columns: Vec<String> = crate::reconcile::enum_columns(others, &swap.enum_name)
+                .into_iter()
+                .map(|c| {
+                    let key = match crate::entity::split_qualified_name(&c.table) {
+                        (Some(schema), name) => (schema, name),
+                        (None, name) => (crate::reconcile::DEFAULT_SCHEMA.to_string(), name),
+                    };
+                    let owner = owned.others.get(&key).map(String::as_str).unwrap_or("another owner");
+                    format!("{}.{} (\"{owner}\")", c.table, c.column)
+                })
+                .collect();
+            if columns.is_empty() {
+                continue;
+            }
+            let values: Vec<String> = swap.removed.iter().map(|v| crate::sql_quote::literal(v)).collect();
+            held.push(format!(
+                "removing {} from {} rewrites every column of that type, and {} {} in another owner's table",
+                values.join(", "),
+                swap.enum_name,
+                columns.join(", "),
+                if columns.len() == 1 { "is" } else { "are" },
+            ));
+        }
+        if held.is_empty() {
+            return Ok(());
+        }
+        Err(DbdError::Config(format!("{}; remove that use first", held.join("; "))))
     }
 
     /// Settle what a prune drops by ownership (#7). Another owner's entities
@@ -399,9 +488,9 @@ impl Design {
 pub(crate) struct LiveOwnership {
     /// This owner's, as `(schema, name)`.
     pub(crate) mine: std::collections::HashSet<(String, String)>,
-    /// Another owner's: hidden from the run, which has no say over them — not
-    /// drift, and never pruned.
-    pub(crate) others: std::collections::HashSet<(String, String)>,
+    /// Another owner's, and that owner: hidden from the run, which has no say
+    /// over them — not drift, and never pruned.
+    pub(crate) others: std::collections::HashMap<(String, String), String>,
     /// Each schema another owner uses, and those owners.
     pub(crate) schema_users: std::collections::BTreeMap<String, Vec<String>>,
     /// The other owners the database records that do not record their uses:

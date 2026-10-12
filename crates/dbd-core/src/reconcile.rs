@@ -849,18 +849,23 @@ pub fn plan_reconcile(live: &Snapshot, desired: &Snapshot) -> ReconcilePlan {
                     });
                 }
             }
-            DiffAction::Drop => {
-                let sql = diff::generate_migration_sql(std::slice::from_ref(d));
-                // Only actionable drops (real `DROP` DDL) become prune targets.
-                // Enum drops emit a warning comment instead — already captured in
-                // `warnings` — so they are never auto-dropped.
-                if sql.to_uppercase().contains("DROP ") {
-                    plan.dropped.push(ReconcileStatement {
-                        entity_name: d.entity_name.clone(),
-                        sql,
-                    });
-                }
+            // Only a table becomes a prune target: a dropped enum is a warning,
+            // already in `warnings`, and never auto-dropped. Named as the live
+            // catalog spells it, quoted — unquoted, a mixed-case `"Report"`
+            // dropped the `report` beside it (#7).
+            DiffAction::Drop if d.entity_type == EntityType::Table => {
+                let (schema, name) = crate::entity::split_qualified_name(&d.entity_name);
+                let schema = schema.unwrap_or_else(|| DEFAULT_SCHEMA.to_string());
+                plan.dropped.push(ReconcileStatement {
+                    entity_name: d.entity_name.clone(),
+                    sql: format!(
+                        "DROP TABLE {}.{} CASCADE;",
+                        crate::sql_quote::ident(&schema),
+                        crate::sql_quote::ident(&name)
+                    ),
+                });
             }
+            DiffAction::Drop => {}
         }
     }
 
@@ -1667,10 +1672,10 @@ pub(crate) fn with_indexes_of(canonical: &Snapshot, raw: &Snapshot) -> Snapshot 
 }
 
 /// A live column whose type is the enum being recreated.
-struct EnumColumn {
+pub(crate) struct EnumColumn {
     /// Qualified table name (`schema.table`).
-    table: String,
-    column: String,
+    pub(crate) table: String,
+    pub(crate) column: String,
     default_value: Option<String>,
     /// Whether the column is `enum[]` rather than plain `enum`.
     is_array: bool,
@@ -1681,7 +1686,7 @@ struct EnumColumn {
 /// Reads the canonicalized snapshot, where an enum column's type is already
 /// schema-qualified and lowercased and an array collapsed to a single `[]` — so
 /// an exact match is enough and there is no spelling to re-derive here.
-fn enum_columns(live: &Snapshot, qname: &str) -> Vec<EnumColumn> {
+pub(crate) fn enum_columns(live: &Snapshot, qname: &str) -> Vec<EnumColumn> {
     let array = format!("{qname}[]");
     let mut out = Vec::new();
     for t in &live.tables {
