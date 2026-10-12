@@ -1,7 +1,8 @@
 # Multi-Project Isolation in One Database (#7)
 
 **Date:** 2026-10-06 (rev 3, 2026-10-07)
-**Status:** Proposed
+**Status:** Proposed — Phase 1 done on `develop` (1a in 0.25.0; 1b, 1c, 1d
+after 0.25.1); Phases 2–4 await the decisions below.
 **Scope:** Let several owners share one database safely: independent projects
 from different repositories, and modules of one workspace kept under
 `database/<module>/`. Ownership is per **entity**, recorded in the shared `dbd`
@@ -362,6 +363,12 @@ These are carried over from rev 1. Each is wrong today even with one project:
   owner declares.
 - **1c. Heal folds only this owner's legacy rows** (H5). It drops a legacy table
   only once it is empty.
+- *Done: 1a in 0.25.0 (`managed_schemas` skips roles and extensions); 1b, 1c
+  and 1d on `develop` after 0.25.1, each with the test the table below names
+  (T2 runs against a pg_cron stand-in, T4 records the staging tables an event
+  trigger sees). 1c also layers the bookkeeping reads — a project's record is
+  its `dbd.meta` row, else its legacy row — since a heal that leaves another
+  project's rows behind must not hide them from that project's guards.*
 - **1d. Import staging moves into `dbd`, one table per owner** (H7).
   `dbd.import_jsonb_to_table` and `dbd."import_tmp:<owner>"` are used, with a
   hashed name past 63 bytes. Imports run through the pool, so `TEMP` tables

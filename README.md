@@ -304,9 +304,11 @@ materialized_views:
 ```
 
 On `apply`, dbd syncs one pg_cron job per scheduled matview, named
-`dbd:refresh:<schema>.<name>`, running `REFRESH MATERIALIZED VIEW
-[CONCURRENTLY] …`. dbd only ever touches jobs with that reserved prefix —
-hand-authored cron jobs are left alone. A matview with no resolved schedule
+`dbd:refresh:<project>:<schema>.<name>`, running `REFRESH MATERIALIZED VIEW
+[CONCURRENTLY] …`. dbd only ever touches the project's own jobs with that
+reserved prefix — another project's sharing the database, and hand-authored
+cron jobs, are left alone. A job an older dbd named `dbd:refresh:<schema>.<name>`
+is replaced for a matview the project declares. A matview with no resolved schedule
 gets no job; refresh it on demand with `dbd refresh`.
 
 `dbd inspect` validates the config offline: scheduling requires `pg_cron` in

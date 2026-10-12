@@ -831,7 +831,7 @@ On a database with no recorded version that is already built (dbd applied it wit
 version, or the design's objects are there), apply records the version and says
 `vN recorded on a database that was already built but had no version`, not "Fresh install".
 
-After entities apply, `dbd apply` (and `dbd deploy`) records a `dbd:hash` drift stamp in `dbd.matview_stamps` for any materialized view it just created, and for one already in the database with no stamp whose deployed query and index keys are the design's (so a brownfield project diffs clean; one that differs stays unstamped) — the matview's own `COMMENT` stays the author's (a dbd before 0.25 kept the stamp as the comment; on upgrade the heal in the next `apply`/`deploy`/`reconcile`/`reset` copies it into `dbd.matview_stamps` before the file's own `COMMENT ON` can erase it) — and syncs pg_cron refresh jobs (`dbd:refresh:<schema>.<name>`) to match `materialized_views:` — see [dbd refresh](#dbd-refresh) and the `materialized_views` config. Matview DDL should be idempotent (`create materialized view if not exists …` + `create [unique] index if not exists …`).
+After entities apply, `dbd apply` (and `dbd deploy`) records a `dbd:hash` drift stamp in `dbd.matview_stamps` for any materialized view it just created, and for one already in the database with no stamp whose deployed query and index keys are the design's (so a brownfield project diffs clean; one that differs stays unstamped) — the matview's own `COMMENT` stays the author's (a dbd before 0.25 kept the stamp as the comment; on upgrade the heal in the next `apply`/`deploy`/`reconcile`/`reset` copies it into `dbd.matview_stamps` before the file's own `COMMENT ON` can erase it) — and syncs the project's own pg_cron refresh jobs (`dbd:refresh:<project>:<schema>.<name>`) to match `materialized_views:` — see [dbd refresh](#dbd-refresh) and the `materialized_views` config. Matview DDL should be idempotent (`create materialized view if not exists …` + `create [unique] index if not exists …`).
 
 **Scope guard.** Every successful `apply`/`deploy`/`reconcile` **pins** the database to the scope it applied, recorded in the bookkeeping table's `scope` column (`dbd.meta.scope` on Postgres/Supabase, `_dbd_meta.scope` on SQLite). A later `apply`/`deploy`/`reconcile`/`reset`/`import`/`export`/`refresh`/`policies` that requests a *different* scope than the pin is refused ("Error: Safety guard: scope guard: this database is pinned to scope 'X', but you requested 'Y'") — an exact match, so a database pinned to `all` refuses `export --scope hub` — preventing a mistyped or forgotten `--scope` from building a divergent schema or loading, reading, refreshing or securing tables the database was never given; so are `reconcile --dry-run`, and the `apply`, `deploy`, `import`, `policies` and `reset` dry runs when a database is configured. `diff` and `migrate --status`, which write nothing, note the pin instead (``note: this database is pinned to scope 'hub'; this diff compares scope 'all', so what 'hub' does not build reads as missing — `--scope hub` compares what it was built with.``). Pass `--allow-scope-change` on `apply`/`deploy`/`reconcile` to re-point the database to the new scope; on `reset` it (and `--force`) only bypasses — reset does not re-pin; `import`, `export`, `refresh` and `policies` take no bypass flag, since none re-pins (the message names the way through: the pinned scope, or `dbd apply --scope <new> --allow-scope-change` first). The guard is the CLI's: `Design::apply`/`deploy`/`reconcile`/`reset`/`import_data` and `design::apply_policies` do not check it — embedders call `Design::check_scope_guard(&marks, scope, allow)` with `Design::database_marks(adapter)`. (The environment and version guards are the library's own.) The pin read is this project's record or, after a `project.name` rename, the one its old name left — see [Safety model](#safety-model). Databases created before this feature are unpinned and pin on their next write.
 
@@ -891,8 +891,8 @@ CRLF and a BOM are handled. On PostgreSQL that is `COPY t (cols…) FROM STDIN W
 csv)` with the header taken off first. (Before 0.25 Postgres skipped the header and loaded
 by position, and SQLite split on commas and trimmed.) A `.json` file is a JSON array of
 records or JSON Lines (decided by its first character; on Convex an array only); `.jsonl`
-is JSON Lines. On PostgreSQL JSON records are staged as bound `jsonb` values in
-`dbd.import_tmp` and moved by `dbd.import_jsonb_to_table`, which the load installs itself
+is JSON Lines. On PostgreSQL JSON records are staged as bound `json` values in the project's
+own `dbd."import_tmp:<project>"` and moved by `dbd.import_jsonb_to_table`, which the load installs itself
 in dbd's own `dbd` schema — no other schema is created — so an ad-hoc JSON import works
 on a fresh database (a database an earlier dbd imported JSON into keeps a
 `staging.import_jsonb_to_table`; drop it if unused). Data files are read as UTF-8.
@@ -1935,7 +1935,7 @@ let graph = design.graph(None, None)?;
 
 | Target | Adapter | URL form | Extensions | Roles | SQL exec | Import | Migrations |
 |--------|---------|----------|------------|-------|----------|--------|------------|
-| PostgreSQL | sqlx-postgres | `postgres://user:pass@host:5432/db` | yes | yes | yes | COPY streaming (CSV/TSV, into the columns the header names); JSON/JSONL staged as `jsonb` in `dbd.import_tmp`, moved by `dbd.import_jsonb_to_table` | `dbd.migrations` (dedicated `dbd` schema) |
+| PostgreSQL | sqlx-postgres | `postgres://user:pass@host:5432/db` | yes | yes | yes | COPY streaming (CSV/TSV, into the columns the header names); JSON/JSONL staged as `json` in the project's `dbd."import_tmp:<project>"`, moved by `dbd.import_jsonb_to_table` | `dbd.migrations` (dedicated `dbd` schema) |
 | Supabase | sqlx-postgres (same adapter; the `supabase` key exposes `public`, protects Supabase schemas from prune/reset, adds PostgREST grants) | `postgres://…` (with `target: supabase`) | yes | yes | yes | COPY streaming | `dbd.migrations` (dedicated `dbd` schema) |
 | SQLite | sqlx-sqlite | `sqlite://./app.db`, `sqlite::memory:`, `file:/abs/path` | no (errors) | no (errors) | yes | multi-row `INSERT ... VALUES (?,?),(?,?), ...` batches in one tx (CSV/TSV/JSON/JSONL) | `_dbd_migrations` (SQLite syntax) |
 | Convex | codegen | `convex:` (→ `./convex`; quote it in YAML), `convex://./out`, append `?deploy=true` to auto-deploy | no (errors) | no (errors) | no — `apply` writes `<dir>/schema.ts` | per-table via `npx convex import --table <name> --replace -y <file>` (always replaces — `truncate: false` has no effect; a `.json` must be an array); whole-deployment export via `npx convex export` (CLI has no per-table flag) | sidecar `<dir>/.dbd_state.json` |
@@ -1996,9 +1996,11 @@ The bookkeeping table records project name, environment, and version. On Postgre
 PostgREST's default `db-schemas` (so it's unreachable via the API), and it's excluded from
 reverse-engineering/`merge`/DBML/`diagram`/introspection and protected from `dbd reset`
 (`--schemas`/`--clean` never drop it). Existing databases heal automatically — on the next
-`apply`/`deploy`/`reconcile`/`reset`, dbd relocates legacy `public._dbd_meta`/`public._dbd_migrations`
-(and any scoped-apply strays in other schemas) into `dbd.meta`/`dbd.migrations` and drops the
-originals; no user action required. On SQLite it's `_dbd_meta`/`_dbd_migrations` (SQLite has no
+`apply`/`deploy`/`reconcile`/`reset`, dbd relocates the project's own rows of legacy
+`public._dbd_meta`/`public._dbd_migrations` (and any scoped-apply strays in other schemas) into
+`dbd.meta`/`dbd.migrations`; another project's rows stay, and so does a legacy table holding any
+(that project may still be on an older dbd, and reads its record there until it heals), while an
+emptied one is dropped; no user action required. On SQLite it's `_dbd_meta`/`_dbd_migrations` (SQLite has no
 schemas, so the prefix is the namespace). Convex keeps migrations + meta in a JSON sidecar next to
 `schema.ts`.
 

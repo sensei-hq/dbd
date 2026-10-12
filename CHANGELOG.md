@@ -9,6 +9,35 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+### Fixed
+
+Projects sharing one database no longer undo each other's bookkeeping, refresh
+jobs or imports — the first phase of [#7], fixes that were wrong with a single
+project too.
+
+- **A heal folds only its own project's legacy bookkeeping.** Upgrading one
+  project folded every project's rows out of a legacy `_dbd_meta` and
+  `_dbd_migrations` into `dbd.*` and dropped the tables — so a project still on
+  an older dbd lost its record and read the database as fresh. A heal now
+  moves the project's own rows; another project's stay, and so does a legacy
+  table while it holds any, unaltered. A project not yet healed reads its own
+  record there, so its guards still see a database it marked prod. An emptied
+  legacy table is dropped.
+- **A pg_cron refresh job is named for its project** —
+  `dbd:refresh:<project>:<schema>.<name>` — and a sync unschedules only its own
+  project's. It unscheduled every `dbd:refresh:` job it was not given, so each
+  project's apply took the other's jobs. A job an older dbd named
+  `dbd:refresh:<schema>.<name>` is replaced for a matview the project declares,
+  and left for one it does not. A `:` or `%` in a project's name is encoded,
+  so one project's name cannot reach another's jobs.
+- **Each project stages its JSON imports in its own table**,
+  `dbd."import_tmp:<project>"`. Every load dropped and recreated one
+  `dbd.import_tmp`, so two projects importing at once emptied each other's
+  staged rows. A name past Postgres's 63-byte limit, which it would cut short
+  and so merge with another, ends in a hash of the whole name.
+
+[#7]: https://github.com/sensei-hq/dbd/issues/7
+
 ## [0.25.1] — 2026-10-12
 
 **Two fixes for refusals that left no way through.** `reconcile` failed on every
