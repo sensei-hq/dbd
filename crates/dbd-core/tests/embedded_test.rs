@@ -3977,7 +3977,7 @@ async fn a_heal_folds_only_its_own_legacy_rows() {
         &*a,
         true,
         &count("dbd.migrations", "a", 1),
-        "a's migration in dbd.migrations",
+        "the migration of a in dbd.migrations",
     )
     .await;
     assert_catalog(
@@ -4034,7 +4034,7 @@ async fn a_heal_folds_only_its_own_legacy_rows() {
         &*b,
         true,
         &count("dbd.migrations", "b", 2),
-        "b's migrations in dbd.migrations",
+        "the migrations of b in dbd.migrations",
     )
     .await;
     assert_table_absent(&*b, "public", "_dbd_meta").await;
