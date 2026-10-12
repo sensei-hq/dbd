@@ -492,9 +492,16 @@ impl Parser {
             if line == "}" {
                 break;
             }
-            // `"value" [note: '…']` or bare `value`.
+            // `"value" [note: '…']` or bare `value` — one to a line.
             let (token, rest) = take_identifier(&line)?;
-            let (settings, _) = take_settings(rest)?;
+            let (settings, rest) = take_settings(rest)?;
+            if !rest.trim().is_empty() {
+                return Err(parse_err(format!(
+                    "enum `{qualified}`: unexpected `{}` after the value `{token}` — each value needs a line of \
+                     its own",
+                    rest.trim()
+                )));
+            }
             let note = settings.and_then(note_setting);
             entity.enum_values.push(crate::entity::EnumValue { name: token, note });
         }
@@ -849,7 +856,11 @@ fn parse_element_header(header: &str) -> Result<ElementHeader> {
         alias = Some(a);
         rest = after.trim_start();
     }
-    let settings = take_settings(rest)?.0.map(str::to_string);
+    let (settings, after) = take_settings(rest)?;
+    if !after.trim().is_empty() {
+        return Err(parse_err(format!("unexpected `{}` in: {header}", after.trim())));
+    }
+    let settings = settings.map(str::to_string);
     Ok(ElementHeader {
         name,
         alias,
@@ -940,7 +951,9 @@ struct ParsedColumn {
 }
 
 /// Parse a column definition line: `"name" <type> [pk] [unique] [settings]`,
-/// as @dbml/core reads one.
+/// as @dbml/core reads one — and nothing after it. A table written on one
+/// line with two columns, `{ id int [pk] name text }`, read as one column
+/// typed `int [pk] name text`; @dbml/core refuses it, and so does this.
 fn parse_column(line: &str, table: &str, enums: &std::collections::HashSet<(String, String)>) -> Result<ParsedColumn> {
     let (name, rest) = take_identifier(line).map_err(|e| parse_err(format!("column in `{table}`: {e}")))?;
     let rest = rest.trim_start();
@@ -966,7 +979,13 @@ fn parse_column(line: &str, table: &str, enums: &std::collections::HashSet<(Stri
             break;
         }
     }
-    let (settings_part, _) = take_settings(rest)?;
+    let (settings_part, rest) = take_settings(rest)?;
+    if !rest.trim().is_empty() {
+        return Err(parse_err(format!(
+            "table `{table}`: unexpected `{}` after the column `{name}` — each column needs a line of its own",
+            rest.trim()
+        )));
+    }
 
     let mut col = ColumnDef {
         name,
