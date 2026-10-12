@@ -2024,6 +2024,10 @@ const AWKWARD: [&str; 6] = ["\"", "\\", " ", ".", "'", "é名"];
 /// refuses a backslash in one by design, and dbd's model joins a schema and a
 /// name with a dot and splits them apart again throughout, so those two are
 /// left out of those three kinds of name and kept in every other.
+///
+/// The default leaves a backslash out too: the deparser spells `'d\'` as
+/// `E'd\\'` and Postgres reports `'d\'`, which `reconcile::canonical_default`
+/// does not settle, so any such default reads as drift — DBML or not.
 fn awkward_project(dir: &Path) {
     let q = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
     let lit = |s: &str| format!("'{}'", s.replace('\'', "''"));
@@ -2076,7 +2080,7 @@ fn awkward_project(dir: &Path) {
                     r = name("ref"),
                     m = name("m"),
                     n = name("n"),
-                    d = lit(&format!("d{w}")),
+                    d = lit(&format!("d{}", if *w == "\\" { "" } else { w })),
                     cpk = name("cpk"),
                     fk = name("fk"),
                     pid = name("id"),
