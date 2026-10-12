@@ -14,12 +14,15 @@ unreleased.
   apply claim first and keep it. Closes the reset/reconcile race.
 - Keys/uses fixes `31bd657e`; red `bfffee35`; docs `b4d0708b`.
 - CI now runs `cli_live` (`37c91e51`) — it had compiled to no tests.
-- Embedded 186/186, `cli_live` 45/45, workspace 1997/0, clippy and fmt clean.
+- Re-verification round: red `f01dbfda`; DBD_NO_TX claims before hooks
+  `780ece9d`; DO blocks, multiranges, nextval strings, bare names by catalog
+  `0e8fedf3`; docs `75d7fb5e`. Race tests poll pg_locks.
+- Embedded 192/192, `cli_live` 46/46, workspace 1997/0, clippy and fmt clean.
 
 ## Next
 
-    # PR #50 pushed; update its body; focused re-verification of
-    # bfffee35..b4d0708b; CI green; merge #50 locally into feat/ownership;
+    # push PR #50, update its body; CI green; merge #50 locally into
+    # feat/ownership;
     # then slice 3: prune rules (a)/(b), --prune-unowned, release.
 
 ## Open
@@ -30,6 +33,8 @@ unreleased.
 - A bare type of another project's (search path, unqualified) is no use:
   bare types are dropped as built-ins; pg_depend still guards the column.
 - `dbd.objects` still allows namespace `type`, unused.
+- An apply in one transaction runs `apply.before` hooks before its claim
+  (documented in the spec; claiming first would strand a killed run's claims).
 - Phase 1 is releasable as 0.25.2 when asked.
 
 ## Known limits
