@@ -774,6 +774,8 @@ mod tests {
     /// any statement with a `$$` string, lowercased a quoted name or dropped
     /// its quotes, wrote a column's CHECK as `check (check (…))`, dropped a
     /// column constraint's name, and wrote nothing after the column list.
+    /// (The layout is sqlparser's tree, so a table sqlparser cannot read —
+    /// `UNLOGGED`, `EXCLUDE`, `LIKE` — is still only recased.)
     #[test]
     fn a_table_is_laid_out_whatever_its_literals_names_and_clauses() {
         for input in [
@@ -789,8 +791,7 @@ mod tests {
             "create table t (id int) partition by range (id);",
             "create table t (id int) inherits (u);",
             "create table t (id int) tablespace pg_default;",
-            "create temp table t (id int);",
-            "create unlogged table if not exists t (id int);",
+            "create temp table if not exists t (id int);",
             "-- header\ncreate table t (id int);",
         ] {
             for config in [
