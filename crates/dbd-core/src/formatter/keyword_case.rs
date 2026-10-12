@@ -1,10 +1,18 @@
 use std::collections::HashSet;
 
+use pg_query::protobuf::KeywordKind;
+
+use super::split::Lexeme;
 use crate::config::KeywordCase;
 
 // ── Keyword case transformation ─────────────────────────
 
-/// SQL keywords for case transformation.
+/// The words recased wherever they stand, beside the keywords libpg_query's
+/// grammar reads (see [`keyword_flags`]): the built-in type names DDL is
+/// written with (`TEXT`, `UUID`, `JSONB` — names to the grammar), words such
+/// as `PLPGSQL`, `SEARCH_PATH` and `BTREE` that are names too but are written
+/// like keywords, and the keywords recased before the grammar was asked. It is
+/// all that recases text libpg_query cannot parse — another engine's DDL.
 pub(in crate::formatter) fn sql_keywords() -> HashSet<&'static str> {
     [
         "ADD",
@@ -244,23 +252,123 @@ pub(in crate::formatter) fn sql_keywords() -> HashSet<&'static str> {
     .collect()
 }
 
-/// `sql` with `recase` applied to each word of SQL in it: every keyword or
-/// unquoted identifier libpg_query's scanner reads, and nothing inside a
-/// string of any kind (`E''`, `U&''`, a `$$` or `$tag$` body …), a quoted
-/// identifier or a comment. Those are text, and keep the case they were
-/// written in — a word recased inside one is a changed file the faithfulness
-/// guard then rejects whole. Everything between tokens is copied as it is.
-/// Text the scanner cannot read is returned unchanged: none of its words can
-/// be told from text.
-pub(in crate::formatter) fn map_sql_words(sql: &str, mut recase: impl FnMut(&str) -> String) -> String {
+/// For each token of `sql`, whether it is a keyword to recase: a word of SQL
+/// (never a string of any kind, a quoted identifier or a comment) that is on
+/// [`sql_keywords`], or that libpg_query's grammar reads as a keyword here.
+///
+/// The scanner names every word's keyword category, but by its spelling:
+/// `name`, `value`, `level` and `version` are keywords to it whether they
+/// are used as one or name a column. So when the statement parses, a word the
+/// scanner calls a keyword is asked of the grammar. The deparser writes every
+/// keyword in upper case and every name as `quote_identifier` does — lower
+/// case, or quoted — so a word the deparsed statement never writes as a name
+/// is a keyword; one it does is quoted where it stands, and is a name if the
+/// statement still means the same. Text libpg_query cannot parse has only the
+/// list: its words cannot be asked.
+pub(in crate::formatter) fn keyword_flags(sql: &str, tokens: &[Lexeme]) -> Vec<bool> {
+    let listed = sql_keywords();
+    let mut flags: Vec<Option<bool>> = tokens
+        .iter()
+        .map(|t| {
+            if !t.is_word(sql) {
+                Some(false)
+            } else if listed.contains(t.text(sql).to_uppercase().as_str()) {
+                Some(true)
+            } else if t.keyword == KeywordKind::NoKeyword {
+                Some(false)
+            } else {
+                None
+            }
+        })
+        .collect();
+    if flags.iter().all(Option::is_some) {
+        return flags.into_iter().map(|f| f == Some(true)).collect();
+    }
+    // Text libpg_query cannot parse has only the list: its words cannot be asked.
+    let Some(meant) = deparsed(sql) else {
+        return flags.into_iter().map(|f| f == Some(true)).collect();
+    };
+    let names = names_in(&meant);
+    // The words left to ask, by spelling.
+    let mut asked: std::collections::BTreeMap<String, Vec<usize>> = std::collections::BTreeMap::new();
+    for (i, t) in tokens.iter().enumerate() {
+        if flags[i].is_none() {
+            let lower = t.text(sql).to_lowercase();
+            if names.contains(&lower) {
+                asked.entry(lower).or_default().push(i);
+            } else {
+                flags[i] = Some(true);
+            }
+        }
+    }
+    for (lower, at) in asked {
+        // Most often every one of them is a name: quoted all at once, the
+        // statement still means the same. Otherwise each is asked alone.
+        let quote = |which: &[usize]| {
+            let mut out = String::with_capacity(sql.len() + 2 * which.len());
+            let mut copied = 0;
+            for &i in which {
+                out.push_str(&sql[copied..tokens[i].start]);
+                out.push('"');
+                out.push_str(&lower);
+                out.push('"');
+                copied = tokens[i].end;
+            }
+            out.push_str(&sql[copied..]);
+            out
+        };
+        if deparsed(&quote(&at)).as_ref() == Some(&meant) {
+            at.iter().for_each(|&i| flags[i] = Some(false));
+        } else {
+            for &i in &at {
+                flags[i] = Some(deparsed(&quote(&[i])).as_ref() != Some(&meant));
+            }
+        }
+    }
+    flags.into_iter().map(|f| f == Some(true)).collect()
+}
+
+/// `sql`'s tree, deparsed — `None` when it does not parse to a statement.
+fn deparsed(sql: &str) -> Option<String> {
+    pg_query::parse(sql)
+        .ok()
+        .filter(|p| !p.protobuf.stmts.is_empty())
+        .and_then(|p| p.deparse().ok())
+}
+
+/// Every word the deparsed `sql` writes as a name, unquoted: its lower-case
+/// words and its quoted identifiers.
+fn names_in(deparsed: &str) -> HashSet<String> {
+    super::split::lex(deparsed)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|t| {
+            let text = t.text(deparsed);
+            match text.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
+                Some(quoted) => Some(quoted.replace("\"\"", "\"")),
+                None => (t.is_word(deparsed) && text == text.to_lowercase()).then(|| text.to_string()),
+            }
+        })
+        .collect()
+}
+
+/// `sql` with `recase` applied to each keyword in it (see [`keyword_flags`]),
+/// and to nothing inside a string of any kind (`E''`, `U&''`, a `$$` or
+/// `$tag$` body …), a quoted identifier or a comment. Those are text, and keep
+/// the case they were written in — a word recased inside one is a changed
+/// file the faithfulness guard then rejects whole. Everything between tokens
+/// is copied as it is. Text the scanner cannot read is returned unchanged:
+/// none of its words can be told from text.
+pub(in crate::formatter) fn map_keywords(sql: &str, mut recase: impl FnMut(&str) -> String) -> String {
     let Some(tokens) = super::split::lex(sql) else {
         return sql.to_string();
     };
+    let flags = keyword_flags(sql, &tokens);
     let mut out = String::with_capacity(sql.len());
     let mut copied = 0;
-    for token in &tokens {
+    for (token, keyword) in tokens.iter().zip(flags) {
         out.push_str(&sql[copied..token.start]);
-        if token.is_word(sql) {
+        if keyword {
             out.push_str(&recase(token.text(sql)));
         } else {
             out.push_str(token.text(sql));
@@ -271,26 +379,14 @@ pub(in crate::formatter) fn map_sql_words(sql: &str, mut recase: impl FnMut(&str
     out
 }
 
-/// Re-case `word` per `case` when it is a SQL keyword; otherwise return it as-is.
-pub(in crate::formatter) fn recase_keyword(word: &str, keywords: &HashSet<&'static str>, case: &KeywordCase) -> String {
-    if !keywords.contains(word.to_uppercase().as_str()) {
-        return word.to_string();
-    }
-    match case {
-        KeywordCase::Lower => word.to_lowercase(),
-        KeywordCase::Upper => word.to_uppercase(),
-        KeywordCase::Preserve => word.to_string(),
-    }
-}
-
-/// Apply keyword case transformation to a SQL string — every keyword outside
-/// the text [`map_sql_words`] leaves alone.
+/// Apply keyword case transformation to a SQL string — every keyword
+/// [`map_keywords`] finds.
 pub(in crate::formatter) fn apply_keyword_case(sql: &str, case: &KeywordCase) -> String {
-    if matches!(case, KeywordCase::Preserve) {
-        return sql.to_string();
+    match case {
+        KeywordCase::Preserve => sql.to_string(),
+        KeywordCase::Lower => map_keywords(sql, str::to_lowercase),
+        KeywordCase::Upper => map_keywords(sql, str::to_uppercase),
     }
-    let keywords = sql_keywords();
-    map_sql_words(sql, |word| recase_keyword(word, &keywords, case))
 }
 
 /// `formatted` — laid out with lowercase keywords — with each keyword given
@@ -304,27 +400,21 @@ pub(in crate::formatter) fn apply_keyword_case(sql: &str, case: &KeywordCase) ->
 /// statement does not have (an `as` before an alias) takes the case most of
 /// the statement's keywords are in.
 pub(in crate::formatter) fn preserve_keyword_case(formatted: &str, original: &str) -> String {
-    let keywords = sql_keywords();
     let mut spelled: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let (mut upper, mut lower) = (0usize, 0usize);
-    map_sql_words(original, |word| {
+    map_keywords(original, |word| {
         let key = word.to_uppercase();
-        if keywords.contains(key.as_str()) {
-            if word == key {
-                upper += 1;
-            } else if word == word.to_lowercase() {
-                lower += 1;
-            }
-            spelled.entry(key).or_insert_with(|| word.to_string());
+        if word == key {
+            upper += 1;
+        } else if word == word.to_lowercase() {
+            lower += 1;
         }
+        spelled.entry(key).or_insert_with(|| word.to_string());
         word.to_string()
     });
     let shout = upper > lower;
-    map_sql_words(formatted, |word| {
+    map_keywords(formatted, |word| {
         let key = word.to_uppercase();
-        if !keywords.contains(key.as_str()) {
-            return word.to_string();
-        }
         match spelled.get(&key) {
             Some(spelling) => spelling.clone(),
             None if shout => key,

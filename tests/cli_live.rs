@@ -2009,3 +2009,141 @@ async fn a_scoped_dry_run_says_the_run_records_a_migration_it_has_nothing_to_run
     assert!(o.status.success(), "apply v2: {}", combined(&o));
     assert!(stdout(&o).contains("Migrated v1 → v2"), "{}", stdout(&o));
 }
+
+// ── Awkward names through DBML and a real database ─────────────────────────
+
+/// The characters a quoted identifier may hold that DBML or SQL must escape,
+/// or that a splitter may take for a delimiter.
+const AWKWARD: [&str; 6] = ["\"", "\\", " ", ".", "'", "é名"];
+
+/// A project whose every name holds one of [`AWKWARD`], one schema per
+/// character: an enum, two tables, named primary, foreign, UNIQUE and CHECK
+/// keys, an index with an INCLUDE column, notes and a default holding it.
+///
+/// A schema, table or enum name is a file or directory name too: `path_safe`
+/// refuses a backslash in one by design, and dbd's model joins a schema and a
+/// name with a dot and splits them apart again throughout, so those two are
+/// left out of those three kinds of name and kept in every other.
+///
+/// The default leaves a backslash out too: the deparser spells `'d\'` as
+/// `E'd\\'` and Postgres reports `'d\'`, which `reconcile::canonical_default`
+/// does not settle, so any such default reads as drift — DBML or not.
+fn awkward_project(dir: &Path) {
+    let q = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+    let lit = |s: &str| format!("'{}'", s.replace('\'', "''"));
+    let mut schemas = Vec::new();
+    for (i, w) in AWKWARD.iter().enumerate() {
+        let file_name = |base: &str| {
+            if *w == "\\" || *w == "." {
+                format!("{base}_{i}")
+            } else {
+                format!("{base}{w}")
+            }
+        };
+        let schema = file_name("s");
+        let (enum_name, parent, child) = (file_name("e"), file_name("p"), file_name("c"));
+        let (s, e, p, c) = (q(&schema), q(&enum_name), q(&parent), q(&child));
+        let name = |base: &str| q(&format!("{base}{w}"));
+        let files = [
+            (
+                format!("ddl/enum/{schema}/{enum_name}.ddl"),
+                format!(
+                    "create type {s}.{e} as enum ({}, {});\n",
+                    lit(&format!("v{w}")),
+                    lit(&format!("it's {w}"))
+                ),
+            ),
+            (
+                format!("ddl/table/{schema}/{parent}.ddl"),
+                format!(
+                    "create table if not exists {s}.{p} ({id} int, constraint {pk} primary key ({id}));\n",
+                    id = name("id"),
+                    pk = name("pk")
+                ),
+            ),
+            (
+                format!("ddl/table/{schema}/{child}.ddl"),
+                format!(
+                    "create table if not exists {s}.{c} (\n  \
+                       id int,\n  \
+                       {r} int not null,\n  \
+                       {m} {s}.{e},\n  \
+                       {n} text not null default {d},\n  \
+                       constraint {cpk} primary key (id),\n  \
+                       constraint {fk} foreign key ({r}) references {s}.{p} ({pid}) on delete cascade,\n  \
+                       constraint {uq} unique ({n}),\n  \
+                       constraint {ck} check (char_length({n}) > 0)\n\
+                     );\n\
+                     create index if not exists {ix} on {s}.{c} ({n}, {m}) include ({r});\n\
+                     comment on table {s}.{c} is {tnote};\n\
+                     comment on column {s}.{c}.{n} is {cnote};\n",
+                    r = name("ref"),
+                    m = name("m"),
+                    n = name("n"),
+                    d = lit(&format!("d{}", if *w == "\\" { "" } else { w })),
+                    cpk = name("cpk"),
+                    fk = name("fk"),
+                    pid = name("id"),
+                    uq = name("uq"),
+                    ck = name("ck"),
+                    ix = name("ix"),
+                    tnote = lit(&format!("table {w} \" odd")),
+                    cnote = lit(&format!("note {w} \" odd")),
+                ),
+            ),
+        ];
+        for (path, sql) in files {
+            let path = dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, sql).unwrap();
+        }
+        schemas.push(format!(
+            "  - \"{}\"\n",
+            schema.replace('\\', "\\\\").replace('"', "\\\"")
+        ));
+    }
+    std::fs::write(
+        dir.join("design.yaml"),
+        format!(
+            "project:\n  name: awkward\nsource:\n  dialect: postgresql\nschemas:\n{}",
+            schemas.concat()
+        ),
+    )
+    .unwrap();
+}
+
+/// Names holding a quote, a backslash, a space, a dot, a single quote or
+/// non-ASCII text survive `dbml` → `init --from-dbml` → `apply`: the project
+/// the document rebuilds inspects clean, applies to a real database, and the
+/// database then matches it. The enum type was written in SQL quoting, the
+/// rebuilt table lost its primary key to a `"` inside a `'…'` setting, and
+/// apply failed on an index over a column named `id [pk, name: …]`.
+#[tokio::test]
+async fn awkward_names_survive_dbml_init_from_dbml_and_a_real_apply() {
+    let (_pg, url) = start_pg().await;
+    let source = tempfile::tempdir().unwrap();
+    awkward_project(source.path());
+    let o = dbd_offline(source.path(), &["inspect"]);
+    assert!(o.status.success(), "the source project is valid: {}", combined(&o));
+    let o = dbd_offline(source.path(), &["dbml", "-f", "design.dbml"]);
+    assert!(o.status.success(), "dbml: {}", combined(&o));
+    let dbml = std::fs::read_to_string(source.path().join("design.dbml")).unwrap();
+
+    let rebuilt = tempfile::tempdir().unwrap();
+    let dir = rebuilt.path();
+    std::fs::write(dir.join("in.dbml"), &dbml).unwrap();
+    let o = Command::cargo_bin("dbd")
+        .unwrap()
+        .args(["init", "--from-dbml", "in.dbml", "-n", "awkward"])
+        .env_remove("DATABASE_URL")
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "init --from-dbml: {}\n{dbml}", combined(&o));
+    let o = dbd_offline(dir, &["inspect"]);
+    assert!(o.status.success(), "inspect: {}\n{dbml}", combined(&o));
+    let o = dbd(dir, &url, &["apply"]);
+    assert!(o.status.success(), "apply: {}\n{dbml}", combined(&o));
+    let o = dbd(dir, &url, &["diff", "--exit-code"]);
+    assert!(o.status.success(), "diff: {}\n{dbml}", combined(&o));
+}

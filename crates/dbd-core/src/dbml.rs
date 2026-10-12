@@ -284,7 +284,11 @@ fn is_included(entity: &Entity, params: &DbmlParams) -> bool {
 }
 
 fn emit_project_block(name: &str, db_type: &str, note: Option<&str>) -> String {
-    let mut block = format!("Project \"{}\" {{\n  database_type: '{}'", name, db_type);
+    let mut block = format!(
+        "Project {} {{\n  database_type: {}",
+        dbml_quoted_name(name),
+        dbml_string(db_type)
+    );
     if let Some(n) = note {
         let n = n.trim();
         if !n.is_empty() {
@@ -304,7 +308,7 @@ fn emit_project_block(name: &str, db_type: &str, note: Option<&str>) -> String {
 /// rebuilt table's apply failed with `type "mood" does not exist`. So a type
 /// naming a declared enum is written qualified, as the table's own path
 /// resolves it; a built-in, or a name already qualified, is written as is.
-struct EnumTypes(std::collections::HashSet<String>);
+struct EnumTypes(std::collections::HashSet<(String, String)>);
 
 impl EnumTypes {
     fn of(design: &[Entity]) -> Self {
@@ -312,26 +316,39 @@ impl EnumTypes {
             design
                 .iter()
                 .filter(|e| e.entity_type == EntityType::Enum)
-                .map(qualified_name)
+                .map(|e| (schema_of(e).to_string(), base_name(e).to_string()))
                 .collect(),
         )
     }
 
-    /// `data_type`, qualified when it names a declared enum on `path`.
+    /// `data_type`, qualified when it names a declared enum on `path` — as
+    /// SQL still; [`quote_type_if_needed`] writes it as DBML.
     fn column_type(&self, data_type: &str, path: &SchemaPath) -> String {
-        // `mood[]` names the enum `mood`; the array suffix rides along.
-        let (base, suffix) = data_type.split_at(data_type.find('[').unwrap_or(data_type.len()));
-        if base.contains('.') {
+        // The type's name as Postgres reads it, so a quoted `"mo""od"` is
+        // the enum `mo"od` and `mood[]` names `mood`.
+        let Some(TypeName { names, dims }) = type_name(data_type) else {
             return data_type.to_string();
-        }
+        };
+        let [name] = names.as_slice() else {
+            return data_type.to_string();
+        };
         // `public` is searched last: apply appends it to every path a file
         // states (`script::keep_public_on_search_path`), and a file stating none
         // resolves there.
         path.schemas()
             .chain(std::iter::once(crate::reconcile::DEFAULT_SCHEMA))
-            .map(|schema| format!("{schema}.{base}"))
-            .find(|name| self.0.contains(name))
-            .map_or_else(|| data_type.to_string(), |name| format!("{name}{suffix}"))
+            .find(|schema| self.0.contains(&(schema.to_string(), name.clone())))
+            .map_or_else(
+                || data_type.to_string(),
+                |schema| {
+                    format!(
+                        "{}.{}{}",
+                        crate::sql_quote::ident_if_needed(schema),
+                        crate::sql_quote::ident_if_needed(name),
+                        "[]".repeat(dims)
+                    )
+                },
+            )
     }
 
     /// `table_def` with each column's type as [`Self::column_type`] writes it.
@@ -344,13 +361,74 @@ impl EnumTypes {
     }
 }
 
+/// A type's name as Postgres reads it, and how many array dimensions follow.
+struct TypeName {
+    names: Vec<String>,
+    dims: usize,
+}
+
+/// The name `data_type` gives its type, read by libpg_query — `None` when it
+/// is not one type name alone, or carries arguments (`varchar(20)`).
+fn type_name(data_type: &str) -> Option<TypeName> {
+    use pg_query::NodeEnum;
+    let parsed = pg_query::parse(&format!("SELECT NULL::{data_type}")).ok()?;
+    let [raw] = parsed.protobuf.stmts.as_slice() else {
+        return None;
+    };
+    let NodeEnum::SelectStmt(select) = raw.stmt.as_ref()?.node.as_ref()? else {
+        return None;
+    };
+    let [target] = select.target_list.as_slice() else {
+        return None;
+    };
+    let NodeEnum::ResTarget(target) = target.node.as_ref()? else {
+        return None;
+    };
+    let NodeEnum::TypeCast(cast) = target.val.as_deref()?.node.as_ref()? else {
+        return None;
+    };
+    let name = cast.type_name.as_ref()?;
+    if !name.typmods.is_empty() || name.setof || name.pct_type {
+        return None;
+    }
+    let names = name
+        .names
+        .iter()
+        .map(|n| match n.node.as_ref() {
+            Some(NodeEnum::String(s)) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(TypeName {
+        names,
+        dims: name.array_bounds.len(),
+    })
+}
+
+/// An entity's schema, `public` when it states none.
+fn schema_of(entity: &Entity) -> &str {
+    entity.schema.as_deref().unwrap_or("public")
+}
+
+/// An entity's own name, without its schema. Taken as what follows the
+/// schema, not the last dot: a table named `we.ird` was written as `ird`.
+fn base_name(entity: &Entity) -> &str {
+    base_of(&entity.name, schema_of(entity))
+}
+
+/// `name` without its `schema.` prefix — or, when it has none, the part
+/// after its last dot.
+fn base_of<'a>(name: &'a str, schema: &str) -> &'a str {
+    name.strip_prefix(schema)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .unwrap_or_else(|| name.rsplit('.').next().unwrap_or(name))
+}
+
 fn emit_enum(entity: &Entity) -> String {
-    let schema = entity.schema.as_deref().unwrap_or("public");
-    let base_name = entity.name.split('.').next_back().unwrap_or(&entity.name);
     let mut lines = vec![format!(
         "Enum {}.{} {{",
-        dbml_quoted_name(schema),
-        dbml_quoted_name(base_name)
+        dbml_quoted_name(schema_of(entity)),
+        dbml_quoted_name(base_name(entity))
     )];
 
     for value in &entity.enum_values {
@@ -369,7 +447,7 @@ fn emit_enum(entity: &Entity) -> String {
 }
 
 fn emit_table(name: &str, schema: &str, table_def: &TableDef) -> String {
-    let base_name = name.split('.').next_back().unwrap_or(name);
+    let base_name = base_of(name, schema);
     let mut lines = vec![format!(
         "Table {}.{} {{",
         dbml_quoted_name(schema),
@@ -717,7 +795,15 @@ pub(crate) mod index_note {
             lines.push(NULLS_NOT_DISTINCT.to_string());
         }
         if !ix.include.is_empty() {
-            lines.push(format!("{INCLUDE} {}", ix.include.join(", ")));
+            // Each name as SQL writes it: bare, the comma between two names
+            // and the space around one were indistinguishable from the names'
+            // own — `ref ` came back as `ref`.
+            let names: Vec<String> = ix
+                .include
+                .iter()
+                .map(|c| crate::sql_quote::ident_if_needed(c))
+                .collect();
+            lines.push(format!("{INCLUDE} {}", names.join(", ")));
         }
         if !ix.with_options.is_empty() {
             let options: Vec<String> = ix.with_options.iter().map(|(k, v)| format!("{k} = {v}")).collect();
@@ -745,7 +831,7 @@ pub(crate) mod index_note {
             } else if line == NULLS_NOT_DISTINCT {
                 ix.nulls_not_distinct = true;
             } else if let Some(columns) = line.strip_prefix(INCLUDE) {
-                ix.include = list(columns);
+                ix.include = names(columns);
             } else if let Some(options) = line.strip_prefix(WITH) {
                 ix.with_options = list(options)
                     .iter()
@@ -764,6 +850,40 @@ pub(crate) mod index_note {
             .filter(|e| !e.is_empty())
             .map(str::to_string)
             .collect()
+    }
+
+    /// The names of a comma-separated line, each bare or SQL-quoted — a
+    /// quoted one's `""` read as `"`, and its commas and spaces its own.
+    fn names(entries: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut current = String::new();
+        let mut quoted = false;
+        let mut chars = entries.chars().peekable();
+        let push = |current: &mut String, out: &mut Vec<String>| {
+            let name = std::mem::take(current);
+            let name = name.trim();
+            if let Some(inner) = name.strip_prefix('"').and_then(|n| n.strip_suffix('"')) {
+                out.push(inner.replace("\"\"", "\""));
+            } else if !name.is_empty() {
+                out.push(name.to_string());
+            }
+        };
+        while let Some(c) = chars.next() {
+            match c {
+                '"' if quoted && chars.peek() == Some(&'"') => {
+                    current.push_str("\"\"");
+                    chars.next();
+                }
+                '"' => {
+                    quoted = !quoted;
+                    current.push(c);
+                }
+                ',' if !quoted => push(&mut current, &mut out),
+                _ => current.push(c),
+            }
+        }
+        push(&mut current, &mut out);
+        out
     }
 
     fn read_opclasses(entries: &str, keys: &mut [IndexColumn]) {
@@ -827,8 +947,8 @@ fn emit_all_refs(entities: &[Entity]) -> String {
             continue;
         };
 
-        let schema = entity.schema.as_deref().unwrap_or("public");
-        let base_name = entity.name.split('.').next_back().unwrap_or(&entity.name);
+        let schema = schema_of(entity);
+        let base_name = base_name(entity);
 
         // Inline FKs from columns
         for col in &table_def.columns {
@@ -1004,9 +1124,7 @@ pub(crate) fn is_stub_note(note: &str) -> bool {
 /// `schema.table` for an entity, as the document's `Table` and `Ref` lines
 /// name it.
 fn qualified_name(entity: &Entity) -> String {
-    let schema = entity.schema.as_deref().unwrap_or("public");
-    let base = entity.name.split('.').next_back().unwrap_or(&entity.name);
-    format!("{schema}.{base}")
+    format!("{}.{}", schema_of(entity), base_name(entity))
 }
 
 /// One stub `Table` block: the referenced `columns` of `target`, and a note
@@ -1168,11 +1286,37 @@ fn quote_unparsed_default(trimmed: &str) -> String {
     dbml_string(&text)
 }
 
+/// A column's SQL type as DBML writes it.
+///
+/// A user type named with its schema — what [`EnumTypes::column_type`] makes
+/// of an enum — is DBML's own reference to it, each part a DBML name:
+/// `"app"."mo\"od"`, which @dbml/core reads as the enum `mo"od` in `app`.
+/// Written as its SQL, `app."mo""od"`, @dbml/core refused the document. Any
+/// other type is written bare when DBML reads it as one word — `int`,
+/// `numeric(10,2)[]` — and as a DBML string of its SQL otherwise: `"timestamp
+/// with time zone"`, `"\"char\""`. Both readers take a quoted type that
+/// names nothing the document declares as the type's own text.
 fn quote_type_if_needed(data_type: &str) -> String {
-    if data_type.contains(' ') {
-        format!("\"{}\"", data_type)
-    } else {
+    if let Some(TypeName { names, dims }) = type_name(data_type)
+        && let [schema, name] = names.as_slice()
+        && schema != "pg_catalog"
+    {
+        let part = |s: &str| {
+            if [schema, name].iter().all(|p| dbml_column_name(p) == p.as_str()) {
+                s.to_string()
+            } else {
+                dbml_quoted_name(s)
+            }
+        };
+        return format!("{}.{}{}", part(schema), part(name), "[]".repeat(dims));
+    }
+    let one_word = data_type
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "_.()[],".contains(c));
+    if one_word && !data_type.is_empty() {
         data_type.to_string()
+    } else {
+        dbml_quoted_name(data_type)
     }
 }
 
@@ -2077,6 +2221,85 @@ mod tests {
         let columns: Vec<&str> = def.columns.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(columns, ["we\"ird", "back\\slash"], "{}", doc.content);
         assert_eq!(def.indexes[0].columns[0].name, "we\"ird", "{}", doc.content);
+    }
+
+    /// Every name the writer puts in a document is in DBML's quoting, read
+    /// from the design's SQL. A column typed by `"mo""od"` — the enum's SQL
+    /// spelling — was written as that SQL, `"mo""od"` or `app."mo""od"`,
+    /// which @dbml/core refuses; a project name holding a quote ended its
+    /// string; and a table named `we.ird` was written as `ird`, the part
+    /// after its last dot.
+    #[test]
+    fn names_and_enum_types_are_written_in_dbml_quoting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/enum/app")).unwrap();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        std::fs::write(dir.join("design.yaml"), "project:\n  name: t\nschemas:\n  - app\n").unwrap();
+        std::fs::write(
+            dir.join("ddl/enum/app/mo\"od.ddl"),
+            "set search_path to app;\ncreate type \"mo\"\"od\" as enum ('calm');\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/app/we\"ird.ddl"),
+            "set search_path to app;\n\
+             create table if not exists \"we\"\"ird\" (\n  \
+               id int,\n  \
+               m \"mo\"\"od\",\n  \
+               n app.\"mo\"\"od\"[],\n  \
+               constraint \"we\"\"ird_pk\" primary key (id)\n\
+             );\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/app/we.ird.ddl"),
+            "set search_path to app;\ncreate table if not exists \"we.ird\" (id int primary key);\n",
+        )
+        .unwrap();
+        let design = crate::Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let doc = generate_dbml(&DbmlParams {
+            entities: design.entities(),
+            project_name: "it's \"q\"",
+            database_type: "PostgreSQL",
+            project_note: None,
+            include_schemas: vec![],
+            exclude_schemas: vec![],
+            include_tables: vec![],
+            exclude_tables: vec![],
+            groups: vec![],
+            auto_group_by_schema: false,
+        });
+        let dbml = &doc.content;
+        assert!(dbml.contains("Project \"it's \\\"q\\\"\""), "{dbml}");
+        assert!(dbml.contains("\"m\" \"app\".\"mo\\\"od\"\n"), "{dbml}");
+        assert!(dbml.contains("\"n\" \"app\".\"mo\\\"od\"[]\n"), "{dbml}");
+        assert!(dbml.contains("Table \"app\".\"we.ird\" {"), "{dbml}");
+
+        let parsed = crate::dbml_parse::parse_dbml(dbml).unwrap_or_else(|e| panic!("{e}\n{dbml}"));
+        let table = parsed
+            .iter()
+            .find(|e| e.name == "app.we\"ird")
+            .expect("table read back");
+        let td = table.table_def.as_ref().unwrap();
+        let types: Vec<(&str, &str)> = td
+            .columns
+            .iter()
+            .map(|c| (c.name.as_str(), c.data_type.as_str()))
+            .collect();
+        assert_eq!(
+            types,
+            [("id", "int"), ("m", "app.\"mo\"\"od\""), ("n", "app.\"mo\"\"od\"[]")],
+            "{dbml}"
+        );
+        assert!(
+            td.constraints.contains(&TableConstraint::PrimaryKey {
+                name: Some("we\"ird_pk".into()),
+                columns: vec!["id".into()],
+            }),
+            "{:?}\n{dbml}",
+            td.constraints
+        );
     }
 
     /// A column comment keeps its line breaks. They were flattened to spaces

@@ -546,3 +546,135 @@ fn primary_and_foreign_key_names_survive_dbml_and_back() {
         "\n{dbml}"
     );
 }
+
+// ── Awkward names ───────────────────────────────────────────────────────────
+
+/// The characters a quoted identifier may hold that DBML or SQL must escape,
+/// or that a splitter may take for a delimiter: a double quote, a backslash,
+/// a space, a dot, a single quote, and non-ASCII text.
+const AWKWARD: [&str; 6] = ["\"", "\\", " ", ".", "'", "é名"];
+
+/// Whether `w` may stand in a schema, table or enum name here. Those names
+/// are file and directory names in a project, and `path_safe` refuses a
+/// backslash in one by design (a separator on Windows). And dbd's model joins
+/// a schema and a name with a dot (`app.orders`) and splits it apart again in
+/// dozens of places, so a dot in either is out of reach of the DBML round
+/// trip alone. Every other name — column, enum value, index and constraint —
+/// takes them all.
+fn names_a_file(w: &str) -> bool {
+    w != "\\" && w != "."
+}
+
+/// A project whose every name holds `w`: a schema, an enum and its values,
+/// two tables, a named primary key, a named foreign key, a named UNIQUE, a
+/// named CHECK, an index with an INCLUDE column, notes with an odd number of
+/// quotes, and a string default holding `w`.
+fn awkward_project(w: &str) -> Vec<(String, String)> {
+    let q = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+    let lit = |s: &str| format!("'{}'", s.replace('\'', "''"));
+    let file_name = |base: &str| {
+        if names_a_file(w) {
+            format!("{base}{w}")
+        } else {
+            format!("{base}_x")
+        }
+    };
+    let schema = file_name("s");
+    let (enum_name, parent, child) = (file_name("e"), file_name("p"), file_name("c"));
+    let (s, e, p, c) = (q(&schema), q(&enum_name), q(&parent), q(&child));
+    let col = |base: &str| q(&format!("{base}{w}"));
+    let name = |base: &str| q(&format!("{base}{w}"));
+    let enum_sql = format!(
+        "create type {s}.{e} as enum ({}, {});\n",
+        lit(&format!("v{w}")),
+        lit(&format!("it's {w}"))
+    );
+    let parent_sql = format!(
+        "create table if not exists {s}.{p} (\n  {} int,\n  constraint {} primary key ({})\n);\n",
+        col("id"),
+        name("pk"),
+        col("id")
+    );
+    let child_sql = format!(
+        "create table if not exists {s}.{c} (\n  \
+           id int,\n  \
+           {r} int not null,\n  \
+           {m} {s}.{e},\n  \
+           {n} text not null default {d},\n  \
+           constraint {cpk} primary key (id),\n  \
+           constraint {fk} foreign key ({r}) references {s}.{p} ({pid}) on delete cascade,\n  \
+           constraint {uq} unique ({n}),\n  \
+           constraint {ck} check (char_length({n}) > 0)\n\
+         );\n\
+         create index if not exists {ix} on {s}.{c} ({n}, {m}) include ({r});\n\
+         comment on table {s}.{c} is {tnote};\n\
+         comment on column {s}.{c}.{n} is {cnote};\n",
+        r = col("ref"),
+        m = col("m"),
+        n = col("n"),
+        d = lit(&format!("d{w}")),
+        cpk = name("cpk"),
+        fk = name("fk"),
+        pid = col("id"),
+        uq = name("uq"),
+        ck = name("ck"),
+        ix = name("ix"),
+        tnote = lit(&format!("table {w} \" odd")),
+        cnote = lit(&format!("note {w} \" odd")),
+    );
+    vec![
+        (format!("ddl/enum/{schema}/{enum_name}.ddl"), enum_sql),
+        (format!("ddl/table/{schema}/{parent}.ddl"), parent_sql),
+        (format!("ddl/table/{schema}/{child}.ddl"), child_sql),
+    ]
+}
+
+/// What the round trip must keep of an entity, ordered so two models that
+/// say the same thing compare equal: its name and enum values, and for a
+/// table its columns, constraints (as a set), indexes and comments.
+fn model(e: &Entity) -> String {
+    let mut out = format!("{:?} {} values={:?}\n", e.entity_type, e.name, e.enum_values);
+    if let Some(td) = &e.table_def {
+        for c in &td.columns {
+            out.push_str(&format!(
+                "  column {:?} {} nullable={} default={:?}\n",
+                c.name, c.data_type, c.nullable, c.default_value
+            ));
+        }
+        let mut constraints: Vec<String> = td.constraints.iter().map(|c| format!("  {c:?}\n")).collect();
+        constraints.sort();
+        out.extend(constraints);
+        for ix in &td.indexes {
+            out.push_str(&format!("  {ix:?}\n"));
+        }
+        out.push_str(&format!("  {:?}\n", td.comments));
+    }
+    out
+}
+
+/// A name holding a quote, a backslash, a space, a dot, a single quote or
+/// non-ASCII text comes back from `dbml` → `init --from-dbml` as itself, for
+/// every kind of name the document carries. Each broke somewhere: the enum
+/// type was written in SQL quoting @dbml/core refuses, a `"` in a `'…'`
+/// setting ended the settings and lost the primary key, a Ref endpoint with
+/// an escaped quote had no operator, and a key tuple with one was refused.
+#[test]
+fn every_kind_of_name_survives_dbml_and_back_whatever_it_holds() {
+    for w in AWKWARD {
+        let originals: Vec<Entity> = awkward_project(w).iter().map(|(path, sql)| parse(path, sql)).collect();
+        let dbml = document(&originals);
+        let parsed = dbd_core::dbml_parse::parse_dbml(&dbml).unwrap_or_else(|e| panic!("{w:?}: {e}\n{dbml}"));
+        for original in &originals {
+            let read = parsed
+                .iter()
+                .find(|e| e.entity_type == original.entity_type && e.name == original.name)
+                .unwrap_or_else(|| panic!("{w:?}: {} missing after the round trip\n{dbml}", original.name));
+            let sql = dbd_core::emit::emit_entity(read).expect("tables and enums always emit");
+            let schema = read.schema.as_deref().unwrap_or("public");
+            let base = &read.name[schema.len() + 1..];
+            let path = format!("ddl/{}/{schema}/{base}.ddl", read.entity_type.folder_name());
+            let reversed = parse(&path, &sql);
+            assert_eq!(model(&reversed), model(original), "{w:?}:\n{dbml}\n{sql}");
+        }
+    }
+}

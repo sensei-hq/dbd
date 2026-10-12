@@ -365,6 +365,9 @@ struct Parser {
     schemas: Vec<String>,
     /// Each `Table … as alias`: the alias, and the `(schema, table)` it names.
     aliases: std::collections::HashMap<String, (String, String)>,
+    /// Every enum the document declares, as `(schema, name)` — what a
+    /// column's type is resolved against before it is written as SQL.
+    enums_declared: std::collections::HashSet<(String, String)>,
 }
 
 impl Parser {
@@ -378,6 +381,7 @@ impl Parser {
             refs: Vec::new(),
             schemas: Vec::new(),
             aliases: std::collections::HashMap::new(),
+            enums_declared: std::collections::HashSet::new(),
         }
     }
 
@@ -396,6 +400,15 @@ impl Parser {
     }
 
     fn parse(&mut self) -> Result<Vec<Entity>> {
+        // A table may use an enum declared after it, so the enums are known
+        // before any column is read.
+        self.enums_declared = self
+            .lines
+            .iter()
+            .filter(|(line, _)| keyword(line.trim()) == "enum")
+            .filter_map(|(line, _)| parse_element_header(line.trim()).ok())
+            .map(|head| head.name)
+            .collect();
         while self.pos < self.lines.len() {
             let line = self.line().to_string();
             // Keyword dispatch on the first token (case-insensitive for the
@@ -479,9 +492,17 @@ impl Parser {
             if line == "}" {
                 break;
             }
-            // `"value" [note: '…']` or bare `value`.
+            // `"value" [note: '…']` or bare `value` — one to a line.
             let (token, rest) = take_identifier(&line)?;
-            let note = parse_value_note(rest.trim());
+            let (settings, rest) = take_settings(rest)?;
+            if !rest.trim().is_empty() {
+                return Err(parse_err(format!(
+                    "enum `{qualified}`: unexpected `{}` after the value `{token}` — each value needs a line of \
+                     its own",
+                    rest.trim()
+                )));
+            }
+            let note = settings.and_then(note_setting);
             entity.enum_values.push(crate::entity::EnumValue { name: token, note });
         }
         self.enums.push(entity);
@@ -558,7 +579,7 @@ impl Parser {
                 _ => {
                     // A column definition, with any `check:` and `ref:`
                     // settings it carries.
-                    let column = parse_column(&line, &qualified)?;
+                    let column = parse_column(&line, &qualified, &self.enums_declared)?;
                     let col = column.def;
                     if col.is_pk {
                         pk_cols.push(col.name.clone());
@@ -835,7 +856,11 @@ fn parse_element_header(header: &str) -> Result<ElementHeader> {
         alias = Some(a);
         rest = after.trim_start();
     }
-    let settings = split_trailing_settings(rest).1.map(str::to_string);
+    let (settings, after) = take_settings(rest)?;
+    if !after.trim().is_empty() {
+        return Err(parse_err(format!("unexpected `{}` in: {header}", after.trim())));
+    }
+    let settings = settings.map(str::to_string);
     Ok(ElementHeader {
         name,
         alias,
@@ -882,52 +907,6 @@ fn take_name_part(s: &str) -> Result<(String, &str)> {
     Ok((s[..end].to_string(), &s[end..]))
 }
 
-/// Split on `.` separators that are outside of double quotes.
-fn split_dotted(input: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut cur = String::new();
-    let mut in_quote = false;
-    let mut escaped = false;
-    for c in input.chars() {
-        match c {
-            // An escaped character inside a quoted name is part of it — an
-            // escaped quote does not end the name.
-            _ if escaped => {
-                escaped = false;
-                cur.push(c);
-            }
-            '\\' if in_quote => {
-                escaped = true;
-                cur.push(c);
-            }
-            '"' => {
-                in_quote = !in_quote;
-                cur.push(c);
-            }
-            '.' if !in_quote => {
-                parts.push(std::mem::take(&mut cur));
-            }
-            _ => cur.push(c),
-        }
-    }
-    if !cur.is_empty() || !parts.is_empty() {
-        parts.push(cur);
-    }
-    parts
-}
-
-/// Strip a single pair of surrounding double quotes, if present.
-fn unquote(s: &str) -> String {
-    let s = s.trim();
-    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
-        // A quoted name takes backslash escapes, as a string does in DBML:
-        // `"we\"ird"` is `we"ird` to @dbml/core.
-        unescape_dbml(&s[1..s.len() - 1])
-    } else {
-        s.to_string()
-    }
-}
-
 /// Take a leading identifier (quoted `"x"` or bare) off the front of `s`,
 /// returning `(identifier, remainder)`.
 fn take_identifier(s: &str) -> Result<(String, &str)> {
@@ -963,13 +942,6 @@ fn note_setting(settings: &str) -> Option<String> {
         .map(|v| note_text(&v))
 }
 
-/// Parse an optional `[note: '…']` setting following an enum value, returning
-/// the note text if present.
-fn parse_value_note(rest: &str) -> Option<String> {
-    let (_, inner) = split_trailing_settings(rest.trim());
-    note_setting(inner?)
-}
-
 /// A column line read: the column, the expressions of its `check:` settings,
 /// and its inline `ref:`s.
 struct ParsedColumn {
@@ -978,14 +950,42 @@ struct ParsedColumn {
     refs: Vec<(RefOp, Endpoint)>,
 }
 
-/// Parse a column definition line: `"name" <type> [settings]`.
-fn parse_column(line: &str, table: &str) -> Result<ParsedColumn> {
+/// Parse a column definition line: `"name" <type> [pk] [unique] [settings]`,
+/// as @dbml/core reads one — and nothing after it. A table written on one
+/// line with two columns, `{ id int [pk] name text }`, read as one column
+/// typed `int [pk] name text`; @dbml/core refuses it, and so does this.
+fn parse_column(line: &str, table: &str, enums: &std::collections::HashSet<(String, String)>) -> Result<ParsedColumn> {
     let (name, rest) = take_identifier(line).map_err(|e| parse_err(format!("column in `{table}`: {e}")))?;
     let rest = rest.trim_start();
+    let (column_type, mut rest) = take_column_type(rest).ok_or_else(|| {
+        parse_err(format!(
+            "column `{name}` in `{table}` has no type DBML can read: `{rest}`"
+        ))
+    })?;
+    let data_type = column_type.sql(enums);
 
-    // Split type from settings: the settings group is the trailing `[ … ]`.
-    let (type_part, settings_part) = split_trailing_settings(rest);
-    let data_type = parse_type(type_part.trim());
+    // `pk` and `unique` may stand bare after the type.
+    let mut inline = Vec::new();
+    loop {
+        let after = rest.trim_start();
+        let end = after
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .unwrap_or(after.len());
+        let word = after[..end].to_ascii_lowercase();
+        if (word == "pk" || word == "unique") && after.len() < rest.len() {
+            inline.push(word);
+            rest = &after[end..];
+        } else {
+            break;
+        }
+    }
+    let (settings_part, rest) = take_settings(rest)?;
+    if !rest.trim().is_empty() {
+        return Err(parse_err(format!(
+            "table `{table}`: unexpected `{}` after the column `{name}` — each column needs a line of its own",
+            rest.trim()
+        )));
+    }
 
     let mut col = ColumnDef {
         name,
@@ -1003,6 +1003,8 @@ fn parse_column(line: &str, table: &str) -> Result<ParsedColumn> {
     };
     let mut checks = Vec::new();
     let mut refs = Vec::new();
+    col.is_pk = inline.iter().any(|w| w == "pk");
+    col.is_unique = inline.iter().any(|w| w == "unique");
 
     if let Some(settings_str) = settings_part {
         let settings = extract_settings(settings_str)
@@ -1111,6 +1113,8 @@ fn backticked(s: &str) -> Option<String> {
     s.trim()
         .strip_prefix('`')?
         .strip_suffix('`')
+        // DBML's expression has no escape: a backtick inside ends it.
+        .filter(|expression| !expression.contains('`'))
         .map(|expression| expression.trim().to_string())
 }
 
@@ -1132,20 +1136,105 @@ fn parse_check_line(line: &str, table: &str) -> Result<TableConstraint> {
     Ok(TableConstraint::Check { name, expression })
 }
 
-/// Parse a column type token. Strips surrounding quotes (types with spaces are
-/// quoted on export); preserves a trailing `[]` array suffix and parameters.
-fn parse_type(input: &str) -> String {
-    let input = input.trim();
-    if let Some(after_quote) = input.strip_prefix('"') {
-        // Quoted type: take to the closing quote, then re-append any suffix
-        // (e.g. `"timestamp with time zone"[]`).
-        if let Some(end_rel) = after_quote.find('"') {
-            let inner = &after_quote[..end_rel];
-            let suffix = &after_quote[end_rel + 1..];
-            return format!("{inner}{}", suffix.trim());
+/// A column's type as DBML spells it: a name — bare words or `"quoted"`
+/// parts, joined by dots — and what is attached to it with no space between:
+/// an argument list `( … )` and array brackets `[ … ]`.
+struct ColumnType<'a> {
+    /// Each part of the name, read, and whether it was quoted.
+    parts: Vec<(String, bool)>,
+    suffix: &'a str,
+}
+
+impl ColumnType<'_> {
+    /// The type as SQL, which is what a column's `data_type` holds.
+    ///
+    /// A quoted name stands for two different things in DBML. Qualified, or
+    /// naming an enum the document declares, it is an identifier: `"app".
+    /// "mo\"od"` is @dbml/core's enum `mo"od` in `app`, and its SQL is
+    /// `app."mo""od"`. Otherwise it is the type's own text, quoted for the
+    /// spaces in it — `"timestamp with time zone"` — and it is that text. A
+    /// bare name is written as it stands, unless it is a declared enum.
+    fn sql(&self, enums: &std::collections::HashSet<(String, String)>) -> String {
+        let ident = crate::sql_quote::ident_if_needed;
+        let name = match self.parts.as_slice() {
+            [(name, _)] if enums.contains(&(crate::reconcile::DEFAULT_SCHEMA.to_string(), name.clone())) => ident(name),
+            [(name, _)] => name.clone(),
+            [(schema, sq), (name, nq)] if *sq || *nq || enums.contains(&(schema.clone(), name.clone())) => {
+                format!("{}.{}", ident(schema), ident(name))
+            }
+            parts => parts
+                .iter()
+                .map(|(part, quoted)| if *quoted { ident(part) } else { part.clone() })
+                .collect::<Vec<_>>()
+                .join("."),
+        };
+        format!("{name}{}", self.suffix)
+    }
+}
+
+/// Take a column's type (see [`ColumnType`]) off the front of `s`, with what
+/// follows it; `None` when `s` does not start with one.
+fn take_column_type(s: &str) -> Option<(ColumnType<'_>, &str)> {
+    let mut parts = Vec::new();
+    let mut rest = s;
+    loop {
+        if rest.starts_with('"') {
+            let (part, after) = take_name_part(rest).ok()?;
+            parts.push((part, true));
+            rest = after;
+        } else {
+            let end = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || !c.is_ascii()))
+                .unwrap_or(rest.len());
+            if end == 0 {
+                return None;
+            }
+            parts.push((rest[..end].to_string(), false));
+            rest = &rest[end..];
+        }
+        match rest.strip_prefix('.') {
+            Some(next) => rest = next,
+            None => break,
         }
     }
-    input.to_string()
+    let attached = rest;
+    while let Some(close) = match rest.chars().next() {
+        Some('(') => group_end(rest, '(', ')'),
+        Some('[') => group_end(rest, '[', ']'),
+        _ => None,
+    } {
+        rest = &rest[close..];
+    }
+    let suffix = &attached[..attached.len() - rest.len()];
+    Some((ColumnType { parts, suffix }, rest))
+}
+
+/// The byte offset just past the `close` that balances the `open` `s` starts
+/// with, outside every quote; `None` when there is none.
+fn group_end(s: &str, open: char, close: char) -> Option<usize> {
+    let mut depth = 0usize;
+    for (at, c) in syntax_chars(s)? {
+        if c == open {
+            depth += 1;
+        } else if c == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(at + c.len_utf8());
+            }
+        }
+    }
+    None
+}
+
+/// A settings group `[ … ]` at the front of `s` (after any whitespace): its
+/// inner text, and what follows it. No group: `None`, and `s` as it was.
+fn take_settings(s: &str) -> Result<(Option<&str>, &str)> {
+    let trimmed = s.trim_start();
+    if !trimmed.starts_with('[') {
+        return Ok((None, s));
+    }
+    let end = group_end(trimmed, '[', ']').ok_or_else(|| parse_err(format!("unterminated settings: {trimmed}")))?;
+    Ok((Some(&trimmed[1..end - 1]), &trimmed[end..]))
 }
 
 /// Parse a `default: <v>` DBML value into a SQL-ready `default_value` string.
@@ -1209,11 +1298,12 @@ fn parse_index_line(line: &str, table: &str) -> Result<IndexEntry> {
     } else {
         vec![cols_part.to_string()]
     };
-    let keys: Vec<IndexColumn> = raw_keys.iter().map(|k| parse_index_key(k)).collect();
-
-    if keys.is_empty() || keys.iter().any(|k| k.name.is_empty()) {
-        return Err(parse_err(format!("malformed index in `{table}`: {line}")));
-    }
+    let keys: Vec<IndexColumn> = raw_keys
+        .iter()
+        .map(|k| parse_index_key(k))
+        .collect::<Option<_>>()
+        .filter(|keys: &Vec<IndexColumn>| !keys.is_empty() && keys.iter().all(|k| !k.name.is_empty()))
+        .ok_or_else(|| parse_err(format!("malformed index in `{table}`: {line}")))?;
 
     let mut unique = false;
     let mut pk = false;
@@ -1293,19 +1383,20 @@ fn parse_index_line(line: &str, table: &str) -> Result<IndexEntry> {
 
 /// One index key: DBML writes an expression in backticks and a column by
 /// (optionally quoted) name. Flagging the expression is what keeps the
-/// emitter from quoting `lower(email)` as an identifier.
-fn parse_index_key(key: &str) -> IndexColumn {
+/// emitter from quoting `lower(email)` as an identifier. Anything else — two
+/// words, a name and a stray setting — is no key at all.
+fn parse_index_key(key: &str) -> Option<IndexColumn> {
     let key = key.trim();
     match backticked(key) {
-        Some(expression) => IndexColumn {
+        Some(expression) => Some(IndexColumn {
             name: expression,
             is_expression: true,
             ..Default::default()
-        },
-        None => IndexColumn {
-            name: unquote(key),
+        }),
+        None => Some(IndexColumn {
+            name: name_token(key)?,
             ..Default::default()
-        },
+        }),
     }
 }
 
@@ -1337,129 +1428,180 @@ fn parse_ref_body(body: &str, name: Option<String>) -> Result<PendingRef> {
 /// Locate the relationship operator (`<>`, `>`, `<`, `-`) outside of quotes and
 /// parentheses, returning `(left, op, right)`.
 fn split_ref_operator(s: &str) -> Option<(&str, RefOp, &str)> {
-    let bytes = s.as_bytes();
-    let mut in_quote = false;
-    let mut paren = 0i32;
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i] as char;
-        match c {
-            '"' => in_quote = !in_quote,
-            '(' if !in_quote => paren += 1,
-            ')' if !in_quote => paren -= 1,
-            '<' if !in_quote && paren == 0 => {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'>' {
-                    return Some((s[..i].trim(), RefOp::ManyToMany, s[i + 2..].trim()));
-                }
-                return Some((s[..i].trim(), RefOp::OneToMany, s[i + 1..].trim()));
-            }
-            '>' if !in_quote && paren == 0 => {
-                return Some((s[..i].trim(), RefOp::ManyToOne, s[i + 1..].trim()));
-            }
-            '-' if !in_quote && paren == 0 => {
-                return Some((s[..i].trim(), RefOp::OneToOne, s[i + 1..].trim()));
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
+    let chars = top_level_chars(s)?;
+    let (i, &(at, c)) = chars
+        .iter()
+        .enumerate()
+        .find(|(_, (_, c))| matches!(c, '<' | '>' | '-'))?;
+    let (op, len) = match c {
+        '<' if chars.get(i + 1) == Some(&(at + 1, '>')) => (RefOp::ManyToMany, 2),
+        '<' => (RefOp::OneToMany, 1),
+        '>' => (RefOp::ManyToOne, 1),
+        _ => (RefOp::OneToOne, 1),
+    };
+    Some((s[..at].trim(), op, s[at + len..].trim()))
 }
 
 /// Parse a Ref endpoint: `"s"."t"."c"` or `"s"."t".(c1, c2)` (or unquoted /
-/// unqualified variants — an unqualified table may be an alias).
+/// unqualified variants — an unqualified table may be an alias). Every part
+/// is one name: anything else — two words, a stray quote — is refused, as
+/// @dbml/core refuses it, rather than read as a name with a space in it.
 fn parse_ref_endpoint(s: &str) -> Result<Endpoint> {
     let s = s.trim();
-    // Composite: a `.(...)` tuple at the end.
-    if let Some(paren_at) = s.find(".(") {
-        let prefix = &s[..paren_at];
-        let tuple = &s[paren_at + 1..];
-        let inner = tuple
-            .strip_prefix('(')
-            .and_then(|t| t.strip_suffix(')'))
-            .ok_or_else(|| parse_err(format!("malformed composite ref endpoint: {s}")))?;
-        let columns: Vec<String> = inner
-            .split(',')
-            .map(|c| unquote(c.trim()))
-            .filter(|c| !c.is_empty())
-            .collect();
-        if columns.is_empty() {
-            return Err(parse_err(format!("composite ref has no columns: {s}")));
+    let malformed = || parse_err(format!("malformed ref endpoint: {s}"));
+    let names =
+        |parts: &[&str]| -> Result<Vec<String>> { parts.iter().map(|p| name_token(p).ok_or_else(malformed)).collect() };
+    // Composite: a `.(...)` tuple at the end, its `.` and `(` both syntax.
+    let chars = syntax_chars(s).ok_or_else(malformed)?;
+    let tuple_at = chars
+        .windows(2)
+        .find(|w| w[0].1 == '.' && w[1] == (w[0].0 + 1, '('))
+        .map(|w| w[0].0);
+    let (table, columns) = match tuple_at {
+        Some(dot) => {
+            let inner = s[dot + 1..]
+                .strip_prefix('(')
+                .and_then(|t| t.strip_suffix(')'))
+                .ok_or_else(|| parse_err(format!("malformed composite ref endpoint: {s}")))?;
+            let parts = split_top_level_commas(inner).ok_or_else(malformed)?;
+            let parts: Vec<&str> = parts.iter().map(|c| c.trim()).filter(|c| !c.is_empty()).collect();
+            if parts.is_empty() {
+                return Err(parse_err(format!("composite ref has no columns: {s}")));
+            }
+            (split_dotted(&s[..dot]).ok_or_else(malformed)?, names(&parts)?)
         }
-        let parts = split_dotted(prefix.trim());
-        return match parts.as_slice() {
-            [schema, table] => Ok(Endpoint {
-                schema: Some(unquote(schema)),
-                table: unquote(table),
-                columns,
-            }),
-            [table] => Ok(Endpoint {
-                schema: None,
-                table: unquote(table),
-                columns,
-            }),
-            _ => Err(parse_err(format!("malformed ref table prefix: {prefix}"))),
-        };
-    }
-
-    // Simple: `schema.table.column` / `table.column`.
-    let parts = split_dotted(s);
-    match parts.as_slice() {
-        [schema, table, col] => Ok(Endpoint {
-            schema: Some(unquote(schema)),
-            table: unquote(table),
-            columns: vec![unquote(col)],
+        // Simple: `schema.table.column` / `table.column`.
+        None => {
+            let mut parts = split_dotted(s).ok_or_else(malformed)?;
+            let column = parts.pop().ok_or_else(malformed)?;
+            (parts, names(&[column])?)
+        }
+    };
+    match names(&table)?.as_slice() {
+        [schema, table] => Ok(Endpoint {
+            schema: Some(schema.clone()),
+            table: table.clone(),
+            columns,
         }),
-        [table, col] => Ok(Endpoint {
+        [table] => Ok(Endpoint {
             schema: None,
-            table: unquote(table),
-            columns: vec![unquote(col)],
+            table: table.clone(),
+            columns,
         }),
-        _ => Err(parse_err(format!("malformed ref endpoint: {s}"))),
+        _ => Err(malformed()),
     }
+}
+
+/// `s` split at the dots that are syntax, not text in a quoted name; `None`
+/// when a quote is left open.
+fn split_dotted(s: &str) -> Option<Vec<&str>> {
+    let mut parts = Vec::new();
+    let mut from = 0;
+    for (at, c) in syntax_chars(s)? {
+        if c == '.' {
+            parts.push(&s[from..at]);
+            from = at + 1;
+        }
+    }
+    parts.push(&s[from..]);
+    Some(parts)
+}
+
+/// `s` as one DBML name — `"quoted"`, its escapes read, or a bare word — or
+/// `None` when it is anything else.
+fn name_token(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s.starts_with('"') {
+        let (name, rest) = take_name_part(s).ok()?;
+        return rest.trim().is_empty().then_some(name);
+    }
+    let bare = !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || !c.is_ascii());
+    bare.then(|| s.to_string())
+}
+
+// ── Reading a line's syntax around its quoted text ───────────────────────────
+
+/// The characters of `s` that are DBML syntax rather than text, each with
+/// its byte offset: everything outside a `'…'` string or a `"…"` name — in
+/// both of which a backslash escapes the character after it — and outside a
+/// `` `…` `` expression, which has no escapes. The quotes themselves are not
+/// included. `None` when a quote is left open.
+///
+/// Every splitter below asks this rather than tracking quotes itself. Each
+/// used to, and each got a different part wrong: the settings splitter kept
+/// one flag for `'` and `"`, so `[name: 'we"ird_pk']` lost its settings and
+/// the table its primary key; the Ref splitter read no escapes, so the Ref
+/// `"c\"y"."w" > …` had no operator; the comma splitter read escapes only in
+/// `'…'`, so an index on `("we\"ird", b)` was refused.
+fn syntax_chars(s: &str) -> Option<Vec<(usize, char)>> {
+    let mut out = Vec::new();
+    let mut chars = s.char_indices();
+    while let Some((at, c)) = chars.next() {
+        match c {
+            '\'' | '"' => loop {
+                match chars.next()?.1 {
+                    '\\' => {
+                        chars.next()?;
+                    }
+                    close if close == c => break,
+                    _ => {}
+                }
+            },
+            '`' => while chars.next()?.1 != '`' {},
+            _ => out.push((at, c)),
+        }
+    }
+    Some(out)
+}
+
+/// The syntax characters of `s` (see [`syntax_chars`]) that stand outside
+/// every `( … )`, each with its byte offset; `None` when a quote is left open
+/// or the parentheses do not balance.
+fn top_level_chars(s: &str) -> Option<Vec<(usize, char)>> {
+    let mut depth = 0usize;
+    let mut out = Vec::new();
+    for (at, c) in syntax_chars(s)? {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.checked_sub(1)?,
+            _ if depth == 0 => out.push((at, c)),
+            _ => {}
+        }
+    }
+    (depth == 0).then_some(out)
 }
 
 /// Split a trailing `[ … ]` settings group off the end of `s`, returning
 /// `(before, Some(inner))` or `(s, None)` when there is no settings group.
 /// Only a settings group that is the literal tail of `s` is considered, so a
-/// `[]` array-type suffix in the middle is left attached to the type.
+/// `[]` array-type suffix in the middle is left attached to the type, and an
+/// empty `[]` at the end is one too.
 fn split_trailing_settings(s: &str) -> (&str, Option<&str>) {
     let trimmed = s.trim_end();
     if !trimmed.ends_with(']') {
         return (s, None);
     }
-    // Walk back to the matching `[`, balancing nested brackets and ignoring
-    // brackets inside quotes.
-    //
-    // Escape-awareness (backward walk): a `'` preceded by an odd run of `\`
-    // is an escaped apostrophe — it must NOT toggle `in_quote`. An even run is
-    // escaped backslashes, so `'C:\\'` still ends at its last quote.
-    let bytes = trimmed.as_bytes();
-    let mut depth = 0i32;
-    let mut in_quote = false;
-    let mut i = bytes.len();
-    while i > 0 {
-        i -= 1;
-        let c = bytes[i] as char;
+    let Some(chars) = syntax_chars(trimmed) else {
+        return (s, None);
+    };
+    // The final `]` must be syntax, not the end of a string's text.
+    if chars.last().copied() != Some((trimmed.len() - 1, ']')) {
+        return (s, None);
+    }
+    let mut depth = 0usize;
+    for &(at, c) in chars.iter().rev() {
         match c {
-            '\'' => {
-                let backslashes = bytes[..i].iter().rev().take_while(|&&b| b == b'\\').count();
-                if backslashes % 2 == 0 {
-                    in_quote = !in_quote;
-                }
-            }
-            '"' => in_quote = !in_quote,
-            ']' if !in_quote => depth += 1,
-            '[' if !in_quote => {
+            ']' => depth += 1,
+            '[' => {
                 depth -= 1;
                 if depth == 0 {
-                    // Guard against an empty `[]` array suffix being treated as
-                    // settings — that belongs to the type.
-                    let inner = &trimmed[i + 1..trimmed.len() - 1];
+                    let inner = &trimmed[at + 1..trimmed.len() - 1];
                     if inner.trim().is_empty() {
                         return (s, None);
                     }
-                    return (&trimmed[..i], Some(inner));
+                    return (&trimmed[..at], Some(inner));
                 }
             }
             _ => {}
@@ -1488,76 +1630,25 @@ fn extract_settings(inner: &str) -> Option<Vec<(String, Option<String>)>> {
     Some(out)
 }
 
-/// Split on commas that are outside quotes, backticks, and parentheses.
+/// Split on commas that are outside quotes, backticks, and parentheses;
+/// `None` when a quote is left open or the parentheses do not balance.
 fn split_top_level_commas(s: &str) -> Option<Vec<String>> {
     let mut parts = Vec::new();
-    let mut cur = String::new();
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut in_back = false;
-    let mut paren = 0i32;
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            // While inside a single-quoted string a backslash escapes the next
-            // character — consume both and push both without toggling quote state.
-            '\\' if in_single => {
-                cur.push(c);
-                if let Some(next) = chars.next() {
-                    cur.push(next);
-                }
-                continue;
-            }
-            '\'' if !in_double && !in_back => in_single = !in_single,
-            '"' if !in_single && !in_back => in_double = !in_double,
-            '`' if !in_single && !in_double => in_back = !in_back,
-            '(' if !in_single && !in_double && !in_back => paren += 1,
-            ')' if !in_single && !in_double && !in_back => paren -= 1,
-            ',' if !in_single && !in_double && !in_back && paren == 0 => {
-                parts.push(std::mem::take(&mut cur));
-                continue;
-            }
-            _ => {}
+    let mut from = 0;
+    for (at, c) in top_level_chars(s)? {
+        if c == ',' {
+            parts.push(s[from..at].to_string());
+            from = at + 1;
         }
-        cur.push(c);
     }
-    if in_single || in_double || in_back || paren != 0 {
-        return None;
-    }
-    parts.push(cur);
+    parts.push(s[from..].to_string());
     Some(parts)
 }
 
 /// Split a setting on its first `:` that is outside quotes/backticks/parens.
 fn split_first_colon(s: &str) -> Option<(&str, &str)> {
-    let bytes = s.as_bytes();
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut in_back = false;
-    let mut paren = 0i32;
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i] as char;
-        match c {
-            // While inside a single-quoted string a backslash escapes the next
-            // character — skip both without toggling quote state.
-            '\\' if in_single && i + 1 < bytes.len() => {
-                i += 2;
-                continue;
-            }
-            '\'' if !in_double && !in_back => in_single = !in_single,
-            '"' if !in_single && !in_back => in_double = !in_double,
-            '`' if !in_single && !in_double => in_back = !in_back,
-            '(' if !in_single && !in_double && !in_back => paren += 1,
-            ')' if !in_single && !in_double && !in_back => paren -= 1,
-            ':' if !in_single && !in_double && !in_back && paren == 0 => {
-                return Some((&s[..i], &s[i + 1..]));
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
+    let (at, _) = top_level_chars(s)?.into_iter().find(|&(_, c)| c == ':')?;
+    Some((&s[..at], &s[at + 1..]))
 }
 
 /// Parse a single-line quoted string value (`'…'` or `"…"`), reading its
@@ -2838,5 +2929,155 @@ mod tests {
             .map(|c| c.name.as_str())
             .collect();
         assert_eq!(columns, ["we\"ird", "back\\slash"]);
+    }
+
+    /// A `"` inside a `'…'` setting is text, as a `'` inside a `"…"` one is.
+    /// The settings splitter kept one flag for both, so an odd number of `"`
+    /// in a single-quoted value ended its settings: the `pk` entry
+    /// `id [pk, name: 'we"ird_pk']` became an index on a column named
+    /// `id [pk, name: 'we"ird_pk']`, and the table lost its primary key.
+    #[test]
+    fn a_quote_inside_a_setting_string_is_text_not_a_delimiter() {
+        let dbml = "Enum app.mood {\n  happy [note: 'say \"hi']\n}\n\
+                    Table app.t [note: 'a \"table'] {\n  \
+                      id int [not null]\n  \
+                      label text [note: 'odd \" quote', default: 'x\"y']\n  \
+                      other text [note: \"it's\"]\n  \
+                      checks {\n    `label <> ''` [name: 'c\"k']\n  }\n  \
+                      indexes {\n    id [pk, name: 'we\"ird_pk']\n    label [name: 'l\"x']\n  }\n\
+                    }\n";
+        let entities = parse_dbml(dbml).unwrap();
+        let td = find_table(&entities, "app.t").table_def.as_ref().unwrap();
+        assert_eq!(
+            td.constraints,
+            vec![
+                TableConstraint::PrimaryKey {
+                    name: Some("we\"ird_pk".into()),
+                    columns: strings(&["id"]),
+                },
+                TableConstraint::Check {
+                    name: Some("c\"k".into()),
+                    expression: "label <> ''".into(),
+                },
+            ]
+        );
+        let indexes: Vec<(Option<&str>, Vec<&str>)> = td
+            .indexes
+            .iter()
+            .map(|ix| (ix.name.as_deref(), ix.columns.iter().map(|k| k.name.as_str()).collect()))
+            .collect();
+        assert_eq!(indexes, vec![(Some("l\"x"), vec!["label"])]);
+        assert_eq!(td.columns[1].comment.as_deref(), Some("odd \" quote"));
+        assert_eq!(td.columns[1].default_value.as_deref(), Some("'x\"y'"));
+        assert_eq!(td.columns[2].comment.as_deref(), Some("it's"));
+        assert_eq!(td.comments.table.as_deref(), Some("a \"table"));
+        let mood = find_enum(&entities, "app.mood");
+        assert_eq!(mood.enum_values[0].note.as_deref(), Some("say \"hi"));
+    }
+
+    /// A Ref endpoint, an index key and a Ref's name read their escapes as
+    /// a quoted name anywhere else does. The relationship operator was looked
+    /// for with every `"` toggling a quote, escaped or not, so
+    /// `"app"."c\"y"."w" > …` had no operator outside quotes and failed; an
+    /// index tuple with an escaped quote was refused as malformed.
+    #[test]
+    fn ref_endpoints_and_index_keys_read_escaped_quotes() {
+        let dbml = "Table \"app\".\"we\\\"ird\" {\n  \"id\" int [pk]\n  \"a,b\" int\n  \"c\\\"d\" int\n  \
+                      indexes {\n    (\"a,b\", \"c\\\"d\") [unique, name: 'u']\n  }\n}\n\
+                    Table \"app\".\"c\\\"y\" {\n  \"id\" int [pk]\n  \"w\" int\n  \"x,y\" int\n  \"z\\\"q\" int\n}\n\
+                    Ref \"f\\\"k\": \"app\".\"c\\\"y\".\"w\" > \"app\".\"we\\\"ird\".\"id\"\n\
+                    Ref: \"app\".\"c\\\"y\".(\"x,y\", \"z\\\"q\") > \"app\".\"we\\\"ird\".(\"a,b\", \"c\\\"d\")\n";
+        let entities = parse_dbml(dbml).unwrap_or_else(|e| panic!("{e}"));
+        let mut found = fks(&entities, "app.c\"y");
+        found.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            found,
+            vec![
+                (
+                    strings(&["w"]),
+                    "app.we\"ird".into(),
+                    strings(&["id"]),
+                    Some("f\"k".into()),
+                    None
+                ),
+                (
+                    strings(&["x,y", "z\"q"]),
+                    "app.we\"ird".into(),
+                    strings(&["a,b", "c\"d"]),
+                    None,
+                    None
+                ),
+            ]
+        );
+        let td = find_table(&entities, "app.we\"ird").table_def.as_ref().unwrap();
+        let keys: Vec<&str> = td.indexes[0].columns.iter().map(|k| k.name.as_str()).collect();
+        assert_eq!(keys, ["a,b", "c\"d"]);
+    }
+
+    /// What @dbml/core refuses on a column's, an enum value's or a header's
+    /// line is refused, naming what was not understood. A table written on
+    /// one line with two columns, `{ id int [pk] name text }`, read as one
+    /// column typed `int [pk] name text`, and `init --from-dbml` wrote it and
+    /// exited 0. The one-line forms @dbml/core accepts still read.
+    #[test]
+    fn what_follows_a_column_or_an_enum_value_on_its_line_is_refused() {
+        for (dbml, unexpected) in [
+            ("Table a.p { id int [pk] name text }", "`name text`"),
+            ("Table a.p {\n  id int, name text\n}", "`, name text`"),
+            ("Table a.p {\n  id int [pk] Note: 'x'\n}", "`Note: 'x'`"),
+            ("Enum a.e { x y }", "`y`"),
+            ("Enum a.e {\n  x [note: 'n'] z\n}", "`z`"),
+            ("Table a.p junk {\n  id int\n}", "`junk`"),
+        ] {
+            let err = parse_dbml(dbml).map(|_| ()).unwrap_err().to_string();
+            assert!(err.contains(unexpected), "{dbml:?}: {err}");
+        }
+        for dbml in [
+            "Table a.p { id int [pk] }",
+            "Table a.p { id int }",
+            "Table a.p { id int pk unique [not null] }",
+            "Table a.p [note: 'x'] { id int }",
+            "Table a.p { id int [pk]\n name text }",
+            "Enum a.e { x }",
+            "Enum a.e { x [note: 'n'] }",
+        ] {
+            parse_dbml(dbml).unwrap_or_else(|e| panic!("{dbml:?}: {e}"));
+        }
+        let entities = parse_dbml("Table a.p { id int pk unique [not null] }").unwrap();
+        let id = &find_table(&entities, "a.p").table_def.as_ref().unwrap().columns[0];
+        assert!(id.is_pk && id.is_unique && !id.nullable, "{id:?}");
+    }
+
+    /// A column typed by an enum the document declares is written in SQL,
+    /// whatever the enum's name holds. `"app"."mo\"od"` — DBML's spelling of
+    /// a schema-qualified enum, which @dbml/core reads as the enum `mo"od` in
+    /// `app` — came back as `app."mo\"od"`, which is not SQL, and the table
+    /// file `init --from-dbml` wrote did not parse.
+    #[test]
+    fn a_column_typed_by_a_declared_enum_is_written_in_sql() {
+        let dbml = "Enum \"app\".\"mo\\\"od\" {\n  calm\n}\nEnum \"Mood\" {\n  calm\n}\n\
+                    Table app.t {\n  \
+                      id int [pk]\n  \
+                      a \"app\".\"mo\\\"od\"\n  \
+                      b \"app\".\"mo\\\"od\"[]\n  \
+                      c \"Mood\"\n  \
+                      d \"timestamp with time zone\"\n  \
+                      e app.thing\n  \
+                      f \"app.\\\"my dom\\\"\"\n}\n";
+        let entities = parse_dbml(dbml).unwrap_or_else(|e| panic!("{e}"));
+        let td = find_table(&entities, "app.t").table_def.as_ref().unwrap();
+        let types: Vec<&str> = td.columns.iter().map(|c| c.data_type.as_str()).collect();
+        assert_eq!(
+            types,
+            [
+                "int",
+                "app.\"mo\"\"od\"",
+                "app.\"mo\"\"od\"[]",
+                "\"Mood\"",
+                "timestamp with time zone",
+                "app.thing",
+                "app.\"my dom\"",
+            ]
+        );
     }
 }
