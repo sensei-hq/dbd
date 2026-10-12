@@ -2147,3 +2147,51 @@ async fn awkward_names_survive_dbml_init_from_dbml_and_a_real_apply() {
     let o = dbd(dir, &url, &["diff", "--exit-code"]);
     assert!(o.status.success(), "diff: {}\n{dbml}", combined(&o));
 }
+
+/// A project declaring an entity another owns is refused by the commands that
+/// claim nothing, too — `refresh` and `policies` — naming the entity and its
+/// owner, before either touches the database (#7).
+#[tokio::test]
+async fn refresh_and_policies_refuse_a_design_declaring_another_owners_entity() {
+    let (_pg, url) = start_pg().await;
+    let owner = tempfile::tempdir().unwrap();
+    project(owner.path());
+    let applied = dbd(owner.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+
+    let intruder = tempfile::tempdir().unwrap();
+    let dir = intruder.path();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: intruder\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    for (rel, sql) in [
+        (
+            "ddl/table/app/widgets.ddl",
+            "set search_path to app;\ncreate table if not exists widgets (id integer primary key);\n",
+        ),
+        (
+            "ddl/materialized_view/app/counts.ddl",
+            "create materialized view if not exists app.counts as select count(*) as n from app.widgets with data;\n",
+        ),
+        (
+            "policies/app/widgets.sql",
+            "alter table app.widgets enable row level security;\n",
+        ),
+    ] {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, sql).unwrap();
+    }
+
+    for command in ["refresh", "policies"] {
+        let out = dbd(dir, &url, &[command]);
+        assert!(!out.status.success(), "{command} succeeded: {}", combined(&out));
+        assert!(
+            combined(&out).contains("relation app.widgets is owned by \"clilive\""),
+            "{command} did not name the entity and its owner: {}",
+            combined(&out)
+        );
+    }
+}

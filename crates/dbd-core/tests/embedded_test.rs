@@ -9898,8 +9898,8 @@ async fn a_project_claims_every_entity_its_whole_design_declares() {
 
 /// A second project declaring an entity the first owns is refused before
 /// anything runs — no hook, no DDL, no claim of its own — naming the entity
-/// and its owner. So are its reconcile and reset; and its dry run and its diff,
-/// which write nothing, refuse the same way (#7).
+/// and its owner. So are its reconcile and reset; and its dry run, its diff and
+/// its import, which claim nothing, refuse the same way (#7).
 #[tokio::test]
 async fn a_project_declaring_an_entity_another_owns_is_refused_before_anything_runs() {
     let (_pg, url) = start_pg().await;
@@ -9949,6 +9949,12 @@ async fn a_project_declaring_an_entity_another_owns_is_refused_before_anything_r
             .diff_live(&*billing_adapter, None)
             .await
             .expect_err("billing's diff"),
+    );
+    refusal(
+        billing
+            .import_data(&*billing_adapter, None, false, None, Progress::none())
+            .await
+            .expect_err("billing's import"),
     );
 
     assert_table_absent(&*billing_adapter, "public", "billing_hook_ran").await;
