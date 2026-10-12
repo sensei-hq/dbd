@@ -6,34 +6,31 @@ unreleased.
 
 ## Done
 
-- Slice 1: `dbd.objects` in `LAYOUT_DDL`; the whole design's entities keyed by
-  every `CREATE` in their files (folded names, the search path for unqualified
-  ones, the path only where nothing parses); tables, views, matviews,
-  sequences and enums share the `relation` namespace, routines are keyed by name.
-- Slice 2: `dbd.uses` — schemas, extensions, roles, and references to another
-  owner's entities (every overload, dotted names split as dbd splits them).
-- Claim-when-built (red `c1d7df8f`, green `9307a6e5`): every command checks
-  first (a dry run, diff, import, refresh and policies only read); apply claims
-  in its batch, reconcile after its writes, reset only checks. A failed, killed
-  or concurrent run takes nothing, so there is no give-back. Registry waits are
-  capped at 5s (55P03/40001 name the table).
-- CHANGELOG and spec describe claim-when-built (`7548ff03`, `59aaf4ca`).
-- Embedded 171/171, `cli_live` 44/44, workspace 1997/0, clippy and fmt clean.
+- Slices 1–2: `dbd.objects`/`dbd.uses`; keys from every `CREATE` (types a file
+  creates too) as the loader reads the design; one namespace for relations
+  and types, routines by name; uses namespaced, bare names along the path.
+- Claim timing (`889a433f`): an apply in one transaction claims last, in it,
+  and before a part-way enum-value commit; reconcile, reset and a DBD_NO_TX
+  apply claim first and keep it. Closes the reset/reconcile race.
+- Keys/uses fixes `31bd657e`; red `bfffee35`; docs `b4d0708b`.
+- CI now runs `cli_live` (`37c91e51`) — it had compiled to no tests.
+- Embedded 186/186, `cli_live` 45/45, workspace 1997/0, clippy and fmt clean.
 
 ## Next
 
-    # PR #50 pushed (4f31184f), body updated; focused review running (3 agents);
-    # fix findings test-first, push, CI green; merge #50 locally into feat/ownership;
+    # PR #50 pushed; update its body; focused re-verification of
+    # bfffee35..b4d0708b; CI green; merge #50 locally into feat/ownership;
     # then slice 3: prune rules (a)/(b), --prune-unowned, release.
 
 ## Open
 
 - Slice 3: an empty design's meta has no uses — the not-upgraded marker.
-- Reconcile writes before it claims: a rival claim in between is refused late.
-- Slice 5: a reset claims nothing, so "drops only what it owns" must also
-  take what nobody owns and the design declares.
+- Declined: the batch rollback error stays best-effort (pre-existing, no
+  state survives it); dropping the old shared `dbd.import_tmp`.
+- A bare type of another project's (search path, unqualified) is no use:
+  bare types are dropped as built-ins; pg_depend still guards the column.
+- `dbd.objects` still allows namespace `type`, unused.
 - Phase 1 is releasable as 0.25.2 when asked.
-- Declined: dropping the old shared `dbd.import_tmp`.
 
 ## Known limits
 
