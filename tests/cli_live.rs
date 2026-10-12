@@ -2339,6 +2339,39 @@ async fn an_interrupted_apply_holds_no_claims() {
     assert_eq!(stdout(&held).trim(), "0", "the killed run's claims");
 }
 
+/// Outside one transaction the claim comes before the first write, and an
+/// `apply.before` hook writes: it ran ahead of the claim, so a hook could
+/// write over an entity another project claimed while it waited. The run
+/// claims before its hooks (#7).
+#[tokio::test]
+async fn an_apply_outside_a_transaction_claims_before_its_hooks() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir);
+    let yaml = std::fs::read_to_string(dir.join("design.yaml")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        format!("{yaml}apply:\n  before:\n    - sql/claimed.sql\n"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("sql")).unwrap();
+    std::fs::write(
+        dir.join("sql/claimed.sql"),
+        "do $$ begin if not exists (select 1 from dbd.objects where owner = 'clilive' and name = 'widgets') \
+         then raise exception 'the hook ran before the claim'; end if; end $$;\n",
+    )
+    .unwrap();
+
+    let out = std::process::Command::new(assert_cmd::cargo::cargo_bin("dbd"))
+        .args(["apply", "-c", dir.join("design.yaml").to_str().unwrap(), "-d", &url])
+        .env("DBD_NO_TX", "1")
+        .current_dir(dir)
+        .output()
+        .expect("run dbd");
+    assert!(out.status.success(), "{}", combined(&out));
+}
+
 /// `DBD_NO_TX` runs each statement on its own — what `CREATE INDEX
 /// CONCURRENTLY` needs — so nothing it builds rolls back: it claims before it
 /// builds, and a run that fails part-way keeps its claims (#7).
