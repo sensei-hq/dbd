@@ -1,12 +1,14 @@
 //! dbd's own version bookkeeping for the Postgres/Supabase adapter.
 //!
 //! Bookkeeping lives in a dedicated, PostgREST-invisible `dbd` schema as
-//! `dbd.meta` / `dbd.migrations`. `heal()` creates that layout and folds any
-//! legacy `public._dbd_*` copy (plus scoped-apply strays in other schemas) into
-//! it in one transaction, so every subsequent read/write in an ownership op
-//! targets `dbd.*` directly. The read-only detection path stays both-names aware
-//! (recognises `dbd.meta` OR a legacy `_dbd_meta` in any schema) because the CLI
-//! scope/prod guards read meta BEFORE the core op runs `heal_bookkeeping()` — on
+//! `dbd.meta` / `dbd.migrations`. `heal()` creates that layout and folds this
+//! project's rows from any legacy `public._dbd_*` copy (plus scoped-apply strays
+//! in other schemas) into it in one transaction, so every subsequent read/write
+//! in an ownership op targets `dbd.*` directly. Another project's rows stay in
+//! the legacy copy, which stays while it holds any: that project may still be on
+//! an older dbd (#7, H5). So reads are layered — a project's record is its
+//! `dbd.meta` row, else its row in a legacy `_dbd_meta` — because the CLI
+//! scope/prod guards read meta BEFORE the core op runs `heal_bookkeeping()`: on
 //! a not-yet-healed legacy DB a read hardcoded to `dbd.meta` would find nothing
 //! and silently disable the guard on the first post-upgrade write.
 
@@ -56,28 +58,36 @@ impl Bookkeeping {
         Ok(())
     }
 
-    /// Resolve the meta relation to read: `dbd.meta` if present, else a legacy
-    /// `_dbd_meta` in any schema (a not-yet-healed DB). Returns (schema, relname).
-    /// `None` = no bookkeeping anywhere (foreign/fresh DB). Only matches
+    /// The meta relations to read, in the order a project's record is looked
+    /// for: `dbd.meta` if present, then each legacy `_dbd_meta` — `public`
+    /// first, then strays by schema — which hold the rows of projects not yet
+    /// healed. Empty = no bookkeeping anywhere (foreign/fresh DB). Only matches
     /// `dbd.meta` or `_dbd_meta` — never an unrelated user table named `meta`.
-    async fn resolve_meta(&self) -> Result<Option<(String, String)>> {
-        let row = sqlx::query(
+    async fn meta_relations(&self) -> Result<Vec<(String, String)>> {
+        let rows = sqlx::query(
             "SELECT n.nspname, c.relname FROM pg_class c \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
              WHERE c.relkind = 'r' \
                AND ((c.relname = 'meta' AND n.nspname = 'dbd') OR c.relname = '_dbd_meta') \
-             ORDER BY (n.nspname = 'dbd') DESC, (n.nspname = 'public') DESC, n.nspname LIMIT 1",
+             ORDER BY (n.nspname = 'dbd') DESC, (n.nspname = 'public') DESC, n.nspname",
         )
-        .fetch_optional(&self.pool)
+        .fetch_all(&self.pool)
         .await
-        .map_err(|e| DbdError::Config(format!("resolve meta relation failed: {e}")))?;
-        Ok(row.map(|r| (r.get::<String, _>("nspname"), r.get::<String, _>("relname"))))
+        .map_err(|e| DbdError::Config(format!("resolve meta relations failed: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|r| (r.get::<String, _>("nspname"), r.get::<String, _>("relname")))
+            .collect())
     }
 
-    /// Create the `dbd` schema + tables, fold every legacy `_dbd_*` copy (in
-    /// `public` or a scoped-apply stray schema) into them, and drop the legacy
-    /// copies. The fold + drop run in one transaction; idempotent (a fresh DB
-    /// yields empty `dbd.*`, an already-migrated DB has no legacy copies → no-op).
+    /// Create the `dbd` schema + tables, and fold this project's rows from every
+    /// legacy `_dbd_*` copy (in `public` or a scoped-apply stray schema) into
+    /// them. Only this project's: another project sharing the database may still
+    /// be on an older dbd, reading and writing the legacy copy, so its rows stay
+    /// and the copy is neither altered nor dropped while it holds any (#7, H5).
+    /// A copy left empty is dropped. The fold + drop run in one transaction;
+    /// idempotent (a fresh DB yields empty `dbd.*`, an already-migrated DB has no
+    /// rows of this project's to fold → no-op).
     ///
     /// The legacy copies are discovered up front on the pool (a `Send`-safe
     /// `fetch`), then all DDL/DML runs inside the transaction via
@@ -120,40 +130,85 @@ impl Bookkeeping {
         .await
         .map_err(|e| DbdError::Config(format!("heal: lift matview stamps failed: {e}")))?;
 
-        // Fold `_dbd_meta` → `dbd.meta` (canonical row wins on conflict).
+        // Fold this project's `_dbd_meta` row → `dbd.meta` (canonical row wins
+        // on conflict). A copy that predates the `scope` column is read as it
+        // is, not given one: an older dbd may still write it.
         for s in meta_schemas {
             let q = s.replace('"', "\"\"");
-            let sql = format!(
-                "ALTER TABLE \"{q}\"._dbd_meta ADD COLUMN IF NOT EXISTS scope varchar; \
-                 INSERT INTO dbd.meta (project, env, version, scope, created_at, updated_at) \
-                   SELECT project, env, version, scope, created_at, updated_at FROM \"{q}\"._dbd_meta \
-                   ON CONFLICT (project) DO NOTHING; \
-                 DROP TABLE IF EXISTS \"{q}\"._dbd_meta;"
-            );
-            (&mut *tx)
-                .execute(sql.as_str())
-                .await
-                .map_err(|e| DbdError::Config(format!("heal: fold {s}._dbd_meta failed: {e}")))?;
+            let has_scope: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute \
+                   WHERE attrelid = format('%I._dbd_meta', $1::text)::regclass \
+                     AND attname = 'scope' AND NOT attisdropped)",
+            )
+            .bind(&s)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| DbdError::Config(format!("heal: read {s}._dbd_meta columns failed: {e}")))?;
+            let scope = if has_scope { "scope" } else { "NULL::varchar" };
+            sqlx::query(&format!(
+                "INSERT INTO dbd.meta (project, env, version, scope, created_at, updated_at) \
+                   SELECT project, env, version, {scope}, created_at, updated_at FROM \"{q}\"._dbd_meta \
+                   WHERE project = $1 ON CONFLICT (project) DO NOTHING"
+            ))
+            .bind(&self.project)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DbdError::Config(format!("heal: fold {s}._dbd_meta failed: {e}")))?;
+            self.release_legacy_rows(&mut tx, &s, "_dbd_meta").await?;
         }
 
-        // Fold `_dbd_migrations` → `dbd.migrations` (composite PK unions copies).
+        // Fold this project's `_dbd_migrations` rows → `dbd.migrations`
+        // (composite PK unions copies).
         for s in migration_schemas {
             let q = s.replace('"', "\"\"");
-            let sql = format!(
+            sqlx::query(&format!(
                 "INSERT INTO dbd.migrations (project, version, applied_at, description, checksum) \
                    SELECT project, version, applied_at, description, checksum FROM \"{q}\"._dbd_migrations \
-                   ON CONFLICT (project, version) DO NOTHING; \
-                 DROP TABLE IF EXISTS \"{q}\"._dbd_migrations;"
-            );
-            (&mut *tx)
-                .execute(sql.as_str())
-                .await
-                .map_err(|e| DbdError::Config(format!("heal: fold {s}._dbd_migrations failed: {e}")))?;
+                   WHERE project = $1 ON CONFLICT (project, version) DO NOTHING"
+            ))
+            .bind(&self.project)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DbdError::Config(format!("heal: fold {s}._dbd_migrations failed: {e}")))?;
+            self.release_legacy_rows(&mut tx, &s, "_dbd_migrations").await?;
         }
 
         tx.commit()
             .await
             .map_err(|e| DbdError::Config(format!("heal: commit failed: {e}")))?;
+        Ok(())
+    }
+
+    /// Delete this project's rows from the legacy `schema.relname`, folded
+    /// already, and drop the table if that leaves it empty — no other project's
+    /// rows, so no older dbd still using it.
+    async fn release_legacy_rows(
+        &self,
+        tx: &mut Transaction<'static, Postgres>,
+        schema: &str,
+        relname: &str,
+    ) -> Result<()> {
+        use sqlx::Executor as _;
+        let table = format!(
+            "\"{}\".\"{}\"",
+            schema.replace('"', "\"\""),
+            relname.replace('"', "\"\"")
+        );
+        sqlx::query(&format!("DELETE FROM {table} WHERE project = $1"))
+            .bind(&self.project)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| DbdError::Config(format!("heal: release {schema}.{relname} failed: {e}")))?;
+        let emptied: bool = sqlx::query_scalar(&format!("SELECT NOT EXISTS (SELECT 1 FROM {table})"))
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(|e| DbdError::Config(format!("heal: read {schema}.{relname} failed: {e}")))?;
+        if emptied {
+            (&mut **tx)
+                .execute(format!("DROP TABLE {table}").as_str())
+                .await
+                .map_err(|e| DbdError::Config(format!("heal: drop {schema}.{relname} failed: {e}")))?;
+        }
         Ok(())
     }
 
@@ -186,27 +241,40 @@ impl Bookkeeping {
     }
 
     /// Read the full meta row (env/version/scope/applied_at) for this project.
-    /// Catalog-resolved (both-names aware): reads `dbd.meta` if present, else a
-    /// legacy `_dbd_meta` in any schema, so the CLI scope/prod guards still work
-    /// on a legacy DB that hasn't been healed yet (the guards read before the core
-    /// op heals).
+    /// Catalog-resolved (both-names aware): its `dbd.meta` row, else its row in
+    /// a legacy `_dbd_meta` in any schema, so the CLI scope/prod guards still
+    /// work on a project not yet healed (the guards read before the core op
+    /// heals) — on a legacy DB, or beside a project that healed first.
     pub(super) async fn get_meta(&self) -> Result<Option<ProjectMeta>> {
         Ok(self.read_meta("project = $1").await?.into_iter().next())
     }
 
     /// Every other project's meta row, by project — what the guards read when
     /// this project has none (see `DatabaseAdapter::other_projects_meta`).
-    /// Resolved as [`Self::get_meta`] is, so a legacy layout reads too.
+    /// Resolved as [`Self::get_meta`] is, so a project not yet healed reads too.
     pub(super) async fn other_projects(&self) -> Result<Vec<ProjectMeta>> {
-        self.read_meta("project <> $1 ORDER BY project").await
+        let mut rows = self.read_meta("project <> $1").await?;
+        rows.sort_by(|a, b| a.project.cmp(&b.project));
+        Ok(rows)
     }
 
     /// The meta rows `filter` selects — a `WHERE` clause over `project`,
-    /// bound to this project's name as `$1`.
+    /// bound to this project's name as `$1` — one per project: the first
+    /// found in [`Self::meta_relations`] order.
     async fn read_meta(&self, filter: &str) -> Result<Vec<ProjectMeta>> {
-        let Some((schema, rel)) = self.resolve_meta().await? else {
-            return Ok(Vec::new()); // no bookkeeping anywhere yet
-        };
+        let mut found: Vec<ProjectMeta> = Vec::new();
+        for (schema, rel) in self.meta_relations().await? {
+            for row in self.read_meta_in(&schema, &rel, filter).await? {
+                if !found.iter().any(|m| m.project == row.project) {
+                    found.push(row);
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    /// The rows `filter` selects in one meta relation, `schema.rel`.
+    async fn read_meta_in(&self, schema: &str, rel: &str, filter: &str) -> Result<Vec<ProjectMeta>> {
         let (sq, rq) = (schema.replace('"', "\"\""), rel.replace('"', "\"\""));
         // Preferred read includes `scope`. On a legacy `_dbd_meta` that predates
         // the column this SELECT errors with 42703; fall back to the legacy shape
@@ -412,15 +480,21 @@ impl Bookkeeping {
     /// records the *last-applied* environment and is not part of the key, so this
     /// read is keyed on `project` only (env-agnostic).
     pub(super) async fn detect_managed_version(&self) -> Result<Option<u32>> {
-        let Some((schema, rel)) = self.resolve_meta().await? else {
+        let relations = self.meta_relations().await?;
+        if relations.is_empty() {
             return Ok(None); // no bookkeeping anywhere → foreign DB
-        };
-        let (sq, rq) = (schema.replace('"', "\"\""), rel.replace('"', "\"\""));
-        let vrow = sqlx::query(&format!("SELECT version FROM \"{sq}\".\"{rq}\" WHERE project = $1"))
-            .bind(&self.project)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| DbdError::Config(format!("detect managed version read failed: {e}")))?;
-        Ok(Some(vrow.map(|r| r.get::<i32, _>("version") as u32).unwrap_or(0)))
+        }
+        for (schema, rel) in relations {
+            let (sq, rq) = (schema.replace('"', "\"\""), rel.replace('"', "\"\""));
+            let vrow = sqlx::query(&format!("SELECT version FROM \"{sq}\".\"{rq}\" WHERE project = $1"))
+                .bind(&self.project)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| DbdError::Config(format!("detect managed version read failed: {e}")))?;
+            if let Some(row) = vrow {
+                return Ok(Some(row.get::<i32, _>("version") as u32));
+            }
+        }
+        Ok(Some(0))
     }
 }
