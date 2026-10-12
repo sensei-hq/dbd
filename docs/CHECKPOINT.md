@@ -1,27 +1,22 @@
 # Checkpoint
 
-**Slice:** #7 Phase 2, slices 1–2 (registry + claim, uses) on `feat/ownership-uses`
-= PR #50 (into the `feat/ownership` integration branch). Phase 1 is on `develop`,
-unreleased.
+**Slice:** #7 Phase 2, slice 3 (prune rules, `--prune-unowned`, release) on
+`feat/ownership-prune`, from `feat/ownership` — where slices 1–2 landed as
+PR #50 (`5e6ad4dc`). Phase 1 is on `develop`, unreleased.
 
 ## Done
 
-- Slices 1–2: `dbd.objects`/`dbd.uses`; keys from every `CREATE` (DO blocks,
-  types and multiranges too) as Postgres makes them; uses namespaced, bare
-  reads the first relation on the path, bare calls every reachable routine.
-- Claim timing: an apply in one transaction claims last, in it, and before a
-  part-way commit; reconcile, reset and a DBD_NO_TX apply claim past their
-  last refusal (before-hooks planned first) and before the first write.
-- Rounds 3–5 fixed test-first; latest red `fba2b27e`, fixes `20515ad4`,
-  `871ad944`; its regression (built-in types bound to a `"Text"` table) red
-  `f383fb12`, fix `b042039d`. CI runs `cli_live` (libossp-uuid for `uuid-ossp`).
-- Embedded 198/198, `cli_live` 47/47, workspace 2002/0, clippy and fmt clean.
+- Slices 1–2 merged into `feat/ownership`: `dbd.objects`/`dbd.uses`; keys and
+  uses as Postgres makes and resolves them; claim in the batch, or first for a
+  run that writes as it goes. Five review rounds, all fixed test-first; CI runs
+  `cli_live`. Embedded 198/198, `cli_live` 47/47, workspace 2002/0.
 
 ## Next
 
-    git push origin feat/ownership-uses:feat/ownership-registry   # PR #50
-    # update its body; CI green; merge #50 locally into feat/ownership;
-    # then slice 3: prune rules (a)/(b), --prune-unowned, release.
+    # slice 3: prune rule (a) owned + undeclared, rule (b) unowned in a schema
+    # no other owner uses; --prune-unowned naming each; release on a successful
+    # run of what is no longer declared and no longer exists; rule (b)
+    # suspended while an owner has not upgraded (meta row, no uses).
 
 ## Open
 
