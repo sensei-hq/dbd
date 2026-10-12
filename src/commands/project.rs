@@ -595,7 +595,29 @@ pub async fn cmd_reconcile(
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
     let (kept, total) = design.scope_counts(&resolved)?;
     output::scope_filtered(&resolved, kept, total);
-    let adapter = get_adapter(config, database_url).await?;
+    // A dry run writes nothing, and the SQLite adapter creates a missing file
+    // on connect — the preview left an empty database behind. So it opens only
+    // a database that is there, as every other dry run does. Only a SQLite
+    // file reads as not there, and what the real run would reconcile against
+    // is then an empty database: an in-memory one is that, and leaves no file.
+    // With no database configured at all, the preview needs one as the run
+    // does, and says how to name it.
+    let configured = super::configured_database_url(config, database_url)?;
+    let adapter = match configured {
+        Some(url) if dry_run => {
+            let project = &design.config().project.name;
+            match dbd_core::connect_existing(&url, project)
+                .await
+                .context("Failed to connect to database")?
+            {
+                Some(adapter) => adapter,
+                None => dbd_core::connect("sqlite::memory:", project)
+                    .await
+                    .context("Failed to open an empty database to preview against")?,
+            }
+        }
+        _ => get_adapter(config, database_url).await?,
+    };
     reconcile_with_adapter(
         &*adapter,
         &design,
