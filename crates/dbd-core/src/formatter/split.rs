@@ -11,13 +11,16 @@
 // `;`s and its `END` recased. So all of them read the tokens PostgreSQL's own
 // scanner produces, through libpg_query.
 
+use pg_query::protobuf::KeywordKind;
 use pg_query::protobuf::Token as Kind;
 
-/// One token of a scanned text: its kind and its byte range.
+/// One token of a scanned text: its kind, its byte range, and the keyword
+/// category the scanner gives its spelling.
 pub(in crate::formatter) struct Lexeme {
     pub(in crate::formatter) kind: Kind,
     pub(in crate::formatter) start: usize,
     pub(in crate::formatter) end: usize,
+    pub(in crate::formatter) keyword: KeywordKind,
 }
 
 impl Lexeme {
@@ -65,6 +68,7 @@ pub(in crate::formatter) fn lex(sql: &str) -> Option<Vec<Lexeme>> {
                 kind: Kind::try_from(t.token).ok()?,
                 start: usize::try_from(t.start).ok()?,
                 end: usize::try_from(t.end).ok()?,
+                keyword: KeywordKind::try_from(t.keyword_kind).ok()?,
             })
         })
         .collect()

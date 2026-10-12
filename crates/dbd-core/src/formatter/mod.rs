@@ -96,7 +96,10 @@ fn format_block(original: &str, config: &FormatConfig) -> String {
             };
             preserve_keyword_case(&format_statement_block(original, &lower), original)
         }
-        _ => format_statement_block(original, config),
+        // Recased again whole: the layout recases the pieces it writes one
+        // at a time, and a piece alone — `COLLATE "C"`, `BIT(3)` — does not
+        // parse, so the grammar cannot say which of its words are keywords.
+        ref case => apply_keyword_case(&format_statement_block(original, config), case),
     };
     if block_is_faithful(original, &laid_out) {
         return laid_out;
