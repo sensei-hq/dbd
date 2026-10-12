@@ -1760,3 +1760,57 @@ fn merge_from_a_sqlite_database_keeps_a_tables_trigger() {
         "the file keeps its trigger: {file}"
     );
 }
+
+/// The triggers a DBML merge keeps were written on their file's
+/// `SET search_path` — `on notes`, `execute function touch()` — and the
+/// rewritten file opened with the document's qualified `CREATE TABLE` and no
+/// path at all, so they would resolve on the session default: `notes` no
+/// longer depended on `app.touch`, and applying the file failed. Each kept
+/// trigger keeps the path it was written on.
+#[test]
+fn a_trigger_merge_from_dbml_keeps_still_resolves_on_its_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write(
+        dir,
+        "design.yaml",
+        "project:\n  name: trig\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    );
+    write(
+        dir,
+        "ddl/function/app/touch.ddl",
+        "set search_path to app;\ncreate or replace function touch() returns trigger language plpgsql \
+         as $$ begin return new; end; $$;\n",
+    );
+    write(
+        dir,
+        "ddl/table/app/notes.ddl",
+        "set search_path to app;\ncreate table if not exists notes (id int primary key);\n\
+         create or replace trigger notes_touch before update on notes for each row execute function touch();\n",
+    );
+    write(
+        dir,
+        "notes.dbml",
+        "Table \"app\".\"notes\" {\n  \"id\" int [pk]\n  \"extra\" text\n}\n",
+    );
+    let edge = |dir: &Path| -> bool {
+        let o = dbd(dir, &["graph"]);
+        assert!(o.status.success(), "graph: {}{}", stdout(&o), stderr(&o));
+        let graph: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+        graph["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["from"] == "app.notes" && e["to"] == "app.touch")
+    };
+    assert!(
+        edge(dir),
+        "before the merge, notes depends on the function its trigger fires"
+    );
+
+    let o = dbd(dir, &["merge", "--from-dbml", dir.join("notes.dbml").to_str().unwrap()]);
+    assert!(o.status.success(), "merge: {}{}", stdout(&o), stderr(&o));
+    let file = fs::read_to_string(dir.join("ddl/table/app/notes.ddl")).unwrap();
+    assert!(file.contains("\"extra\""), "the document's change is written: {file}");
+    assert!(edge(dir), "and after it, still: {file}");
+}
