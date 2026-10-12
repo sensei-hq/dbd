@@ -632,6 +632,74 @@ async fn a_json_array_file_imports_one_row_per_record() {
     .await;
 }
 
+// ── Test: each project stages its JSON imports in its own table ───────────────
+
+/// Projects sharing a database each stage a JSON import in a table of their own
+/// (#7, H7). Every import staged in one `dbd.import_tmp`, which each load drops
+/// and recreates — so two at once, from two projects, emptied each other's rows
+/// mid-flight. A project's is `dbd."import_tmp:<project>"`; a name past
+/// Postgres's 63-byte limit, which Postgres would cut short and so merge with
+/// another project's, ends in a hash of the whole name instead.
+#[tokio::test]
+async fn each_project_stages_its_json_imports_in_its_own_table() {
+    let (_pg, url) = start_pg().await;
+    let long_a = format!("{}-alpha", "p".repeat(40));
+    let long_b = format!("{}-beta", "p".repeat(40));
+    let setup = connect(&url, "setup").await.unwrap();
+    setup
+        .execute_script(
+            "CREATE SCHEMA app; CREATE TABLE app.people (id integer, name text); \
+             CREATE TABLE public.staged (name text); \
+             CREATE FUNCTION public.log_staging() RETURNS event_trigger LANGUAGE plpgsql AS $$ \
+               DECLARE r record; BEGIN \
+                 FOR r IN SELECT * FROM pg_event_trigger_ddl_commands() \
+                   WHERE command_tag = 'CREATE TABLE' AND object_identity LIKE 'dbd.%import_tmp%' \
+                 LOOP INSERT INTO public.staged VALUES (r.object_identity); END LOOP; \
+               END $$; \
+             CREATE EVENT TRIGGER log_staging ON ddl_command_end WHEN TAG IN ('CREATE TABLE') \
+               EXECUTE FUNCTION public.log_staging();",
+        )
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("people.jsonl");
+    std::fs::write(&path, "{\"id\": 1, \"name\": \"alpha\"}\n").unwrap();
+    let mut entity = Entity::new(EntityType::Table, "app.people");
+    entity.file = Some(path);
+    entity.format = Some("jsonl".to_string());
+
+    for owner in ["a", "b", long_a.as_str(), long_b.as_str()] {
+        connect(&url, owner)
+            .await
+            .unwrap()
+            .import_data(&entity, "", false)
+            .await
+            .unwrap_or_else(|e| panic!("{owner}'s import: {e}"));
+    }
+
+    assert_catalog(
+        &*setup,
+        true,
+        "SELECT 1 WHERE (SELECT count(DISTINCT name) FROM public.staged) = 4",
+        "four staging tables, one per project",
+    )
+    .await;
+    assert_catalog(
+        &*setup,
+        true,
+        "SELECT 1 FROM public.staged WHERE name = 'dbd.\"import_tmp:a\"'",
+        "the staging table of a",
+    )
+    .await;
+    assert_catalog(
+        &*setup,
+        true,
+        "SELECT 1 WHERE (SELECT count(*) FROM app.people) = 4",
+        "a row from each import",
+    )
+    .await;
+}
+
 // ── Test: a JSON import leaves no schema the design did not declare ───────────
 
 /// dbd's JSON loader is its own machinery, and it was installed in a schema
