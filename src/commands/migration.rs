@@ -17,13 +17,78 @@ pub(crate) struct ResetOptions {
     pub allow_scope_change: bool,
 }
 
+/// The targets `reset` has a script for — what `--target` accepts.
+const RESET_TARGETS: &[&str] = &["postgres", "supabase", "sqlite"];
+
+/// The platform reset runs for: `--target` when given, otherwise the design's
+/// target (its first `target:` key), otherwise plain `postgres`. It decides
+/// the dialect of the drops and which schemas reset must leave alone.
+/// Defaulting to `postgres` regardless of the design let a Supabase project's
+/// `reset --schemas` drop `public`, and ran PostgreSQL's drops on SQLite.
+fn reset_target<'a>(flag: Option<&'a str>, design: &'a Design) -> &'a str {
+    flag.or_else(|| design.config().default_target()).unwrap_or("postgres")
+}
+
+/// Refuse, before connecting, a target reset has no script for. clap refuses
+/// such a `--target`; this catches the design's own (a `convex:` target).
+fn check_reset_target(target: &str) -> Result<()> {
+    if !RESET_TARGETS.contains(&target) {
+        anyhow::bail!(
+            "reset supports the {} targets; this design's target is `{target}`",
+            RESET_TARGETS.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Refuse, before connecting, a reset whose target is not the kind of
+/// database `url` reaches. `flagged` is whether the target came from
+/// `--target` rather than the design.
+///
+/// The target picks the dialect of the drops and the schemas reset protects.
+/// `reset --target postgres` on a SQLite project was accepted, connected, and
+/// failed on PostgreSQL's `CASCADE` — after reading the database, and under
+/// `--force` with nothing said of why.
+fn check_target_matches_connection(target: &str, flagged: bool, url: &str) -> Result<()> {
+    let sqlite = url.starts_with("sqlite:") || url.starts_with("file:");
+    let (connection, fits, instead) = if sqlite {
+        ("SQLite", target == "sqlite", "--target sqlite")
+    } else if url.starts_with("convex:") {
+        // Not a reset target at all; `check_reset_target` says so.
+        return Ok(());
+    } else {
+        (
+            "PostgreSQL",
+            matches!(target, "postgres" | "supabase"),
+            "--target postgres or --target supabase",
+        )
+    };
+    if fits {
+        return Ok(());
+    }
+    let named = if flagged {
+        format!("--target {target}")
+    } else {
+        format!("the design's target, {target},")
+    };
+    anyhow::bail!(
+        "reset: {named} does not match the database — the connection is {connection}. The target picks the \
+         dialect of the drops, so it must be the kind of database the connection reaches: pass {instead}{}.",
+        if flagged {
+            ", or drop --target to use the design's"
+        } else {
+            ""
+        }
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn cmd_reset(
     config: &Path,
     env: &str,
     project_dir: &Path,
     database_url: Option<&str>,
-    target: &str,
+    target: Option<&str>,
     opts: ResetOptions,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
@@ -38,18 +103,47 @@ pub async fn cmd_reset(
     } = opts;
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
     let resolved = design.resolve_scope(scope, deps)?;
+    let (kept, total) = design.scope_counts(&resolved)?;
+    output::scope_filtered(&resolved, kept, total);
+    let flagged = target.is_some();
+    let target = reset_target(target, &design);
+    check_reset_target(target)?;
+    if let Some(url) = super::configured_database_url(config, database_url)? {
+        check_target_matches_connection(target, flagged, &url)?;
+    }
+    if target == "sqlite" && (drop_schemas || drop_extensions) {
+        output::warn("SQLite has no schemas or extensions: --schemas, --extensions and --clean change nothing here.");
+    }
 
     if dry_run {
+        // A preview of a reset the real run would refuse is a false promise, so
+        // with a database to ask, ask it first. With none configured the plan
+        // is all there is to show, and the dry run stays database-free.
+        // The roles the real run keeps are asked of the same database, so the
+        // preview does not list a `DROP ROLE` the run will not perform.
+        let mut kept = Vec::new();
+        if let Some(adapter) = super::dry_run_adapter(config, database_url).await? {
+            check_reset_guards(&*adapter, &design, &resolved, force, allow_scope_change).await?;
+            kept = design.roles_kept_by_reset(&*adapter, target, Some(&resolved)).await?;
+        }
+        let keep: Vec<String> = kept.iter().map(|k| k.role.clone()).collect();
         let sql = design
-            .reset_script(target, drop_schemas, drop_extensions, Some(&resolved))?
+            .reset_script_keeping(target, drop_schemas, drop_extensions, Some(&resolved), &keep)?
             .unwrap_or_else(|| "-- nothing to drop".to_string());
         output::info(verbosity, "[dry-run] Reset would run:");
         output::always(&sql);
+        let preview = dbd_core::ResetComplete {
+            roles_kept: kept,
+            ..Default::default()
+        };
+        for line in kept_role_lines(&preview) {
+            output::info(verbosity, &format!("[dry-run] {line}"));
+        }
         return Ok(());
     }
 
     let adapter = get_adapter(config, database_url).await?;
-    reset_with_adapter(
+    let summary = reset_with_adapter(
         &*adapter,
         &design,
         target,
@@ -59,7 +153,74 @@ pub async fn cmd_reset(
         &resolved,
         allow_scope_change,
     )
-    .await
+    .await?;
+    for line in format_reset_summary(&summary) {
+        output::info(verbosity, &line);
+    }
+    Ok(())
+}
+
+/// What a reset did, as `dbd reset` prints it: what it dropped, counted by
+/// kind — and the roles by name, since a role outlives any one database — or
+/// that it found nothing to drop. It printed nothing at all, so a reset that
+/// emptied the schema and one that found nothing looked the same.
+pub(crate) fn format_reset_summary(summary: &dbd_core::ResetComplete) -> Vec<String> {
+    use dbd_core::EntityType;
+    if summary.dropped.is_empty() {
+        let mut lines = vec!["Reset dropped nothing — none of the project's objects were in the database.".to_string()];
+        lines.extend(kept_role_lines(summary));
+        return lines;
+    }
+    let counted = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let mut parts: Vec<String> = [
+        (EntityType::Function, "function", "functions"),
+        (EntityType::Procedure, "procedure", "procedures"),
+        (EntityType::MaterializedView, "materialized view", "materialized views"),
+        (EntityType::View, "view", "views"),
+        (EntityType::Table, "table", "tables"),
+        (EntityType::Sequence, "sequence", "sequences"),
+        (EntityType::Enum, "enum", "enums"),
+        (EntityType::Extension, "extension", "extensions"),
+        (EntityType::Schema, "schema", "schemas"),
+    ]
+    .into_iter()
+    .filter_map(|(kind, one, many)| match summary.count(kind) {
+        0 => None,
+        n => Some(counted(n, one, many)),
+    })
+    .collect();
+    let roles: Vec<&str> = summary
+        .dropped
+        .iter()
+        .filter(|(kind, _)| *kind == EntityType::Role)
+        .map(|(_, name)| name.as_str())
+        .collect();
+    if !roles.is_empty() {
+        parts.push(format!(
+            "{} ({})",
+            counted(roles.len(), "role", "roles"),
+            roles.join(", ")
+        ));
+    }
+    let mut lines = vec![format!("Reset dropped {}.", parts.join(", "))];
+    lines.extend(kept_role_lines(summary));
+    lines
+}
+
+/// One line per role the reset kept: which, and the databases that hold it.
+fn kept_role_lines(summary: &dbd_core::ResetComplete) -> Vec<String> {
+    summary
+        .roles_kept
+        .iter()
+        .map(|k| {
+            format!(
+                "Role {} kept: it holds privileges or objects in database {} — roles are server-wide, \
+                 and dropping it would break that database.",
+                k.role,
+                k.databases.join(", ")
+            )
+        })
+        .collect()
 }
 
 /// The body of a non-dry-run `dbd reset`, with the adapter supplied rather than
@@ -77,22 +238,54 @@ pub(crate) async fn reset_with_adapter(
     drop_extensions: bool,
     resolved: &dbd_core::ResolvedScope,
     allow_scope_change: bool,
-) -> Result<()> {
-    let meta = adapter.get_project_meta().await?;
-    Design::check_scope_guard(meta.as_ref(), &resolved.name, force || allow_scope_change)?;
-    design
+) -> Result<dbd_core::ResetComplete> {
+    check_reset_guards(adapter, design, resolved, force, allow_scope_change).await?;
+    Ok(design
         .reset(adapter, target, force, drop_schemas, drop_extensions, Some(resolved))
-        .await?;
+        .await?)
+}
+
+/// Every guard a reset checks before it drops anything, read-only: the scope
+/// pin (cleared by `--force` or `--allow-scope-change`), then prod and applied
+/// migrations (cleared by `--force` alone).
+///
+/// One function for both runs, so `--dry-run` refuses exactly where the real
+/// reset does. [`Design::reset`] checks the second guard again after it heals
+/// the bookkeeping; this read needs no heal, since meta is read under either
+/// layout.
+pub(crate) async fn check_reset_guards(
+    adapter: &dyn dbd_core::DatabaseAdapter,
+    design: &Design,
+    resolved: &dbd_core::ResolvedScope,
+    force: bool,
+    allow_scope_change: bool,
+) -> Result<()> {
+    let marks = design.database_marks(adapter).await?;
+    Design::check_scope_guard(&marks, &resolved.name, force || allow_scope_change)?;
+    if !force {
+        design.check_reset_guard(&marks)?;
+    }
     Ok(())
 }
 
 pub async fn cmd_migrate_status(
     config: &Path,
+    env: &str,
     database_url: Option<&str>,
     project_dir: &Path,
     verbosity: Verbosity,
 ) -> Result<()> {
+    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
     let adapter = get_adapter(config, database_url).await?;
+    // The versions are the whole project's; a database pinned to a scope was
+    // built with that scope's entities alone, and said nothing of it.
+    let unscoped = design.resolve_scope(None, None)?;
+    if let Some((pinned, by)) = super::other_scope_pin(&*adapter, &design, &unscoped).await? {
+        output::always(&format!(
+            "note: this database is pinned to scope '{pinned}'{by} — it was built with that scope's \
+             entities, not the whole design."
+        ));
+    }
     migrate_status_with_adapter(&*adapter, project_dir, verbosity).await
 }
 
@@ -109,18 +302,41 @@ pub(crate) async fn migrate_status_with_adapter(
     let snapshots = dbd_core::snapshot::list_snapshots(project_dir);
     let latest_version = snapshots.last().map(|s| s.version).unwrap_or(0);
 
-    output::always(&format!(
-        "Database version: {}",
-        dbd_core::snapshot::pad_version(db_version)
-    ));
-    output::always(&format!(
-        "Latest snapshot:  {}",
-        dbd_core::snapshot::pad_version(latest_version)
-    ));
+    let pad = dbd_core::snapshot::pad_version;
+    // Version 0 is no version: a database built before the project had one.
+    let recorded = if db_version == 0 {
+        "none recorded".to_string()
+    } else {
+        pad(db_version)
+    };
+    output::always(&format!("Database version: {recorded}"));
+    output::always(&format!("Latest snapshot:  {}", pad(latest_version)));
 
+    // "Up to date" only when the versions agree. With no migration pending it
+    // was printed beside 000 and 001 alike, which is the one case where the
+    // next apply still has something to record.
     let pending = dbd_core::snapshot::pending_migrations(db_version, project_dir);
     if pending.is_empty() {
-        output::info(verbosity, "Database is up to date.");
+        let state = match db_version.cmp(&latest_version) {
+            std::cmp::Ordering::Equal => "Database is up to date.".to_string(),
+            std::cmp::Ordering::Greater => format!(
+                "The database is at v{}, ahead of the latest snapshot v{} — it was applied from a newer design.",
+                pad(db_version),
+                pad(latest_version)
+            ),
+            std::cmp::Ordering::Less if db_version == 0 => format!(
+                "No migration is pending — the next `dbd apply` applies the current DDL and records v{}.",
+                pad(latest_version)
+            ),
+            std::cmp::Ordering::Less => format!(
+                "No migration from v{} to v{} is under snapshots/ — `dbd apply` re-applies the current DDL \
+                 and leaves the recorded version at v{}.",
+                pad(db_version),
+                pad(latest_version),
+                pad(db_version)
+            ),
+        };
+        output::info(verbosity, &state);
     } else {
         output::always(&format!("{} pending migration(s):", pending.len()));
         for m in &pending {
@@ -250,16 +466,112 @@ mod tests {
         cmd_snapshot_list(&testutil::fixtures(), Verbosity::Verbose);
     }
 
-    /// `--dry-run` builds the reset script and returns before any DB adapter is
-    /// constructed, so it runs without a live connection.
+    /// A Supabase project resets as a Supabase project without being told so:
+    /// the design already names its target. Before, `--target` defaulted to
+    /// `postgres`, and `reset --schemas` dropped `public` CASCADE.
+    #[test]
+    fn reset_protects_the_designs_platform_unless_told_otherwise() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("design.yaml");
+        std::fs::write(
+            &config,
+            "project:\n  name: t\ntarget:\n  supabase:\n    url: $DATABASE_URL\nschemas:\n  - public\n  - app\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("ddl/table/app")).unwrap();
+        std::fs::write(
+            tmp.path().join("ddl/table/app/items.ddl"),
+            "create table if not exists app.items (id int primary key);\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&config, "dev", Some(tmp.path())).unwrap();
+
+        let target = reset_target(None, &design);
+        assert_eq!(target, "supabase");
+        let sql = design.reset_script(target, true, false, None).unwrap().unwrap();
+        assert!(
+            !sql.contains("DROP SCHEMA IF EXISTS \"public\""),
+            "public must survive: {sql}"
+        );
+        assert!(
+            sql.contains("DROP SCHEMA IF EXISTS \"app\""),
+            "the project's own schema still drops: {sql}"
+        );
+
+        // The flag still wins, and a design with no target falls back to postgres.
+        assert_eq!(reset_target(Some("postgres"), &design), "postgres");
+        std::fs::write(&config, "project:\n  name: t\n").unwrap();
+        let bare = Design::from_config_with_dir(&config, "dev", Some(tmp.path())).unwrap();
+        assert_eq!(reset_target(None, &bare), "postgres");
+    }
+
+    /// With no database configured — no `-d`, and a target with no `url` — the
+    /// dry run builds the reset script without a connection. The project names
+    /// no URL rather than `$DATABASE_URL`, so a variable set in the shell running
+    /// the tests cannot point it at a database.
     #[tokio::test]
     async fn reset_dry_run_needs_no_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("design.yaml");
+        std::fs::write(
+            &config,
+            "project:\n  name: t\ntarget:\n  postgres: {}\nschemas:\n  - app\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("ddl/table/app")).unwrap();
+        std::fs::write(
+            tmp.path().join("ddl/table/app/items.ddl"),
+            "create table if not exists app.items (id int primary key);\n",
+        )
+        .unwrap();
         cmd_reset(
-            &testutil::fixture_config(),
+            &config,
             "dev",
-            &testutil::fixtures(),
+            tmp.path(),
             None,
+            None,
+            ResetOptions {
+                dry_run: true,
+                force: false,
+                drop_schemas: false,
+                drop_extensions: false,
+                allow_scope_change: false,
+            },
+            None,
+            None,
+            Verbosity::Normal,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// A target `url: $VAR` whose variable is unset names no database, so the
+    /// dry run stays the offline preview it always was. Most projects write
+    /// `url: $DATABASE_URL`; were the unresolved `$VAR` taken for a URL, every
+    /// dry run on a machine without the variable would fail to connect to it.
+    #[tokio::test]
+    async fn reset_dry_run_with_an_unset_url_variable_needs_no_database() {
+        const VAR: &str = "DBD_TEST_RESET_DRY_RUN_NEVER_SET";
+        assert!(std::env::var_os(VAR).is_none(), "{VAR} must be unset for this test");
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("design.yaml");
+        std::fs::write(
+            &config,
+            format!("project:\n  name: t\ntarget:\n  postgres:\n    url: ${VAR}\nschemas:\n  - app\n"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("ddl/table/app")).unwrap();
+        std::fs::write(
+            tmp.path().join("ddl/table/app/items.ddl"),
+            "create table if not exists app.items (id int primary key);\n",
+        )
+        .unwrap();
+        cmd_reset(
+            &config,
             "dev",
+            tmp.path(),
+            None,
+            None,
             ResetOptions {
                 dry_run: true,
                 force: false,
@@ -418,7 +730,7 @@ mod tests {
     /// `--allow-scope-change` is the documented override for the scope guard, so
     /// the same mismatch then proceeds and the reset runs.
     ///
-    /// The pinned version stays 0 on purpose: a database with applied migrations
+    /// The pinned version stays 0 on purpose: a versioned database
     /// trips a *separate* safety guard that only `--force` clears, which would
     /// mask whether the scope override worked.
     #[tokio::test]

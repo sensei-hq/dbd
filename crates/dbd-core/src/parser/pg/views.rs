@@ -68,6 +68,35 @@ pub(crate) fn parse_view(mut entity: Entity, sql: &str) -> Result<Entity> {
         });
     }
 
+    // A trigger kept beside its view — `INSTEAD OF`, which makes the view
+    // writable — fires a function the view now depends on. Functions apply
+    // after views unless an edge says otherwise, so without one a fresh apply
+    // created the trigger before its function existed. Read as the table
+    // parser reads a table's triggers.
+    for stmt in &parsed.protobuf.stmts {
+        let Some(pg_query::NodeEnum::CreateTrigStmt(trigger)) = stmt.stmt.as_ref().and_then(|s| s.node.as_ref()) else {
+            continue;
+        };
+        let function: Vec<&str> = trigger
+            .funcname
+            .iter()
+            .filter_map(|n| match n.node.as_ref() {
+                Some(pg_query::NodeEnum::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .collect();
+        if let Some((name, schema_source)) = common::qualify_name_source(&function.join("."), &default_schema)
+            && !references.iter().any(|r| r.name == name)
+        {
+            references.push(Ref {
+                name,
+                kind: RefKind::Calls,
+                schema_source,
+                unresolved: false,
+            });
+        }
+    }
+
     entity.refs = references;
     Ok(entity)
 }

@@ -55,7 +55,7 @@ pub mod sql_expr;
 pub mod sql_quote;
 
 pub use adapter::DatabaseAdapter;
-pub use design::{ApplyComplete, ApplyStrategy, DeployComplete, Design, ImportComplete};
+pub use design::{ApplyComplete, ApplyStrategy, DeployComplete, Design, ImportComplete, ResetComplete};
 pub use entity::{Entity, EntityType};
 pub use error::{DbdError, Result};
 pub use project::{ProjectSurvey, survey};
@@ -108,6 +108,22 @@ pub async fn connect(url: &str, project: &str) -> Result<Box<dyn DatabaseAdapter
     }
     #[cfg(not(feature = "postgres"))]
     Err(DbdError::Config(format!("No adapter compiled in for URL: {url}")))
+}
+
+/// [`connect`], to a database that already exists — `None` when it does not.
+///
+/// For a caller that must not create one: a dry run asks the database for
+/// its guards and writes nothing. Only SQLite creates its database on
+/// connect, so only a SQLite URL whose file is missing reads as `None`; every
+/// other URL connects as [`connect`] does, a server that cannot be reached
+/// being an error as it is for the run.
+pub async fn connect_existing(url: &str, project: &str) -> Result<Option<Box<dyn DatabaseAdapter>>> {
+    #[cfg(feature = "sqlite")]
+    if url.starts_with("sqlite:") || url.starts_with("file:") {
+        let adapter = adapter::sqlite::SqliteAdapter::open_existing(url, project).await?;
+        return Ok(adapter.map(|a| Box::new(a) as Box<dyn DatabaseAdapter>));
+    }
+    connect(url, project).await.map(Some)
 }
 
 /// The database a URL scheme names, when dbd has a reader for it but no

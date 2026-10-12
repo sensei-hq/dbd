@@ -1,5 +1,78 @@
 use super::*;
 
+/// Refuse a plan whose enum value removal a live materialized view blocks,
+/// naming each one and the steps that let the removal through.
+///
+/// Reconcile used to decide this from the design and plan nothing for the
+/// enum, with a warning — and the run exited 0, "Reconciled", having not
+/// converged. Its instruction did not work either: the matview, dropped by
+/// hand, was re-created by the very run that re-checked the design, which
+/// declined again. Asked of the database, a dropped matview blocks nothing, and
+/// the re-run removes the value and re-creates the matview from its DDL.
+async fn refuse_enum_swaps_a_matview_blocks(
+    adapter: &dyn DatabaseAdapter,
+    plan: &crate::reconcile::ReconcilePlan,
+    desired_entities: &[&Entity],
+) -> Result<()> {
+    let mut blocks: Vec<String> = Vec::new();
+    let mut drops: Vec<String> = Vec::new();
+    let mut undeclared: Vec<String> = Vec::new();
+    for swap in &plan.enum_swaps {
+        let matviews = adapter.matviews_reading_columns(&swap.columns).await?;
+        if matviews.is_empty() {
+            continue;
+        }
+        let values: Vec<String> = swap.removed.iter().map(|v| crate::sql_quote::literal(v)).collect();
+        blocks.push(format!(
+            "{} from {}: materialized view{} {} read{} a column of that type",
+            values.join(", "),
+            swap.enum_name,
+            if matviews.len() == 1 { "" } else { "s" },
+            matviews.join(", "),
+            if matviews.len() == 1 { "s" } else { "" },
+        ));
+        for mv in matviews {
+            if !desired_entities
+                .iter()
+                .any(|e| e.entity_type == EntityType::MaterializedView && e.name == mv)
+                && !undeclared.contains(&mv)
+            {
+                undeclared.push(mv.clone());
+            }
+            let drop = format!("DROP MATERIALIZED VIEW {};", crate::sql_quote::qualified(&mv));
+            if !drops.contains(&drop) {
+                drops.push(drop);
+            }
+        }
+    }
+    if blocks.is_empty() {
+        return Ok(());
+    }
+    let mut steps = vec![
+        format!(
+            "  1. drop {} by hand: {}",
+            if drops.len() == 1 { "it" } else { "them" },
+            drops.join(" ")
+        ),
+        "  2. re-run `dbd reconcile --allow-destructive`: it removes the value and re-creates, from the \
+         design, the materialized views it declares"
+            .to_string(),
+    ];
+    if !undeclared.is_empty() {
+        steps.push(format!(
+            "  3. re-create {} yourself — the design does not declare {}",
+            undeclared.join(", "),
+            if undeclared.len() == 1 { "it" } else { "them" },
+        ));
+    }
+    Err(DbdError::Config(format!(
+        "reconcile cannot remove enum value {}. dbd never drops a materialized view, so nothing was changed. \
+         To go on:\n{}",
+        blocks.join("; and "),
+        steps.join("\n")
+    )))
+}
+
 impl Design {
     /// Read-only materialized-view detection for `reconcile`: for each design
     /// matview, decide create/skip/restamp/warn against the live `dbd:hash`
@@ -75,12 +148,25 @@ impl Design {
         Ok((mv_to_create, mv_to_restamp))
     }
 
-    /// Execute reconcile's write passes against the live database, in order:
-    /// A prerequisites + newly-added tables/enums, B ALTERs (with a `search_path`
-    /// prelude), C code objects (CREATE OR REPLACE), C-mv matview creates,
-    /// C-mv-restamp matview sentinel upgrades, and D prune (only when `prune`).
-    /// Returns the tallied summary. Factored out of [`Design::reconcile`] so its
-    /// body reads as setup → detect → write.
+    /// Execute reconcile's writes against the live database. One pass over the
+    /// design in dependency order creates, alters and re-applies each entity at
+    /// its place in that order; then matview sentinel upgrades, then prune (only
+    /// when `prune`). Returns the tallied summary. Factored out of
+    /// [`Design::reconcile`] so its body reads as setup → detect → write.
+    ///
+    /// The single pass is the point. Reconcile used to run every table create,
+    /// then every ALTER, then every function and view — so on a fresh database
+    /// a table whose `DEFAULT` called a project function, or whose file declared
+    /// a trigger on one, failed for want of a function the later pass would
+    /// have created. `desired_entities` is already in the order `apply` creates
+    /// in (see [`crate::dependency::sort_by_dependencies`]), which records a
+    /// default's call, a column's enum and a trigger's function as edges.
+    ///
+    /// These writes are NOT one transaction: each statement commits as it runs,
+    /// so a failure part-way leaves the entities before it in place. A batch
+    /// transaction is not a drop-in here — an enum value added by `ALTER TYPE …
+    /// ADD VALUE` cannot be used until its transaction commits, and a later
+    /// default or CHECK naming that value in the same batch would fail.
     #[allow(clippy::too_many_arguments)]
     async fn execute_reconcile_writes<S, D>(
         &self,
@@ -98,9 +184,7 @@ impl Design {
         S: FnMut(&str),
         D: FnMut(&str, Option<&str>),
     {
-        use crate::reconcile::{
-            ReconcileComplete, matview_create_sql, matview_hash_comment_sql, qualified_entity_name,
-        };
+        use crate::reconcile::{ReconcileComplete, matview_create_sql, matview_stamp, qualified_entity_name};
         use std::collections::{HashMap, HashSet};
 
         let added: HashSet<&str> = plan.added.iter().map(|s| s.as_str()).collect();
@@ -109,32 +193,12 @@ impl Design {
             .iter()
             .map(|s| (s.entity_name.as_str(), s.sql.as_str()))
             .collect();
+        let mv_create: HashMap<&str, &str> = mv_to_create
+            .iter()
+            .map(|(e, want)| (e.name.as_str(), want.as_str()))
+            .collect();
 
         let mut summary = ReconcileComplete::default();
-
-        // Pass A — prerequisites + added tables/enums, in dependency order.
-        //   schema/extension/role/sequence: always (idempotent DDL);
-        //   enum/table: only when newly added (a full create).
-        for e in desired_entities {
-            let do_apply = match e.entity_type {
-                EntityType::Schema | EntityType::Extension | EntityType::Role | EntityType::Sequence => true,
-                EntityType::Enum | EntityType::Table => added.contains(qualified_entity_name(e).as_str()),
-                _ => false,
-            };
-            if !do_apply {
-                continue;
-            }
-            let is_created = matches!(e.entity_type, EntityType::Enum | EntityType::Table);
-            let desc = format!("{}:{}", e.entity_type.tag(), e.name);
-            on_start(&desc);
-            let result = adapter.apply_entity(e).await;
-            report_step_result(&desc, on_done, result)?;
-            if is_created {
-                summary.created += 1;
-            } else {
-                summary.reapplied += 1;
-            }
-        }
 
         // Generated ALTERs carry no `set search_path`, unlike the project's DDL
         // files. Prepend one covering every managed schema (+ public) so bare
@@ -142,48 +206,74 @@ impl Design {
         // resolve the same way they do when the DDL file runs.
         let search_path = search_path_prelude(managed_schemas);
 
-        // Pass B — ALTER existing tables/enums, in dependency order.
         for e in desired_entities {
             let n = qualified_entity_name(e);
-            if let Some(sql) = alter_sql.get(n.as_str()) {
-                let desc = format!("alter {}:{n}", e.entity_type.tag());
-                on_start(&desc);
-                let script = format!("{search_path}{sql}");
-                let result = adapter.execute_script(&script).await;
-                report_step_result(&desc, on_done, result)?;
-                summary.altered += 1;
+            match e.entity_type {
+                // Prerequisites and code objects: idempotent DDL (`IF NOT
+                // EXISTS` / `CREATE OR REPLACE`), re-applied on every run.
+                EntityType::Schema
+                | EntityType::Extension
+                | EntityType::Role
+                | EntityType::Sequence
+                | EntityType::View
+                | EntityType::Function
+                | EntityType::Procedure => {
+                    let desc = format!("{}:{}", e.entity_type.tag(), e.name);
+                    on_start(&desc);
+                    let result = adapter.apply_entity(e).await;
+                    report_step_result(&desc, on_done, result)?;
+                    summary.reapplied += 1;
+                }
+                // Tables and enums are diffed: a full create when new, the
+                // generated ALTERs when changed, nothing when in sync.
+                EntityType::Enum | EntityType::Table => {
+                    if added.contains(n.as_str()) {
+                        let desc = format!("{}:{}", e.entity_type.tag(), e.name);
+                        on_start(&desc);
+                        let result = adapter.apply_entity(e).await;
+                        report_step_result(&desc, on_done, result)?;
+                        summary.created += 1;
+                    }
+                    if let Some(sql) = alter_sql.get(n.as_str()) {
+                        let desc = format!("alter {}:{n}", e.entity_type.tag());
+                        on_start(&desc);
+                        let script = format!("{search_path}{sql}");
+                        let result = adapter.execute_script(&script).await;
+                        report_step_result(&desc, on_done, result)?;
+                        summary.altered += 1;
+                    }
+                }
+                // A matview detection found absent. Postgres has no `CREATE OR
+                // REPLACE MATERIALIZED VIEW`, so one that exists is left alone
+                // (see `detect_reconcile_matviews`). The CREATE carries the same
+                // `search_path` prelude the ALTERs use.
+                EntityType::MaterializedView => {
+                    let Some(want) = mv_create.get(e.name.as_str()) else {
+                        continue;
+                    };
+                    let desc = format!("{}:{}", e.entity_type.tag(), e.name);
+                    on_start(&desc);
+                    // A file that states no path was read against
+                    // `source.search_path`, so its body is created on that path
+                    // — as `apply` runs the file — not on the managed-schema one.
+                    let prelude = crate::script::project_search_path(e)
+                        .map(|set| format!("{set}\n"))
+                        .unwrap_or_else(|| search_path.clone());
+                    let result = match adapter
+                        .execute_script(&format!("{prelude}{}", matview_create_sql(e)))
+                        .await
+                    {
+                        Ok(()) => adapter.stamp_matview(&n, &matview_stamp(want)).await,
+                        err => err,
+                    };
+                    report_step_result(&desc, on_done, result)?;
+                    summary.reapplied += 1;
+                }
+                _ => {}
             }
         }
 
-        // Pass C — code objects (CREATE OR REPLACE), after tables/columns exist.
-        for e in desired_entities {
-            if !matches!(
-                e.entity_type,
-                EntityType::View | EntityType::Function | EntityType::Procedure
-            ) {
-                continue;
-            }
-            let desc = format!("{}:{}", e.entity_type.tag(), e.name);
-            on_start(&desc);
-            let result = adapter.apply_entity(e).await;
-            report_step_result(&desc, on_done, result)?;
-            summary.reapplied += 1;
-        }
-
-        // Pass C-mv (WRITES) — CREATE the matviews detection found absent. Reuses
-        // the pre-computed `mv_to_create` (no second `matview_states()` fetch).
-        // Each CREATE carries the same `search_path` prelude the ALTERs use.
-        for (e, want) in mv_to_create {
-            let desc = format!("{}:{}", e.entity_type.tag(), e.name);
-            on_start(&desc);
-            let result = adapter
-                .execute_script(&format!("{search_path}{}", matview_create_sql(e, want)))
-                .await;
-            report_step_result(&desc, on_done, result)?;
-            summary.reapplied += 1;
-        }
-
-        // Pass C-mv-restamp (WRITES) — upgrade the sentinel on matviews whose
+        // Matview restamp — upgrade the sentinel on matviews whose
         // live comment is a v1 (unversioned) stamp. This never runs under
         // `--dry-run`: `Design::reconcile` returns before this method is even
         // called in that case. A v1 hash covers a superseded body contract, so
@@ -192,13 +282,14 @@ impl Design {
         for (e, want) in mv_to_restamp {
             let desc = format!("{}:{} (restamp v1→v2)", e.entity_type.tag(), e.name);
             on_start(&desc);
-            let sql = matview_hash_comment_sql(&qualified_entity_name(e), want);
-            let result = adapter.execute_script(&format!("{search_path}{sql}")).await;
+            let result = adapter
+                .stamp_matview(&qualified_entity_name(e), &matview_stamp(want))
+                .await;
             report_step_result(&desc, on_done, result)?;
             summary.restamped += 1;
         }
 
-        // Pass D — prune orphaned tables (in managed schemas, gone from the
+        // Prune orphaned tables (in managed schemas, gone from the
         // design), only when explicitly requested. Otherwise they are reported
         // via the returned plan and left untouched.
         if prune {
@@ -248,8 +339,9 @@ impl Design {
         C: FnMut(crate::reconcile::ReconcileComplete),
     {
         use crate::reconcile::{
-            plan_check_convergence, plan_comment_convergence, plan_enum_recreation, plan_fk_convergence,
-            plan_index_convergence, plan_reconcile, raw_snapshot_from_entities, snapshot_from_entities,
+            plan_check_convergence, plan_comment_convergence, plan_enum_recreation, plan_exclusion_convergence,
+            plan_fk_convergence, plan_index_convergence, plan_reconcile, raw_snapshot_from_entities,
+            snapshot_from_entities,
         };
 
         // Batch adapters (e.g. Convex) have no live SQL schema to diff.
@@ -259,6 +351,10 @@ impl Design {
             ));
         }
         self.refuse_without_a_structured_model("reconcile")?;
+        // A dev reconcile of a database marked prod is refused before it plans
+        // anything, `dry_run` included: a plan for a run the guard refuses
+        // previews something that cannot happen.
+        self.guard_env(adapter).await?;
 
         // Desired entities: valid, non-external, in scope — in dependency order.
         let working_set = self.scope_working_set(scope)?;
@@ -267,6 +363,11 @@ impl Design {
         // partial design reports drift that isn't there and misses drift that is.
         self.ensure_fully_parsed(scope, working_set.as_ref(), None)?;
         let desired_entities = self.entities_in_scope(scope, working_set.as_ref(), None);
+
+        // A reconciled database is the one an apply builds, so reconcile runs
+        // the apply hooks, filtered by scope through apply's own rule.
+        let hook_scope = self.hook_scope(scope, working_set.as_ref());
+        let hook_scope = hook_scope.as_ref().map(|(name, outside)| (*name, outside));
 
         // Desired snapshot (tables + enums, schema-normalized).
         let desired_owned: Vec<Entity> = desired_entities.iter().map(|e| (*e).clone()).collect();
@@ -310,6 +411,9 @@ impl Design {
         // snapshots, matching by canonical expression since Postgres auto-names
         // every CHECK.
         plan_check_convergence(&mut plan, &live_raw, &desired_raw);
+        // EXCLUDE constraints, stripped by canonicalize as CHECKs are, and
+        // matched the same way: by definition, since Postgres names them.
+        plan_exclusion_convergence(&mut plan, &live_raw, &desired_raw);
 
         // Column comments: canonicalize clears these as well, so reconcile could
         // never act on the comment drift `dbd diff` kept reporting. Metadata only,
@@ -321,8 +425,16 @@ impl Design {
         // `0 altered` while `dbd diff` flagged the same drift forever. Plan the
         // type-swap that does converge. Needs the entity list, not just the
         // snapshots: the managed views to drop first come from the dependency
-        // graph, and pass C re-applies them afterwards.
-        plan_enum_recreation(&mut plan, &live, &desired, &desired_owned);
+        // graph, and the write pass re-applies each one at its place in
+        // dependency order — after the enum whose ALTER dropped it. The
+        // snapshots carry their raw indexes back in: the swap rebuilds the ones
+        // that read the column, and canonicalizing stripped them.
+        plan_enum_recreation(
+            &mut plan,
+            &crate::reconcile::with_indexes_of(&live, &live_raw),
+            &crate::reconcile::with_indexes_of(&desired, &desired_raw),
+            &desired_owned,
+        );
 
         // Materialized-view DETECTION (read-only) — done BEFORE the dry_run return
         // so `--dry-run` previews matview creates, restamps, AND drift warnings.
@@ -341,7 +453,29 @@ impl Design {
             .detect_reconcile_matviews(adapter, &desired_entities, &mut plan)
             .await?;
 
+        // A materialized view reading a column an enum swap moves blocks the
+        // swap, and dbd never drops one: refused here, before any write and
+        // under `dry_run`, against what the database has.
+        refuse_enum_swaps_a_matview_blocks(adapter, &plan, &desired_entities).await?;
+
         if dry_run {
+            // Checked as the run checks them, executing none: a hook file that
+            // is missing is a misconfiguration whether or not we write.
+            for (entries, kind) in [
+                (&self.config.apply.before, hooks::HookKind::Before),
+                (&self.config.apply.after, hooks::HookKind::After),
+            ] {
+                hooks::run_hooks(
+                    adapter,
+                    self.hook_source(),
+                    entries,
+                    kind,
+                    hook_scope,
+                    true,
+                    &mut progress,
+                )
+                .await?;
+            }
             return Ok(plan);
         }
 
@@ -353,8 +487,22 @@ impl Design {
 
         ensure_reconcile_not_destructive(&plan, allow_destructive)?;
 
-        // Write passes A–D (see `execute_reconcile_writes`).
-        let summary = self
+        // `apply.before` where apply runs it: after every gate, so a refused
+        // reconcile fires no hook, and before the first write, so a hook can
+        // prepare the ground the DDL lands on.
+        let before = hooks::run_hooks(
+            adapter,
+            self.hook_source(),
+            &self.config.apply.before,
+            hooks::HookKind::Before,
+            hook_scope,
+            false,
+            &mut progress,
+        )
+        .await?;
+
+        // The writes, in dependency order (see `execute_reconcile_writes`).
+        let mut summary = self
             .execute_reconcile_writes(
                 adapter,
                 &plan,
@@ -376,8 +524,24 @@ impl Design {
         // no-op on databases (and non-Postgres targets) without the extension.
         adapter.sync_refresh_jobs(&self.all_matview_jobs()).await?;
 
+        // `apply.after`, once everything it may seed or adjust is in place.
+        let after = hooks::run_hooks(
+            adapter,
+            self.hook_source(),
+            &self.config.apply.after,
+            hooks::HookKind::After,
+            hook_scope,
+            false,
+            &mut progress,
+        )
+        .await?;
+        summary.before_scripts = before.ran;
+        summary.after_scripts = after.ran;
+
         // Stamp the project version so `migrate --status` / `apply` stay consistent.
-        let version = self.config.project.version.unwrap_or(1);
+        // No `project.version` means no migration applied — 0, as `apply`
+        // records. Recording 1 made a dev `reset` refuse as if migrations ran.
+        let version = self.config.project.version.unwrap_or(0);
         adapter
             .set_project_meta(&self.env, version, scope.map(|s| s.name.as_str()))
             .await?;
@@ -423,11 +587,28 @@ impl Design {
     fn refuse_without_a_structured_model(&self, op: &str) -> Result<()> {
         if !self.parser.produces_structure() {
             let dialect = &self.dialect;
+            // What still works depends on whether dbd can connect at all. SQLite
+            // has an adapter; T-SQL and MySQL are read-only — `connect` refuses
+            // them — so pointing those projects at `apply` sent people from
+            // this refusal straight into a "no adapter" one.
+            let what_works = match self.parser {
+                crate::parser::ParserChoice::TSql | crate::parser::ParserChoice::MySql => {
+                    let database = if self.parser == crate::parser::ParserChoice::TSql {
+                        "SQL Server"
+                    } else {
+                        "MySQL"
+                    };
+                    format!(
+                        "dbd has no adapter for {database} either, so nothing can connect to one; \
+                         `inspect`, `graph`, `combine`, `dbml` and `diagram` work offline."
+                    )
+                }
+                _ => "`apply`, `deploy`, `import` and `export` work normally.".to_string(),
+            };
             return Err(DbdError::Config(format!(
                 "{op} needs a structured model, and this project's DDL is not read into one \
                  (source.dialect: {dialect}) — its files give identity and references but no \
-                 columns or constraints, so there is nothing to compare. \
-                 `apply`, `deploy`, `import` and `export` work normally."
+                 columns or constraints, so there is nothing to compare. {what_works}"
             )));
         }
         Ok(())

@@ -15,7 +15,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{Column, Row, SqlitePool};
+use sqlx::{Row, SqlitePool};
 
 use super::{DatabaseAdapter, ProjectMeta, ReferenceClass};
 use crate::entity::{Entity, EntityType};
@@ -214,6 +214,64 @@ impl SqliteAdapter {
         })
     }
 
+    /// Open the database at `url` only if it already exists — `None` when its
+    /// file does not (an in-memory URL names no file, so it is `None` too).
+    ///
+    /// [`Self::new`] creates a missing file, as a run that builds the
+    /// database must. A dry run writes nothing, and asking a database that is
+    /// not there for its guards created it: `reset --dry-run` left an empty
+    /// database file behind. A file that is not there holds nothing to guard.
+    pub async fn open_existing(url: &str, project: &str) -> Result<Option<Self>> {
+        let options: SqliteConnectOptions = url
+            .parse::<SqliteConnectOptions>()
+            .map_err(|e| DbdError::Config(format!("Invalid sqlite URL '{url}': {e}")))?
+            .create_if_missing(false);
+        if !options.get_filename().is_file() {
+            return Ok(None);
+        }
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(options)
+            .await
+            .map_err(|e| DbdError::Config(format!("SQLite connection failed: {e}")))?;
+        Ok(Some(Self {
+            pool,
+            project: project.to_string(),
+        }))
+    }
+
+    /// The triggers on table or view `name`, as `sqlite_master` holds them and
+    /// each runnable twice — what `introspect` writes after the table or view,
+    /// where an authored file keeps its triggers (see [`Entity::triggers`]).
+    ///
+    /// Left out, `merge` rewrote a table file without the trigger written in
+    /// it, though the database still had it. SQLite stores the text it was
+    /// created with, normalised to open with `CREATE TRIGGER` and with any
+    /// `IF NOT EXISTS` removed; it is put back, so applying the file to the
+    /// database it came from does not fail on the trigger.
+    async fn triggers_on(&self, name: &str) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT sql FROM sqlite_master \
+             WHERE type = 'trigger' AND tbl_name = ?1 AND sql IS NOT NULL \
+             ORDER BY name",
+        )
+        .bind(name)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbdError::Config(format!("introspect triggers for {name} failed: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let sql: String = r.get("sql");
+                let sql = sql.trim();
+                match sql.strip_prefix("CREATE TRIGGER ") {
+                    Some(rest) => format!("CREATE TRIGGER IF NOT EXISTS {rest}"),
+                    None => sql.to_string(),
+                }
+            })
+            .collect())
+    }
+
     /// Strip the leading `schema.` from a Postgres-style entity name.
     /// Returns the original string when no `.` is present.
     fn bare_name(name: &str) -> &str {
@@ -342,10 +400,49 @@ impl DatabaseAdapter for SqliteAdapter {
         let data = std::fs::read_to_string(file_path)?;
 
         match format {
-            "csv" | "tsv" => self.import_delimited(&data, table, format == "tsv", null_value).await,
-            "jsonl" => self.import_jsonl(&data, table).await,
+            "csv" | "tsv" => {
+                let records = super::Delimited::new(&data, format == "tsv", file_path);
+                self.import_delimited(records, table, null_value).await
+            }
+            "json" | "jsonl" => {
+                let records = super::json_records(&data, format, file_path)?;
+                self.import_json_records(&records, table).await
+            }
             _ => Err(DbdError::Config(format!("Unsupported sqlite import format: {format}"))),
         }
+    }
+
+    async fn truncate_table(&self, table: &str) -> Result<()> {
+        // SQLite has no `TRUNCATE`; an unfiltered `DELETE` is its equivalent,
+        // and SQLite optimizes it to drop the table's pages wholesale. The
+        // schema is stripped as everywhere else here — SQLite has none.
+        self.execute_script(&format!(
+            "DELETE FROM {}",
+            crate::sql_quote::ident(Self::bare_name(table))
+        ))
+        .await
+    }
+
+    async fn foreign_keys(&self) -> Result<Vec<(String, String)>> {
+        // A key names its table as its DDL wrote it, and SQLite matches table
+        // names without regard to case — so the referenced table is looked up
+        // the same way, and reported by its own name. A key to a table that
+        // does not exist orders nothing, and drops out of the join.
+        let rows = sqlx::query(
+            "SELECT DISTINCT m.name AS referencing, p.name AS referenced \
+             FROM sqlite_master m \
+             JOIN pragma_foreign_key_list(m.name) f \
+             JOIN sqlite_master p ON p.type = 'table' AND p.name = f.\"table\" COLLATE NOCASE \
+             WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%' \
+             ORDER BY 1, 2",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbdError::Config(format!("reading the foreign keys failed: {e}")))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<String, _>("referencing"), r.get::<String, _>("referenced")))
+            .collect())
     }
 
     async fn export_data(&self, entity: &Entity, out_dir: Option<&Path>) -> Result<()> {
@@ -364,24 +461,44 @@ impl DatabaseAdapter for SqliteAdapter {
             )));
         }
 
-        let rows = sqlx::query(&format!("SELECT * FROM {}", crate::sql_quote::ident(table)))
+        // The columns an import can write, in table order — read from the
+        // catalog, not from the first row: an empty table has none, and its
+        // export was a blank line where the header belongs. Generated columns
+        // (`hidden` 2 and 3) are left out: SQLite computes them and refuses a
+        // value for one, so an export holding them could not be imported back.
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_xinfo(?1) WHERE hidden = 0 ORDER BY cid")
+                .bind(table)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| DbdError::Config(format!("reading the columns of {} failed: {e}", entity.name)))?;
+        if columns.is_empty() {
+            return Err(DbdError::Config(format!(
+                "cannot export {}: no such table or view",
+                entity.name
+            )));
+        }
+        let select_list = columns
+            .iter()
+            .map(|c| crate::sql_quote::ident(c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let rows = sqlx::query(&format!("SELECT {select_list} FROM {}", crate::sql_quote::ident(table)))
             .fetch_all(&self.pool)
             .await
             .map_err(|e| DbdError::Config(format!("export query failed: {e}")))?;
-
-        let columns: Vec<String> = rows
-            .first()
-            .map(|row| row.columns().iter().map(|c| c.name().to_string()).collect())
-            .unwrap_or_default();
 
         let mut output = String::new();
         match format {
             "csv" | "tsv" => {
                 let sep = if format == "tsv" { '\t' } else { ',' };
-                output.push_str(&columns.join(&sep.to_string()));
+                let header: Vec<String> = columns.iter().map(|c| delimited_cell(Some(c), sep)).collect();
+                output.push_str(&header.join(&sep.to_string()));
                 output.push('\n');
                 for row in &rows {
-                    let cells: Vec<String> = (0..columns.len()).map(|i| sqlite_cell_to_text(row, i)).collect();
+                    let cells: Vec<String> = (0..columns.len())
+                        .map(|i| delimited_cell(sqlite_cell_to_text(row, i).as_deref(), sep))
+                        .collect();
                     output.push_str(&cells.join(&sep.to_string()));
                     output.push('\n');
                 }
@@ -499,6 +616,7 @@ impl DatabaseAdapter for SqliteAdapter {
             let mut e = Entity::new(EntityType::Table, &name);
             e.schema = None; // SQLite is schema-less
             e.raw_ddl = Some(parts.join(";\n\n"));
+            e.triggers = self.triggers_on(&name).await?;
             entities.push(e);
         }
 
@@ -515,6 +633,7 @@ impl DatabaseAdapter for SqliteAdapter {
             let mut e = Entity::new(EntityType::View, &name);
             e.schema = None;
             e.raw_ddl = Some(sql.trim().to_string());
+            e.triggers = self.triggers_on(&name).await?;
             entities.push(e);
         }
 
@@ -593,41 +712,34 @@ impl DatabaseAdapter for SqliteAdapter {
         Ok(())
     }
 
+    async fn forget_project_meta(&self) -> Result<()> {
+        // No `_dbd_meta` table means nothing was ever recorded to forget; any
+        // other failure is surfaced — a row left behind keeps its prod mark.
+        let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info('_dbd_meta')")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("read _dbd_meta failed: {e}")))?;
+        if exists > 0 {
+            sqlx::query("DELETE FROM _dbd_meta WHERE project = ?1")
+                .bind(&self.project)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| DbdError::Config(format!("clear _dbd_meta failed: {e}")))?;
+        }
+        Ok(())
+    }
+
     async fn ensure_import_procedure(&self) -> Result<()> {
         // No stored procedures in SQLite.
         Ok(())
     }
 
     async fn get_project_meta(&self) -> Result<Option<ProjectMeta>> {
-        // Inspect the table shape via pragma (which returns zero rows for a missing
-        // table — not an error), so we pick the right SELECT and let genuine read
-        // failures surface instead of masking them as "no meta", which would
-        // silently disable the scope AND prod guards.
-        let columns: Vec<String> = sqlx::query_scalar::<_, String>("SELECT name FROM pragma_table_info('_dbd_meta')")
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| DbdError::Config(format!("read _dbd_meta columns failed: {e}")))?;
-        if columns.is_empty() {
-            return Ok(None); // `_dbd_meta` doesn't exist yet — fresh/unmanaged DB
-        }
-        let has_scope = columns.iter().any(|c| c == "scope");
-        let sql = if has_scope {
-            "SELECT project, env, version, scope, updated_at AS applied_at FROM _dbd_meta WHERE project = ?1"
-        } else {
-            "SELECT project, env, version, updated_at AS applied_at FROM _dbd_meta WHERE project = ?1"
-        };
-        let row = sqlx::query(sql)
-            .bind(&self.project)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| DbdError::Config(format!("read _dbd_meta failed: {e}")))?;
-        Ok(row.map(|row| ProjectMeta {
-            project: row.get("project"),
-            env: row.get("env"),
-            version: row.get::<i64, _>("version") as u32,
-            scope: if has_scope { row.try_get("scope").ok() } else { None },
-            applied_at: row.try_get("applied_at").ok(),
-        }))
+        Ok(self.read_meta("project = ?1").await?.into_iter().next())
+    }
+
+    async fn other_projects_meta(&self) -> Result<Vec<ProjectMeta>> {
+        self.read_meta("project <> ?1 ORDER BY project").await
     }
 
     async fn set_project_meta(&self, env: &str, version: u32, scope: Option<&str>) -> Result<()> {
@@ -652,19 +764,77 @@ impl DatabaseAdapter for SqliteAdapter {
 // ── helpers ────────────────────────────────────────────────────
 
 impl SqliteAdapter {
-    async fn import_delimited(&self, data: &str, table: &str, tab: bool, null_value: &str) -> Result<()> {
-        let sep = if tab { '\t' } else { ',' };
-        let mut lines = data.lines();
-        let header_line = match lines.next() {
-            Some(h) if !h.trim().is_empty() => h,
-            _ => return Ok(()),
-        };
-        let columns: Vec<&str> = header_line.split(sep).map(|s| s.trim()).collect();
+    /// The `_dbd_meta` rows `filter` selects — a `WHERE` clause over
+    /// `project`, bound to this project's name as `?1`.
+    ///
+    /// The table's shape is read via pragma (zero rows for a missing table —
+    /// not an error), so the right SELECT is picked and a genuine read failure
+    /// surfaces instead of reading as "no meta", which would silently disable
+    /// the scope AND prod guards.
+    async fn read_meta(&self, filter: &str) -> Result<Vec<ProjectMeta>> {
+        let columns: Vec<String> = sqlx::query_scalar::<_, String>("SELECT name FROM pragma_table_info('_dbd_meta')")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("read _dbd_meta columns failed: {e}")))?;
         if columns.is_empty() {
-            return Ok(());
+            return Ok(Vec::new()); // `_dbd_meta` doesn't exist yet — fresh/unmanaged DB
         }
-        let col_count = columns.len();
-        let cols_clause = columns.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(",");
+        let has_scope = columns.iter().any(|c| c == "scope");
+        let scope = if has_scope { "scope, " } else { "" };
+        let rows = sqlx::query(&format!(
+            "SELECT project, env, version, {scope}updated_at AS applied_at FROM _dbd_meta WHERE {filter}"
+        ))
+        .bind(&self.project)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbdError::Config(format!("read _dbd_meta failed: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|row| ProjectMeta {
+                project: row.get("project"),
+                env: row.get("env"),
+                version: row.get::<i64, _>("version") as u32,
+                scope: if has_scope { row.try_get("scope").ok() } else { None },
+                applied_at: row.try_get("applied_at").ok(),
+            })
+            .collect())
+    }
+
+    /// Load a CSV/TSV file's rows into `table`, each value into the column its
+    /// header names.
+    ///
+    /// Read by [`super::Delimited`], as Postgres reads the same file: each line
+    /// was split on the delimiter and every cell trimmed, so a quoted comma was
+    /// "too many columns" and a quote stayed in the value — a CSV Postgres
+    /// exported could not be imported here. An unquoted field matching
+    /// `null_value` is NULL; a quoted one is a value, as in Postgres's COPY,
+    /// which writes `''` as `""` and NULL as an empty field.
+    /// The columns of `table` declared `BLOB` — the ones an import decodes a
+    /// `\x…` value into bytes for (see [`blob_from_text`]). Judged by the
+    /// declared type, as SQLite's own affinity rule reads `BLOB`, so a text
+    /// column keeps a text that merely looks like hex.
+    async fn blob_columns(&self, table: &str) -> Result<std::collections::HashSet<String>> {
+        let names: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info(?1) WHERE upper(type) LIKE '%BLOB%'")
+                .bind(table)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| DbdError::Config(format!("reading the columns of {table} failed: {e}")))?;
+        Ok(names.into_iter().collect())
+    }
+
+    async fn import_delimited(&self, mut records: super::Delimited<'_>, table: &str, null_value: &str) -> Result<()> {
+        let Some(header) = records.next_record()? else {
+            return Ok(()); // An empty file: no columns, no rows.
+        };
+        let col_count = header.len();
+        let cols_clause = header
+            .iter()
+            .map(|f| crate::sql_quote::ident(&f.value))
+            .collect::<Vec<_>>()
+            .join(",");
+        let blobs = self.blob_columns(table).await?;
+        let is_blob: Vec<bool> = header.iter().map(|f| blobs.contains(&f.value)).collect();
         let batch_rows = batch_row_size(col_count);
 
         let mut tx = self
@@ -674,32 +844,27 @@ impl SqliteAdapter {
             .map_err(|e| DbdError::Config(format!("import begin failed: {e}")))?;
 
         let mut batch: Vec<Vec<Option<String>>> = Vec::with_capacity(batch_rows);
-        for line in lines {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let values: Vec<&str> = line.split(sep).collect();
-            if values.len() != col_count {
+        while let Some(record) = records.next_record()? {
+            if record.len() != col_count {
                 return Err(DbdError::Config(format!(
-                    "csv row has {} columns, expected {col_count}",
-                    values.len()
+                    "{}: the row on line {} has {} field(s), but the header has {col_count}",
+                    records.file().display(),
+                    records.line(),
+                    record.len()
                 )));
             }
-            let row: Vec<Option<String>> = values
-                .iter()
-                .map(|v| {
-                    let t = v.trim();
-                    if t == null_value { None } else { Some(t.to_string()) }
-                })
+            let row: Vec<Option<String>> = record
+                .into_iter()
+                .map(|f| (f.quoted || f.value != null_value).then_some(f.value))
                 .collect();
             batch.push(row);
             if batch.len() >= batch_rows {
-                flush_csv_batch(&mut tx, table, &cols_clause, col_count, &batch).await?;
+                flush_csv_batch(&mut tx, table, &cols_clause, &is_blob, &batch).await?;
                 batch.clear();
             }
         }
         if !batch.is_empty() {
-            flush_csv_batch(&mut tx, table, &cols_clause, col_count, &batch).await?;
+            flush_csv_batch(&mut tx, table, &cols_clause, &is_blob, &batch).await?;
         }
 
         tx.commit()
@@ -708,32 +873,38 @@ impl SqliteAdapter {
         Ok(())
     }
 
-    async fn import_jsonl(&self, data: &str, table: &str) -> Result<()> {
+    async fn import_json_records(&self, records: &[String], table: &str) -> Result<()> {
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| DbdError::Config(format!("import begin failed: {e}")))?;
 
-        // Group consecutive lines with identical column sets into batches so
+        // Group consecutive records with identical column sets into batches so
         // we can flush each group as a single multi-row INSERT. When the
         // column set changes, flush whatever we have and start a new batch.
         let mut current_cols: Option<Vec<String>> = None;
         let mut batch: Vec<Vec<JsonBindable>> = Vec::new();
+        let blobs = self.blob_columns(table).await?;
 
-        for line in data.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
+        for record in records {
             let value: serde_json::Value =
-                serde_json::from_str(line).map_err(|e| DbdError::Config(format!("jsonl parse failed: {e}")))?;
+                serde_json::from_str(record).map_err(|e| DbdError::Config(format!("json parse failed: {e}")))?;
             let obj = value
                 .as_object()
-                .ok_or_else(|| DbdError::Config("jsonl line must be a JSON object".into()))?;
+                .ok_or_else(|| DbdError::Config("a json record must be a JSON object".into()))?;
 
             let cols: Vec<String> = obj.keys().cloned().collect();
-            let row: Vec<JsonBindable> = cols.iter().map(|c| JsonBindable::from(&obj[c])).collect();
+            let row: Vec<JsonBindable> = cols
+                .iter()
+                .map(|c| match &obj[c] {
+                    serde_json::Value::String(text) if blobs.contains(c) => match blob_from_text(text) {
+                        Some(bytes) => JsonBindable::Blob(bytes),
+                        None => JsonBindable::String(text.clone()),
+                    },
+                    value => JsonBindable::from(value),
+                })
+                .collect();
 
             let cols_changed = current_cols.as_ref().is_some_and(|cur| cur != &cols);
             if cols_changed {
@@ -786,17 +957,24 @@ async fn flush_csv_batch(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     table: &str,
     cols_clause: &str,
-    col_count: usize,
+    is_blob: &[bool],
     rows: &[Vec<Option<String>>],
 ) -> Result<()> {
-    let placeholders = multi_row_placeholders(col_count, rows.len());
-    let sql = format!("INSERT INTO \"{table}\" ({cols_clause}) VALUES {placeholders}");
+    let placeholders = multi_row_placeholders(is_blob.len(), rows.len());
+    let sql = format!(
+        "INSERT INTO {} ({cols_clause}) VALUES {placeholders}",
+        crate::sql_quote::ident(table)
+    );
     let mut q = sqlx::query(&sql);
     for row in rows {
-        for cell in row {
-            q = match cell {
-                Some(s) => q.bind(s.clone()),
-                None => q.bind(None::<String>),
+        for (cell, blob) in row.iter().zip(is_blob) {
+            q = match (cell, blob) {
+                (Some(s), true) => match blob_from_text(s) {
+                    Some(bytes) => q.bind(bytes),
+                    None => q.bind(s.clone()),
+                },
+                (Some(s), false) => q.bind(s.clone()),
+                (None, _) => q.bind(None::<String>),
             };
         }
     }
@@ -827,6 +1005,7 @@ async fn flush_jsonl_batch(
                 JsonBindable::Int(i) => q.bind(*i),
                 JsonBindable::Float(f) => q.bind(*f),
                 JsonBindable::String(s) => q.bind(s.clone()),
+                JsonBindable::Blob(b) => q.bind(b.clone()),
                 JsonBindable::Other(s) => q.bind(s.clone()),
             };
         }
@@ -845,6 +1024,8 @@ enum JsonBindable {
     Int(i64),
     Float(f64),
     String(String),
+    /// A `\x…` string bound for a `BLOB` column (see [`blob_from_text`]).
+    Blob(Vec<u8>),
     Other(String),
 }
 
@@ -861,22 +1042,76 @@ impl JsonBindable {
                 }
             }
             serde_json::Value::String(s) => Self::String(s.clone()),
+            // `{"$json": X}` is how a Postgres export writes a json column's
+            // JSON value when it is `null` or itself such an object (see
+            // `import_jsonb_to_table`): unwrapped one level, to X's text, as
+            // any other JSON value lands here.
+            serde_json::Value::Object(map) if map.len() == 1 && map.contains_key("$json") => {
+                Self::Other(map["$json"].to_string())
+            }
             other => Self::Other(other.to_string()),
         }
     }
 }
 
-fn sqlite_cell_to_text(row: &sqlx::sqlite::SqliteRow, idx: usize) -> String {
+/// A cell's text, `None` for NULL — kept apart from `''`, which a delimited
+/// export has to write differently.
+fn sqlite_cell_to_text(row: &sqlx::sqlite::SqliteRow, idx: usize) -> Option<String> {
     if let Ok(v) = row.try_get::<Option<String>, _>(idx) {
-        return v.unwrap_or_default();
+        return v;
     }
     if let Ok(v) = row.try_get::<Option<i64>, _>(idx) {
-        return v.map(|n| n.to_string()).unwrap_or_default();
+        return v.map(|n| n.to_string());
     }
     if let Ok(v) = row.try_get::<Option<f64>, _>(idx) {
-        return v.map(|n| n.to_string()).unwrap_or_default();
+        return v.map(|n| n.to_string());
     }
-    String::new()
+    if let Ok(v) = row.try_get::<Option<Vec<u8>>, _>(idx) {
+        return v.map(|bytes| blob_text(&bytes));
+    }
+    None
+}
+
+/// A BLOB as text: `\x` and its bytes in lowercase hex — what PostgreSQL
+/// writes for a `bytea` and reads back, so a SQLite export loads into a
+/// `bytea` column, and [`blob_from_text`] reads it back into a BLOB. A BLOB
+/// has no text of its own; the cell readers knew only text and numbers, and
+/// wrote every one as NULL.
+fn blob_text(bytes: &[u8]) -> String {
+    let mut text = String::with_capacity(2 + bytes.len() * 2);
+    text.push_str("\\x");
+    for byte in bytes {
+        text.push_str(&format!("{byte:02x}"));
+    }
+    text
+}
+
+/// The bytes [`blob_text`] wrote — `\x` then an even number of hex digits —
+/// or `None` for any other text, which then loads as the text it is.
+fn blob_from_text(text: &str) -> Option<Vec<u8>> {
+    let hex = text.strip_prefix("\\x")?;
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+        .collect()
+}
+
+/// One CSV/TSV field as Postgres's `COPY … CSV` writes it, so the RFC 4180
+/// reader on the other side — this adapter's or Postgres's — reads back what
+/// was there: NULL is an empty field, `''` is `""`, and a value holding the
+/// delimiter, a quote or a line break is quoted with its quotes doubled.
+/// Joined bare, a comma in a value split the row, and NULL and `''` both came
+/// out empty.
+fn delimited_cell(value: Option<&str>, sep: char) -> String {
+    match value {
+        None => String::new(),
+        Some("") => "\"\"".to_string(),
+        Some(v) if v.contains([sep, '"', '\n', '\r']) => format!("\"{}\"", v.replace('"', "\"\"")),
+        Some(v) => v.to_string(),
+    }
 }
 
 fn sqlite_cell_to_json(row: &sqlx::sqlite::SqliteRow, idx: usize) -> serde_json::Value {
@@ -890,6 +1125,11 @@ fn sqlite_cell_to_json(row: &sqlx::sqlite::SqliteRow, idx: usize) -> serde_json:
         && let Some(jn) = serde_json::Number::from_f64(n)
     {
         return serde_json::Value::Number(jn);
+    }
+    // JSON has no bytes: a BLOB is the same `\x…` string PostgreSQL's
+    // `to_json` writes for a `bytea`.
+    if let Ok(Some(bytes)) = row.try_get::<Option<Vec<u8>>, _>(idx) {
+        return serde_json::Value::String(blob_text(&bytes));
     }
     serde_json::Value::Null
 }
@@ -1023,15 +1263,61 @@ mod tests {
         a.set_project_meta("dev", 1, Some("public")).await.unwrap();
         let meta = a.get_project_meta().await.unwrap();
         assert_eq!(meta.as_ref().unwrap().scope.as_deref(), Some("public"));
+        let meta = crate::design::DatabaseMarks::of_own("test", meta);
 
         // Same scope → allowed.
-        assert!(Design::check_scope_guard(meta.as_ref(), "public", false).is_ok());
+        assert!(Design::check_scope_guard(&meta, "public", false).is_ok());
         // Different scope → blocked, message names both scopes.
-        let err = Design::check_scope_guard(meta.as_ref(), "internal", false).unwrap_err();
+        let err = Design::check_scope_guard(&meta, "internal", false).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("public") && msg.contains("internal"), "msg was: {msg}");
         // Bypass → allowed.
-        assert!(Design::check_scope_guard(meta.as_ref(), "internal", true).is_ok());
+        assert!(Design::check_scope_guard(&meta, "internal", true).is_ok());
+    }
+
+    /// `_dbd_meta` is keyed on `project.name` as `dbd.meta` is, and a renamed
+    /// design read a production SQLite database as one it had never seen:
+    /// `reset` with no `--force` dropped its tables. The database holds the
+    /// design's tables and only another name's record of them, so that record
+    /// is the guard's mark.
+    #[tokio::test]
+    async fn s11_a_renamed_project_is_held_to_the_record_its_old_name_left() {
+        use crate::design::{Design, Progress};
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let url = format!("sqlite://{}", dir.join("app.db").display());
+        std::fs::write(dir.join("app.db"), "").unwrap();
+        std::fs::create_dir_all(dir.join("ddl/table")).unwrap();
+        std::fs::write(
+            dir.join("ddl/table/items.ddl"),
+            "CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY);\n",
+        )
+        .unwrap();
+        let design = |name: &str| {
+            std::fs::write(
+                dir.join("design.yaml"),
+                format!("project:\n  name: {name}\nsource:\n  dialect: sqlite\nschemas: []\n"),
+            )
+            .unwrap();
+            Design::from_config_with_dir(&dir.join("design.yaml"), "prod", Some(dir)).unwrap()
+        };
+
+        let alpha = design("alpha");
+        let built = SqliteAdapter::new(&url, "alpha").await.unwrap();
+        alpha
+            .apply(&built, None, false, None, Progress::none())
+            .await
+            .expect("alpha's prod apply");
+
+        let renamed = design("alpha2");
+        let adapter = SqliteAdapter::new(&url, "alpha2").await.unwrap();
+        let err = renamed
+            .reset(&adapter, "sqlite", false, false, false, None)
+            .await
+            .expect_err("the renamed project's unforced reset of a prod database is refused")
+            .to_string();
+        assert!(err.contains("'alpha'") && err.contains("project.name"), "{err}");
+        assert_eq!(built.list_entities().await.unwrap(), vec!["items".to_string()]);
     }
 
     /// A fresh DB with no `_dbd_meta` reads as `None` (not an error) — the pragma
@@ -1150,6 +1436,102 @@ mod tests {
         );
     }
 
+    /// `import.options.truncate` defaults to true, so a default import empties
+    /// each staging table before loading it. That step was issued as Postgres's
+    /// `TRUNCATE "schema"."table"`, which SQLite has no statement for — every
+    /// default import on SQLite failed before a single row loaded.
+    #[tokio::test]
+    async fn the_default_import_empties_a_staging_table_before_loading_it() {
+        use crate::design::{Design, Progress};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("design.yaml"),
+            "project:\n  name: t\nsource:\n  dialect: sqlite\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("import/staging")).unwrap();
+        std::fs::write(dir.path().join("import/staging/items.csv"), "id,name\n1,fresh\n").unwrap();
+        let design = Design::from_config_with_dir(&dir.path().join("design.yaml"), "dev", Some(dir.path())).unwrap();
+        assert!(
+            design.config().import.table_truncate("staging.items"),
+            "precondition: truncate is the default"
+        );
+
+        let a = mem().await;
+        a.execute_script("CREATE TABLE items (id INTEGER, name TEXT); INSERT INTO items VALUES (99, 'stale');")
+            .await
+            .unwrap();
+
+        design
+            .import_data(&a, None, false, None, Progress::none())
+            .await
+            .expect("the default import must run on SQLite");
+
+        let rows: Vec<(i64, String)> = sqlx::query_as("SELECT id, name FROM items ORDER BY id")
+            .fetch_all(&a.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![(1, "fresh".to_string())],
+            "the stale row must be gone and only the file's row loaded"
+        );
+    }
+
+    /// A SQLite project keeps a table's data in `import/<table>.csv` and its
+    /// dev-only rows in `import/dev/<table>.csv`. The dev file was read as a
+    /// table `dev.<table>` that every env loads, and SQLite, having no
+    /// schemas, loaded it into `<table>` — in prod.
+    #[tokio::test]
+    async fn a_prod_import_leaves_a_dev_folders_rows_out() {
+        use crate::design::{Design, Progress};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("design.yaml"),
+            "project:\n  name: t\nsource:\n  dialect: sqlite\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("import/dev")).unwrap();
+        std::fs::write(dir.path().join("import/items.csv"), "id,name\n1,shared\n").unwrap();
+        std::fs::write(dir.path().join("import/dev/items.csv"), "id,name\n2,dev only\n").unwrap();
+
+        let loaded = |env: &'static str| {
+            let dir = dir.path().to_path_buf();
+            async move {
+                let design = Design::from_config_with_dir(&dir.join("design.yaml"), env, Some(&dir)).unwrap();
+                let a = mem().await;
+                a.execute_script("CREATE TABLE items (id INTEGER, name TEXT)")
+                    .await
+                    .unwrap();
+                design
+                    .import_data(&a, None, false, None, Progress::none())
+                    .await
+                    .unwrap();
+                let rows: Vec<(i64, String)> = sqlx::query_as("SELECT id, name FROM items ORDER BY id")
+                    .fetch_all(&a.pool)
+                    .await
+                    .unwrap();
+                (rows, design.import_warnings(None))
+            }
+        };
+
+        let (prod, warnings) = loaded("prod").await;
+        assert_eq!(prod, vec![(1, "shared".to_string())], "prod loads the shared rows only");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("import/dev/") && w.contains("'prod'")),
+            "and says it left the dev file out: {warnings:?}"
+        );
+
+        let (dev, _) = loaded("dev").await;
+        assert_eq!(
+            dev,
+            vec![(1, "shared".to_string()), (2, "dev only".to_string())],
+            "dev loads both"
+        );
+    }
+
     #[tokio::test]
     async fn s10_bare_name_strips_schema() {
         assert_eq!(SqliteAdapter::bare_name("auth.users"), "users");
@@ -1187,6 +1569,148 @@ mod tests {
         assert!(body.contains("1,alice"), "row missing: {body}");
     }
 
+    /// The header came from the first row, so an empty table wrote an empty
+    /// line — a file no import can read as the table's columns. Postgres's
+    /// COPY writes the header either way.
+    #[tokio::test]
+    async fn an_empty_table_exports_its_header() {
+        let a = mem().await;
+        a.execute_script("CREATE TABLE empty_t (id INTEGER, label TEXT)")
+            .await
+            .unwrap();
+        for (format, header) in [("csv", "id,label\n"), ("tsv", "id\tlabel\n")] {
+            let mut entity = Entity::new(EntityType::Table, "empty_t");
+            entity.format = Some(format.to_string());
+            let out = tempfile::tempdir().unwrap();
+            a.export_data(&entity, Some(out.path())).await.unwrap();
+            let body = std::fs::read_to_string(out.path().join(format!("empty_t.{format}"))).unwrap();
+            assert_eq!(body, header, "{format}");
+        }
+    }
+
+    /// An import names its tables in load order — a referenced table before
+    /// one that references it — and SQLite enforces foreign keys on dbd's
+    /// connections, so emptying them in that order deleted the parent's rows
+    /// out from under the child's key and failed. They are emptied the other
+    /// way round, the referencing table first.
+    #[tokio::test]
+    async fn tables_linked_by_a_foreign_key_are_emptied_referencing_table_first() {
+        let a = mem().await;
+        a.execute_script(
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY); \
+             CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent (id)); \
+             INSERT INTO parent VALUES (1); INSERT INTO child VALUES (1, 1);",
+        )
+        .await
+        .unwrap();
+        a.truncate_tables(&["parent".to_string(), "child".to_string()])
+            .await
+            .expect("both empty");
+        let left: i64 = sqlx::query_scalar("SELECT (SELECT count(*) FROM parent) + (SELECT count(*) FROM child)")
+            .fetch_one(&a.pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0);
+    }
+
+    /// A BLOB has no text, and the export's cell readers knew only text and
+    /// numbers, so every BLOB was written as NULL — the file imported back
+    /// without its binary data, in every format. A BLOB is written as `\x`
+    /// and its bytes in hex — what PostgreSQL writes for a `bytea` and reads
+    /// back — and an import decodes that form into a BLOB for a column
+    /// declared `BLOB`, so the round trip is exact; an empty BLOB stays empty,
+    /// NULL stays NULL, and a text column keeps a text that looks like hex.
+    #[tokio::test]
+    async fn a_blob_survives_an_export_and_import_in_every_format() {
+        const DDL: &str = "CREATE TABLE files (id INTEGER PRIMARY KEY, data BLOB, note TEXT)";
+        let a = mem().await;
+        a.execute_script(DDL).await.unwrap();
+        a.execute_script("INSERT INTO files VALUES (1, x'00ff10', 'bytes'), (2, x'', 'empty'), (3, NULL, '\\x00ff')")
+            .await
+            .unwrap();
+        let rows = |pool: &sqlx::SqlitePool| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_as::<_, (i64, Option<Vec<u8>>, String, Option<String>)>(
+                    "SELECT id, data, typeof(data), note FROM files ORDER BY id",
+                )
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let expected = rows(&a.pool).await;
+        assert_eq!(expected[0].1.as_deref(), Some(&[0x00, 0xff, 0x10][..]));
+
+        for format in ["csv", "tsv", "jsonl"] {
+            let mut entity = Entity::new(EntityType::Table, "files");
+            entity.format = Some(format.to_string());
+            let out = tempfile::tempdir().unwrap();
+            a.export_data(&entity, Some(out.path())).await.unwrap();
+            let file = out.path().join(format!("files.{format}"));
+            let body = std::fs::read_to_string(&file).unwrap();
+            assert!(
+                body.contains("\\x00ff10"),
+                "{format}: the bytes, as PostgreSQL writes a bytea: {body}"
+            );
+
+            let b = mem().await;
+            b.execute_script(DDL).await.unwrap();
+            entity.file = Some(file);
+            b.import_data(&entity, "", false)
+                .await
+                .unwrap_or_else(|e| panic!("{format}: import failed: {e}"));
+            assert_eq!(rows(&b.pool).await, expected, "{format}: the rows exported\n{body}");
+        }
+    }
+
+    /// A generated column is computed, and SQLite refuses a value for one
+    /// ("cannot INSERT into generated column"), so an export that wrote it
+    /// could not be imported back. The export writes what an import can, and
+    /// the import recomputes the rest.
+    #[tokio::test]
+    async fn an_export_leaves_out_generated_columns_and_imports_back() {
+        const DDL: &str = "CREATE TABLE g (id INTEGER PRIMARY KEY, a INTEGER, \
+                           b INTEGER GENERATED ALWAYS AS (a * 2) STORED, \
+                           c INTEGER GENERATED ALWAYS AS (a * 3) VIRTUAL)";
+        let a = mem().await;
+        a.execute_script(DDL).await.unwrap();
+        a.execute_script("INSERT INTO g (id, a) VALUES (1, 10), (2, 20)")
+            .await
+            .unwrap();
+
+        for format in ["csv", "tsv", "jsonl"] {
+            let mut entity = Entity::new(EntityType::Table, "g");
+            entity.format = Some(format.to_string());
+            let out = tempfile::tempdir().unwrap();
+            a.export_data(&entity, Some(out.path())).await.unwrap();
+            let file = out.path().join(format!("g.{format}"));
+            let body = std::fs::read_to_string(&file).unwrap();
+            let first = body.lines().next().unwrap_or_default();
+            match format {
+                "csv" => assert_eq!(first, "id,a", "only the columns an import can write"),
+                "tsv" => assert_eq!(first, "id\ta", "only the columns an import can write"),
+                _ => assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(first).unwrap(),
+                    serde_json::json!({"id": 1, "a": 10}),
+                    "jsonl: only the columns an import can write"
+                ),
+            }
+
+            let b = mem().await;
+            b.execute_script(DDL).await.unwrap();
+            entity.file = Some(file);
+            b.import_data(&entity, "", false)
+                .await
+                .unwrap_or_else(|e| panic!("{format}: the export imports back: {e}"));
+            let rows: Vec<(i64, i64, i64, i64)> = sqlx::query_as("SELECT id, a, b, c FROM g ORDER BY id")
+                .fetch_all(&b.pool)
+                .await
+                .unwrap();
+            assert_eq!(rows, vec![(1, 10, 20, 30), (2, 20, 40, 60)], "{format}");
+        }
+    }
+
     #[test]
     fn s11_builtins_sorted_for_binary_search() {
         // binary_search relies on alphabetical order — guard against typos
@@ -1222,6 +1746,153 @@ mod tests {
     fn s14_multi_row_placeholders_shape() {
         assert_eq!(multi_row_placeholders(3, 1), "(?,?,?)");
         assert_eq!(multi_row_placeholders(2, 3), "(?,?),(?,?),(?,?)");
+    }
+
+    // ── CSV/TSV is read as CSV ───────────────────────────────────────────────
+
+    /// Load `body` as a `format` data file into `t (id INTEGER, v TEXT)`, and
+    /// read every row back in id order.
+    async fn load_delimited(format: &str, body: &str, null_value: &str) -> Result<Vec<(i64, Option<String>)>> {
+        let a = mem().await;
+        a.execute_script("CREATE TABLE t (id INTEGER, v TEXT)").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("t.{format}"));
+        std::fs::write(&path, body).unwrap();
+        let mut entity = Entity::new(EntityType::Import, "staging.t");
+        entity.file = Some(path);
+        entity.format = Some(format.to_string());
+        a.import_data(&entity, null_value, false).await?;
+        Ok(
+            sqlx::query_as::<_, (i64, Option<String>)>("SELECT id, v FROM t ORDER BY id")
+                .fetch_all(&a.pool)
+                .await
+                .unwrap(),
+        )
+    }
+
+    fn rows(expected: &[(i64, Option<&str>)]) -> Vec<(i64, Option<String>)> {
+        expected.iter().map(|(id, v)| (*id, v.map(str::to_string))).collect()
+    }
+
+    /// A SQLite export imports back to the same values. Cells were joined with
+    /// the delimiter unquoted, so a comma, quote or line break in a value broke
+    /// the row, and NULL and `''` both came out empty. Written as Postgres
+    /// writes CSV — quoted where needed, NULL empty, `''` as `""` — the RFC 4180
+    /// reader on the other side gets back what was there.
+    #[tokio::test]
+    async fn a_csv_export_imports_back_to_the_same_values() {
+        let expected = rows(&[
+            (1, Some("Japan, Nippon")),
+            (2, Some("say \"hi\"")),
+            (3, Some("two\nlines")),
+            (4, Some("  padded  ")),
+            (5, Some("")),
+            (6, None),
+        ]);
+        let a = mem().await;
+        a.execute_script("CREATE TABLE t (id INTEGER, v TEXT)").await.unwrap();
+        for (id, v) in &expected {
+            sqlx::query("INSERT INTO t (id, v) VALUES (?, ?)")
+                .bind(id)
+                .bind(v)
+                .execute(&a.pool)
+                .await
+                .unwrap();
+        }
+        let mut entity = Entity::new(EntityType::Table, "default.t");
+        entity.format = Some("csv".to_string());
+        let out = tempfile::tempdir().unwrap();
+        a.export_data(&entity, Some(out.path())).await.unwrap();
+        let body = std::fs::read_to_string(out.path().join("t.csv")).unwrap();
+
+        let got = load_delimited("csv", &body, "").await.expect("the export must import");
+        assert_eq!(got, expected, "{body}");
+    }
+
+    /// RFC 4180: a quoted field may hold the delimiter, a doubled quote and a
+    /// line break, and nothing is trimmed. Each line was split on commas and
+    /// every cell trimmed — a quoted comma was "too many columns", quotes were
+    /// kept in the value, and padding was lost — so a CSV Postgres exported
+    /// could not be imported here.
+    #[tokio::test]
+    async fn a_csv_is_read_as_rfc_4180() {
+        let got = load_delimited(
+            "csv",
+            "id,v\n1,\"Japan, Nippon\"\n2,\"say \"\"hi\"\"\"\n3,\"two\nlines\"\n4,  padded  \n",
+            "",
+        )
+        .await
+        .expect("import failed");
+        assert_eq!(
+            got,
+            rows(&[
+                (1, Some("Japan, Nippon")),
+                (2, Some("say \"hi\"")),
+                (3, Some("two\nlines")),
+                (4, Some("  padded  ")),
+            ])
+        );
+    }
+
+    /// RFC 4180 ends lines with CRLF; a `\r` is not part of the last value.
+    #[tokio::test]
+    async fn a_crlf_csv_loads_without_its_carriage_returns() {
+        let got = load_delimited("csv", "id,v\r\n1,a\r\n2,\"b\"\r\n", "")
+            .await
+            .expect("import failed");
+        assert_eq!(got, rows(&[(1, Some("a")), (2, Some("b"))]));
+    }
+
+    /// Quoting is how CSV tells an empty string from NULL: Postgres's COPY
+    /// writes NULL as an empty unquoted field and `''` as `""`, and reads them
+    /// back that way. An unquoted field matching `null_value` is NULL; a quoted
+    /// one is always a value — under the default sentinel and a configured one.
+    #[tokio::test]
+    async fn a_quoted_field_is_a_value_never_null() {
+        let got = load_delimited("csv", "id,v\n1,\n2,\"\"\n", "")
+            .await
+            .expect("import failed");
+        assert_eq!(got, rows(&[(1, None), (2, Some(""))]));
+
+        let got = load_delimited("csv", "id,v\n1,\\N\n2,\"\\N\"\n3,\n", "\\N")
+            .await
+            .expect("import failed");
+        assert_eq!(got, rows(&[(1, None), (2, Some("\\N")), (3, Some(""))]));
+    }
+
+    /// A TSV is the same format with a tab between fields, so a quoted field
+    /// may hold a tab.
+    #[tokio::test]
+    async fn a_tsv_field_may_quote_a_tab() {
+        let got = load_delimited("tsv", "id\tv\n1\t\"a\tb\"\n2\t c \n", "")
+            .await
+            .expect("import failed");
+        assert_eq!(got, rows(&[(1, Some("a\tb")), (2, Some(" c "))]));
+    }
+
+    /// A quote left open runs to the end of the file: loading it would put
+    /// every row after it into one value. Refused, saying where it opened, and
+    /// nothing is loaded.
+    #[tokio::test]
+    async fn an_unterminated_quote_is_refused() {
+        let err = load_delimited("csv", "id,v\n1,a\n2,\"open\n3,c\n", "")
+            .await
+            .expect_err("an unterminated quote must be refused")
+            .to_string();
+        assert!(err.contains("quote") && err.contains("line 3"), "{err}");
+    }
+
+    /// A row with more or fewer fields than the header is refused, saying which.
+    #[tokio::test]
+    async fn a_row_with_the_wrong_field_count_is_refused() {
+        let err = load_delimited("csv", "id,v\n1,a\n2,b,c\n", "")
+            .await
+            .expect_err("a ragged row must be refused")
+            .to_string();
+        assert!(
+            err.contains("line 3") && err.contains('3') && err.contains('2'),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -1309,6 +1980,84 @@ mod tests {
             .unwrap();
         let score: Option<f64> = r.try_get("score").unwrap();
         assert_eq!(score, None);
+    }
+
+    /// A Postgres JSONL export writes a json column's JSON `null` as
+    /// `{"$json": null}`, and wraps a value that is itself a one-key `$json`
+    /// object the same way. SQLite has no json type: a JSON value lands as its
+    /// text, so the wrapper must come off one level here as it does on
+    /// Postgres — or SQLite stores the encoding instead of the value.
+    #[tokio::test]
+    async fn a_json_value_written_as_dollar_json_lands_as_its_own_text() {
+        use std::io::Write;
+        let a = mem().await;
+        a.execute_script("CREATE TABLE docs (id INTEGER, j TEXT)")
+            .await
+            .unwrap();
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tmp, r#"{{"id":1,"j":{{"$json":null}}}}"#).unwrap();
+        writeln!(tmp, r#"{{"id":2,"j":{{"$json":{{"$json":5}}}}}}"#).unwrap();
+        writeln!(tmp, r#"{{"id":3,"j":{{"a":1}}}}"#).unwrap();
+        writeln!(tmp, r#"{{"id":4,"j":null}}"#).unwrap();
+        let mut entity = Entity::new(EntityType::Import, "default.docs");
+        entity.file = Some(tmp.path().to_path_buf());
+        entity.format = Some("jsonl".to_string());
+        a.import_data(&entity, "", false).await.unwrap();
+
+        let rows: Vec<(i64, Option<String>)> = sqlx::query_as("SELECT id, j FROM docs ORDER BY id")
+            .fetch_all(&a.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (1, Some("null".to_string())),
+                (2, Some(r#"{"$json":5}"#.to_string())),
+                (3, Some(r#"{"a":1}"#.to_string())),
+                (4, None),
+            ]
+        );
+    }
+
+    /// Load `body` as a `json`-format file into a fresh `people` table and
+    /// return its rows.
+    async fn import_json(body: &str) -> Result<Vec<(i64, String)>> {
+        let a = mem().await;
+        a.execute_script("CREATE TABLE people (id INTEGER, name TEXT)")
+            .await
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("people.json");
+        std::fs::write(&path, body).unwrap();
+        let mut entity = Entity::new(EntityType::Import, "default.people");
+        entity.file = Some(path);
+        entity.format = Some("json".to_string());
+        a.import_data(&entity, "", false).await?;
+        Ok(sqlx::query_as("SELECT id, name FROM people ORDER BY id")
+            .fetch_all(&a.pool)
+            .await
+            .unwrap())
+    }
+
+    /// A `.json` file is what most tools mean by one — Convex's importer
+    /// included: a JSON array of records. The scanner has always picked `.json`
+    /// files out of `import/`, and SQLite refused every one of them.
+    #[tokio::test]
+    async fn a_json_array_file_imports_one_row_per_record() {
+        let rows = import_json("[\n  {\"id\": 1, \"name\": \"alpha\"},\n  {\"id\": 2, \"name\": \"beta\"}\n]\n")
+            .await
+            .expect("a JSON array must import");
+        assert_eq!(rows, vec![(1, "alpha".to_string()), (2, "beta".to_string())]);
+    }
+
+    /// Postgres has always read a `.json` file as JSON lines; that shape must
+    /// keep working, and work the same here.
+    #[tokio::test]
+    async fn a_json_file_of_json_lines_still_imports() {
+        let rows = import_json("{\"id\": 1, \"name\": \"alpha\"}\n{\"id\": 2, \"name\": \"beta\"}\n")
+            .await
+            .expect("JSON lines in a .json file must import");
+        assert_eq!(rows, vec![(1, "alpha".to_string()), (2, "beta".to_string())]);
     }
 
     #[tokio::test]

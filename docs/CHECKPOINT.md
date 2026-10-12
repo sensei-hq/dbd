@@ -1,32 +1,34 @@
 # Checkpoint
 
-**Slice:** #40 fixed on `develop` (`98480df`) — `reconcile --prune --scope` no
-longer drops the project's own out-of-scope tables. Not yet on `main` or released.
+**Slice:** 0.25.0 release — PR #45 (`develop` → `main`).
 
 ## Done
 
-- v0.24.0 released and verified (crates.io, `main` `d36902c`).
-- #40: `declared_out_of_scope` + `hide_declared` in reconcile and diff_live;
-  3 embedded-PG tests (scoped reconcile, scoped diff, unscoped control).
-- Docs: guide 04, llms.txt, llms-full.txt; CHANGELOG [Unreleased] Fixed entry.
-
-## Verified
-
-    embedded suite 55/55 · workspace 1635/0 · clippy 1.99 --all-features
-    PR #42 green on every check (incl. the embedded CI job)
+- PR #44 merged into `develop` (`6fccb0ff`). Release notes `99edd363`;
+  `make bump minor` → `6d7769d9`, annotated tag `v0.25.0`.
+- `release.yml` run 38253359492 green on the tagged tree (tests, clippy, fmt,
+  `cargo doc`, publish). `dbd-core` and `dbd-cli` 0.25.0 are on crates.io.
+- Shipped artifact verified: `cargo install dbd-cli --version 0.25.0 --locked`
+  refuses `-e staging`; `emit --dialect tsql` puts `CREATE SCHEMA` and
+  `CREATE VIEW` in `GO` batches of their own and keeps key names; MySQL gets
+  `LONGTEXT` and reports the `PRIMARY` rename.
+- History rewritten earlier (2026-10-12): every author, committer and tagger is
+  Jerry Thomas <me@jerrythomas.name>. Backup:
+  `~/Developer/dbd-backup-2026-10-12-pre-author-rewrite.bundle`.
 
 ## Next
 
-    # if releasing the fix: cut 0.24.1 (patch) per the Release Checklist —
-    # PR develop → main (closes #40), then `make bump` on develop
+    gh pr checks 45 --watch    # all green → merge #45 → main CI + Workers production build
 
-## Open questions
+## Open
 
-- Cut 0.24.1 for #40 (data loss in released versions)?
-- #7: keep for separately-maintained designs on one DB, or close in favour of
-  "one design + scopes" now that #40 makes scopes safe?
+- Cloudflare "Workers Builds: dbd" failed on `6fccb0ff`, `99edd363` and
+  `6d7769d9`. `6fccb0ff`'s tree is identical to `c932b65d`, which built; a
+  clean local `CF_PAGES=1 bun run build` at `6fccb0ff` passes, as does CI's
+  site build. The cause is Cloudflare-side; its log is only in the dashboard
+  (build `df5a6e58-bfdc-4466-9c04-74580ef4437a`).
 
-## Known-broken / upstream
+## Known limits
 
-- History has no views/routines: snapshots hold tables and enums only.
-- Snapshots cut before inline FKs were recorded show a one-time FK "change".
+- CHANGELOG Known limitations; `docs/BACKLOG.md` (0.25.1).
+- Local `make _check-ci` does not run `cargo doc`; CI does (once per push).

@@ -659,12 +659,69 @@ mod tests {
         );
     }
 
+    /// A file may set the path more than once. Its entity's CREATE runs on the
+    /// last path set before it, and Postgres resolves the CREATE's names
+    /// there — but the entity took the first path the file set, so a migration
+    /// of it ran on that path (a `data.sql` naming its table bare failed with
+    /// `relation "people" does not exist`) and its references were read on it.
+    /// A path set after the CREATE changes nothing.
+    #[test]
+    fn an_entity_takes_the_search_path_in_effect_at_its_create() {
+        for (file, sql) in [
+            (
+                "ddl/table/app/people.ddl",
+                "set search_path to public;\nset search_path to app;\n\
+                 create table if not exists people (id int primary key);\n",
+            ),
+            (
+                "ddl/view/app/recent.ddl",
+                "set search_path to public;\nset search_path to app;\n\
+                 create or replace view recent as select id from people;\n",
+            ),
+            (
+                "ddl/function/app/headcount.ddl",
+                "set search_path to public;\nset search_path to app;\n\
+                 create or replace function headcount() returns bigint language sql \
+                 as $$ select count(*) from people $$;\n",
+            ),
+            (
+                "ddl/enum/app/mood.ddl",
+                "set search_path to public;\nset search_path to app;\ncreate type mood as enum ('ok');\n",
+            ),
+            (
+                "ddl/table/app/notes.ddl",
+                "set search_path to app;\ncreate table if not exists notes (id int primary key);\n\
+                 set search_path to public;\ncreate index if not exists notes_id on app.notes (id);\n",
+            ),
+        ] {
+            let entity = parse_entity(Path::new(file), sql).unwrap();
+            assert!(entity.errors.is_empty(), "{file}: {:?}", entity.errors);
+            assert_eq!(
+                entity.schema_path.schemas().collect::<Vec<_>>(),
+                vec!["app"],
+                "{file} runs its CREATE on app"
+            );
+        }
+        let function = parse_entity(
+            Path::new("ddl/function/app/headcount.ddl"),
+            "set search_path to public;\nset search_path to app;\n\
+             create or replace function headcount() returns bigint language sql \
+             as $$ select count(*) from people $$;\n",
+        )
+        .unwrap();
+        assert!(
+            function.reads().any(|r| r.name == "app.people"),
+            "its body's names are read on app: {:?}",
+            function.reads().collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn table_sqlparser_cannot_read_still_errors() {
         let entity = parse_entity(
-            Path::new("ddl/table/app/excl.ddl"),
+            Path::new("ddl/table/app/inherits.ddl"),
             "set search_path to app;\n\
-             create table excl (id int primary key, r int4range, exclude using gist (r with &&));",
+             create table inherits (id int primary key) inherits (app.base);",
         )
         .unwrap();
         assert!(

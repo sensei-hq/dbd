@@ -19,19 +19,22 @@ export const OVERVIEW_ICONS = {
   function: DEFAULT_ICONS.function,
   procedure: DEFAULT_ICONS.procedure,
   trigger: DEFAULT_ICONS.trigger,
+  /** @rokkit/graph has no sequence glyph; a number field is what one hands out. */
+  sequence: 'i-glyph:input-number',
   enums: DEFAULT_ICONS.enum,
   /** The diagram's foreign-key row badge. */
   references: DEFAULT_ICONS.fk,
   database: 'i-glyph:database',
 } as const;
 
-/** v2 entity kinds, in reading order: derived data, then behaviour. */
+/** Entity kinds, in reading order: derived data, behaviour, then the sequences tables draw on. */
 const ENTITY_KINDS = [
   ['view', 'View', 'Views'],
   ['materialized_view', 'Materialized view', 'Materialized views'],
   ['function', 'Function', 'Functions'],
   ['procedure', 'Procedure', 'Procedures'],
   ['trigger', 'Trigger', 'Triggers'],
+  ['sequence', 'Sequence', 'Sequences'],
 ] as const;
 
 export type Count = { key: string; count: number; label: string; icon: string };

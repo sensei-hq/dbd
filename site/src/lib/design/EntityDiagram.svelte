@@ -19,7 +19,7 @@
   import { Neighborhood } from '@rokkit/graph';
   import { toGraphInput } from '@rokkit/graph/schema';
   import { vibe } from '@rokkit/states';
-  import type { SchemaModel } from '$lib/design/model';
+  import { withStubs, type SchemaModel } from '$lib/design/model';
 
   let {
     model,
@@ -27,7 +27,7 @@
     onNav,
   }: { model: SchemaModel; entityKey: string; onNav: (key: string) => void } = $props();
 
-  const input = $derived(toGraphInput(model, 'er'));
+  const input = $derived(toGraphInput(withStubs(model), 'er'));
   const mode = $derived<'light' | 'dark'>(vibe.mode === 'dark' ? 'dark' : 'light');
 </script>
 

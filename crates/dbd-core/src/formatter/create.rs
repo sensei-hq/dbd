@@ -9,20 +9,21 @@ pub(in crate::formatter) fn format_create_table(
     original: &str,
     config: &FormatConfig,
 ) -> String {
-    let mut out = String::new();
-
-    // Header: create table [if not exists] <name>
-    let kw = |s: &str| match config.keyword_case {
-        KeywordCase::Lower => s.to_lowercase(),
-        KeywordCase::Upper => s.to_uppercase(),
-        KeywordCase::Preserve => s.to_string(),
+    // What lies outside the column list is written as the statement has it:
+    // the layout wrote `create table [if not exists] <name>` and nothing
+    // after `)`, so a quoted name lost its case, and `temp`, `unlogged`,
+    // `with (…)`, `partition by …`, `inherits (…)` and `tablespace …` were
+    // dropped — and every such table kept as written.
+    // A table with no column list — `partition of u for values from (1)
+    // to (10)`, `of mytype` — has nothing to lay out, and its first `(` is
+    // not a column list.
+    let around = (!ct.columns.is_empty() || !ct.constraints.is_empty())
+        .then(|| around_column_list(original))
+        .flatten();
+    let Some((header, tail)) = around else {
+        return ensure_semicolon(&apply_keyword_case(original, &config.keyword_case));
     };
-
-    out.push_str(&kw("CREATE TABLE"));
-    if ct.if_not_exists {
-        out.push_str(&format!(" {}", kw("IF NOT EXISTS")));
-    }
-    out.push_str(&format!(" {} (\n", ct.name.to_string().to_lowercase()));
+    let mut out = format!("{header} (\n");
 
     // Build each column/constraint line (in source-emit order: columns first),
     // then interleave the inline comments sqlparser discarded.
@@ -50,8 +51,61 @@ pub(in crate::formatter) fn format_create_table(
     let indent = " ".repeat(config.indent);
     emit_table_items(&mut out, &item_lines, original, &indent);
 
-    out.push_str(");");
+    out.push(')');
+    if !tail.is_empty() {
+        out.push(' ');
+        out.push_str(&tail);
+    }
+    out.push(';');
     out
+}
+
+/// The text of a `CREATE TABLE` before its column list's `(` and after its
+/// `)` — `create unlogged table if not exists app."T"`, `with (fillfactor =
+/// 70)` — each as the statement writes it, with its unquoted names in lower
+/// case as the layout writes the columns' and the space between its tokens
+/// settled to one (a line break after a `--` comment). `None` when the
+/// statement has no column list to find.
+fn around_column_list(original: &str) -> Option<(String, String)> {
+    use pg_query::protobuf::Token as Kind;
+    let tokens = lex(original)?;
+    // The column list opens at the first `(`: a table name carries none.
+    let open = tokens.iter().position(|t| t.kind == Kind::Ascii40)?;
+    let mut depth = 0usize;
+    let close = open
+        + tokens[open..].iter().position(|t| {
+            match t.kind {
+                Kind::Ascii40 => depth += 1,
+                Kind::Ascii41 => depth -= 1,
+                _ => {}
+            }
+            depth == 0
+        })?;
+    let end = tokens
+        .iter()
+        .rposition(|t| t.kind != Kind::Ascii59 && !t.is_comment())?;
+    let keywords = keyword_flags(original, &tokens);
+    let written = |range: std::ops::Range<usize>| {
+        let mut out = String::new();
+        for i in range.clone() {
+            let t = &tokens[i];
+            if i > range.start && t.start > tokens[i - 1].end {
+                out.push(if tokens[i - 1].kind == Kind::SqlComment {
+                    '\n'
+                } else {
+                    ' '
+                });
+            }
+            let text = t.text(original);
+            if t.is_word(original) && !keywords[i] {
+                out.push_str(&text.to_lowercase());
+            } else {
+                out.push_str(text);
+            }
+        }
+        out
+    };
+    Some((written(0..open), written(close + 1..(end + 1).max(close + 1))))
 }
 
 /// Emit each column/constraint line into `out`, re-attaching captured inline
@@ -104,138 +158,70 @@ pub(in crate::formatter) struct ItemComments {
 
 /// Extract inline comments from a `CREATE TABLE` column list, one [`ItemComments`]
 /// per top-level (comma-separated) item, in source order. Returns `None` if the
-/// column-list parentheses can't be located. sqlparser discards comments, so this
-/// recovers them from the raw text; the caller only uses the result when it lines
-/// up 1:1 with the parsed items and otherwise keeps the original text verbatim.
+/// column list cannot be located. sqlparser discards comments, so this recovers
+/// them from the text — read as libpg_query's scanner reads it, so a `--`, a
+/// `,` or a `)` inside a string of any kind or a quoted identifier is neither a
+/// comment nor a boundary. The caller only uses the result when it lines up 1:1
+/// with the parsed items and otherwise keeps the original text verbatim.
+///
+/// Within each item, a comment before any code is `leading`; one after code is
+/// `trailing`. A comment after an item's comma on the comma's own line is
+/// that item's trailing comment too — `id int,  -- the id` documents `id`,
+/// and is how the trailing-comma layout writes one. Read as the next item's,
+/// it moved to a line of its own on every second pass.
 pub(in crate::formatter) fn extract_item_comments(original: &str) -> Option<Vec<ItemComments>> {
-    Some(segment_item_comments(table_body(original)?))
-}
-
-/// The text inside a `CREATE TABLE`'s outermost `( … )` column list (exclusive of
-/// the parentheses), or `None` if it can't be located. Skips string literals,
-/// quoted identifiers, and comments while finding the opener and its match.
-pub(in crate::formatter) fn table_body(sql: &str) -> Option<&str> {
-    let bytes = sql.as_bytes();
-    let mut i = 0;
-
-    // Find the column-list opener: the first top-level '(' that is not inside a
-    // string/identifier/comment (a table name carries no parens).
-    let open = loop {
-        if i >= bytes.len() {
-            return None;
-        }
-        match bytes[i] {
-            b'\'' => i = scan_single_quoted(bytes, i),
-            b'"' => i = scan_double_quoted(bytes, i),
-            b'-' if bytes.get(i + 1) == Some(&b'-') => i = scan_line_comment(bytes, i),
-            b'/' if bytes.get(i + 1) == Some(&b'*') => i = scan_block_comment(bytes, i),
-            b'(' => break i,
-            _ => i += 1,
-        }
-    };
-
-    // Scan to the matching close paren, tracking depth (and skipping the same
-    // string/comment regions so a ')' inside them doesn't close early).
-    let mut depth = 0i32;
-    let mut j = open;
-    while j < bytes.len() {
-        match bytes[j] {
-            b'\'' => {
-                j = scan_single_quoted(bytes, j);
-                continue;
-            }
-            b'"' => {
-                j = scan_double_quoted(bytes, j);
-                continue;
-            }
-            b'-' if bytes.get(j + 1) == Some(&b'-') => {
-                j = scan_line_comment(bytes, j);
-                continue;
-            }
-            b'/' if bytes.get(j + 1) == Some(&b'*') => {
-                j = scan_block_comment(bytes, j);
-                continue;
-            }
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(&sql[open + 1..j]);
-                }
-            }
-            _ => {}
-        }
-        j += 1;
-    }
-    None
-}
-
-/// Split a column-list body into per-item comments at top-level commas. Within
-/// each item, a comment before any code is `leading`; one after code is
-/// `trailing`. Skips string literals and quoted identifiers so a `--`/`,` inside
-/// them is not mistaken for a comment or an item boundary.
-pub(in crate::formatter) fn segment_item_comments(body: &str) -> Vec<ItemComments> {
-    let bytes = body.as_bytes();
+    use pg_query::protobuf::Token as Kind;
+    let tokens = lex(original)?;
+    // The column list opens at the first `(`: a table name carries none.
+    let open = tokens.iter().position(|t| t.kind == Kind::Ascii40)?;
     let mut items: Vec<ItemComments> = Vec::new();
     let mut cur = ItemComments::default();
     let mut seen_code = false;
-    let mut depth = 0i32;
-    let mut i = 0;
-
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\'' => {
-                seen_code = true;
-                i = scan_single_quoted(bytes, i);
-            }
-            b'"' => {
-                seen_code = true;
-                i = scan_double_quoted(bytes, i);
-            }
-            b'-' if bytes.get(i + 1) == Some(&b'-') => {
-                let end = scan_line_comment(bytes, i);
-                let text = body[i..end].trim_end().to_string();
-                if seen_code {
-                    cur.trailing.push(text);
-                } else {
-                    cur.leading.push(text);
-                }
-                i = end;
-            }
-            b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                let end = scan_block_comment(bytes, i);
-                let text = body[i..end].trim().to_string();
-                if seen_code {
-                    cur.trailing.push(text);
-                } else {
-                    cur.leading.push(text);
-                }
-                i = end;
-            }
-            b'(' => {
+    let mut depth = 1usize;
+    // Where the last item-ending comma (or a comment after it on its line)
+    // ended, while nothing but those has followed it on that line.
+    let mut after_comma: Option<usize> = None;
+    for token in &tokens[open + 1..] {
+        let on_comma_line = after_comma.is_some_and(|at| !original[at..token.start].contains('\n'));
+        after_comma = None;
+        match token.kind {
+            Kind::Ascii40 => {
                 depth += 1;
                 seen_code = true;
-                i += 1;
             }
-            b')' => {
+            Kind::Ascii41 => {
                 depth -= 1;
+                if depth == 0 {
+                    items.push(cur);
+                    return Some(items);
+                }
                 seen_code = true;
-                i += 1;
             }
-            b',' if depth == 0 => {
+            Kind::Ascii44 if depth == 1 => {
                 items.push(std::mem::take(&mut cur));
                 seen_code = false;
-                i += 1;
+                after_comma = Some(token.end);
             }
-            b' ' | b'\t' | b'\r' | b'\n' => i += 1,
-            _ => {
-                seen_code = true;
-                i += 1;
+            Kind::SqlComment | Kind::CComment => {
+                let text = token.text(original);
+                let text = if token.kind == Kind::SqlComment {
+                    text.trim_end()
+                } else {
+                    text.trim()
+                };
+                if seen_code {
+                    cur.trailing.push(text.to_string());
+                } else if on_comma_line && let Some(previous) = items.last_mut() {
+                    previous.trailing.push(text.to_string());
+                    after_comma = Some(token.end);
+                } else {
+                    cur.leading.push(text.to_string());
+                }
             }
+            _ => seen_code = true,
         }
     }
-    items.push(cur);
-    items
+    None
 }
 
 /// Render one column line for CREATE TABLE, applying the configured comma style.
@@ -250,7 +236,7 @@ pub(in crate::formatter) fn format_table_column(
 ) -> String {
     let indent = " ".repeat(config.indent);
     let type_col = config.type_alignment;
-    let col_name = col.name.value.to_lowercase();
+    let col_name = layout_ident(&col.name);
     let type_str = format_column_type(&col.data_type, config);
     let constraints_str = format_column_constraints(&col.options, config);
 
@@ -310,6 +296,18 @@ pub(in crate::formatter) fn format_column_line(
     format!("{indent}{name_with_pad}{type_str}{constraints_str}")
 }
 
+/// A name as the layout writes it: as written, quotes and all, when it is
+/// quoted — its case and its characters are the name — else in lower case,
+/// the name Postgres folds it to. Lowercased whole, `"Note"` became `note`, a
+/// different column.
+pub(in crate::formatter) fn layout_ident(ident: &sqlparser::ast::Ident) -> String {
+    if ident.quote_style.is_some() {
+        ident.to_string()
+    } else {
+        ident.value.to_lowercase()
+    }
+}
+
 pub(in crate::formatter) fn pad_to_width(s: &str, width: usize) -> String {
     if s.len() >= width {
         format!("{s} ")
@@ -335,6 +333,12 @@ pub(in crate::formatter) fn format_column_constraints(
 
     let mut parts = Vec::new();
     for opt in options {
+        // A named constraint — `constraint nn not null` — is written whole,
+        // its name with it; written by kind, the name was dropped.
+        if opt.name.is_some() {
+            parts.push(apply_keyword_case(&opt.to_string(), &config.keyword_case));
+            continue;
+        }
         let s = match &opt.option {
             sqlparser::ast::ColumnOption::PrimaryKey(_) => kw("PRIMARY KEY"),
             sqlparser::ast::ColumnOption::Unique(_) => kw("UNIQUE"),
@@ -344,24 +348,17 @@ pub(in crate::formatter) fn format_column_constraints(
                 let expr_str = apply_keyword_case(&expr.to_string(), &config.keyword_case);
                 format!("{} {expr_str}", kw("DEFAULT"))
             }
-            sqlparser::ast::ColumnOption::ForeignKey(fk_constraint) => {
-                let cols: Vec<String> = fk_constraint
-                    .referred_columns
-                    .iter()
-                    .map(|c| c.value.to_lowercase())
-                    .collect();
-                let col_list = cols.join(", ");
-                format!(
-                    "{} {}({})",
-                    kw("REFERENCES"),
-                    fk_constraint.foreign_table.to_string().to_lowercase(),
-                    col_list
-                )
+            // sqlparser's own rendering carries the referential actions, MATCH
+            // and DEFERRABLE. Writing `REFERENCES t(id)` alone dropped them, so
+            // the guard kept every table with `on delete cascade` as written —
+            // no layout, and no keyword case.
+            sqlparser::ast::ColumnOption::ForeignKey(_) => {
+                apply_keyword_case(&opt.option.to_string(), &config.keyword_case)
             }
-            sqlparser::ast::ColumnOption::Check(expr) => {
-                let expr_str = apply_keyword_case(&expr.to_string(), &config.keyword_case);
-                format!("{} ({expr_str})", kw("CHECK"))
-            }
+            // sqlparser's CHECK renders as `CHECK (…)` itself, its name with
+            // it; wrapped again it was `check (check (…))`, so every column
+            // with a CHECK of its own kept the table as written.
+            sqlparser::ast::ColumnOption::Check(_) => apply_keyword_case(&opt.option.to_string(), &config.keyword_case),
             _ => {
                 // Fallback: render via Display and apply keyword case
                 let raw = format!("{}", opt.option);

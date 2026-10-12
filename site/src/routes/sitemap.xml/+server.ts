@@ -1,12 +1,10 @@
-import { SITE_URL } from '$lib/seo';
+import { SITE_URL, indexableRoutes } from '$lib/seo';
 import { pages } from '$lib/guide';
 
 export const prerender = true;
 
-// Indexable routes. /projects is intentionally excluded (noindex — a personal,
-// localStorage-backed workspace with no crawlable content).
 export function GET() {
-	const routes = ['/', '/guide', '/diagram', ...pages.map((p) => `/guide/${p.slug}`)];
+	const routes = indexableRoutes(pages.map((p) => p.slug));
 	const urls = routes
 		.map((r) => `\t<url><loc>${SITE_URL}${r === '/' ? '/' : r}</loc></url>`)
 		.join('\n');

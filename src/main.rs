@@ -29,6 +29,7 @@ use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() {
+    exit_quietly_when_stdout_closes();
     let args = cli::Cli::parse();
     let verbosity = Verbosity::from_flag(args.verbose);
 
@@ -54,4 +55,44 @@ async fn main() {
         eprintln!("Error: {e:#}");
         std::process::exit(1);
     }
+}
+
+/// End the process quietly once stdout's reader has gone away.
+///
+/// `println!` panics when a write fails, so `dbd inspect | head` ended with
+/// `failed printing to stdout: Broken pipe` as soon as `head` had what it
+/// wanted — every command prints that way, so every command did. One hook here
+/// covers them all.
+///
+/// Restoring the default SIGPIPE action would also end it, but for every
+/// descriptor: a Postgres connection over a Unix socket (which Linux writes
+/// without `MSG_NOSIGNAL`) whose server went away would then kill dbd without a
+/// word, where today the write fails and dbd says so. So only a failed print is
+/// caught, and only when stdout itself now fails with `BrokenPipe` — any other
+/// failure (a full disk behind `>`) still panics. It exits with 141, the status
+/// of a process SIGPIPE ends, as `cat` and `grep` end.
+fn exit_quietly_when_stdout_closes() {
+    let report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let message = info
+            .payload()
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| info.payload().downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        if message.starts_with("failed printing to std") && stdout_is_a_closed_pipe() {
+            std::process::exit(141);
+        }
+        report(info);
+    }));
+}
+
+/// Whether a write to stdout fails because nothing reads it any more.
+fn stdout_is_a_closed_pipe() -> bool {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    matches!(
+        out.write_all(b"\n").and_then(|()| out.flush()),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe
+    )
 }

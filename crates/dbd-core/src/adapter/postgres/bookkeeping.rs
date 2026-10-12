@@ -35,7 +35,10 @@ impl Bookkeeping {
             created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now() ); \
          CREATE TABLE IF NOT EXISTS dbd.migrations ( \
             project varchar NOT NULL, version integer NOT NULL, applied_at timestamptz NOT NULL DEFAULT now(), \
-            description text, checksum text, PRIMARY KEY (project, version) );";
+            description text, checksum text, PRIMARY KEY (project, version) ); \
+         CREATE TABLE IF NOT EXISTS dbd.matview_stamps ( \
+            project varchar NOT NULL, matview varchar NOT NULL, stamp text NOT NULL, \
+            stamped_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (project, matview) );";
 
     pub(super) fn new(pool: PgPool, project: String) -> Self {
         Self { pool, project }
@@ -99,6 +102,23 @@ impl Bookkeeping {
             .execute(Self::LAYOUT_DDL)
             .await
             .map_err(|e| DbdError::Config(format!("heal: create dbd layout failed: {e}")))?;
+
+        // Lift each materialized view's legacy drift stamp — a dbd before 0.25
+        // kept it as the view's whole comment — into `dbd.matview_stamps`,
+        // before anything re-runs the view's file. That file's own
+        // `COMMENT ON` would erase the stamp, leaving the view untracked. A
+        // recorded stamp wins; the comment itself is left for its author.
+        sqlx::query(
+            "INSERT INTO dbd.matview_stamps (project, matview, stamp) \
+               SELECT $1, n.nspname || '.' || c.relname, obj_description(c.oid, 'pg_class') \
+               FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+               WHERE c.relkind = 'm' AND obj_description(c.oid, 'pg_class') LIKE 'dbd:hash=%' \
+             ON CONFLICT (project, matview) DO NOTHING",
+        )
+        .bind(&self.project)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| DbdError::Config(format!("heal: lift matview stamps failed: {e}")))?;
 
         // Fold `_dbd_meta` → `dbd.meta` (canonical row wins on conflict).
         for s in meta_schemas {
@@ -171,8 +191,21 @@ impl Bookkeeping {
     /// on a legacy DB that hasn't been healed yet (the guards read before the core
     /// op heals).
     pub(super) async fn get_meta(&self) -> Result<Option<ProjectMeta>> {
+        Ok(self.read_meta("project = $1").await?.into_iter().next())
+    }
+
+    /// Every other project's meta row, by project — what the guards read when
+    /// this project has none (see `DatabaseAdapter::other_projects_meta`).
+    /// Resolved as [`Self::get_meta`] is, so a legacy layout reads too.
+    pub(super) async fn other_projects(&self) -> Result<Vec<ProjectMeta>> {
+        self.read_meta("project <> $1 ORDER BY project").await
+    }
+
+    /// The meta rows `filter` selects — a `WHERE` clause over `project`,
+    /// bound to this project's name as `$1`.
+    async fn read_meta(&self, filter: &str) -> Result<Vec<ProjectMeta>> {
         let Some((schema, rel)) = self.resolve_meta().await? else {
-            return Ok(None); // no bookkeeping anywhere yet
+            return Ok(Vec::new()); // no bookkeeping anywhere yet
         };
         let (sq, rq) = (schema.replace('"', "\"\""), rel.replace('"', "\"\""));
         // Preferred read includes `scope`. On a legacy `_dbd_meta` that predates
@@ -180,21 +213,21 @@ impl Bookkeeping {
         // (scope = None) so env/version — and the prod guard — still work.
         let with_scope = sqlx::query(&format!(
             "SELECT project, env, version, scope, updated_at::text AS applied_at \
-             FROM \"{sq}\".\"{rq}\" WHERE project = $1"
+             FROM \"{sq}\".\"{rq}\" WHERE {filter}"
         ))
         .bind(&self.project)
-        .fetch_optional(&self.pool)
+        .fetch_all(&self.pool)
         .await;
 
+        let read = |row: &sqlx::postgres::PgRow, with_scope: bool| ProjectMeta {
+            project: row.get("project"),
+            env: row.get("env"),
+            version: row.get::<i32, _>("version") as u32,
+            scope: if with_scope { row.try_get("scope").ok() } else { None },
+            applied_at: row.try_get("applied_at").ok(),
+        };
         match with_scope {
-            Ok(Some(row)) => Ok(Some(ProjectMeta {
-                project: row.get("project"),
-                env: row.get("env"),
-                version: row.get::<i32, _>("version") as u32,
-                scope: row.try_get("scope").ok(),
-                applied_at: row.try_get("applied_at").ok(),
-            })),
-            Ok(None) => Ok(None),
+            Ok(rows) => Ok(rows.iter().map(|row| read(row, true)).collect()),
             // A legacy `_dbd_meta` lacking the `scope` column → SQLSTATE 42703
             // (undefined_column): read the legacy shape in that one case. Any
             // OTHER error is real (transient failure, permission, etc.) and must
@@ -205,21 +238,15 @@ impl Bookkeeping {
                 if !undefined_column {
                     return Err(DbdError::Config(format!("read meta failed: {e}")));
                 }
-                let row = sqlx::query(&format!(
+                let rows = sqlx::query(&format!(
                     "SELECT project, env, version, updated_at::text AS applied_at \
-                     FROM \"{sq}\".\"{rq}\" WHERE project = $1"
+                     FROM \"{sq}\".\"{rq}\" WHERE {filter}"
                 ))
                 .bind(&self.project)
-                .fetch_optional(&self.pool)
+                .fetch_all(&self.pool)
                 .await
                 .map_err(|e| DbdError::Config(format!("read meta failed: {e}")))?;
-                Ok(row.map(|row| ProjectMeta {
-                    project: row.get("project"),
-                    env: row.get("env"),
-                    version: row.get::<i32, _>("version") as u32,
-                    scope: None,
-                    applied_at: row.try_get("applied_at").ok(),
-                }))
+                Ok(rows.iter().map(|row| read(row, false)).collect())
             }
         }
     }
@@ -256,6 +283,72 @@ impl Bookkeeping {
         }
         .map_err(|e| DbdError::Config(format!("set dbd.meta failed: {e}")))?;
         Ok(())
+    }
+
+    /// Record `stamp` as the drift stamp of materialized view `matview`
+    /// (`schema.name`). `tx` routes through the caller's open batch, as
+    /// [`Self::set_meta`] does.
+    ///
+    /// The stamp lives here, not in the view's comment: that comment is the
+    /// author's (`COMMENT ON MATERIALIZED VIEW` in the DDL file), and sharing it
+    /// meant the first apply overwrote the author's text and the next erased the
+    /// stamp.
+    pub(super) async fn stamp_matview(
+        &self,
+        tx: Option<&mut Transaction<'static, Postgres>>,
+        matview: &str,
+        stamp: &str,
+    ) -> Result<()> {
+        self.ensure_dbd_layout().await?;
+        let q = sqlx::query(
+            "INSERT INTO dbd.matview_stamps (project, matview, stamp) VALUES ($1, $2, $3) \
+             ON CONFLICT (project, matview) DO UPDATE SET stamp = EXCLUDED.stamp, stamped_at = now()",
+        )
+        .bind(&self.project)
+        .bind(matview)
+        .bind(stamp);
+        match tx {
+            Some(tx) => q.execute(&mut **tx).await,
+            None => q.execute(&self.pool).await,
+        }
+        .map_err(|e| DbdError::Config(format!("stamp {matview} failed: {e}")))?;
+        Ok(())
+    }
+
+    /// Delete this project's drift stamps for `matviews` (`schema.name`). The
+    /// only caller (`reset`) heals first, so `dbd.matview_stamps` exists here —
+    /// errors (permission/transient) are surfaced, not swallowed.
+    pub(super) async fn forget_matview_stamps(&self, matviews: &[String]) -> Result<()> {
+        if matviews.is_empty() {
+            return Ok(());
+        }
+        sqlx::query("DELETE FROM dbd.matview_stamps WHERE project = $1 AND matview = ANY($2)")
+            .bind(&self.project)
+            .bind(matviews)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("forget matview stamps failed: {e}")))?;
+        Ok(())
+    }
+
+    /// Every drift stamp this project recorded, `schema.name` → stamp. Empty on
+    /// a database not yet healed (no `dbd.matview_stamps`): read-only commands
+    /// call this without healing, and must not fail for it.
+    pub(super) async fn matview_stamps(&self) -> Result<std::collections::HashMap<String, String>> {
+        let exists: Option<String> = sqlx::query_scalar("SELECT to_regclass('dbd.matview_stamps')::text")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("matview stamps lookup failed: {e}")))?;
+        if exists.is_none() {
+            return Ok(Default::default());
+        }
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT matview, stamp FROM dbd.matview_stamps WHERE project = $1")
+                .bind(&self.project)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| DbdError::Config(format!("matview stamps read failed: {e}")))?;
+        Ok(rows.into_iter().collect())
     }
 
     /// Record a migration in `dbd.migrations`. `tx` is the caller's open batch
@@ -295,6 +388,17 @@ impl Bookkeeping {
             .execute(&self.pool)
             .await
             .map_err(|e| DbdError::Config(format!("clear dbd.migrations failed: {e}")))?;
+        Ok(())
+    }
+
+    /// Delete this project's `dbd.meta` row. Like [`Self::clear_migrations`],
+    /// called only by `reset`, which heals first.
+    pub(super) async fn forget_meta(&self) -> Result<()> {
+        sqlx::query("DELETE FROM dbd.meta WHERE project = $1")
+            .bind(&self.project)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("clear dbd.meta failed: {e}")))?;
         Ok(())
     }
 

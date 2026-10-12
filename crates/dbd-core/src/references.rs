@@ -50,7 +50,7 @@ fn resolve_entity_references(
 ) {
     // The parser qualifies bare references with the first search_path entry.
     // dbd appends `public` to every applied search_path (see
-    // `ensure_public_in_search_path`), so a bare name can resolve there too.
+    // `script::keep_public_on_search_path`), so a bare name can resolve there too.
     let default_schema = entity.schema_path.default_schema().unwrap_or("public").to_string();
     let search_path: Vec<String> = {
         // Only the NAMED entries: `"$user"` is the connecting role's schema and
@@ -133,6 +133,11 @@ fn resolve_entity_refers(
             r.name = format!("{sch}.{table}");
             r.schema_source = SchemaSource::Resolved;
             resolved.push(r);
+            continue;
+        }
+        // A type or sequence that resolves to nothing is a built-in; unlike an
+        // unresolved call it is not kept at all — see `RefKind::Uses`.
+        if r.kind == crate::entity::RefKind::Uses {
             continue;
         }
         // A call that resolves to nothing is a built-in, not a broken edge —
@@ -439,6 +444,7 @@ mod tests {
             generated: None,
             comment: None,
             inline_fk: Some(bare_fk("ns_inline")),
+            collation: None,
         };
         // Bare in the source, so the parser supplied `dojo.` — the shape the
         // resolver may re-point. The FK structs below say the same via

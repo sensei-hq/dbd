@@ -69,6 +69,55 @@ impl Design {
             .collect())
     }
 
+    /// The entity a `-n <name>` selects, checked against the scope a run acts on.
+    ///
+    /// A name that matched nothing used to select nothing, and every command
+    /// that takes one reported that as success — "Everything looks ok", "0
+    /// entities — no issues", an empty graph. Selecting nothing is never what
+    /// the name was for, so it is an error here, said one way for every caller:
+    /// `no entity named 'X'`, or `X is outside scope 'S'` when the design has it
+    /// but the scope does not build it. Under `None` or the all-scope only
+    /// existence is checked.
+    ///
+    /// Searches the import staging tables too, since `inspect -n` reports on
+    /// them; callers that act only on DDL entities check what they got.
+    pub fn resolve_name(&self, name: &str, scope: Option<&ResolvedScope>) -> Result<&Entity> {
+        let entity = self
+            .entities
+            .iter()
+            .chain(self.import_tables.iter())
+            .find(|e| e.name == name)
+            .ok_or_else(|| DbdError::Config(format!("no entity named '{name}'")))?;
+        if let Some(s) = scope.filter(|s| !s.is_all) {
+            let ws = self.working_set(s)?;
+            if !Self::entity_in_scope(entity, s, &ws) {
+                return Err(DbdError::Config(format!("{name} is outside scope '{}'", s.name)));
+            }
+        }
+        Ok(entity)
+    }
+
+    /// `(kept, total)`: how many entities `scope` builds, and how many the
+    /// design declares.
+    ///
+    /// The one count every command reports for a scope. They used to count four
+    /// ways — `inspect` before the `deps: include` closure, `combine`/`dbml`
+    /// with every external and every extension an `extensions:` allowlist
+    /// drops, `deploy --dry-run` the whole design — so one scope had four sizes
+    /// depending on which command was asked.
+    ///
+    /// `kept` is the scope's working set (closure included) as
+    /// [`Self::scoped_entities`] resolves it. Externals are left out of both
+    /// numbers: they declare something outside the design that no command
+    /// builds, so counting them made the scope look bigger than what an apply
+    /// lists. For the all-scope `kept == total`.
+    pub fn scope_counts(&self, scope: &ResolvedScope) -> Result<(usize, usize)> {
+        let built = |e: &&Entity| e.entity_type != EntityType::External;
+        let total = self.entities.iter().filter(built).count();
+        let kept = self.scoped_entities(scope)?.iter().filter(built).count();
+        Ok((kept, total))
+    }
+
     /// Resolve a scope to its working set, running the `report`-policy gap gate
     /// first (aborts before any write). `None`/all-scope ⇒ `Ok(None)` (no
     /// filtering). Shared by `apply`, `reconcile`, and `diff_live`.
@@ -125,6 +174,21 @@ impl Design {
                 _ => true,
             })
             .collect()
+    }
+
+    /// The entities a command run under `scope` covers but dbd could not read
+    /// — what a document generated from the design leaves out.
+    ///
+    /// The same judgement `Design::ensure_fully_parsed` refuses on. A command
+    /// that writes documentation (`dbml`, `diagram`) names these instead and
+    /// writes what it can, as `emit` reports them: left out without a word, a
+    /// document missing a table reads exactly like a complete one.
+    pub fn unparsed(&self, scope: &ResolvedScope) -> Result<Vec<&Entity>> {
+        if scope.is_all {
+            return Ok(self.unparseable_in_scope(None, None, None));
+        }
+        let working = self.working_set(scope)?;
+        Ok(self.unparseable_in_scope(Some(scope), Some(&working), None))
     }
 
     /// Refuse to act on a design dbd could not fully read.
@@ -196,12 +260,49 @@ impl Design {
         declared.difference(&wanted).cloned().collect()
     }
 
+    /// What a run's hooks are judged against under `scope`: the scope's name,
+    /// and what the design manages outside `working_set` (a hook touching any
+    /// of it is skipped). `None` for an unscoped or all-scope run, where every
+    /// hook runs.
+    ///
+    /// The one statement of the rule, for every run and every preview — the
+    /// `import --dry-run` preview once passed the working set itself where the
+    /// run passed what lies outside it, and so reported each hook the run
+    /// executes as skipped, and each one it skips as run.
+    pub(in crate::design) fn hook_scope<'s>(
+        &self,
+        scope: Option<&'s ResolvedScope>,
+        working_set: Option<&std::collections::HashSet<String>>,
+    ) -> Option<(&'s str, std::collections::HashSet<String>)> {
+        match (scope, working_set) {
+            (Some(s), Some(ws)) if !s.is_all => Some((s.name.as_str(), self.managed_outside(ws))),
+            _ => None,
+        }
+    }
+
+    /// What the design manages that a working set leaves out — the names a
+    /// scoped hook must not touch. Externals are not the design's to manage.
+    fn managed_outside(&self, working_set: &std::collections::HashSet<String>) -> std::collections::HashSet<String> {
+        self.entities
+            .iter()
+            .filter(|e| e.entity_type != EntityType::External && !working_set.contains(&e.name))
+            .map(|e| e.name.clone())
+            .collect()
+    }
+
     /// The schemas a desired-entity set occupies: a bare `Schema` entity → its
     /// name; anything else → its `schema` (or the default schema). Shared by
     /// `reconcile` and `diff_live` to bound the live diff to managed schemas.
+    ///
+    /// Roles and extensions occupy no schema of the design's: a role is
+    /// cluster-wide, and an extension's objects are the extension's. Mapping
+    /// their empty `schema` to `public` made `public` managed for any design
+    /// with a role or a bare extension, and `reconcile --prune` then dropped
+    /// tables there that the design never declared.
     pub(in crate::design) fn managed_schemas(desired: &[&Entity]) -> std::collections::HashSet<String> {
         desired
             .iter()
+            .filter(|e| !matches!(e.entity_type, EntityType::Role | EntityType::Extension))
             .map(|e| match e.entity_type {
                 EntityType::Schema => e.name.clone(),
                 _ => {
@@ -241,29 +342,79 @@ impl Design {
     }
 
     /// Scope guard: refuse to operate under a scope different from the one this
-    /// database was pinned to. `meta` is the stored project meta (`None` on a
-    /// fresh database), `requested` is the resolved scope name for this run, and
-    /// `allow_scope_change` bypasses the guard (the next successful write re-pins
-    /// the DB). A database with no recorded scope (`meta.scope == None`) is
-    /// unpinned and never blocks — the current run pins it. Mirrors the prod
-    /// guard in [`Design::reset`]; invoked from the CLI write handlers.
-    pub fn check_scope_guard(
-        meta: Option<&crate::adapter::ProjectMeta>,
-        requested: &str,
-        allow_scope_change: bool,
-    ) -> Result<()> {
+    /// database was pinned to. `marks` are what the database records (one dbd
+    /// has never written to passes): this project's record or, after a rename,
+    /// the one its old `project.name` left (see [`DatabaseMarks`]).
+    /// `requested` is the resolved scope name for this run, and
+    /// `allow_scope_change` bypasses the guard (the next successful write
+    /// re-pins the DB). A record with no scope is unpinned and never blocks —
+    /// the current run pins it. Mirrors the prod guard in [`Design::reset`];
+    /// invoked from the CLI write handlers.
+    pub fn check_scope_guard(marks: &DatabaseMarks, requested: &str, allow_scope_change: bool) -> Result<()> {
         if allow_scope_change {
             return Ok(());
         }
-        if let Some(pinned) = meta.and_then(|m| m.scope.as_deref())
-            && pinned != requested
-        {
+        if let Some((pinned, by)) = Self::conflicting_pin(marks, requested) {
             return Err(DbdError::SafetyGuard(format!(
-                "scope guard: this database is pinned to scope '{pinned}', but you requested '{requested}'.\n\
+                "scope guard: this database is pinned to scope '{pinned}'{by}, but you requested '{requested}'.\n{}\
                  Applying a different scope would build a divergent schema.\n\
-                 → re-run with --scope {pinned}, or pass --allow-scope-change to re-point this database to '{requested}'."
+                 → re-run with --scope {pinned}, or pass --allow-scope-change to re-point this database to '{requested}'.",
+                marks.rename_note()
             )));
         }
         Ok(())
+    }
+
+    /// The scope pin a run under `requested` contradicts, if any, and who set
+    /// it — `" by project 'x'"` for another project's mark, empty for this
+    /// project's own. The decision behind [`Self::check_scope_guard`], for a
+    /// command that words its own refusal.
+    pub fn conflicting_pin<'a>(marks: &'a DatabaseMarks, requested: &str) -> Option<(&'a str, String)> {
+        marks.rows().find_map(|row| {
+            let pinned = row.scope.as_deref().filter(|pinned| *pinned != requested)?;
+            let by = marks
+                .recorded_by(row)
+                .map(|p| format!(" by project '{p}'"))
+                .unwrap_or_default();
+            Some((pinned, by))
+        })
+    }
+
+    /// Version guard: refuse to apply a project older than the database.
+    ///
+    /// `marks` are what the database records — this project's record or,
+    /// after a rename, the one its old `project.name` left (see
+    /// [`DatabaseMarks`]) — and `design_version` the project's
+    /// `project.version` (0 when it has none). A database ahead of the design
+    /// was built from a newer revision — typically a branch checked out behind
+    /// it. The plan then came out "current" and re-applied the older DDL over
+    /// the newer schema, reporting "Already up to date". Nothing short of a
+    /// newer revision makes that right, so there is no flag to pass it.
+    /// Shaped like [`Self::check_scope_guard`] and [`Self::check_reset_guard`];
+    /// [`Self::apply`] runs it before anything it writes, and the CLI dry runs
+    /// run it whenever they have a database to ask.
+    pub fn check_version_guard(marks: &DatabaseMarks, design_version: u32) -> Result<()> {
+        let Some(row) = marks.rows().find(|m| m.version > design_version) else {
+            return Ok(());
+        };
+        let db_version = row.version;
+        let project = match design_version {
+            0 => "this project records no version".to_string(),
+            v => format!("this project is at v{v}"),
+        };
+        let (by, back) = match marks.recorded_by(row) {
+            None => (String::new(), ""),
+            Some(other) => (
+                format!(" (recorded by project '{other}')"),
+                "set project.name back, or ",
+            ),
+        };
+        Err(DbdError::SafetyGuard(format!(
+            "version guard: the database is at v{db_version}{by}, but {project}.\n{}\
+             Applying an older project would re-apply its DDL over a newer schema.\n\
+             → {back}check out a newer revision of the project (at v{db_version} or later), or point it at \
+             a database built from this one.",
+            marks.rename_note()
+        )))
     }
 }

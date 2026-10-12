@@ -448,6 +448,7 @@ fn dbml_respects_scope_filtering() {
 
     let docs = dbd_core::dbml::generate_all(&dbd_core::dbml::DbmlMultiParams {
         entities: &entities,
+        design_entities: d.entities(),
         project_name: &d.config().project.name,
         database_type: &d.config().source.dialect,
         project_note: d.config().project.note.as_deref(),
@@ -535,7 +536,7 @@ async fn reset_blocked_after_v1_in_dev() {
     let mock = dbd_core::adapter::mock::MockAdapter::new().with_meta("dev", 1);
     let result = d.reset(&mock, "postgres", false, false, false, None).await;
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("migrations"));
+    assert!(result.unwrap_err().to_string().contains("versioned at v1"));
 }
 
 #[tokio::test]
@@ -589,7 +590,7 @@ async fn apply_single_entity_by_name() {
 #[test]
 fn diagram_model_json_round_trips() {
     let d = design(); // existing helper in this file
-    let model = dbd_core::schema_model::build(&d, None);
+    let model = dbd_core::schema_model::build(&d, None).unwrap();
     let json = serde_json::to_string(&model).unwrap();
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert!(v["project"]["name"].is_string());
