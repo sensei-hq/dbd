@@ -291,7 +291,7 @@ impl Design {
         }
         // The last gate, before the first hook: refuse a design declaring an
         // entity another owner holds (#7). A real run heals the bookkeeping
-        // first; it claims what it builds once built, below.
+        // first; it claims below — with its work, or before it.
         self.preflight(
             adapter,
             if dry_run {
@@ -440,6 +440,10 @@ impl Design {
 
         if use_txn {
             adapter.begin_batch().await?;
+        } else {
+            // Outside one transaction nothing this run builds rolls back, so it
+            // claims before it builds — see `Design::claim_first` (#7).
+            self.claim(adapter).await?;
         }
 
         // Execute plan steps inside an async block so a mid-plan error routes
@@ -458,15 +462,21 @@ impl Design {
                 )
                 .await?;
                 // A version's new enum values commit before the rest of it
-                // uses them (see `ExecutionStep::AddEnumValues`).
+                // uses them (see `ExecutionStep::AddEnumValues`) — claimed
+                // first, so nothing commits unclaimed (#7).
                 if use_txn && matches!(step, ExecutionStep::AddEnumValues { .. }) {
+                    self.claim_built(adapter).await?;
                     adapter.commit_batch().await?;
                     adapter.begin_batch().await?;
                 }
             }
             // Built: claim it, in the batch, so the claim commits with the
-            // work and rolls back with it (#7).
-            self.claim_built(adapter).await
+            // work and rolls back with it (#7). Claimed already outside one.
+            if use_txn {
+                self.claim_built(adapter).await
+            } else {
+                self.record_declared_uses(adapter).await
+            }
         }
         .await;
 

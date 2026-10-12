@@ -363,8 +363,7 @@ impl Design {
         // partial design reports drift that isn't there and misses drift that is.
         self.ensure_fully_parsed(scope, working_set.as_ref(), None)?;
         // Before planning: a design declaring an entity another owner holds is
-        // refused before anything runs (#7). It claims what it builds, once
-        // built, below.
+        // refused before anything runs (#7). It claims below, before it writes.
         self.preflight(adapter, ownership::Preflight::Read).await?;
         let desired_entities = self.entities_in_scope(scope, working_set.as_ref(), None);
 
@@ -486,9 +485,10 @@ impl Design {
         }
 
         ensure_reconcile_not_destructive(&plan, allow_destructive)?;
-        // Past the last refusal, before the first write: heal the bookkeeping,
-        // and check again.
-        self.preflight(adapter, ownership::Preflight::Write).await?;
+        // Past the last refusal, before the first write: heal the bookkeeping
+        // and claim. Reconcile's writes commit as they run, so it claims first
+        // — see `Design::claim_first` (#7).
+        self.claim_first(adapter).await?;
 
         // `apply.before` where apply runs it: after every gate, so a refused
         // reconcile fires no hook, and before the first write, so a hook can
@@ -518,9 +518,8 @@ impl Design {
                 &mut progress.on_done,
             )
             .await?;
-        // Built: claim it. Reconcile's writes commit as they run, so its claim
-        // has a transaction of its own, after them (#7).
-        self.claim_built(adapter).await?;
+        // Built: record what it uses (#7).
+        self.record_declared_uses(adapter).await?;
 
         // Sync pg_cron refresh jobs, mirroring the apply path. This MUST cover the
         // whole design, not the scoped `desired_entities`: `sync_refresh_jobs`

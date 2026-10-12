@@ -4,13 +4,14 @@ use crate::entity::RefKind;
 
 /// What a run does with the database's ownership registry before it does
 /// anything else (#7). Both refuse a design declaring an entity another owner
-/// holds; neither claims — a run claims what it built, once built (see
-/// [`Design::claim_built`]).
+/// holds; neither claims — see [`Design::claim_built`] and
+/// [`Design::claim_first`] for when a run does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Preflight {
-    /// `apply`, `deploy`, `reconcile`, `reset`: heal the bookkeeping, then check.
+    /// `apply` and `deploy`: heal the bookkeeping, then check.
     Write,
-    /// A dry run, `diff`, `import`, `refresh`, `policies`: check, writing nothing.
+    /// A dry run, `diff`, `import`, `refresh`, `policies`, and `reconcile`
+    /// before it plans: check, writing nothing.
     Read,
 }
 
@@ -178,20 +179,47 @@ impl Design {
         Ok(())
     }
 
-    /// Claim the design's entities and record what it uses — once the run has
-    /// built them, and in its own transaction when it has one, so the claim
-    /// commits with the work or not at all. A run that fails, or is killed,
-    /// before this claims nothing; two runs of one project at once claim the
-    /// same rows. A project that claimed an entity since [`Self::preflight`]
-    /// checked is still refused here, and in a batch the run's work rolls back
-    /// with the claim (#7).
+    /// Claim the design's entities and record what it uses, in the run's own
+    /// transaction, as the last of its work — `apply`'s batch, before it
+    /// commits — so the claim commits with the work or not at all. A run that
+    /// fails, or is killed, before this claims nothing; two runs of one
+    /// project at once claim the same rows. A project that claimed an entity
+    /// since [`Self::preflight`] checked is refused here, and the run's work
+    /// rolls back with the claim (#7).
     pub(crate) async fn claim_built(&self, adapter: &dyn DatabaseAdapter) -> Result<()> {
+        self.claim(adapter).await?;
+        self.record_declared_uses(adapter).await
+    }
+
+    /// Heal the bookkeeping and claim the design's entities, committed, before
+    /// a run's first write — for a run whose writes commit as they go:
+    /// `reconcile`, `reset`, an `apply` outside one transaction. Claimed after
+    /// its writes, such a run found an entity unowned, waited on a project
+    /// building it, and wrote over — or dropped — what that project had just
+    /// claimed. Claimed first, whichever run claims first owns it, and the
+    /// other is refused before it writes. A run that then fails keeps its
+    /// claims: what its design declares is its own, built yet or not (#7).
+    pub(crate) async fn claim_first(&self, adapter: &dyn DatabaseAdapter) -> Result<()> {
+        adapter.heal_bookkeeping().await?;
+        self.claim(adapter).await
+    }
+
+    /// Claim the design's entities — in the open batch when there is one —
+    /// refusing, naming each, those another owner holds.
+    pub(crate) async fn claim(&self, adapter: &dyn DatabaseAdapter) -> Result<()> {
         let held = adapter
             .claim_objects(self.owner(), &self.declared_objects(), true)
             .await?;
         if !held.is_empty() {
             return Err(DbdError::Config(held_refusal(&held)));
         }
+        Ok(())
+    }
+
+    /// Record what the design uses, replacing what it used before — in the
+    /// open batch when there is one. Written once the work is built: the uses
+    /// describe what is, so a run that fails keeps the record it had.
+    pub(crate) async fn record_declared_uses(&self, adapter: &dyn DatabaseAdapter) -> Result<()> {
         adapter.record_uses(self.owner(), &self.declared_uses()).await
     }
 }

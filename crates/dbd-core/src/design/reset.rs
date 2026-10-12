@@ -49,13 +49,14 @@ impl Design {
     ) -> Result<ResetComplete> {
         // The guards first, as `apply` runs them — they read the marks without
         // healing, and a renamed project is best told it was renamed. Then
-        // heal, and refuse a design declaring another owner's entity before
-        // anything is dropped (#7). A reset builds nothing, so claims nothing.
+        // heal and claim the design's entities, refusing a design declaring
+        // another owner's, before anything is dropped: a reset's drops commit,
+        // so it claims first — see `Design::claim_first` (#7).
         let marks = self.database_marks(adapter).await?;
         if !force {
             self.check_reset_guard(&marks)?;
         }
-        self.preflight(adapter, ownership::Preflight::Write).await?;
+        self.claim_first(adapter).await?;
 
         let roles_kept = self.roles_kept_by_reset(adapter, target, scope).await?;
         let keep: Vec<String> = roles_kept.iter().map(|k| k.role.clone()).collect();
