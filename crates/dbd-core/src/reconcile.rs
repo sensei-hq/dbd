@@ -159,6 +159,16 @@ pub fn snapshot_from_entities(entities: &[Entity]) -> Snapshot {
     snap
 }
 
+/// [`snapshot_from_entities`] for a comparison with a live database whose
+/// extensions own `extension_types`, spelled as [`qualify_extension_types`]
+/// spells them.
+pub(crate) fn compared_snapshot(entities: &[Entity], extension_types: &[(String, String)]) -> Snapshot {
+    let mut snap = raw_snapshot_from_entities(entities);
+    qualify_extension_types(&mut snap, extension_types);
+    canonicalize(&mut snap);
+    snap
+}
+
 /// Representation normalization shared by reconcile's `canonicalize` and (in a
 /// future task) the read-only `dbd diff`'s `schema_diff::normalize_for_diff`.
 /// Makes a **parsed** (desired) and an **introspected** (live) form of the
@@ -194,6 +204,47 @@ pub(crate) fn normalize_common(snap: &mut Snapshot) {
     for t in &mut snap.tables {
         lift_pk_unique_keep_others(t);
         normalize_column_types(t, &enum_types);
+    }
+}
+
+/// Spell each column type an extension owns as `format_type` does — bare in
+/// `public`, `schema.name` elsewhere — on a snapshot compared with the live
+/// database whose extensions own `extension_types` (#41).
+///
+/// `format_type` qualifies a type wherever the session `search_path` does not
+/// reach its schema, so introspection reads `extensions.citext`; DDL reaches it
+/// through its own `set search_path` and writes `citext`. They are one type,
+/// and compared as text they read as a change on every run. Given the same
+/// spelling on both sides they match, and the `ALTER … TYPE` a real change
+/// emits names the type wherever the session path points.
+///
+/// Runs on a raw snapshot, before [`canonicalize`] or
+/// [`crate::schema_diff::normalize_for_diff`]: both leave a qualified name as
+/// it is.
+pub(crate) fn qualify_extension_types(snap: &mut Snapshot, extension_types: &[(String, String)]) {
+    let spelled: HashMap<String, String> = extension_types
+        .iter()
+        .map(|(schema, name)| {
+            let short = name.to_lowercase();
+            let canonical = if schema.eq_ignore_ascii_case(DEFAULT_SCHEMA) {
+                short.clone()
+            } else {
+                format!("{}.{short}", schema.to_lowercase())
+            };
+            (short, canonical)
+        })
+        .collect();
+    if spelled.is_empty() {
+        return;
+    }
+    for t in &mut snap.tables {
+        for c in &mut t.columns {
+            let lowered = c.data_type.trim().to_lowercase();
+            let (element, array_suffix) = split_array_suffix(&lowered);
+            if let Some(canonical) = spelled.get(element) {
+                c.data_type = format!("{canonical}{array_suffix}");
+            }
+        }
     }
 }
 

@@ -2244,6 +2244,29 @@ impl DatabaseAdapter for PostgresAdapter {
         Ok(out)
     }
 
+    async fn extension_types(&self) -> Result<Vec<(String, String)>> {
+        // `deptype = 'e'` is what `CREATE EXTENSION` records for each object
+        // its script makes. Every schema counts — an extension may live in one
+        // introspection leaves out — and the array types it makes too are
+        // skipped, since a column spells one as its element type plus `[]`.
+        let rows = sqlx::query(
+            "SELECT n.nspname, t.typname \
+             FROM pg_catalog.pg_type t \
+             JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace \
+             JOIN pg_catalog.pg_depend d ON d.classid = 'pg_catalog.pg_type'::pg_catalog.regclass \
+               AND d.objid = t.oid AND d.deptype = 'e' \
+             WHERE t.typcategory <> 'A' \
+             ORDER BY n.nspname, t.typname",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbdError::Config(format!("extension_types failed: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|row| (row.get::<String, _>("nspname"), row.get::<String, _>("typname")))
+            .collect())
+    }
+
     async fn introspect_roles(&self) -> Result<Vec<Entity>> {
         use std::collections::HashSet;
 

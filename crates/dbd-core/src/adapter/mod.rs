@@ -350,6 +350,19 @@ pub trait DatabaseAdapter: Send + Sync {
         ))
     }
 
+    /// The types the database's extensions own, as `(schema, name)` — `citext`
+    /// in `extensions` is `("extensions", "citext")`. Array types are left out;
+    /// a column names one by its element type.
+    ///
+    /// [`Self::introspect`] reports such a type the way `format_type` does,
+    /// qualified wherever the session `search_path` does not reach its schema,
+    /// while DDL reaches it through its own path and writes it bare. Comparing
+    /// a design with the database needs to know which bare names these are.
+    /// Engines without extensions have none.
+    async fn extension_types(&self) -> Result<Vec<(String, String)>> {
+        Ok(Vec::new())
+    }
+
     /// What objects in the database need from other objects, at the level of
     /// whole objects and across schemas or from extensions — see
     /// [`Dependency`]. Default: nothing known (a source with no catalog of
