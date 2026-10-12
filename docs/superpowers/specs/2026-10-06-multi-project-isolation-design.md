@@ -197,6 +197,22 @@ is of the first relation on the path that exists, owned or not. A call is
 resolved by its arguments as well, which dbd does not weigh, so it is a use of
 every routine on the path it could reach.
 
+The guard walks `pg_depend` from what goes — a table with its row type, a
+column, a constraint with the index behind it, an enum's type, a routine —
+through each dependent's owning relation or routine, as a `CASCADE` reaches
+them: a view, an inheriting table, a foreign key, a column of the type. For a
+part of a table, the catalog's dependencies are column by column, and
+`dbd.uses` adds only the uses recorded through routine bodies, which the
+catalog does not track. It runs before any write, dry runs included:
+
+- `reconcile` refuses a dropped column, constraint, index or enum value another
+  owner depends on; a prune keeps a table another owner depends on, named:
+  `app.old is used by "billing" (view billing.v_old) — not pruned; remove that
+  use first`.
+- `apply` reads what each pending migration it runs drops — a `DROP`, an
+  `ALTER TABLE … DROP COLUMN` or `DROP CONSTRAINT` — and refuses the run when
+  another owner depends on any of it.
+
 This is the contract between owners. It plays the role an API plays between
 services.
 
