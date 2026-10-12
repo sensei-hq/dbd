@@ -19,16 +19,27 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   project holds is refused before its first hook or statement, naming each:
   `relation app.orders is owned by "shop"; owners sharing a database must not
   declare the same entity`. A dry run, `diff`, `import`, `refresh` and
-  `policies` refuse the same way and write nothing. Entities a project already
-  has are claimed on its first run; what no design declares stays unowned. A
-  renamed project's objects stay with its old name, so even a forced `reset`
-  of the renamed design is refused for them.
+  `policies` — the CLI's `--dry-run` previews included — refuse the same way
+  and write nothing. An entity is owned as Postgres names it: the schema its
+  `CREATE` states, else its search path, and an unquoted name folded to lower
+  case; one in a file dbd cannot read is claimed by its path, since a reset
+  still drops it. A table and an enum of one name are one entity. Entities a
+  project already has are claimed on its first run; what no design declares
+  stays unowned. A run that fails after its claim gives back what it newly
+  claimed, and a claim waits at most 5 seconds for another session's write to
+  the registry. A renamed project's objects stay with its old name, so even a
+  forced `reset` of the renamed design is refused for them.
+- **A project records what it uses**: the schemas its entities live in, its
+  extensions and roles, and each reference one of its entities makes to
+  another project's — `relation:app.orders`, through `view billing.v_orders`
+  — in `dbd.uses`, afresh on every run.
 
 ### Library API
 
-- `DatabaseAdapter` gains `claim_objects` (a default that claims nothing, so
-  an adapter that does not override it builds unchanged), with the
-  `adapter::OwnedObject` and `adapter::HeldObject` it takes and returns; and
+- `DatabaseAdapter` gains `claim_objects`, `release_objects` and
+  `record_uses` (defaults that do nothing, so an adapter that does not
+  override them builds unchanged), with the `adapter::OwnedObject`,
+  `HeldObject`, `Claim` and `Use` they take and return; and
   `Design::check_ownership` refuses a design declaring an entity another
   project owns.
 
