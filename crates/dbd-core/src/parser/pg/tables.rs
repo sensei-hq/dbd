@@ -205,6 +205,43 @@ pub(crate) fn trigger_names(sql: &str) -> Vec<String> {
         .collect()
 }
 
+/// The statements of a table or view file that are about its triggers, as the
+/// file wrote them — `CREATE [CONSTRAINT] TRIGGER`, the `DROP TRIGGER IF
+/// EXISTS` that keeps a constraint trigger re-runnable, and `COMMENT ON
+/// TRIGGER` — each with the comment lines written above it, in file order.
+/// `None` when the file does not parse.
+///
+/// For a rewrite of the file from a source that cannot hold a trigger — a
+/// DBML document — which would otherwise drop them (see
+/// [`crate::reverse::keep_authored_triggers`]).
+pub(crate) fn trigger_statements(sql: &str) -> Option<Vec<String>> {
+    use protobuf::ObjectType;
+    let parsed = pg_query::parse(sql).ok()?;
+    Some(
+        parsed
+            .protobuf
+            .stmts
+            .iter()
+            .filter(|raw| match raw.stmt.as_ref().and_then(|s| s.node.as_ref()) {
+                Some(NodeEnum::CreateTrigStmt(_)) => true,
+                Some(NodeEnum::DropStmt(d)) => d.remove_type() == ObjectType::ObjectTrigger,
+                Some(NodeEnum::CommentStmt(c)) => c.objtype() == ObjectType::ObjectTrigger,
+                _ => false,
+            })
+            .filter_map(|raw| {
+                let start = usize::try_from(raw.stmt_location).ok()?.min(sql.len());
+                // `stmt_len` 0 means "to the end of the script".
+                let end = match usize::try_from(raw.stmt_len).unwrap_or(0) {
+                    0 => sql.len(),
+                    len => (start + len).min(sql.len()),
+                };
+                let text = sql.get(start..end)?.trim();
+                (!text.is_empty()).then(|| text.to_string())
+            })
+            .collect(),
+    )
+}
+
 /// A `RangeVar` as a qualified name, defaulting the schema like Postgres does.
 fn qualified(rel: &protobuf::RangeVar, default_schema: &str) -> String {
     let schema = if rel.schemaname.is_empty() {

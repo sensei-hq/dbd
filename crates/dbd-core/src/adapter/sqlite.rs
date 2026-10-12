@@ -240,6 +240,38 @@ impl SqliteAdapter {
         }))
     }
 
+    /// The triggers on table or view `name`, as `sqlite_master` holds them and
+    /// each runnable twice — what `introspect` writes after the table or view,
+    /// where an authored file keeps its triggers (see [`Entity::triggers`]).
+    ///
+    /// Left out, `merge` rewrote a table file without the trigger written in
+    /// it, though the database still had it. SQLite stores the text it was
+    /// created with, normalised to open with `CREATE TRIGGER` and with any
+    /// `IF NOT EXISTS` removed; it is put back, so applying the file to the
+    /// database it came from does not fail on the trigger.
+    async fn triggers_on(&self, name: &str) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT sql FROM sqlite_master \
+             WHERE type = 'trigger' AND tbl_name = ?1 AND sql IS NOT NULL \
+             ORDER BY name",
+        )
+        .bind(name)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbdError::Config(format!("introspect triggers for {name} failed: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let sql: String = r.get("sql");
+                let sql = sql.trim();
+                match sql.strip_prefix("CREATE TRIGGER ") {
+                    Some(rest) => format!("CREATE TRIGGER IF NOT EXISTS {rest}"),
+                    None => sql.to_string(),
+                }
+            })
+            .collect())
+    }
+
     /// Strip the leading `schema.` from a Postgres-style entity name.
     /// Returns the original string when no `.` is present.
     fn bare_name(name: &str) -> &str {
@@ -584,6 +616,7 @@ impl DatabaseAdapter for SqliteAdapter {
             let mut e = Entity::new(EntityType::Table, &name);
             e.schema = None; // SQLite is schema-less
             e.raw_ddl = Some(parts.join(";\n\n"));
+            e.triggers = self.triggers_on(&name).await?;
             entities.push(e);
         }
 
@@ -600,6 +633,7 @@ impl DatabaseAdapter for SqliteAdapter {
             let mut e = Entity::new(EntityType::View, &name);
             e.schema = None;
             e.raw_ddl = Some(sql.trim().to_string());
+            e.triggers = self.triggers_on(&name).await?;
             entities.push(e);
         }
 
