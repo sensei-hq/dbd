@@ -84,9 +84,25 @@ pub struct OwnedObject {
     pub kind: String,
 }
 
+/// What the ownership registry says of a run's live entities (#7), for a
+/// prune to decide by.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Ownership {
+    /// The owner of each entity asked about, in order; `None` for one nobody
+    /// owns.
+    pub owners: Vec<Option<String>>,
+    /// Each schema another owner uses, and those owners.
+    pub schema_users: std::collections::BTreeMap<String, Vec<String>>,
+    /// The owners that record their uses — every owner a dbd that keeps the
+    /// registry has run for.
+    pub recording: std::collections::BTreeSet<String>,
+}
+
 /// What an owner uses without owning it, in `dbd.uses` (#7): a `schema`, an
 /// `extension` or a `role` it shares with other owners, or an `entity` another
-/// owner holds, through one of its own.
+/// owner holds, through one of its own. `owner`, its own name, marks that it
+/// records its uses — so an owner that uses nothing still reads as one that
+/// does.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Use {
     /// `schema`, `extension`, `role` or `entity`.
@@ -472,6 +488,26 @@ pub trait DatabaseAdapter: Send + Sync {
     /// nothing.
     async fn record_uses(&self, owner: &str, uses: &[Use]) -> Result<()> {
         let _ = (owner, uses);
+        Ok(())
+    }
+
+    /// What the registry says of `objects` for `owner`'s prune — see
+    /// [`Ownership`]. Reads only. Adapters without a registry find nothing
+    /// owned, no schema shared, and no owner recording.
+    async fn ownership(&self, owner: &str, objects: &[OwnedObject]) -> Result<Ownership> {
+        let _ = owner;
+        Ok(Ownership {
+            owners: vec![None; objects.len()],
+            ..Ownership::default()
+        })
+    }
+
+    /// Release `owner`'s claims of what it no longer declares — not among
+    /// `declared` — and no longer exists: pruned, or dropped by a migration
+    /// or by hand. One removed from the design but still there stays owned,
+    /// for the owner to prune (#7). In the open batch when there is one.
+    async fn release_objects(&self, owner: &str, declared: &[OwnedObject]) -> Result<()> {
+        let _ = (owner, declared);
         Ok(())
     }
     async fn get_db_version(&self) -> Result<u32>;

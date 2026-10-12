@@ -1,38 +1,37 @@
 # Checkpoint
 
-**Slice:** #7 Phase 2, slices 1–2 (registry + claim, uses) on `feat/ownership-uses`
-= PR #50 (into the `feat/ownership` integration branch). Phase 1 is on `develop`,
-unreleased.
+**Slice:** #7 Phase 2, slice 3 (prune rules, `--prune-unowned`, release) on
+`feat/ownership-prune`, from `feat/ownership` — where slices 1–2 landed as
+PR #50 (`5e6ad4dc`). Phase 1 is on `develop`, unreleased.
 
 ## Done
 
-- Slices 1–2: `dbd.objects`/`dbd.uses`; keys from every `CREATE` (DO blocks,
-  types and multiranges too) as Postgres makes them; uses namespaced, bare
-  reads the first relation on the path, bare calls every reachable routine.
-- Claim timing: an apply in one transaction claims last, in it, and before a
-  part-way commit; reconcile, reset and a DBD_NO_TX apply claim past their
-  last refusal (before-hooks planned first) and before the first write.
-- Rounds 3–5 fixed test-first; latest red `fba2b27e`, fixes `20515ad4`,
-  `871ad944`; its regression (built-in types bound to a `"Text"` table) red
-  `f383fb12`, fix `b042039d`. CI runs `cli_live` (libossp-uuid for `uuid-ossp`).
-- Embedded 198/198, `cli_live` 47/47, workspace 2002/0, clippy and fmt clean.
+- Slices 1–2 merged into `feat/ownership` (PR #50): registry, claim, uses.
+- Slice 3 = PR #51 (`f8c09c35`; fixes `78030d9f`, `63310fa8`, `31e70002`):
+  reconcile and diff hide other owners' entities; `--prune` drops own
+  undeclared (a) and unowned in an unshared schema (b); the rest kept, named,
+  unless `--prune-unowned`; release of what is undeclared and gone. A prune
+  claims and drops in one RC transaction, quotes its DROP, keeps what the
+  design creates; an enum swap another owner's column holds is refused.
+- Embedded 214/214, `cli_live` 48/48, workspace 2002/0, clippy, fmt, doc clean.
 
 ## Next
 
-    git push origin feat/ownership-uses:feat/ownership-registry   # PR #50
-    # update its body; CI green; merge #50 locally into feat/ownership;
-    # then slice 3: prune rules (a)/(b), --prune-unowned, release.
+    # PR #51: CI green → merge locally into feat/ownership. Then slice 4: the
+    # uses guard (refuse dropping/altering what another uses, by dbd.uses and
+    # pg_depend) — incl. a prune's CASCADE reaching another owner's child/view.
 
 ## Open
 
-- Slice 3: an empty design's meta has no uses — the not-upgraded marker.
 - Pre-existing, outside #7: reconcile re-emits a mixed-case or quoted
   `nextval('App.Seq')` default every run (`canonical_default`) — needs an
   issue and a pg_get_expr probe first.
-- Declined: best-effort batch rollback error; dropping the old `dbd.import_tmp`.
+- Declined: best-effort batch rollback error; dropping the old `dbd.import_tmp`;
+  migrating a branch build's `dbd.uses` CHECK (no `owner`) — rebuild those.
 - A bare type of another project's is no use (dropped as a built-in).
 - An apply in one transaction runs `apply.before` hooks before its claim
   (documented in the spec). `dbd.objects` still allows namespace `type`, unused.
+- Docs slice (end of Phase 2) must cover `--prune-unowned` in the guides.
 - Phase 1 is releasable as 0.25.2 when asked.
 
 ## Known limits

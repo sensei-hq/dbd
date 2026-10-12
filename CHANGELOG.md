@@ -57,6 +57,25 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   the first relation on the search path that exists; a call, which Postgres
   also resolves by its arguments, is a use of every routine on the path it
   could reach.
+- **`reconcile --prune` prunes by ownership** (#7, phase 2). Another
+  project's table is never dropped, and `reconcile` and `diff` no longer
+  report it as drift. `--prune` drops a table this project owns and no longer
+  declares, and one nobody owns in a schema no other project uses. One nobody
+  owns in a schema another project uses — or any, while a project the
+  database records has not upgraded dbd — is kept and named: `unowned:
+  app.tmp_report — not dropped because app is shared with "billing"
+  (--prune-unowned drops it)`. `reconcile --prune-unowned` drops those too,
+  naming each. A prune claims what it drops in the transaction that drops it,
+  so a table another project claims meanwhile is kept, naming it, and a run
+  that fails keeps no such claim; a table the design creates under a spelling
+  its path does not share is never pruned; and removing an enum
+  value that a column of another project's table holds is refused, dry run
+  included, naming the column and its owner. A successful `apply`, `deploy`
+  or `reconcile` releases what its
+  project no longer declares once it is gone — pruned, or dropped by a
+  migration or by hand; until then it stays the project's. A prune's `DROP`
+  now quotes the table it names: `app."Report"` written unquoted dropped the
+  `app.report` beside it.
 
 ### Library API
 
@@ -65,6 +84,10 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   with the `adapter::OwnedObject`, `HeldObject` and `Use` they take and
   return; and `Design::check_ownership` refuses a design declaring an entity
   another project owns.
+- `Design::reconcile` takes `prune: impl Into<Prune>` — `Prune::Off`, `On`
+  or `Unowned`; a `bool` still reads as `Off` or `On`. `DatabaseAdapter` gains
+  `ownership` and `release_objects` (defaults: nothing owned, nothing
+  released), with the `adapter::Ownership` the first returns.
 - `Entity::refs` keeps a schema-qualified type or sequence reference that
   resolves to nothing — another project's, an extension's — marked
   `unresolved` and unwarned, where it was dropped. A bare one is still dropped

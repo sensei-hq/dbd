@@ -16,6 +16,27 @@ pub(crate) enum Preflight {
     Read,
 }
 
+/// What `reconcile` drops of the live tables its design no longer declares
+/// (#7). A `bool` reads as `Off` or `On`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Prune {
+    /// Drop nothing; report what a prune would drop.
+    #[default]
+    Off,
+    /// Drop this owner's own, and those nobody owns in a schema no other
+    /// owner uses; keep, naming each, those nobody owns that might be
+    /// another owner's.
+    On,
+    /// As `On`, and drop those too, naming each.
+    Unowned,
+}
+
+impl From<bool> for Prune {
+    fn from(prune: bool) -> Self {
+        if prune { Self::On } else { Self::Off }
+    }
+}
+
 impl Design {
     /// The owner this design's runs claim as: its project's name.
     pub(crate) fn owner(&self) -> &str {
@@ -147,6 +168,8 @@ impl Design {
             .iter()
             .flat_map(|(_, keys)| keys.iter().map(|o| shared("schema", &o.schema)))
             .collect();
+        // That this owner records its uses, even when it uses nothing.
+        uses.insert(shared("owner", self.owner()));
         for e in self.entities.iter().filter(|e| e.errors.is_empty()) {
             match e.entity_type {
                 EntityType::Schema => {
@@ -229,7 +252,7 @@ impl Design {
     /// rolls back with the claim (#7).
     pub(crate) async fn claim_built(&self, adapter: &dyn DatabaseAdapter) -> Result<()> {
         self.claim(adapter).await?;
-        self.record_declared_uses(adapter).await
+        self.settle(adapter).await
     }
 
     /// Heal the bookkeeping and claim the design's entities, committed, before
@@ -257,12 +280,245 @@ impl Design {
         Ok(())
     }
 
-    /// Record what the design uses, replacing what it used before — in the
-    /// open batch when there is one. Written once the work is built: the uses
-    /// describe what is, so a run that fails keeps the record it had.
-    pub(crate) async fn record_declared_uses(&self, adapter: &dyn DatabaseAdapter) -> Result<()> {
-        adapter.record_uses(self.owner(), &self.declared_uses()).await
+    /// Once the work is built — in the open batch when there is one: record
+    /// what the design uses, replacing what it used before, and release what
+    /// it no longer declares and is gone. The uses describe what is, so a run
+    /// that fails keeps the record it had (#7).
+    pub(crate) async fn settle(&self, adapter: &dyn DatabaseAdapter) -> Result<()> {
+        adapter.record_uses(self.owner(), &self.declared_uses()).await?;
+        adapter.release_objects(self.owner(), &self.declared_objects()).await
     }
+
+    /// Who owns each table and enum of `live`, and what a prune of unowned
+    /// ones must wait for (#7).
+    pub(crate) async fn live_ownership(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        live: &crate::snapshot::Snapshot,
+    ) -> Result<LiveOwnership> {
+        let keys: Vec<(String, String)> = live
+            .tables
+            .iter()
+            .map(|t| (t.schema.clone(), t.name.clone()))
+            .chain(live.enums.iter().map(|e| (e.schema.clone(), e.name.clone())))
+            .collect();
+        let objects: Vec<OwnedObject> = keys
+            .iter()
+            .map(|(schema, name)| OwnedObject {
+                namespace: "relation".to_string(),
+                schema: schema.clone(),
+                name: name.clone(),
+                kind: String::new(),
+            })
+            .collect();
+        let found = adapter.ownership(self.owner(), &objects).await?;
+        let mut owned = LiveOwnership {
+            schema_users: found.schema_users,
+            ..LiveOwnership::default()
+        };
+        for (key, owner) in keys.into_iter().zip(found.owners) {
+            match owner {
+                Some(owner) if owner == self.owner() => {
+                    owned.mine.insert(key);
+                }
+                Some(owner) => {
+                    owned.others.insert(key, owner);
+                }
+                None => {}
+            }
+        }
+        owned.not_recording = adapter
+            .other_projects_meta()
+            .await?
+            .into_iter()
+            .map(|m| m.project)
+            .filter(|p| p != self.owner() && !found.recording.contains(p))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        Ok(owned)
+    }
+
+    /// Claim what a prune is about to drop, in the transaction that drops it:
+    /// read as this owner's or nobody's while the run planned, a table another
+    /// project has claimed since is kept, naming it — dropped, that project's
+    /// data was gone. What is claimed is released once dropped (#7).
+    pub(crate) async fn claim_prune(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        plan: &mut crate::reconcile::ReconcilePlan,
+    ) -> Result<()> {
+        loop {
+            let candidates: Vec<OwnedObject> = plan
+                .dropped
+                .iter()
+                .map(|stmt| {
+                    let (schema, name) = crate::entity::split_qualified_name(&stmt.entity_name);
+                    OwnedObject {
+                        namespace: "relation".to_string(),
+                        schema: schema.unwrap_or_else(|| crate::reconcile::DEFAULT_SCHEMA.to_string()),
+                        name,
+                        kind: "table".to_string(),
+                    }
+                })
+                .collect();
+            if candidates.is_empty() {
+                return Ok(());
+            }
+            // A claim takes all of them or none; the held ones out, again.
+            let held = adapter.claim_objects(self.owner(), &candidates, true).await?;
+            if held.is_empty() {
+                return Ok(());
+            }
+            for h in held {
+                let name = format!("{}.{}", h.object.schema, h.object.name);
+                plan.dropped.retain(|stmt| stmt.entity_name != name);
+                plan.warnings.push(format!(
+                    "{name} is owned by \"{}\", which claimed it while this run planned — not dropped",
+                    h.owner
+                ));
+            }
+        }
+    }
+
+    /// Refuse, before any write and under a dry run, removing an enum value
+    /// when a column of that type is in another owner's table: the swap
+    /// rewrites every such column, and this run has no say over that table —
+    /// left to it, the swap failed on every run with Postgres's word for it
+    /// (#7). `others` is the live snapshot of those tables.
+    pub(crate) fn refuse_enum_swaps_another_owner_holds(
+        &self,
+        plan: &crate::reconcile::ReconcilePlan,
+        others: &crate::snapshot::Snapshot,
+        owned: &LiveOwnership,
+    ) -> Result<()> {
+        let mut held = Vec::new();
+        for swap in &plan.enum_swaps {
+            let columns: Vec<String> = crate::reconcile::enum_columns(others, &swap.enum_name)
+                .into_iter()
+                .map(|c| {
+                    let key = match crate::entity::split_qualified_name(&c.table) {
+                        (Some(schema), name) => (schema, name),
+                        (None, name) => (crate::reconcile::DEFAULT_SCHEMA.to_string(), name),
+                    };
+                    let owner = owned.others.get(&key).map(String::as_str).unwrap_or("another owner");
+                    format!("{}.{} (\"{owner}\")", c.table, c.column)
+                })
+                .collect();
+            if columns.is_empty() {
+                continue;
+            }
+            let values: Vec<String> = swap.removed.iter().map(|v| crate::sql_quote::literal(v)).collect();
+            held.push(format!(
+                "removing {} from {} rewrites every column of that type, and {} {} in another owner's table",
+                values.join(", "),
+                swap.enum_name,
+                columns.join(", "),
+                if columns.len() == 1 { "is" } else { "are" },
+            ));
+        }
+        if held.is_empty() {
+            return Ok(());
+        }
+        Err(DbdError::Config(format!("{}; remove that use first", held.join("; "))))
+    }
+
+    /// Settle what a prune drops by ownership (#7). Another owner's entities
+    /// never reach the plan — see [`LiveOwnership::others`]. This owner's
+    /// own, undeclared, are dropped (rule (a)). One nobody owns is dropped
+    /// when no other owner uses its schema and every owner records its uses
+    /// (rule (b)); otherwise it may be another owner's, and is kept, named,
+    /// unless the run says `--prune-unowned`, which drops it, named.
+    pub(crate) fn prune_by_ownership(
+        &self,
+        plan: &mut crate::reconcile::ReconcilePlan,
+        owned: &LiveOwnership,
+        prune: Prune,
+    ) {
+        let quoted = |names: &[String]| names.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", ");
+        // What the design creates is no orphan, whatever its path calls it:
+        // `report.ddl` creating `app."Report"` reads as an undeclared
+        // `Report` beside a missing `report`.
+        let created: std::collections::HashMap<(String, String), String> = self
+            .entity_keys()
+            .into_iter()
+            .flat_map(|(e, keys)| {
+                let file = e
+                    .file
+                    .as_ref()
+                    .map(|f| f.display().to_string())
+                    .unwrap_or_else(|| e.name.clone());
+                keys.into_iter()
+                    .filter(|k| k.namespace == "relation")
+                    .map(move |k| ((k.schema, k.name), file.clone()))
+            })
+            .collect();
+        let mut kept = Vec::new();
+        for stmt in std::mem::take(&mut plan.dropped) {
+            let (schema, name) = match crate::entity::split_qualified_name(&stmt.entity_name) {
+                (Some(schema), name) => (schema, name),
+                (None, name) => (crate::reconcile::DEFAULT_SCHEMA.to_string(), name),
+            };
+            if let Some(file) = created.get(&(schema.clone(), name.clone())) {
+                kept.push(format!(
+                    "{} is created by {file}, whose path names another table — not dropped",
+                    stmt.entity_name
+                ));
+                continue;
+            }
+            let why = if owned.mine.contains(&(schema.clone(), name)) {
+                None
+            } else if !owned.not_recording.is_empty() {
+                let (who, verb) = (
+                    quoted(&owned.not_recording),
+                    if owned.not_recording.len() == 1 { "has" } else { "have" },
+                );
+                Some(format!(
+                    "{who} {verb} not upgraded dbd, so the schemas it uses are unknown"
+                ))
+            } else {
+                owned
+                    .schema_users
+                    .get(&schema)
+                    .map(|users| format!("{schema} is shared with {}", quoted(users)))
+            };
+            match why {
+                None => plan.dropped.push(stmt),
+                Some(why) if prune == Prune::Unowned => {
+                    plan.warnings.push(format!(
+                        "unowned: {} — dropped by --prune-unowned ({why})",
+                        stmt.entity_name
+                    ));
+                    plan.dropped.push(stmt);
+                }
+                Some(why) => kept.push(format!(
+                    "unowned: {} — not dropped {} (--prune-unowned drops it)",
+                    stmt.entity_name,
+                    if why.contains(" is shared with ") {
+                        format!("because {why}")
+                    } else {
+                        format!("while {why}")
+                    }
+                )),
+            }
+        }
+        plan.warnings.extend(kept);
+    }
+}
+
+/// What the registry says of a run's live tables and enums (#7).
+#[derive(Debug, Default)]
+pub(crate) struct LiveOwnership {
+    /// This owner's, as `(schema, name)`.
+    pub(crate) mine: std::collections::HashSet<(String, String)>,
+    /// Another owner's, and that owner: hidden from the run, which has no say
+    /// over them — not drift, and never pruned.
+    pub(crate) others: std::collections::HashMap<(String, String), String>,
+    /// Each schema another owner uses, and those owners.
+    pub(crate) schema_users: std::collections::BTreeMap<String, Vec<String>>,
+    /// The other owners the database records that do not record their uses:
+    /// their schemas are unknown, so an unowned entity might be theirs.
+    pub(crate) not_recording: Vec<String>,
 }
 
 /// The registry's namespace and kind for an entity type, or `None` for one

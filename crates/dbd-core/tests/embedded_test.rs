@@ -11887,3 +11887,613 @@ fn a_table_depends_on_its_own_sequence_named_bare() {
     let refers: Vec<&str> = orders.refers().collect();
     assert!(refers.contains(&"app.Order_No"), "{refers:?}");
 }
+
+// ── #7 Phase 2, slice 3: prune by ownership ──────────────────────────────────
+
+/// `shop` owns `app.orders`, `billing` owns `app.invoices`: both use `app`.
+async fn shop_and_billing_share_app(url: &str) -> (Box<dyn dbd_core::DatabaseAdapter>, tempfile::TempDir) {
+    let shop = connect(url, "shop").await.unwrap();
+    let billing = connect(url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1])
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    named_project(bd.path(), "billing", "", &ORDERS_OWNER_FILES[1..])
+        .apply(&*billing, None, false, None, Progress::none())
+        .await
+        .expect("billing's apply");
+    (shop, sd)
+}
+
+/// Another project's table is never shop's to prune: `app.invoices` lives in
+/// a schema shop manages and shop does not declare it, and `--prune` dropped
+/// it (#7).
+#[tokio::test]
+async fn a_prune_never_drops_another_projects_table() {
+    let (_pg, url) = start_pg().await;
+    let (shop, sd) = shop_and_billing_share_app(&url).await;
+    let plan = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1])
+        .reconcile(&*shop, false, false, true, None, Progress::none())
+        .await
+        .expect("shop's reconcile");
+    assert!(
+        !plan.dropped.iter().any(|s| s.entity_name == "app.invoices"),
+        "{:?}",
+        plan.dropped.iter().map(|s| &s.entity_name).collect::<Vec<_>>()
+    );
+    assert_table_exists(&*shop, "app", "invoices").await;
+}
+
+/// A table nobody owns, in a schema another project also uses, might be that
+/// project's: `--prune` keeps it and says so, naming the flag that drops it
+/// (#7).
+#[tokio::test]
+async fn an_unowned_table_in_a_schema_another_project_uses_is_kept_and_named() {
+    let (_pg, url) = start_pg().await;
+    let (shop, sd) = shop_and_billing_share_app(&url).await;
+    shop.execute_script("CREATE TABLE app.tmp_report (id int);")
+        .await
+        .unwrap();
+    let plan = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1])
+        .reconcile(&*shop, false, false, true, None, Progress::none())
+        .await
+        .expect("shop's reconcile");
+    assert_table_exists(&*shop, "app", "tmp_report").await;
+    let expected =
+        "unowned: app.tmp_report — not dropped because app is shared with \"billing\" (--prune-unowned drops it)";
+    assert!(plan.warnings.iter().any(|w| w == expected), "{:?}", plan.warnings);
+}
+
+/// A table nobody owns, in a schema no other project uses, is the drift
+/// `--prune` has always cleaned up (#7).
+#[tokio::test]
+async fn an_unowned_table_in_a_schema_no_other_project_uses_is_pruned() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    let design = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1]);
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    shop.execute_script("CREATE TABLE app.tmp (id int);").await.unwrap();
+    design
+        .reconcile(&*shop, false, false, true, None, Progress::none())
+        .await
+        .expect("shop's reconcile");
+    assert_table_absent(&*shop, "app", "tmp").await;
+}
+
+/// A project recorded in the database whose dbd records no uses — not yet
+/// upgraded — might use any schema: an unowned table could be its own. Until
+/// it upgrades, `--prune` drops no unowned table, and says who it waits for
+/// (#7).
+#[tokio::test]
+async fn unowned_tables_are_kept_while_a_project_has_not_upgraded() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    let design = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1]);
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    shop.execute_script(
+        "INSERT INTO dbd.meta (project, env, version) VALUES ('oldie', 'dev', 1); \
+         CREATE TABLE app.tmp (id int);",
+    )
+    .await
+    .unwrap();
+    let plan = design
+        .reconcile(&*shop, false, false, true, None, Progress::none())
+        .await
+        .expect("shop's reconcile");
+    assert_table_exists(&*shop, "app", "tmp").await;
+    assert!(
+        plan.warnings
+            .iter()
+            .any(|w| w.contains("app.tmp") && w.contains("\"oldie\"") && w.contains("--prune-unowned")),
+        "{:?}",
+        plan.warnings
+    );
+}
+
+/// A project whose design uses nothing has still upgraded: its run records
+/// that it records its uses, so it holds no prune up (#7).
+#[tokio::test]
+async fn a_project_that_uses_nothing_holds_no_prune_up() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let empty = connect(&url, "empty").await.unwrap();
+    let (sd, ed) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let design = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1]);
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    write_project(
+        ed.path(),
+        "project:\n  name: empty\n  version: 1\nsource:\n  dialect: postgresql\n",
+        &[],
+    )
+    .apply(&*empty, None, false, None, Progress::none())
+    .await
+    .expect("empty's apply");
+    assert_catalog(
+        &*shop,
+        true,
+        "SELECT 1 FROM dbd.meta WHERE project = 'empty'",
+        "empty's record",
+    )
+    .await;
+    shop.execute_script("CREATE TABLE app.tmp (id int);").await.unwrap();
+    design
+        .reconcile(&*shop, false, false, true, None, Progress::none())
+        .await
+        .expect("shop's reconcile");
+    assert_table_absent(&*shop, "app", "tmp").await;
+}
+
+/// An entity a project no longer declares stays its own while it exists —
+/// so nobody else can take it before the project prunes it — and is released
+/// once a run finds it gone: pruned here, by `reconcile --prune` (#7).
+#[tokio::test]
+async fn a_pruned_entity_is_released() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let rival = connect(&url, "rival").await.unwrap();
+    let (sd, rd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    named_project(sd.path(), "shop", "", ORDERS_OWNER_FILES)
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    std::fs::remove_file(sd.path().join(ORDERS_OWNER_FILES[1].0)).unwrap();
+    let shop_now = Design::from_config_with_dir(&sd.path().join("design.yaml"), "dev", Some(sd.path())).unwrap();
+    shop_now
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply without invoices");
+    let rival_design = named_project(rd.path(), "rival", "", &ORDERS_OWNER_FILES[1..]);
+    let err = rival_design
+        .apply(&*rival, None, false, None, Progress::none())
+        .await
+        .expect_err("app.invoices is still shop's, and still there")
+        .to_string();
+    assert!(err.contains("relation app.invoices is owned by \"shop\""), "{err}");
+
+    shop_now
+        .reconcile(&*shop, false, false, true, None, Progress::none())
+        .await
+        .expect("shop's prune");
+    assert_table_absent(&*shop, "app", "invoices").await;
+    assert_catalog(
+        &*shop,
+        false,
+        "SELECT 1 FROM dbd.objects WHERE schema = 'app' AND name = 'invoices'",
+        "an owner of the pruned app.invoices",
+    )
+    .await;
+    rival_design
+        .apply(&*rival, None, false, None, Progress::none())
+        .await
+        .expect("app.invoices is free");
+}
+
+/// Gone by other means — a migration's drop, or by hand — an entity a project
+/// no longer declares is released by its next successful apply (#7).
+#[tokio::test]
+async fn an_entity_dropped_otherwise_is_released_by_the_next_apply() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    named_project(sd.path(), "shop", "", ORDERS_OWNER_FILES)
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    std::fs::remove_file(sd.path().join(ORDERS_OWNER_FILES[1].0)).unwrap();
+    shop.execute_script("DROP TABLE app.invoices;").await.unwrap();
+    Design::from_config_with_dir(&sd.path().join("design.yaml"), "dev", Some(sd.path()))
+        .unwrap()
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    assert_catalog(
+        &*shop,
+        false,
+        "SELECT 1 FROM dbd.objects WHERE schema = 'app' AND name = 'invoices'",
+        "an owner of the dropped app.invoices",
+    )
+    .await;
+    assert_catalog(
+        &*shop,
+        true,
+        &owned_by("relation", "app", "orders", "table", "shop"),
+        "shop's app.orders, still declared",
+    )
+    .await;
+}
+
+/// `diff` reports another project's table as no drift of this one's: it is
+/// not this project's to have or to drop (#7).
+#[tokio::test]
+async fn a_diff_does_not_report_another_projects_table() {
+    let (_pg, url) = start_pg().await;
+    let (shop, sd) = shop_and_billing_share_app(&url).await;
+    let diff = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1])
+        .diff_live(&*shop, None)
+        .await
+        .expect("shop's diff");
+    assert!(
+        !format!("{:?}", diff.changes).contains("invoices"),
+        "{:?}",
+        diff.changes
+    );
+}
+
+/// Wait — at most `seconds` — until some other session waits on a lock;
+/// whether one did.
+async fn await_any_lock_waiter(adapter: &dyn dbd_core::DatabaseAdapter, seconds: u64) -> bool {
+    let probe = "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_stat_activity \
+                 WHERE wait_event_type = 'Lock' AND pid <> pg_backend_pid()) \
+                 THEN RAISE EXCEPTION 'no wait'; END IF; END $$";
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    while std::time::Instant::now() < deadline {
+        if adapter.execute_script(probe).await.is_ok() {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// A prune read a table as unowned, then dropped it — though another project
+/// had claimed it meanwhile: its data, gone. A prune claims what it drops,
+/// with the run's other claims and before any write, and keeps, naming the
+/// owner, what another project holds by then (#7).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_prune_keeps_a_table_another_project_claims_while_it_runs() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let watcher = connect(&url, "watcher").await.unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    let design = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1]);
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    shop.execute_script("CREATE TABLE app.tmp (id int); INSERT INTO app.tmp VALUES (1);")
+        .await
+        .unwrap();
+    // billing's claim, written and not yet committed when shop reads.
+    let holder = connect(&url, "billing").await.unwrap();
+    holder.begin_batch().await.unwrap();
+    holder
+        .execute_script(
+            "INSERT INTO dbd.objects (namespace, schema, name, kind, owner) \
+             VALUES ('relation', 'app', 'tmp', 'table', 'billing');",
+        )
+        .await
+        .unwrap();
+
+    let (pruned, ()) = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        tokio::join!(
+            design.reconcile(&*shop, false, false, true, None, Progress::none()),
+            async {
+                await_any_lock_waiter(&*watcher, 10).await;
+                holder.commit_batch().await.unwrap();
+            }
+        )
+    })
+    .await
+    .expect("neither may hang");
+
+    let plan = pruned.expect("shop's reconcile");
+    assert_table_exists(&*shop, "app", "tmp").await;
+    assert!(
+        plan.warnings
+            .iter()
+            .any(|w| w.contains("app.tmp") && w.contains("\"billing\"")),
+        "{:?}",
+        plan.warnings
+    );
+}
+
+/// Removing an enum value rewrites every column of that type, and one in
+/// another project's table — hidden from the run, which has no say over it —
+/// made the rewrite fail on every run, with Postgres's word for it, and a dry
+/// run said nothing. Refused before any write, dry run included, naming the
+/// column and its owner (#7).
+#[tokio::test]
+async fn an_enum_value_another_projects_column_holds_is_refused_naming_it() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let colour = |values: &str| {
+        (
+            "ddl/enum/app/colour.ddl",
+            format!("create type app.colour as enum ({values});\n"),
+        )
+    };
+    let (path, sql) = colour("'red', 'blue'");
+    named_project(sd.path(), "shop", "", &[(path, &sql)])
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    named_project(
+        bd.path(),
+        "billing",
+        "",
+        &[(
+            "ddl/table/app/inv.ddl",
+            "create table if not exists app.inv (id int primary key, c app.colour);\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    let (path, sql) = colour("'red'");
+    let design = named_project(sd.path(), "shop", "", &[(path, &sql)]);
+    for dry_run in [true, false] {
+        let err = design
+            .reconcile(&*shop, dry_run, true, false, None, Progress::none())
+            .await
+            .expect_err("billing's app.inv.c holds app.colour")
+            .to_string();
+        assert!(err.contains("\"billing\"") && err.contains("app.inv"), "{err}");
+    }
+    assert_catalog(
+        &*shop,
+        true,
+        "SELECT 1 FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname = 'colour' AND e.enumlabel = 'blue'",
+        "app.colour's 'blue', untouched",
+    )
+    .await;
+}
+
+/// A prune drops the table it decided on: `app."Report"` written unquoted is
+/// `app.report` — another project's, which a prune of shop's own `"Report"`
+/// dropped (#7).
+#[tokio::test]
+async fn a_prune_drops_the_mixed_case_table_it_names() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let report = (
+        "ddl/table/app/Report.ddl",
+        "create table if not exists app.\"Report\" (id int);\n",
+    );
+    named_project(sd.path(), "shop", "", &[ORDERS_OWNER_FILES[0], report])
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    named_project(
+        bd.path(),
+        "billing",
+        "",
+        &[(
+            "ddl/table/app/report.ddl",
+            "create table if not exists app.report (id int);\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    std::fs::remove_file(sd.path().join(report.0)).unwrap();
+    Design::from_config_with_dir(&sd.path().join("design.yaml"), "dev", Some(sd.path()))
+        .unwrap()
+        .reconcile(&*shop, false, false, true, None, Progress::none())
+        .await
+        .expect("shop's prune");
+    assert_table_exists(&*shop, "app", "report").await;
+    assert_table_absent(&*shop, "app", "Report").await;
+    assert_catalog(
+        &*shop,
+        false,
+        "SELECT 1 FROM dbd.objects WHERE schema = 'app' AND name = 'Report'",
+        "a claim of the pruned app.\"Report\"",
+    )
+    .await;
+}
+
+/// A file may name its table differently from its path — `report.ddl`
+/// creating `app."Report"` — and a prune read that table as undeclared and,
+/// dropping it by its exact name, took the design's own table and its rows.
+/// What the design creates is never pruned (#7).
+#[tokio::test]
+async fn a_prune_keeps_a_table_the_design_creates_under_another_spelling() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    let design = named_project(
+        sd.path(),
+        "shop",
+        "",
+        &[(
+            "ddl/table/app/report.ddl",
+            "create table if not exists app.\"Report\" (id int);\n",
+        )],
+    );
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    shop.execute_script("INSERT INTO app.\"Report\" VALUES (42);")
+        .await
+        .unwrap();
+    let _ = design
+        .reconcile(&*shop, false, false, true, None, Progress::none())
+        .await;
+    assert_catalog(
+        &*shop,
+        true,
+        "SELECT 1 FROM app.\"Report\" WHERE id = 42",
+        "the design's app.\"Report\" and its row",
+    )
+    .await;
+}
+
+/// A prune claims what it drops in the transaction that drops it: a run that
+/// failed before its prune left claims on unowned tables `--prune-unowned`
+/// was going to drop, and a later plain `--prune` dropped them as its own,
+/// saying nothing (#7).
+#[tokio::test]
+async fn a_failed_prune_unowned_run_leaves_no_claim() {
+    let (_pg, url) = start_pg().await;
+    let (shop, sd) = shop_and_billing_share_app(&url).await;
+    shop.execute_script("CREATE TABLE app.tmp_report (id int); INSERT INTO app.tmp_report VALUES (7);")
+        .await
+        .unwrap();
+    named_project(
+        sd.path(),
+        "shop",
+        "apply:\n  before:\n    - sql/fail.sql\n",
+        &[ORDERS_OWNER_FILES[0], ("sql/fail.sql", "select 1 / 0;\n")],
+    )
+    .reconcile(&*shop, false, false, dbd_core::Prune::Unowned, None, Progress::none())
+    .await
+    .expect_err("the hook divides by zero");
+    assert_catalog(
+        &*shop,
+        false,
+        "SELECT 1 FROM dbd.objects WHERE schema = 'app' AND name = 'tmp_report'",
+        "a claim of the unowned app.tmp_report",
+    )
+    .await;
+
+    let plan = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1])
+        .reconcile(&*shop, false, false, true, None, Progress::none())
+        .await
+        .expect("shop's plain prune");
+    assert_table_exists(&*shop, "app", "tmp_report").await;
+    assert!(
+        plan.warnings
+            .iter()
+            .any(|w| w.contains("app.tmp_report") && w.contains("\"billing\"")),
+        "{:?}",
+        plan.warnings
+    );
+}
+
+/// Dropping a parent `CASCADE` drops the tables that inherit from it, and a
+/// prune that then dropped a child by name failed — and, dropping in one
+/// transaction, kept every table. A prune drops what is still there (#7).
+#[tokio::test]
+async fn a_prune_drops_an_inherited_family_in_one_run() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    let design = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1]);
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    let children: String = (1..=15)
+        .map(|i| format!("CREATE TABLE app.measurement_{i} () INHERITS (app.measurement);"))
+        .collect();
+    shop.execute_script(&format!("CREATE TABLE app.measurement (id int); {children}"))
+        .await
+        .unwrap();
+    design
+        .reconcile(&*shop, false, false, true, None, Progress::none())
+        .await
+        .expect("one prune drops the family");
+    assert_catalog(
+        &*shop,
+        false,
+        "SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = 'app' AND c.relname LIKE 'measurement%'",
+        "a table of the measurement family",
+    )
+    .await;
+}
+
+/// The prune's claim waits for a rival's in flight and then reads what the
+/// rival committed — at READ COMMITTED, whatever the database's default: at
+/// REPEATABLE READ the wait ended in a serialization failure, after the
+/// run's other writes had committed (#7).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_prune_keeps_a_rivals_table_whatever_the_databases_isolation() {
+    let (_pg, url) = start_pg().await;
+    connect(&url, "setup")
+        .await
+        .unwrap()
+        .execute_script("ALTER DATABASE testdb SET default_transaction_isolation = 'repeatable read';")
+        .await
+        .unwrap();
+    let shop = connect(&url, "shop").await.unwrap();
+    let watcher = connect(&url, "watcher").await.unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    let design = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1]);
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    shop.execute_script("CREATE TABLE app.tmp (id int);").await.unwrap();
+    let holder = connect(&url, "billing").await.unwrap();
+    holder.begin_batch().await.unwrap();
+    holder
+        .execute_script(
+            "INSERT INTO dbd.objects (namespace, schema, name, kind, owner) \
+             VALUES ('relation', 'app', 'tmp', 'table', 'billing');",
+        )
+        .await
+        .unwrap();
+
+    let (pruned, ()) = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        tokio::join!(
+            design.reconcile(&*shop, false, false, true, None, Progress::none()),
+            async {
+                await_any_lock_waiter(&*watcher, 10).await;
+                holder.commit_batch().await.unwrap();
+            }
+        )
+    })
+    .await
+    .expect("neither may hang");
+
+    let plan = pruned.expect("shop's reconcile");
+    assert_table_exists(&*shop, "app", "tmp").await;
+    assert!(
+        plan.warnings
+            .iter()
+            .any(|w| w.contains("app.tmp") && w.contains("\"billing\"")),
+        "{:?}",
+        plan.warnings
+    );
+}
+
+/// A prune that fails part-way rolls back the drops before it — and said
+/// nothing of them, so a table reported dropped was still there. The error
+/// says nothing was pruned (#7).
+#[tokio::test]
+async fn a_prune_that_fails_part_way_says_nothing_was_pruned() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    let design = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1]);
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    shop.execute_script(
+        "CREATE TABLE app.aa_legacy (id int); CREATE TABLE app.zz_blocked (id int); \
+         CREATE FUNCTION public.block_zz() RETURNS event_trigger LANGUAGE plpgsql AS $$ \
+         BEGIN IF EXISTS (SELECT 1 FROM pg_event_trigger_dropped_objects() WHERE object_name = 'zz_blocked') \
+         THEN RAISE EXCEPTION 'zz_blocked may not be dropped'; END IF; END $$; \
+         CREATE EVENT TRIGGER block_zz ON sql_drop EXECUTE FUNCTION public.block_zz();",
+    )
+    .await
+    .unwrap();
+    let err = design
+        .reconcile(&*shop, false, false, true, None, Progress::none())
+        .await
+        .expect_err("app.zz_blocked may not be dropped")
+        .to_string();
+    assert!(err.contains("nothing was pruned"), "{err}");
+    assert_table_exists(&*shop, "app", "aa_legacy").await;
+}

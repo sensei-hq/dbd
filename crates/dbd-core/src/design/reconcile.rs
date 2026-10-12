@@ -176,7 +176,6 @@ impl Design {
         managed_schemas: &std::collections::HashSet<String>,
         mv_to_create: &[(&Entity, String)],
         mv_to_restamp: &[(&Entity, String)],
-        prune: bool,
         on_start: &mut S,
         on_done: &mut D,
     ) -> Result<crate::reconcile::ReconcileComplete>
@@ -289,20 +288,74 @@ impl Design {
             summary.restamped += 1;
         }
 
-        // Prune orphaned tables (in managed schemas, gone from the
-        // design), only when explicitly requested. Otherwise they are reported
-        // via the returned plan and left untouched.
-        if prune {
+        Ok(summary)
+    }
+
+    /// Prune the orphans `plan` drops — claimed and dropped in one
+    /// transaction where the adapter has them: a table another project holds
+    /// by then is kept, naming it (see [`Design::claim_prune`]), and a run
+    /// that fails, or is killed, mid-prune keeps neither the drops nor the
+    /// claims — claims left behind made a later `--prune` drop an unowned
+    /// table as this project's own (#7). Returns how many it dropped.
+    async fn prune_claimed<S, D>(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        plan: &mut crate::reconcile::ReconcilePlan,
+        on_start: &mut S,
+        on_done: &mut D,
+    ) -> Result<u32>
+    where
+        S: FnMut(&str),
+        D: FnMut(&str, Option<&str>),
+    {
+        let batch = adapter.supports_transactional_apply();
+        if batch {
+            adapter.begin_batch().await?;
+        }
+        let mut done: Vec<String> = Vec::new();
+        let result: Result<()> = async {
+            if batch {
+                // Read committed, as the registry's own transactions are: the
+                // claim may wait on a rival's, and must then read what the
+                // rival committed — at REPEATABLE READ the wait ended in a
+                // serialization failure. The batch's first statement.
+                adapter
+                    .execute_script("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                    .await?;
+            }
+            self.claim_prune(adapter, plan).await?;
             for stmt in &plan.dropped {
                 let desc = format!("prune table:{}", stmt.entity_name);
                 on_start(&desc);
                 let result = adapter.execute_script(&stmt.sql).await;
                 report_step_result(&desc, on_done, result)?;
-                summary.dropped += 1;
+                done.push(stmt.entity_name.clone());
+            }
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                if batch {
+                    adapter.commit_batch().await?;
+                }
+                Ok(done.len() as u32)
+            }
+            Err(e) => {
+                if !batch {
+                    return Err(e);
+                }
+                // Best-effort rollback; surface the original failure — and
+                // that the drops reported before it are undone with it.
+                let _ = adapter.rollback_batch().await;
+                let undone = if done.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — the drops of {} are rolled back with it", done.join(", "))
+                };
+                Err(DbdError::Config(format!("{e}; nothing was pruned{undone}")))
             }
         }
-
-        Ok(summary)
     }
 
     /// Reconcile the live database to the desired schema in place (declarative).
@@ -329,7 +382,7 @@ impl Design {
         adapter: &dyn DatabaseAdapter,
         dry_run: bool,
         allow_destructive: bool,
-        prune: bool,
+        prune: impl Into<ownership::Prune>,
         scope: Option<&ResolvedScope>,
         mut progress: Progress<S, D, C>,
     ) -> Result<crate::reconcile::ReconcilePlan>
@@ -343,6 +396,7 @@ impl Design {
             plan_exclusion_convergence, plan_fk_convergence, plan_index_convergence, plan_reconcile,
             raw_snapshot_from_entities,
         };
+        let prune: ownership::Prune = prune.into();
 
         // Batch adapters (e.g. Convex) have no live SQL schema to diff.
         if adapter.prefers_batch_apply() {
@@ -386,13 +440,33 @@ impl Design {
         // `desired` surface as `plan.dropped` (orphans) — pruned only on request.
         // Under a scope, also hide what the design declares outside it: those are
         // the project's own, not orphans, and a scoped `--prune` dropped them (#40).
-        let hidden = self.declared_out_of_scope(&desired_entities);
+        // And hide what another owner holds: it is not this project's to
+        // have, alter or drop (#7).
+        let mut hidden = self.declared_out_of_scope(&desired_entities);
         let live_entities = adapter.introspect().await?;
-        let live_full = compared_snapshot(&live_entities, &extension_types);
-        let live = hide_declared(restrict_snapshot_to_schemas(live_full, &managed_schemas), &hidden);
+        let live_full =
+            restrict_snapshot_to_schemas(compared_snapshot(&live_entities, &extension_types), &managed_schemas);
+        let owned = self.live_ownership(adapter, &live_full).await?;
+        hidden.extend(owned.others.keys().cloned());
+        // Kept aside: an enum swap rewrites another owner's column too, which
+        // the run must refuse rather than hide.
+        let others_live = crate::snapshot::Snapshot {
+            tables: live_full
+                .tables
+                .iter()
+                .filter(|t| owned.others.contains_key(&(t.schema.clone(), t.name.clone())))
+                .cloned()
+                .collect(),
+            enums: Vec::new(),
+            version: live_full.version,
+            description: String::new(),
+            timestamp: String::new(),
+        };
+        let live = hide_declared(live_full, &hidden);
 
         let mut plan = plan_reconcile(&live, &desired);
         self.drop_platform_owned_drops(&mut plan);
+        self.prune_by_ownership(&mut plan, &owned, prune);
 
         // Foreign keys (issue #8): canonicalize strips FKs from the snapshots
         // above, so converge them from the RAW snapshots — adding declared FKs
@@ -462,6 +536,7 @@ impl Design {
         // swap, and dbd never drops one: refused here, before any write and
         // under `dry_run`, against what the database has.
         refuse_enum_swaps_a_matview_blocks(adapter, &plan, &desired_entities).await?;
+        self.refuse_enum_swaps_another_owner_holds(&plan, &others_live, &owned)?;
 
         if dry_run {
             // Checked as the run checks them, executing none: a hook file that
@@ -521,13 +596,17 @@ impl Design {
                 &managed_schemas,
                 &mv_to_create,
                 &mv_to_restamp,
-                prune,
                 &mut progress.on_start,
                 &mut progress.on_done,
             )
             .await?;
-        // Built: record what it uses (#7).
-        self.record_declared_uses(adapter).await?;
+        if prune != ownership::Prune::Off && !plan.dropped.is_empty() {
+            summary.dropped = self
+                .prune_claimed(adapter, &mut plan, &mut progress.on_start, &mut progress.on_done)
+                .await?;
+        }
+        // Built: record what it uses, and release what it pruned (#7).
+        self.settle(adapter).await?;
 
         // Sync pg_cron refresh jobs, mirroring the apply path. This MUST cover the
         // whole design, not the scoped `desired_entities`: `sync_refresh_jobs`
@@ -668,11 +747,13 @@ impl Design {
         // Live snapshot, restricted to managed schemas. Raw so introspected
         // FK/CHECK/indexes/comments reach `SchemaDiff::normalize_for_diff`.
         // The same hiding as `reconcile`, so the diff shows what reconcile would do (#40).
-        let hidden = self.declared_out_of_scope(&desired_entities);
+        let mut hidden = self.declared_out_of_scope(&desired_entities);
         let live_entities = adapter.introspect().await?;
         let mut live_full = raw_snapshot_from_entities(&live_entities);
         crate::reconcile::qualify_extension_types(&mut live_full, &extension_types);
-        let live = hide_declared(restrict_snapshot_to_schemas(live_full, &managed_schemas), &hidden);
+        let live_full = restrict_snapshot_to_schemas(live_full, &managed_schemas);
+        hidden.extend(self.live_ownership(adapter, &live_full).await?.others.into_keys());
+        let live = hide_declared(live_full, &hidden);
 
         let mut diff = crate::SchemaDiff::compute(live, desired);
 

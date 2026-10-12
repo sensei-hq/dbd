@@ -82,7 +82,7 @@ CREATE TABLE IF NOT EXISTS dbd.objects (
 -- or another owner's entity (and through which of its own entities).
 CREATE TABLE IF NOT EXISTS dbd.uses (
   owner   varchar NOT NULL,
-  kind    varchar NOT NULL CHECK (kind IN ('schema', 'extension', 'role', 'entity')),
+  kind    varchar NOT NULL CHECK (kind IN ('schema', 'extension', 'role', 'entity', 'owner')),
   target  varchar NOT NULL,        -- 'app', 'vector', 'basic', 'relation:identity.users'
   via     varchar NOT NULL DEFAULT '',  -- 'view billing.v_invoices'
   PRIMARY KEY (owner, kind, target, via)
@@ -152,9 +152,20 @@ named as it goes:
 
 `unowned: public.tmp_report — not dropped because public is shared with "billing" (--prune-unowned drops it)`
 
-Entities owned by someone else are never candidates. This replaces
-`managed_schemas` as the prune boundary. `restrict_snapshot_to_schemas` stays
-as a second lock.
+With `--prune-unowned` the run reports instead `unowned: public.tmp_report —
+dropped by --prune-unowned (public is shared with "billing")`.
+
+Entities owned by someone else are never candidates: `reconcile` and `diff`
+hide them, so they are neither drift nor orphans. A table the design creates —
+whatever its file's path calls it — is never an orphan. A prune claims each
+table it is about to drop in the transaction that drops it, after the run's
+other writes: one another owner has claimed since the run read the registry is
+kept, naming that owner; a run that fails or is killed mid-prune keeps neither
+its drops nor those claims; and what is claimed is released once dropped. Removing an enum value rewrites
+every column of that type, so a column in another owner's table refuses it,
+before any write and under a dry run, naming the column and its owner. Ownership decides which
+orphans go; `managed_schemas`, through `restrict_snapshot_to_schemas`, stays as
+a second lock on where a candidate can be at all.
 
 **Release.** An entity is released when its owner's successful run no longer
 declares it and the entity no longer exists: it was pruned, or a migration's
@@ -210,10 +221,12 @@ that already exist and nobody owns. Undeclared live entities stay unowned. On a
 database with one owner, rule (b) keeps pruning them exactly as today. No
 migration step is needed.
 
-Rule (b) is suspended while any owner in `dbd.meta` has not upgraded yet (a
-meta row with no `dbd.uses` rows). That owner's schema uses are unknown, so an
+Rule (b) is suspended while any owner in `dbd.meta` has not upgraded yet: a
+meta row whose owner has no `owner` row in `dbd.uses`. Every run that records
+its uses writes that row, naming itself, so a design that uses nothing still
+counts as upgraded. A not-yet-upgraded owner's schema uses are unknown, so an
 unowned entity might be its own. The prune report names the owners still to
-upgrade.
+upgrade, and `--prune-unowned` drops such entities anyway, each named.
 
 **SQLite** uses the same model in its single namespace (`_dbd_objects`,
 `_dbd_uses`), with no special case. **Convex** is one deployment per project and

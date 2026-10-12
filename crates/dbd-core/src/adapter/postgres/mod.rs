@@ -2572,6 +2572,15 @@ ORDER BY 1, 2, 4, 5"#;
         self.bookkeeping.record_uses(guard.as_mut(), owner, uses).await
     }
 
+    async fn ownership(&self, owner: &str, objects: &[super::OwnedObject]) -> Result<super::Ownership> {
+        self.bookkeeping.ownership(owner, objects).await
+    }
+
+    async fn release_objects(&self, owner: &str, declared: &[super::OwnedObject]) -> Result<()> {
+        let mut guard = self.batch.lock().await;
+        self.bookkeeping.release_objects(guard.as_mut(), owner, declared).await
+    }
+
     async fn get_db_version(&self) -> Result<u32> {
         self.bookkeeping.version().await
     }
