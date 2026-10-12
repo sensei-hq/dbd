@@ -104,8 +104,13 @@ impl Bookkeeping {
     /// against `&mut PgConnection` under `#[async_trait]` (see
     /// `PostgresAdapter::exec_raw`). Projects sharing a database run at once,
     /// so each copy is locked before it is read — see [`Self::lock_legacy`] —
-    /// and one gone since the discovery, or out of this role's reach, is
-    /// passed over.
+    /// and one gone since the discovery is passed over.
+    ///
+    /// The transaction reads `READ COMMITTED`, whatever the database's default:
+    /// a lock waits for a writer in flight, and only a fresh snapshot per
+    /// statement then sees what it committed. One heal runs at a time per
+    /// database — two first runs each creating the `dbd` schema collided on it
+    /// — and none waits past [`HEAL_LOCK_TIMEOUT`] for a lock.
     pub(super) async fn heal(&self) -> Result<()> {
         use sqlx::Executor as _;
 
@@ -118,6 +123,30 @@ impl Bookkeeping {
             .begin()
             .await
             .map_err(|e| DbdError::Config(format!("heal: begin failed: {e}")))?;
+
+        (&mut *tx)
+            .execute(
+                format!(
+                    "SET TRANSACTION ISOLATION LEVEL READ COMMITTED; \
+                     SET LOCAL lock_timeout = '{HEAL_LOCK_TIMEOUT}'"
+                )
+                .as_str(),
+            )
+            .await
+            .map_err(|e| DbdError::Config(format!("heal: begin failed: {e}")))?;
+        if let Err(e) = (&mut *tx)
+            .execute("SELECT pg_advisory_xact_lock(hashtext('dbd:heal'))")
+            .await
+        {
+            return Err(DbdError::Config(if sqlstate(&e).as_deref() == Some("55P03") {
+                format!(
+                    "heal: another dbd run is healing this database's bookkeeping and did not \
+                     finish within {HEAL_LOCK_TIMEOUT}; run again"
+                )
+            } else {
+                format!("heal: waiting for another heal failed: {e}")
+            }));
+        }
 
         (&mut *tx)
             .execute(Self::LAYOUT_DDL)
@@ -140,6 +169,27 @@ impl Bookkeeping {
         .execute(&mut *tx)
         .await
         .map_err(|e| DbdError::Config(format!("heal: lift matview stamps failed: {e}")))?;
+
+        // Fold this project's `_dbd_migrations` rows → `dbd.migrations`
+        // (composite PK unions copies) — before `_dbd_meta`, the order a dbd
+        // before the `dbd` schema writes them in one batch. Locked the other
+        // way round, the heal and such a batch each waited for the other.
+        for s in migration_schemas {
+            if !self.lock_legacy(&mut tx, &s, "_dbd_migrations").await? {
+                continue;
+            }
+            let q = s.replace('"', "\"\"");
+            sqlx::query(&format!(
+                "INSERT INTO dbd.migrations (project, version, applied_at, description, checksum) \
+                   SELECT project, version, applied_at, description, checksum FROM \"{q}\"._dbd_migrations \
+                   WHERE project = $1 ON CONFLICT (project, version) DO NOTHING"
+            ))
+            .bind(&self.project)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DbdError::Config(format!("heal: fold {s}._dbd_migrations failed: {e}")))?;
+            self.release_legacy_rows(&mut tx, &s, "_dbd_migrations").await?;
+        }
 
         // Fold this project's `_dbd_meta` row → `dbd.meta` (canonical row wins
         // on conflict). A copy that predates the `scope` column is read as it
@@ -171,25 +221,6 @@ impl Bookkeeping {
             self.release_legacy_rows(&mut tx, &s, "_dbd_meta").await?;
         }
 
-        // Fold this project's `_dbd_migrations` rows → `dbd.migrations`
-        // (composite PK unions copies).
-        for s in migration_schemas {
-            if !self.lock_legacy(&mut tx, &s, "_dbd_migrations").await? {
-                continue;
-            }
-            let q = s.replace('"', "\"\"");
-            sqlx::query(&format!(
-                "INSERT INTO dbd.migrations (project, version, applied_at, description, checksum) \
-                   SELECT project, version, applied_at, description, checksum FROM \"{q}\"._dbd_migrations \
-                   WHERE project = $1 ON CONFLICT (project, version) DO NOTHING"
-            ))
-            .bind(&self.project)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| DbdError::Config(format!("heal: fold {s}._dbd_migrations failed: {e}")))?;
-            self.release_legacy_rows(&mut tx, &s, "_dbd_migrations").await?;
-        }
-
         tx.commit()
             .await
             .map_err(|e| DbdError::Config(format!("heal: commit failed: {e}")))?;
@@ -203,9 +234,11 @@ impl Bookkeeping {
     /// holds writers until the heal commits.
     ///
     /// `false`, with the transaction as it was, for a table this role cannot
-    /// lock, read or delete from — another project's role owns it, so it holds
-    /// nothing of this project's — or one dropped since it was found, by
-    /// another project's heal.
+    /// lock, read or delete from — another project's role owns it — unless it
+    /// holds this project's own row, which would go on being read there: that
+    /// is refused, naming the table. `false` too for one dropped since it was
+    /// found, by another project's heal. A writer that holds it past
+    /// [`HEAL_LOCK_TIMEOUT`] fails the heal, naming the table.
     async fn lock_legacy(&self, tx: &mut Transaction<'static, Postgres>, schema: &str, relname: &str) -> Result<bool> {
         use sqlx::Executor as _;
         let table = quoted_table(schema, relname);
@@ -217,10 +250,12 @@ impl Bookkeeping {
             (&mut **tx)
                 .execute(format!("LOCK TABLE {table} IN SHARE ROW EXCLUSIVE MODE").as_str())
                 .await?;
-            sqlx::query_scalar::<_, bool>(&format!(
-                "SELECT has_table_privilege('{0}', 'SELECT') AND has_table_privilege('{0}', 'DELETE')",
-                table.replace('\'', "''")
-            ))
+            sqlx::query_scalar::<_, bool>(
+                "SELECT has_table_privilege(format('%I.%I', $1::text, $2::text), 'SELECT') \
+                    AND has_table_privilege(format('%I.%I', $1::text, $2::text), 'DELETE')",
+            )
+            .bind(schema)
+            .bind(relname)
             .fetch_one(&mut **tx)
             .await
         }
@@ -235,14 +270,62 @@ impl Bookkeeping {
             }
             Ok(false) => {
                 self.undo_to(tx, "dbd_heal_lock").await?;
+                self.refuse_if_holding_own_row(tx, schema, relname).await?;
                 Ok(false)
             }
-            Err(e) if matches!(sqlstate(&e).as_deref(), Some("42P01" | "42501")) => {
+            Err(e) if sqlstate(&e).as_deref() == Some("42P01") => {
                 self.undo_to(tx, "dbd_heal_lock").await?;
                 Ok(false)
             }
+            Err(e) if sqlstate(&e).as_deref() == Some("42501") => {
+                self.undo_to(tx, "dbd_heal_lock").await?;
+                self.refuse_if_holding_own_row(tx, schema, relname).await?;
+                Ok(false)
+            }
+            Err(e) if sqlstate(&e).as_deref() == Some("55P03") => Err(DbdError::Config(format!(
+                "heal: {schema}.{relname} is held by another session's open write, which did not finish \
+                 within {HEAL_LOCK_TIMEOUT} — let it finish, or end it, and run again"
+            ))),
             Err(e) => Err(DbdError::Config(format!("heal: lock {schema}.{relname} failed: {e}"))),
         }
+    }
+
+    /// Refuse a legacy `schema.relname` this role can read but not take that
+    /// holds this project's row: passed over, the row would never move to
+    /// `dbd.*` and would go on being read — after a reset forgot the project,
+    /// its old record would come back.
+    async fn refuse_if_holding_own_row(
+        &self,
+        tx: &mut Transaction<'static, Postgres>,
+        schema: &str,
+        relname: &str,
+    ) -> Result<()> {
+        let readable: bool =
+            sqlx::query_scalar("SELECT has_table_privilege(format('%I.%I', $1::text, $2::text), 'SELECT')")
+                .bind(schema)
+                .bind(relname)
+                .fetch_one(&mut **tx)
+                .await
+                .map_err(|e| DbdError::Config(format!("heal: read {schema}.{relname} privileges failed: {e}")))?;
+        if !readable {
+            return Ok(());
+        }
+        let holds: bool = sqlx::query_scalar(&format!(
+            "SELECT EXISTS (SELECT 1 FROM {} WHERE project = $1)",
+            quoted_table(schema, relname)
+        ))
+        .bind(&self.project)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|e| DbdError::Config(format!("heal: read {schema}.{relname} failed: {e}")))?;
+        if holds {
+            return Err(DbdError::Config(format!(
+                "heal: {schema}.{relname} holds this project's record, but this role cannot lock and delete \
+                 from it, so the record cannot move to dbd.*; grant it DELETE on {schema}.{relname}, or run \
+                 as its owner"
+            )));
+        }
+        Ok(())
     }
 
     /// Roll the heal back to `savepoint` and release it.
@@ -408,9 +491,13 @@ impl Bookkeeping {
                 ))
                 .bind(&self.project)
                 .fetch_all(&self.pool)
-                .await
-                .map_err(|e| DbdError::Config(format!("read meta failed: {e}")))?;
-                Ok(rows.iter().map(|row| read(row, false)).collect())
+                .await;
+                match rows {
+                    Ok(rows) => Ok(rows.iter().map(|row| read(row, false)).collect()),
+                    // Dropped between the two reads, by another project's heal.
+                    Err(e) if sqlstate(&e).as_deref() == Some("42P01") => Ok(Vec::new()),
+                    Err(e) => Err(DbdError::Config(format!("read meta failed: {e}"))),
+                }
             }
         }
     }
@@ -598,6 +685,10 @@ impl Bookkeeping {
         Ok(Some(0))
     }
 }
+
+/// How long a heal waits for a lock — another heal, or a writer on a legacy
+/// table — before it gives up and says which.
+const HEAL_LOCK_TIMEOUT: &str = "5s";
 
 /// `"schema"."relname"`, each part quoted.
 fn quoted_table(schema: &str, relname: &str) -> String {
