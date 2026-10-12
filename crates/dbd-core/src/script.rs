@@ -759,6 +759,14 @@ pub fn build_reset_script_keeping(
 /// a view calling an in-scope function goes before it. Extensions go before
 /// schemas, which may hold them.
 ///
+/// A table's policies go first. `dbd policies` creates them after every
+/// entity, so they are not entities and that order cannot place them: a policy
+/// calling one of the scope's functions held the function's drop while its
+/// table still stood, and the refusal blamed a dependent outside the scope for
+/// one inside it. They go with their table anyway, so dropping them first
+/// takes nothing more; a policy on a table outside the scope is left, and still
+/// refuses the drop of what it calls.
+///
 /// The drops share one block: if any is refused because something outside the
 /// scope depends on it, every drop rolls back and the error names the object
 /// and its dependents (Postgres's `DETAIL`, which the driver's message leaves
@@ -773,6 +781,27 @@ pub fn build_scoped_reset_script(
     schemas: &[String],
 ) -> Option<String> {
     let mut drops = Vec::new();
+    let tables: Vec<String> = entities
+        .iter()
+        .filter(|e| e.entity_type == EntityType::Table)
+        .map(|e| {
+            let (_, bare) = crate::entity::split_qualified_name(&e.name);
+            format!(
+                "('{}', '{}')",
+                sql_quote_escape(entity_schema(e)),
+                sql_quote_escape(&bare)
+            )
+        })
+        .collect();
+    if !tables.is_empty() {
+        drops.push(format!(
+            "FOR r IN SELECT pol.polname, n.nspname, c.relname FROM pg_policy pol\n    \
+             JOIN pg_class c ON c.oid = pol.polrelid JOIN pg_namespace n ON n.oid = c.relnamespace\n    \
+             WHERE (n.nspname, c.relname) IN ({})\n  \
+             LOOP EXECUTE format('DROP POLICY %I ON %I.%I', r.polname, r.nspname, r.relname); END LOOP;",
+            tables.join(", ")
+        ));
+    }
     let mut seen_routines = std::collections::HashSet::new();
     for e in entities.iter().rev() {
         let schema = entity_schema(e);
