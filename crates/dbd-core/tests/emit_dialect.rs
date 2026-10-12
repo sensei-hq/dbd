@@ -2474,7 +2474,8 @@ fn the_emitted_sqlite_script_with_named_keys_applies() {
 // ── A name holding the target's own quote character ─────────────────────────
 
 /// A project whose table and column names hold every target's quote
-/// character: `"` (SQLite), `` ` `` (MySQL) and `]` (SQL Server).
+/// character: `"` (SQLite), `` ` `` (MySQL) and `]` (SQL Server). The indexed
+/// column is a `varchar`, which every target can index.
 fn quote_project(dir: &Path) -> Design {
     std::fs::write(
         dir.join("design.yaml"),
@@ -2487,7 +2488,7 @@ fn quote_project(dir: &Path) -> Design {
         t.join("w\"]x`.ddl"),
         "create table if not exists app.\"w\"\"]x`\" (\n  \
            \"i\"\"d\" integer primary key,\n  \
-           \"a]b`c\" text not null\n\
+           \"a]b`c\" varchar(20) not null\n\
          );\n\
          create index \"ix\"\"]`\" on app.\"w\"\"]x`\" (\"a]b`c\");\n",
     )
