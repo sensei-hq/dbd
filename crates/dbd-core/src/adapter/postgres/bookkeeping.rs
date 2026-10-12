@@ -48,7 +48,7 @@ impl Bookkeeping {
             PRIMARY KEY (namespace, schema, name) ); \
          CREATE TABLE IF NOT EXISTS dbd.uses ( \
             owner varchar NOT NULL, \
-            kind varchar NOT NULL CHECK (kind IN ('schema', 'extension', 'role', 'entity')), \
+            kind varchar NOT NULL CHECK (kind IN ('schema', 'extension', 'role', 'entity', 'owner')), \
             target varchar NOT NULL, via varchar NOT NULL DEFAULT '', \
             PRIMARY KEY (owner, kind, target, via) );";
 
@@ -638,6 +638,80 @@ impl Bookkeeping {
         bounded_wait(tx, "dbd.uses", false).await
     }
 
+    /// What the registry says of `objects` for `owner`'s prune: each one's
+    /// owner, the schemas other owners use, and the owners that record their
+    /// uses. Reads only; a database with no registry yet has none of it.
+    pub(super) async fn ownership(
+        &self,
+        owner: &str,
+        objects: &[crate::adapter::OwnedObject],
+    ) -> Result<crate::adapter::Ownership> {
+        let read = |e: sqlx::Error| DbdError::Config(format!("ownership read failed: {e}"));
+        let mut found = crate::adapter::Ownership {
+            owners: vec![None; objects.len()],
+            ..Default::default()
+        };
+        let registry: Option<String> = sqlx::query_scalar("SELECT to_regclass('dbd.objects')::text")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(read)?;
+        if registry.is_none() {
+            return Ok(found);
+        }
+        let column = |f: fn(&crate::adapter::OwnedObject) -> &str| -> Vec<String> {
+            objects.iter().map(|o| f(o).to_string()).collect()
+        };
+        found.owners = sqlx::query_scalar(
+            "SELECT o.owner \
+             FROM unnest($1::text[], $2::text[], $3::text[]) WITH ORDINALITY AS d(namespace, schema, name, i) \
+             LEFT JOIN dbd.objects o ON o.namespace = d.namespace AND o.schema = d.schema AND o.name = d.name \
+             ORDER BY d.i",
+        )
+        .bind(column(|o| &o.namespace))
+        .bind(column(|o| &o.schema))
+        .bind(column(|o| &o.name))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(read)?;
+        let shared: Vec<(String, Vec<String>)> = sqlx::query_as(
+            "SELECT target, array_agg(DISTINCT owner ORDER BY owner) FROM dbd.uses \
+             WHERE kind = 'schema' AND owner <> $1 GROUP BY target",
+        )
+        .bind(owner)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(read)?;
+        found.schema_users = shared.into_iter().collect();
+        let recording: Vec<String> = sqlx::query_scalar("SELECT DISTINCT owner FROM dbd.uses WHERE kind = 'owner'")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(read)?;
+        found.recording = recording.into_iter().collect();
+        Ok(found)
+    }
+
+    /// Release `owner`'s claims of what is neither among `declared` nor in
+    /// the catalog any more — in `tx`, the run's open batch, when there is
+    /// one, so it sees the batch's own drops; else in a transaction of its
+    /// own. Waits at most [`HEAL_LOCK_TIMEOUT`] for the registry.
+    pub(super) async fn release_objects(
+        &self,
+        tx: Option<&mut Transaction<'static, Postgres>>,
+        owner: &str,
+        declared: &[crate::adapter::OwnedObject],
+    ) -> Result<()> {
+        match tx {
+            Some(tx) => release_in(tx, owner, declared).await,
+            None => {
+                let mut own = self.registry_tx("release").await?;
+                release_in(&mut own, owner, declared).await?;
+                own.commit()
+                    .await
+                    .map_err(|e| DbdError::Config(format!("release: commit failed: {e}")))
+            }
+        }
+    }
+
     /// Read the recorded version for this project (authoritative version source).
     /// Catalog-resolved (both-names aware) so a not-yet-healed legacy DB is read
     /// correctly instead of silently missed as version 0. `0` when there is no
@@ -1021,4 +1095,37 @@ fn registry_error(e: &sqlx::Error, table: &str, what: &str) -> DbdError {
         Some("40001") => format!("{what}: another run wrote {table} at the same time; run again"),
         _ => format!("{what} failed: {e}"),
     })
+}
+
+/// [`Bookkeeping::release_objects`]'s statement, in `tx`.
+async fn release_in(
+    tx: &mut Transaction<'static, Postgres>,
+    owner: &str,
+    declared: &[crate::adapter::OwnedObject],
+) -> Result<()> {
+    let column = |f: fn(&crate::adapter::OwnedObject) -> &str| -> Vec<String> {
+        declared.iter().map(|o| f(o).to_string()).collect()
+    };
+    bounded_wait(tx, "dbd.objects", true).await?;
+    sqlx::query(
+        "DELETE FROM dbd.objects o WHERE o.owner = $1 \
+           AND NOT EXISTS (SELECT 1 FROM unnest($2::text[], $3::text[], $4::text[]) AS d(namespace, schema, name) \
+                           WHERE d.namespace = o.namespace AND d.schema = o.schema AND d.name = o.name) \
+           AND NOT CASE o.namespace \
+             WHEN 'routine' THEN EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+                                         WHERE n.nspname = o.schema AND p.proname = o.name) \
+             ELSE EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                          WHERE n.nspname = o.schema AND c.relname = o.name) \
+               OR EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
+                          WHERE n.nspname = o.schema AND t.typname = o.name) \
+           END",
+    )
+    .bind(owner)
+    .bind(column(|o| &o.namespace))
+    .bind(column(|o| &o.schema))
+    .bind(column(|o| &o.name))
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| registry_error(&e, "dbd.objects", "release"))?;
+    bounded_wait(tx, "dbd.objects", false).await
 }

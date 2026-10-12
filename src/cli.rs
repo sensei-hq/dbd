@@ -356,9 +356,16 @@ pub enum Commands {
         /// Allow destructive changes (dropping columns/constraints, removing an enum value)
         #[arg(long)]
         allow_destructive: bool,
-        /// Drop orphaned tables — those in a managed schema but no longer in the design
+        /// Drop orphaned tables — those in a managed schema but no longer in the
+        /// design: this project's own, and those nobody owns in a schema no
+        /// other project uses. Another project's table is never dropped.
         #[arg(long)]
         prune: bool,
+        /// With `--prune`, also drop the tables nobody owns that might be
+        /// another project's — in a schema another project uses, or any while a
+        /// project here has not upgraded dbd — naming each. Implies `--prune`.
+        #[arg(long)]
+        prune_unowned: bool,
         /// Allow this database to be re-pointed to a different scope
         /// (bypasses the scope guard).
         #[arg(long)]

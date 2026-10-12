@@ -489,7 +489,7 @@ impl Design {
             if use_txn {
                 self.claim_built(adapter).await
             } else {
-                self.record_declared_uses(adapter).await
+                self.settle(adapter).await
             }
         }
         .await;

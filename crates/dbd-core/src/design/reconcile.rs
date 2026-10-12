@@ -329,7 +329,7 @@ impl Design {
         adapter: &dyn DatabaseAdapter,
         dry_run: bool,
         allow_destructive: bool,
-        prune: bool,
+        prune: impl Into<ownership::Prune>,
         scope: Option<&ResolvedScope>,
         mut progress: Progress<S, D, C>,
     ) -> Result<crate::reconcile::ReconcilePlan>
@@ -343,6 +343,7 @@ impl Design {
             plan_exclusion_convergence, plan_fk_convergence, plan_index_convergence, plan_reconcile,
             raw_snapshot_from_entities,
         };
+        let prune: ownership::Prune = prune.into();
 
         // Batch adapters (e.g. Convex) have no live SQL schema to diff.
         if adapter.prefers_batch_apply() {
@@ -386,13 +387,19 @@ impl Design {
         // `desired` surface as `plan.dropped` (orphans) — pruned only on request.
         // Under a scope, also hide what the design declares outside it: those are
         // the project's own, not orphans, and a scoped `--prune` dropped them (#40).
-        let hidden = self.declared_out_of_scope(&desired_entities);
+        // And hide what another owner holds: it is not this project's to
+        // have, alter or drop (#7).
+        let mut hidden = self.declared_out_of_scope(&desired_entities);
         let live_entities = adapter.introspect().await?;
-        let live_full = compared_snapshot(&live_entities, &extension_types);
-        let live = hide_declared(restrict_snapshot_to_schemas(live_full, &managed_schemas), &hidden);
+        let live_full =
+            restrict_snapshot_to_schemas(compared_snapshot(&live_entities, &extension_types), &managed_schemas);
+        let owned = self.live_ownership(adapter, &live_full).await?;
+        hidden.extend(owned.others.iter().cloned());
+        let live = hide_declared(live_full, &hidden);
 
         let mut plan = plan_reconcile(&live, &desired);
         self.drop_platform_owned_drops(&mut plan);
+        self.prune_by_ownership(&mut plan, &owned, prune);
 
         // Foreign keys (issue #8): canonicalize strips FKs from the snapshots
         // above, so converge them from the RAW snapshots — adding declared FKs
@@ -521,13 +528,13 @@ impl Design {
                 &managed_schemas,
                 &mv_to_create,
                 &mv_to_restamp,
-                prune,
+                prune != ownership::Prune::Off,
                 &mut progress.on_start,
                 &mut progress.on_done,
             )
             .await?;
-        // Built: record what it uses (#7).
-        self.record_declared_uses(adapter).await?;
+        // Built: record what it uses, and release what it pruned (#7).
+        self.settle(adapter).await?;
 
         // Sync pg_cron refresh jobs, mirroring the apply path. This MUST cover the
         // whole design, not the scoped `desired_entities`: `sync_refresh_jobs`
@@ -668,11 +675,13 @@ impl Design {
         // Live snapshot, restricted to managed schemas. Raw so introspected
         // FK/CHECK/indexes/comments reach `SchemaDiff::normalize_for_diff`.
         // The same hiding as `reconcile`, so the diff shows what reconcile would do (#40).
-        let hidden = self.declared_out_of_scope(&desired_entities);
+        let mut hidden = self.declared_out_of_scope(&desired_entities);
         let live_entities = adapter.introspect().await?;
         let mut live_full = raw_snapshot_from_entities(&live_entities);
         crate::reconcile::qualify_extension_types(&mut live_full, &extension_types);
-        let live = hide_declared(restrict_snapshot_to_schemas(live_full, &managed_schemas), &hidden);
+        let live_full = restrict_snapshot_to_schemas(live_full, &managed_schemas);
+        hidden.extend(self.live_ownership(adapter, &live_full).await?.others);
+        let live = hide_declared(live_full, &hidden);
 
         let mut diff = crate::SchemaDiff::compute(live, desired);
 

@@ -587,7 +587,7 @@ pub async fn cmd_reconcile(
     database_url: Option<&str>,
     dry_run: bool,
     allow_destructive: bool,
-    prune: bool,
+    prune: dbd_core::Prune,
     allow_scope_change: bool,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
@@ -652,7 +652,7 @@ pub(crate) async fn reconcile_with_adapter(
     resolved: &dbd_core::ResolvedScope,
     dry_run: bool,
     allow_destructive: bool,
-    prune: bool,
+    prune: dbd_core::Prune,
     allow_scope_change: bool,
     verbosity: Verbosity,
 ) -> Result<()> {
@@ -682,7 +682,7 @@ pub(crate) async fn reconcile_with_adapter(
             )
             .await
             .context("Reconcile planning failed")?;
-        print_reconcile_plan(&plan, prune, verbosity);
+        print_reconcile_plan(&plan, prune != dbd_core::Prune::Off, verbosity);
         // The run goes on to the apply hooks and the grants; a preview of it
         // that stops at the schema changes leaves them out.
         for hook in design.apply_hooks_to_run(Some(resolved))? {
@@ -729,7 +729,7 @@ pub(crate) async fn reconcile_with_adapter(
         output::always(&format!("⚠ {w}"));
     }
     // Orphaned tables left untouched (only pruned with --prune).
-    if !prune && !plan.dropped.is_empty() {
+    if prune == dbd_core::Prune::Off && !plan.dropped.is_empty() {
         output::always(&format!(
             "{} orphaned table(s) not in the design were left untouched (re-run with --prune to drop):",
             plan.dropped.len()
@@ -1207,7 +1207,7 @@ mod tests {
             None,
             /*dry_run*/ true,
             /*allow_destructive*/ false,
-            /*prune*/ false,
+            dbd_core::Prune::Off,
             /*allow_scope_change*/ false,
             None,
             None,
@@ -1235,7 +1235,7 @@ mod tests {
             &resolved,
             /*dry_run*/ true,
             /*allow_destructive*/ false,
-            /*prune*/ false,
+            dbd_core::Prune::Off,
             /*allow_scope_change*/ false,
             Verbosity::Normal,
         )
@@ -1262,7 +1262,7 @@ mod tests {
             &resolved,
             /*dry_run*/ true,
             /*allow_destructive*/ false,
-            /*prune*/ false,
+            dbd_core::Prune::Off,
             /*allow_scope_change*/ true,
             Verbosity::Normal,
         )

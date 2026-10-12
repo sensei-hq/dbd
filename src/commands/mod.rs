@@ -458,6 +458,7 @@ pub async fn run(
             dry_run,
             allow_destructive,
             prune,
+            prune_unowned,
             allow_scope_change,
         } => {
             project::cmd_reconcile(
@@ -467,7 +468,11 @@ pub async fn run(
                 database_url,
                 *dry_run,
                 *allow_destructive,
-                *prune,
+                if *prune_unowned {
+                    dbd_core::Prune::Unowned
+                } else {
+                    dbd_core::Prune::from(*prune)
+                },
                 *allow_scope_change,
                 scope,
                 deps,
