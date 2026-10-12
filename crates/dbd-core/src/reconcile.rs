@@ -4741,6 +4741,39 @@ mod extension_type_tests {
         assert!(plan.altered.is_empty(), "{:?}", plan.altered);
     }
 
+    /// A database whose own path reaches the schema — Supabase's does — reads
+    /// the type bare, and so does a pooled connection that ran a file's `set
+    /// search_path`. The live side is qualified the same way as the design's.
+    #[test]
+    fn a_live_type_read_bare_is_qualified_too() {
+        let types = owned(&[("extensions", "vector"), ("extensions", "citext")]);
+        let mut live = snap(vec![col("embedding", "vector(384)"), col("tags", "citext[]")], vec![]);
+        qualify_extension_types(&mut live, &types);
+        assert_eq!(types_of(&live), ["extensions.vector(384)", "extensions.citext[]"]);
+    }
+
+    /// A real change to an extension type names it qualified, so the ALTER
+    /// resolves under a path that does not reach the extension's schema.
+    #[test]
+    fn a_real_change_to_an_extension_type_alters_to_the_qualified_type() {
+        let types = owned(&[("extensions", "citext")]);
+        let mut desired = snap(vec![col("note", "citext")], vec![]);
+        let mut live = snap(vec![col("note", "text")], vec![]);
+        qualify_extension_types(&mut desired, &types);
+        qualify_extension_types(&mut live, &types);
+        canonicalize(&mut desired);
+        canonicalize(&mut live);
+        let plan = plan_reconcile(&live, &desired);
+        assert_eq!(plan.altered.len(), 1, "{:?}", plan.altered);
+        assert!(
+            plan.altered[0]
+                .sql
+                .contains("TYPE extensions.citext USING note::extensions.citext"),
+            "{}",
+            plan.altered[0].sql
+        );
+    }
+
     /// Two extensions that each own a `ltree`, in different schemas: which one
     /// a bare `ltree` names depends on the file's path, which the snapshot does
     /// not carry. It is left as written rather than guessed at.

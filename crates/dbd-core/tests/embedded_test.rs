@@ -2526,19 +2526,38 @@ async fn reconcile_creates_alters_and_drops_in_place() {
 }
 
 /// A type an extension installs outside the session `search_path` is the same
-/// type however the DDL spells it (#41). Introspection reads it through
-/// `format_type`, which qualifies what the path does not reach —
+/// type however it is spelled (#41). Introspection reads it through
+/// `format_type`, which qualifies what the session path does not reach —
 /// `extensions.citext`, `extensions.citext[]`, `extensions.cube` — while the
 /// DDL reaches it through its own `set search_path` and writes it bare.
 /// Compared as text the two differed, so every reconcile after the first
 /// planned an `ALTER … TYPE` that changed nothing, and Postgres refused it for
 /// a column a view reads, failing the reconcile. `dbd diff` reported the same
-/// false drift. A real change to such a type still applies, and lands on the
-/// extension's type wherever the session path points.
+/// false drift.
+///
+/// Which spelling introspection reads depends on the connection: pooled
+/// connections do not share a session path, and a database whose own path
+/// reaches the schema — Supabase's does — reads every one bare. So each check
+/// runs on a fresh connection, under the default path and then under one that
+/// reaches `extensions`. The schema is the platform's, not the project's, so
+/// the path dbd sets for an ALTER does not reach it either: a real change
+/// applies only if its ALTER names the type qualified.
 #[tokio::test]
 async fn an_extension_type_outside_the_search_path_is_not_drift() {
     let (_pg, url) = start_pg().await;
-    let adapter = connect(&url, "ext_types_test").await.unwrap();
+    // A new pool, whose connections have run nothing: introspection reads
+    // through the database's own default path.
+    let fresh = || connect(&url, "ext_types_test");
+    fresh()
+        .await
+        .unwrap()
+        .execute_script(
+            "CREATE SCHEMA extensions; \
+             CREATE EXTENSION citext SCHEMA extensions; \
+             CREATE EXTENSION cube SCHEMA extensions;",
+        )
+        .await
+        .unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
@@ -2551,7 +2570,7 @@ async fn an_extension_type_outside_the_search_path_is_not_drift() {
          target:\n  postgres:\n    url: $DATABASE_URL\n    extensions:\n\
          \x20     - name: citext\n        schema: extensions\n\
          \x20     - name: cube\n        schema: extensions\n\
-         schemas:\n  - app\n  - extensions\n",
+         schemas:\n  - app\n",
     )
     .unwrap();
     let write_items = |note_type: &str| {
@@ -2578,43 +2597,58 @@ async fn an_extension_type_outside_the_search_path_is_not_drift() {
     )
     .unwrap();
     let load = || Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design");
-    let type_changes = |plan: &dbd_core::reconcile::ReconcilePlan| -> Vec<String> {
-        plan.warnings
-            .iter()
-            .filter(|w| w.contains("type change"))
-            .cloned()
-            .collect()
-    };
+
+    /// What a fresh connection's introspection reads `app.items.email` as.
+    fn reads_email_as(spelling: &str) -> String {
+        format!(
+            "SELECT 1 FROM pg_attribute WHERE attrelid = 'app.items'::regclass \
+               AND attname = 'email' AND format_type(atttypid, atttypmod) = '{spelling}'"
+        )
+    }
+
+    /// Reconcile the unchanged design, then diff it, each on a fresh
+    /// connection: nothing is planned, refused or reported.
+    async fn assert_converged(url: &str, load: &dyn Fn() -> Design, reads: &str) {
+        let adapter = connect(url, "ext_types_test").await.unwrap();
+        assert_catalog(
+            &*adapter,
+            true,
+            &reads_email_as(reads),
+            &format!("email read as {reads}"),
+        )
+        .await;
+        let plan = load()
+            .reconcile(&*adapter, false, false, false, None, Progress::none())
+            .await
+            .unwrap_or_else(|e| panic!("reconciling an unchanged design (read as {reads}) must not fail: {e}"));
+        assert!(
+            plan.altered.is_empty(),
+            "an unchanged design (read as {reads}) altered: {:?}",
+            plan.altered
+        );
+        let type_changes: Vec<&String> = plan.warnings.iter().filter(|w| w.contains("type change")).collect();
+        assert!(type_changes.is_empty(), "read as {reads}: {type_changes:?}");
+
+        let adapter = connect(url, "ext_types_test").await.unwrap();
+        let diff = load().diff_live(&*adapter, None).await.expect("diff_live");
+        assert!(
+            diff.changes.is_empty(),
+            "an unchanged design (read as {reads}) reported drift: {:?}",
+            diff.changes
+        );
+    }
 
     write_items("text");
     load()
-        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .reconcile(&*fresh().await.unwrap(), false, false, false, None, Progress::none())
         .await
         .expect("the first reconcile creates the table and the view");
-    assert_table_exists(&*adapter, "app", "items").await;
+    assert_converged(&url, &load, "extensions.citext").await;
 
-    // Nothing changed, so nothing is planned — and nothing is refused.
-    let plan = load()
-        .reconcile(&*adapter, false, false, false, None, Progress::none())
-        .await
-        .expect("reconciling an unchanged design must not fail");
-    assert!(
-        plan.altered.is_empty(),
-        "an unchanged design altered: {:?}",
-        plan.altered
-    );
-    assert!(type_changes(&plan).is_empty(), "{:?}", type_changes(&plan));
-
-    let diff = load().diff_live(&*adapter, None).await.expect("diff_live");
-    assert!(
-        diff.changes.is_empty(),
-        "an unchanged design reported drift: {:?}",
-        diff.changes
-    );
-
-    // A real change to an extension type applies, and the column ends up with
-    // the extension's own type, which the session path does not reach.
+    // A real change to an extension type applies under a path that does not
+    // reach the type, so its ALTER names it qualified.
     write_items("citext");
+    let adapter = fresh().await.unwrap();
     let plan = load()
         .reconcile(&*adapter, false, false, false, None, Progress::none())
         .await
@@ -2625,6 +2659,13 @@ async fn an_extension_type_outside_the_search_path_is_not_drift() {
         "{:?}",
         plan.altered
     );
+    assert!(
+        plan.altered[0]
+            .sql
+            .contains("TYPE extensions.citext USING note::extensions.citext"),
+        "{}",
+        plan.altered[0].sql
+    );
     assert_catalog(
         &*adapter,
         true,
@@ -2633,15 +2674,14 @@ async fn an_extension_type_outside_the_search_path_is_not_drift() {
         "app.items.note typed extensions.citext",
     )
     .await;
-    let plan = load()
-        .reconcile(&*adapter, false, false, false, None, Progress::none())
+    assert_converged(&url, &load, "extensions.citext").await;
+
+    // A database whose own path reaches `extensions` reads every one bare.
+    adapter
+        .execute_script("ALTER DATABASE testdb SET search_path TO \"$user\", public, extensions;")
         .await
-        .expect("reconciling the changed design again must not fail");
-    assert!(
-        plan.altered.is_empty(),
-        "a converged design altered: {:?}",
-        plan.altered
-    );
+        .unwrap();
+    assert_converged(&url, &load, "citext").await;
 }
 
 /// Source-hash drift handling for materialized views, end to end:
