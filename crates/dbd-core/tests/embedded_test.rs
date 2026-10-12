@@ -46,17 +46,19 @@ fn load_design() -> Design {
 /// Run a catalog existence assertion via an anonymous `DO` block. Raises (and
 /// so fails the test) when `predicate` matches in the wrong direction:
 /// `should_exist == true` fails when it finds nothing, `false` fails when it
-/// finds something. `subject` is the human label, e.g. "table config.lookups".
+/// finds something. `subject` is the human label, e.g. "table config.lookups";
+/// a `'` or `%` in it is written as the `RAISE` message needs.
 async fn assert_catalog(adapter: &dyn dbd_core::DatabaseAdapter, should_exist: bool, predicate: &str, subject: &str) {
     let (guard, verb) = if should_exist {
         ("NOT EXISTS", "does not exist")
     } else {
         ("EXISTS", "unexpectedly exists")
     };
+    let message = subject.replace('\'', "''").replace('%', "%%");
     let sql = format!(
         "DO $$ BEGIN \
            IF {guard} ( {predicate} ) \
-           THEN RAISE EXCEPTION '{subject} {verb}'; \
+           THEN RAISE EXCEPTION '{message} {verb}'; \
            END IF; \
          END $$"
     );
