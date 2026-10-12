@@ -996,6 +996,7 @@ impl Design {
         hooks::HookSource {
             dir: &self.project_dir,
             search_path: self.script_search_path(),
+            entities: &self.entities,
         }
     }
 
