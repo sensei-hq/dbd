@@ -339,11 +339,10 @@ impl Design {
         Ok(owned)
     }
 
-    /// Claim what a prune is about to drop, before the first write, as the
-    /// run's other claims: read as this owner's or nobody's while the run
-    /// planned, a table another project has claimed since is kept, naming it
-    /// — dropped, that project's data was gone. What is claimed is released
-    /// once dropped (#7).
+    /// Claim what a prune is about to drop, in the transaction that drops it:
+    /// read as this owner's or nobody's while the run planned, a table another
+    /// project has claimed since is kept, naming it — dropped, that project's
+    /// data was gone. What is claimed is released once dropped (#7).
     pub(crate) async fn claim_prune(
         &self,
         adapter: &dyn DatabaseAdapter,
@@ -437,12 +436,36 @@ impl Design {
         prune: Prune,
     ) {
         let quoted = |names: &[String]| names.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", ");
+        // What the design creates is no orphan, whatever its path calls it:
+        // `report.ddl` creating `app."Report"` reads as an undeclared
+        // `Report` beside a missing `report`.
+        let created: std::collections::HashMap<(String, String), String> = self
+            .entity_keys()
+            .into_iter()
+            .flat_map(|(e, keys)| {
+                let file = e
+                    .file
+                    .as_ref()
+                    .map(|f| f.display().to_string())
+                    .unwrap_or_else(|| e.name.clone());
+                keys.into_iter()
+                    .filter(|k| k.namespace == "relation")
+                    .map(move |k| ((k.schema, k.name), file.clone()))
+            })
+            .collect();
         let mut kept = Vec::new();
         for stmt in std::mem::take(&mut plan.dropped) {
             let (schema, name) = match crate::entity::split_qualified_name(&stmt.entity_name) {
                 (Some(schema), name) => (schema, name),
                 (None, name) => (crate::reconcile::DEFAULT_SCHEMA.to_string(), name),
             };
+            if let Some(file) = created.get(&(schema.clone(), name.clone())) {
+                kept.push(format!(
+                    "{} is created by {file}, whose path names another table — not dropped",
+                    stmt.entity_name
+                ));
+                continue;
+            }
             let why = if owned.mine.contains(&(schema.clone(), name)) {
                 None
             } else if !owned.not_recording.is_empty() {

@@ -176,7 +176,6 @@ impl Design {
         managed_schemas: &std::collections::HashSet<String>,
         mv_to_create: &[(&Entity, String)],
         mv_to_restamp: &[(&Entity, String)],
-        prune: bool,
         on_start: &mut S,
         on_done: &mut D,
     ) -> Result<crate::reconcile::ReconcileComplete>
@@ -289,20 +288,58 @@ impl Design {
             summary.restamped += 1;
         }
 
-        // Prune orphaned tables (in managed schemas, gone from the
-        // design), only when explicitly requested. Otherwise they are reported
-        // via the returned plan and left untouched.
-        if prune {
+        Ok(summary)
+    }
+
+    /// Prune the orphans `plan` drops — claimed and dropped in one
+    /// transaction where the adapter has them: a table another project holds
+    /// by then is kept, naming it (see [`Design::claim_prune`]), and a run
+    /// that fails, or is killed, mid-prune keeps neither the drops nor the
+    /// claims — claims left behind made a later `--prune` drop an unowned
+    /// table as this project's own (#7). Returns how many it dropped.
+    async fn prune_claimed<S, D>(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        plan: &mut crate::reconcile::ReconcilePlan,
+        on_start: &mut S,
+        on_done: &mut D,
+    ) -> Result<u32>
+    where
+        S: FnMut(&str),
+        D: FnMut(&str, Option<&str>),
+    {
+        let batch = adapter.supports_transactional_apply();
+        if batch {
+            adapter.begin_batch().await?;
+        }
+        let result: Result<u32> = async {
+            self.claim_prune(adapter, plan).await?;
+            let mut dropped = 0;
             for stmt in &plan.dropped {
                 let desc = format!("prune table:{}", stmt.entity_name);
                 on_start(&desc);
                 let result = adapter.execute_script(&stmt.sql).await;
                 report_step_result(&desc, on_done, result)?;
-                summary.dropped += 1;
+                dropped += 1;
+            }
+            Ok(dropped)
+        }
+        .await;
+        match result {
+            Ok(dropped) => {
+                if batch {
+                    adapter.commit_batch().await?;
+                }
+                Ok(dropped)
+            }
+            Err(e) => {
+                if batch {
+                    // Best-effort rollback; surface the original failure.
+                    let _ = adapter.rollback_batch().await;
+                }
+                Err(e)
             }
         }
-
-        Ok(summary)
     }
 
     /// Reconcile the live database to the desired schema in place (declarative).
@@ -519,9 +556,6 @@ impl Design {
         // and claim. Reconcile's writes commit as they run, so it claims first
         // — see `Design::claim_first` (#7).
         self.claim_first(adapter).await?;
-        if prune != ownership::Prune::Off {
-            self.claim_prune(adapter, &mut plan).await?;
-        }
 
         // `apply.before` where apply runs it: after every gate, so a refused
         // reconcile fires no hook, and before the first write, so a hook can
@@ -546,11 +580,15 @@ impl Design {
                 &managed_schemas,
                 &mv_to_create,
                 &mv_to_restamp,
-                prune != ownership::Prune::Off,
                 &mut progress.on_start,
                 &mut progress.on_done,
             )
             .await?;
+        if prune != ownership::Prune::Off && !plan.dropped.is_empty() {
+            summary.dropped = self
+                .prune_claimed(adapter, &mut plan, &mut progress.on_start, &mut progress.on_done)
+                .await?;
+        }
         // Built: record what it uses, and release what it pruned (#7).
         self.settle(adapter).await?;
 
