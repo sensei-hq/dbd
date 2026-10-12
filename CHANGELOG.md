@@ -70,8 +70,8 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   `unresolved` and unwarned, where it was dropped. A bare one is still dropped
   as a built-in. A sequence a `nextval` default names is read as Postgres
   reads the string — `nextval('App.Seq')` refers to `app.seq` — and a type or
-  sequence reference reaches the entity whose path names it, folded
-  (`Order_No.ddl`).
+  sequence reference reaches the sequence or enum whose mixed-case path names
+  it, folded (`Order_No.ddl`).
 
 ### Fixed
 
