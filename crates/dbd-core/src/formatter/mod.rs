@@ -34,7 +34,21 @@ pub fn format_ddl(input: &str, config: &FormatConfig) -> String {
         if trimmed.is_empty() {
             continue;
         }
-        output_parts.push(format_block(trimmed, config));
+        output_parts.push(match around_statement(trimmed) {
+            // The comments around a statement are text, kept as written and
+            // where they were written — on its line, or on the lines above
+            // it. Only the statement between them is formatted: a layout
+            // carries no comment outside the statement, so one beside or
+            // above it made the guard keep the whole statement as written.
+            Some((leading, statement, trailing)) => {
+                format!(
+                    "{}{}{trailing}",
+                    settle_leading(leading),
+                    format_block(statement, config)
+                )
+            }
+            None => trimmed.to_string(),
+        });
     }
 
     let mut result = output_parts.join("\n\n");
@@ -43,6 +57,21 @@ pub fn format_ddl(input: &str, config: &FormatConfig) -> String {
         result.push('\n');
     }
     result
+}
+
+/// The comments before a statement, with the space after them settled: a
+/// space when they share the statement's line, else the line breaks alone.
+/// A layout may start with indentation of its own (river's `    select`);
+/// kept as written, the gap before it grew by that much on every pass.
+fn settle_leading(leading: &str) -> String {
+    let text = leading.trim_end();
+    if text.is_empty() {
+        return String::new();
+    }
+    match leading[text.len()..].matches('\n').count() {
+        0 => format!("{text} "),
+        breaks => format!("{text}{}", "\n".repeat(breaks)),
+    }
 }
 
 /// One statement, formatted as far as stays faithful to it: laid out with its
@@ -67,8 +96,12 @@ fn format_block(original: &str, config: &FormatConfig) -> String {
             };
             preserve_keyword_case(&format_statement_block(original, &lower), original)
         }
-        _ => format_statement_block(original, config),
+        // Recased again whole: the layout recases the pieces it writes one
+        // at a time, and a piece alone — `COLLATE "C"`, `BIT(3)` — does not
+        // parse, so the grammar cannot say which of its words are keywords.
+        ref case => apply_keyword_case(&format_statement_block(original, config), case),
     };
+    let laid_out = spelled_as_written(original, &laid_out);
     if block_is_faithful(original, &laid_out) {
         return laid_out;
     }
@@ -132,16 +165,17 @@ fn format_statement_block(block: &str, config: &FormatConfig) -> String {
         return String::new();
     }
 
-    // A statement with a dollar-quoted body (a function's, a `DO` block's) is
-    // only recased: the body is one token of text, left as written.
-    if has_dollar_body(trimmed) {
-        return ensure_semicolon(&apply_keyword_case(trimmed, &config.keyword_case));
-    }
-
     // Try parsing with sqlparser
     let dialect = PostgreSqlDialect {};
     let sql_to_parse = ensure_semicolon(trimmed);
     match Parser::parse_sql(&dialect, &sql_to_parse) {
+        // A statement with a dollar-quoted body (a function's, a `DO`
+        // block's) is only recased: the body is one token of text, left as
+        // written. A table's `$$` string is a literal like any other — and
+        // skipping it kept every table with a `$$` default as written.
+        Ok(statements) if has_dollar_body(trimmed) && !matches!(statements.as_slice(), [Statement::CreateTable(_)]) => {
+            ensure_semicolon(&apply_keyword_case(trimmed, &config.keyword_case))
+        }
         Ok(statements) if !statements.is_empty() => format_parsed_statements(&statements, trimmed, config),
         _ => {
             // Unparseable: apply keyword case only
@@ -453,6 +487,46 @@ mod tests {
         }
     }
 
+    /// Every word libpg_query's grammar reads as a keyword is recased, not
+    /// just those on a hand-written list: `ATOMIC`, `COLLATE`, `BIT`,
+    /// `PARTITION BY RANGE` kept whatever case the file had. And a word the
+    /// grammar reads as a name keeps its case though it is a keyword
+    /// elsewhere — the columns `name`, `value` and `level`.
+    #[test]
+    fn every_keyword_the_grammar_reads_is_recased_and_no_name_is() {
+        let sql = "CREATE TABLE t (name text COLLATE \"C\", value BIT(3), level int) PARTITION BY RANGE (level);\n\
+                   CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT 1; END;\n\
+                   CREATE TABLE u (id int GENERATED ALWAYS AS IDENTITY, v text) WITH (fillfactor = 70);\n\
+                   COMMENT ON COLUMN t.name IS 'x';\n";
+        let lower = format_ddl(sql, &in_case(KeywordCase::Lower));
+        for spelled in ["collate \"C\"", "bit(3)", "partition by range", "begin atomic", "end;"] {
+            assert!(lower.contains(spelled), "lower writes {spelled}:\n{lower}");
+        }
+        for unspelled in ["COLLATE", "BIT", "PARTITION", "ATOMIC", "END"] {
+            assert!(!lower.contains(unspelled), "lower leaves no {unspelled}:\n{lower}");
+        }
+        let upper = format_ddl(
+            &sql.to_lowercase().replace("\"c\"", "\"C\""),
+            &in_case(KeywordCase::Upper),
+        );
+        for spelled in [
+            "COLLATE \"C\"",
+            "BIT(3)",
+            "PARTITION BY RANGE",
+            "BEGIN ATOMIC",
+            "END;",
+            "WITH (fillfactor",
+        ] {
+            assert!(upper.contains(spelled), "upper writes {spelled}:\n{upper}");
+        }
+        for name in ["NAME", "VALUE", "LEVEL", "FILLFACTOR"] {
+            assert!(
+                !upper.contains(name),
+                "upper leaves the name {name} as written:\n{upper}"
+            );
+        }
+    }
+
     /// `preserve` uppercased a lowercase file: the layout writes its keywords
     /// itself (`CREATE TABLE`, `PRIMARY KEY`, sqlparser's `VARCHAR`), and wrote
     /// them uppercase whatever the file said. Each keyword now keeps the
@@ -620,6 +694,128 @@ mod tests {
                     opaque_tokens(&out),
                     opaque_tokens(input),
                     "{label} changed a literal, name or comment in:\n{input}\n--- into ---\n{out}"
+                );
+            }
+        }
+    }
+
+    /// Inputs a second pass treated differently from the first: a final
+    /// statement with no `;` and a comment after it, on its line or the next;
+    /// a comment on the line a statement ends; leading comments; bodies.
+    const SECOND_PASS: &[&str] = &[
+        "create table app.t (\n  id int primary key,\n  note text\n)\n-- c\n",
+        "create table app.t (id int primary key, note text) -- c",
+        "create table a (id int); -- the a table\ncreate table b (id int);",
+        "-- header\ncreate table b (id int primary key, note text);",
+        "/* lead */ create table c (id int);",
+        "create function f() returns int language sql as $$ select 1; $$",
+        "create function g() returns int language plpgsql as $tag$ begin return 1; end $tag$; -- done",
+        "create function h() returns int language sql begin atomic select 1; select 2; end",
+        "create function h2() returns int language sql begin atomic select 1; end -- atomic",
+        "create table d (id int, note text default $$x$$); /* after */",
+        "set search_path to app;\n\ncreate table e (\n  id int -- the id\n, note text\n);\n-- trailing\n",
+        "-- only a comment\n",
+        "select 1 /* a */ ; select 2 -- b",
+        "create table f (id int)\n\n\n-- c1\n-- c2\n",
+        "comment on table t is 'a; b'",
+        "create table g (n text default E'it\\'s; tricky') -- x",
+        "create view v as select 1 as a -- c",
+        "create index i on t (a) -- c",
+        "create type mood as enum ('a', 'b') -- c",
+        "CREATE TABLE T (ID INT) -- C",
+        "create table h (id int); -- one\n-- two\ncreate table i (id int);",
+    ];
+
+    /// `format` then `format` again changes nothing, and every comment comes
+    /// out once, as written, in order. A final statement with no `;` and a
+    /// `-- c` after it became `…; -- c`, and the next pass moved the comment
+    /// to a line of its own — so `format --check` failed right after `format`.
+    /// A comment on the line a statement ends stays on that line: it moved
+    /// below it, onto the next statement.
+    #[test]
+    fn formatting_twice_changes_nothing_and_keeps_every_comment() {
+        let configs = [KeywordCase::Lower, KeywordCase::Upper, KeywordCase::Preserve]
+            .into_iter()
+            .flat_map(|case| {
+                [CommaStyle::Leading, CommaStyle::Trailing].map(|comma_style| FormatConfig {
+                    keyword_case: case.clone(),
+                    comma_style,
+                    ..Default::default()
+                })
+            })
+            .collect::<Vec<_>>();
+        for input in SECOND_PASS.iter().chain(TRICKY) {
+            for config in &configs {
+                let label = format!("{:?}/{:?}", config.keyword_case, config.comma_style);
+                let once = format_ddl(input, config);
+                let twice = format_ddl(&once, config);
+                assert_eq!(
+                    twice, once,
+                    "{label}: a second pass changed\n{input}\n--- once ---\n{once}"
+                );
+                assert_eq!(
+                    opaque_tokens(&once),
+                    opaque_tokens(input),
+                    "{label} changed a literal, name or comment in:\n{input}\n--- into ---\n{once}"
+                );
+            }
+        }
+        let out = format_ddl(SECOND_PASS[2], &FormatConfig::default());
+        let line = out.lines().find(|l| l.contains("-- the a table")).unwrap();
+        assert!(
+            line.ends_with("); -- the a table"),
+            "stays where it was written:\n{out}"
+        );
+        let out = format_ddl(SECOND_PASS[1], &FormatConfig::default());
+        assert!(out.trim_end().ends_with("); -- c"), "{out}");
+    }
+
+    /// A table is laid out whatever its literals, names and clauses — as
+    /// long as the layout means the same. Each of these was recased and left
+    /// as written: the layout re-spelled `U&'d\0061t'` as `U&'dat'`, skipped
+    /// any statement with a `$$` string, lowercased a quoted name or dropped
+    /// its quotes, wrote a column's CHECK as `check (check (…))`, dropped a
+    /// column constraint's name, and wrote nothing after the column list.
+    /// (The layout is sqlparser's tree, so a table sqlparser cannot read —
+    /// `UNLOGGED`, `EXCLUDE`, `LIKE` — is still only recased.)
+    #[test]
+    fn a_table_is_laid_out_whatever_its_literals_names_and_clauses() {
+        for input in [
+            "create table t (id int, note text default U&'d\\0061t');",
+            "create table t (id int, note text default $$x$$);",
+            "create table t (id int, note text default $tag$x$tag$);",
+            "create table t (id int, \"Note\" text, \"a b\" int, \"x\"\"y\" int, \"note\" text);",
+            "create table t (id int, note text check (note <> 'x'), n int check (n > 0));",
+            "create table \"T\" (id int);",
+            "create table app.\"T\" (id int);",
+            "create table t (id int constraint nn not null, n int constraint n_pk primary key);",
+            "create table t (id int) with (fillfactor = 70);",
+            "create table t (id int) partition by range (id);",
+            "create table t (id int) inherits (u);",
+            "create table t (id int) tablespace pg_default;",
+            "create temp table if not exists t (id int);",
+            "-- header\ncreate table t (id int);",
+        ] {
+            for config in [
+                in_case(KeywordCase::Lower),
+                in_case(KeywordCase::Upper),
+                in_case(KeywordCase::Preserve),
+            ] {
+                let out = format_ddl(input, &config);
+                let first = out
+                    .lines()
+                    .find(|l| l.trim_start().starts_with("id"))
+                    .unwrap_or_default();
+                assert!(
+                    first.starts_with("  id                       "),
+                    "{:?} lays out:\n{input}\n--- into ---\n{out}",
+                    config.keyword_case
+                );
+                assert_eq!(meaning(&out), meaning(input), "{input}\n--- into ---\n{out}");
+                assert_eq!(
+                    opaque_tokens(&out),
+                    opaque_tokens(input),
+                    "{input}\n--- into ---\n{out}"
                 );
             }
         }

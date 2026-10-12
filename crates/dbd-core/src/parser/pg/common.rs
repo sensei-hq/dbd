@@ -67,7 +67,7 @@ pub(in crate::parser) fn extract_enum_values_via_pg_query(raw_sql: &str) -> Vec<
 /// a parameter to every per-type parser, so the fallback reaches all of them
 /// through the one line each already had.
 pub(in crate::parser) fn resolve_schema_path(raw_sql: &str, seeded: &SchemaPath) -> SchemaPath {
-    let from_file = extract_search_paths_via_pg_query(raw_sql);
+    let from_file = search_path_at_declaration(raw_sql);
     if from_file.stated() || seeded.source == crate::entity::PathSource::SessionDefault {
         return from_file;
     }
@@ -127,6 +127,59 @@ pub(crate) fn extract_search_paths_via_pg_query(raw_sql: &str) -> SchemaPath {
         }
     }
     SchemaPath::postgres_default()
+}
+
+/// The `search_path` a file's entity is created on: the last `SET
+/// search_path` naming schemas before the statement that declares it.
+///
+/// A file may set the path more than once, and its CREATE runs — and has its
+/// names resolved — on the one in effect there. The first one set was taken
+/// instead, so a migration of the entity ran on a path its CREATE never did,
+/// and a `data.sql` naming its table bare failed. A path set after the CREATE
+/// changes nothing.
+///
+/// Falls back to [`extract_search_paths_via_pg_query`] — the first path the
+/// file sets — when no path is set before a declaring statement, or the file
+/// declares nothing this recognises: a CREATE running before any SET runs on
+/// whatever path the connection has, which no scan can know. A `RESET` or
+/// `SET … TO DEFAULT` names no schema and is passed over, as there.
+pub(crate) fn search_path_at_declaration(raw_sql: &str) -> SchemaPath {
+    use pg_query::NodeEnum;
+    let Ok(parsed) = pg_query::parse(raw_sql) else {
+        return SchemaPath::postgres_default();
+    };
+    let mut in_effect: Option<SchemaPath> = None;
+    for stmt in &parsed.protobuf.stmts {
+        match stmt.stmt.as_ref().and_then(|s| s.node.as_ref()) {
+            Some(NodeEnum::VariableSetStmt(set)) if set.name.eq_ignore_ascii_case("search_path") => {
+                let entries: Vec<PathEntry> = set.args.iter().filter_map(const_str).map(path_entry).collect();
+                if !entries.is_empty() {
+                    in_effect = Some(SchemaPath::from_file(entries));
+                }
+            }
+            // The statements an entity file declares its entity with — a DO
+            // block being the guarded `CREATE TYPE … AS ENUM`.
+            Some(
+                NodeEnum::CreateStmt(_)
+                | NodeEnum::ViewStmt(_)
+                | NodeEnum::CreateTableAsStmt(_)
+                | NodeEnum::CreateFunctionStmt(_)
+                | NodeEnum::CreateEnumStmt(_)
+                | NodeEnum::CreateSeqStmt(_)
+                | NodeEnum::CompositeTypeStmt(_)
+                | NodeEnum::CreateDomainStmt(_)
+                | NodeEnum::CreateRangeStmt(_)
+                | NodeEnum::DoStmt(_),
+            ) => {
+                if let Some(path) = in_effect {
+                    return path;
+                }
+                break;
+            }
+            _ => {}
+        }
+    }
+    extract_search_paths_via_pg_query(raw_sql)
 }
 
 /// `"$user"` is a placeholder, not a schema. Reading it as one produced

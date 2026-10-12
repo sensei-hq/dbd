@@ -451,6 +451,18 @@ pub async fn cmd_deploy(
             Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
             design.check_apply_guards(&marks)?;
         }
+        // The migrations its apply phase executes first, built before anything
+        // is printed: it refuses where the run does — an unresolved `-- TODO`
+        // in a pending data script — and a refused preview should not list a
+        // plan first, as this one listed its entity count.
+        let preview = match &adapter {
+            Some(adapter) => Some(
+                design
+                    .pending_migration_preview(&**adapter, None, Some(&resolved))
+                    .await?,
+            ),
+            None => None,
+        };
         // The hooks the run would skip, decided as the run decides them.
         for skip in design.hook_skips(Some(&resolved))? {
             output::warn(&skip);
@@ -462,13 +474,8 @@ pub async fn cmd_deploy(
         }
         output::info(verbosity, &format!("{to_apply} entities would be applied."));
         // The migrations its apply phase executes first, as `apply --dry-run` lists them.
-        match &adapter {
-            Some(adapter) => super::print_migration_preview(
-                verbosity,
-                &design
-                    .pending_migration_preview(&**adapter, None, Some(&resolved))
-                    .await?,
-            ),
+        match &preview {
+            Some(preview) => super::print_migration_preview(verbosity, preview),
             None => super::note_unlisted_migrations(verbosity, &project_dir),
         }
 
@@ -595,7 +602,29 @@ pub async fn cmd_reconcile(
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
     let (kept, total) = design.scope_counts(&resolved)?;
     output::scope_filtered(&resolved, kept, total);
-    let adapter = get_adapter(config, database_url).await?;
+    // A dry run writes nothing, and the SQLite adapter creates a missing file
+    // on connect — the preview left an empty database behind. So it opens only
+    // a database that is there, as every other dry run does. Only a SQLite
+    // file reads as not there, and what the real run would reconcile against
+    // is then an empty database: an in-memory one is that, and leaves no file.
+    // With no database configured at all, the preview needs one as the run
+    // does, and says how to name it.
+    let configured = super::configured_database_url(config, database_url)?;
+    let adapter = match configured {
+        Some(url) if dry_run => {
+            let project = &design.config().project.name;
+            match dbd_core::connect_existing(&url, project)
+                .await
+                .context("Failed to connect to database")?
+            {
+                Some(adapter) => adapter,
+                None => dbd_core::connect("sqlite::memory:", project)
+                    .await
+                    .context("Failed to open an empty database to preview against")?,
+            }
+        }
+        _ => get_adapter(config, database_url).await?,
+    };
     reconcile_with_adapter(
         &*adapter,
         &design,

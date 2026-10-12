@@ -5,8 +5,11 @@
 use crate::entity::Entity;
 
 /// Quote a SQL identifier.
+/// A quoted identifier, its quotes doubled — through the one quoting rule.
+/// Wrapped without doubling, a name holding `"` ended early and the file
+/// did not parse.
 fn q(ident: &str) -> String {
-    format!("\"{ident}\"")
+    crate::sql_quote::ident(ident)
 }
 
 /// Bare (unqualified) name from a possibly-qualified entity name (`schema.name` → `name`).
@@ -509,7 +512,9 @@ pub fn emit_entity(entity: &Entity) -> Option<String> {
     // emitter entirely. Re-terminate with a single trailing `;`.
     if let Some(raw) = &entity.raw_ddl {
         let body = raw.trim_end().trim_end_matches(';').trim_end();
-        return Some(format!("{body};"));
+        let mut out = format!("{body};");
+        push_triggers(&mut out, entity);
+        return Some(out);
     }
     match entity.entity_type {
         EntityType::Schema | EntityType::Extension | EntityType::Role => crate::script::ddl_from_entity(entity),
@@ -789,6 +794,28 @@ mod tests {
         let mut p = Entity::new(EntityType::Procedure, "app.p");
         p.body = vec!["CREATE OR REPLACE PROCEDURE app.p() LANGUAGE sql AS $$ select 1 $$".into()];
         assert!(emit_entity(&p).unwrap().ends_with("$$;"));
+    }
+
+    /// A quote in a name is doubled, as SQL writes it. Wrapped as it was,
+    /// `"we"ird"` ended the name early and the table file did not parse —
+    /// reached through `init --from-dbml` from a DBML name `"we\"ird"`.
+    #[test]
+    fn a_quote_in_a_name_is_doubled_and_reads_back() {
+        let ddl = "create table app.t (\"we\"\"ird\" int primary key, \"back\\slash\" text);\n\
+                   create index t_w on app.t (\"we\"\"ird\");";
+        let path = std::path::Path::new("ddl/table/app/t.ddl");
+        let entity = crate::parser::parse_entity(path, ddl).unwrap();
+        let emitted = emit_table(&entity);
+        let reparsed = crate::parser::parse_entity(path, &emitted).unwrap_or_else(|e| panic!("{e}\n{emitted}"));
+        assert!(
+            reparsed.errors.is_empty(),
+            "the emitted DDL parses: {:?}\n{emitted}",
+            reparsed.errors
+        );
+        let def = reparsed.table_def.unwrap();
+        let columns: Vec<&str> = def.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(columns, ["we\"ird", "back\\slash"], "{emitted}");
+        assert_eq!(def.indexes[0].columns[0].name, "we\"ird", "{emitted}");
     }
 
     /// A CHECK keeps the name it was given. Written unnamed, `init --from-dbml`

@@ -30,6 +30,35 @@ pub fn ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+/// Render one identifier the way Postgres's own `quote_identifier` does: bare
+/// when it reads back as itself — lower-case letters, digits and `_`, not
+/// starting with a digit, and no keyword beyond an unreserved one — quoted
+/// (by [`ident`]) otherwise.
+///
+/// For a name that is compared with Postgres's spelling of it — a column's
+/// type, which the deparser and `format_type` write as `app.mood`, not
+/// `"app"."mood"` — where always quoting would read as a different spelling of
+/// the same type. Anywhere else, [`ident`]: it never needs the keyword list.
+pub fn ident_if_needed(name: &str) -> String {
+    let plain = name.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    // libpg_query's scanner names the keyword's category: 0 is none, 1 an
+    // unreserved keyword — the two a bare name may be.
+    let reserved = || {
+        pg_query::scan(name)
+            .ok()
+            .and_then(|scanned| scanned.tokens.first().map(|t| t.keyword_kind))
+            .is_none_or(|kind| kind > 1)
+    };
+    if plain && !reserved() {
+        name.to_string()
+    } else {
+        ident(name)
+    }
+}
+
 /// Render a possibly-qualified name (`schema.table`) by quoting each part.
 ///
 /// Splitting on `.` is right for names dbd itself composed from catalog parts,

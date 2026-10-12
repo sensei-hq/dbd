@@ -108,12 +108,14 @@ pub async fn cmd_import_dry_run(
     verbosity: Verbosity,
 ) -> Result<()> {
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
-    // The guards, whenever a database is configured to ask.
-    let guard = async |resolved: &dbd_core::ResolvedScope| -> Result<()> {
-        if let Some(adapter) = super::dry_run_adapter(config, database_url).await? {
-            check_import_guards(&*adapter, &design, resolved).await?;
+    // The guards, whenever a database is configured to ask — and the database
+    // asked, which the plan below is ordered by as the import's is.
+    let guard = async |resolved: &dbd_core::ResolvedScope| -> Result<Option<Box<dyn dbd_core::DatabaseAdapter>>> {
+        let adapter = super::dry_run_adapter(config, database_url).await?;
+        if let Some(adapter) = &adapter {
+            check_import_guards(&**adapter, &design, resolved).await?;
         }
-        Ok(())
+        Ok(adapter)
     };
 
     // Ad-hoc single-file import plan: print the one line and write nothing.
@@ -140,8 +142,13 @@ pub async fn cmd_import_dry_run(
     design.check_scope_gaps(&resolved).context("scope check failed")?;
     let (kept, total) = design.scope_counts(&resolved)?;
     output::scope_filtered(&resolved, kept, total);
-    guard(&resolved).await?;
-    let (plan, skips) = design.scoped_import_plan(name, Some(&resolved))?;
+    let adapter = guard(&resolved).await?;
+    // In the order the import loads them: by the database's own foreign keys
+    // too, when there is one to ask (see `Design::live_import_plan`).
+    let (plan, skips) = match &adapter {
+        Some(adapter) => design.live_import_plan(&**adapter, name, Some(&resolved)).await?,
+        None => design.scoped_import_plan(name, Some(&resolved))?,
+    };
 
     // Anything the scan, plan or scope left out, before listing what remains —
     // so a preview that shows no steps still explains itself, exactly as the
@@ -559,13 +566,21 @@ fn refuse_shared_files(tables: &[&dbd_core::Entity], root: &Path) -> Result<()> 
     if shared.is_empty() {
         return Ok(());
     }
+    // The folder above is no way out: exporting there gives each table a
+    // folder of its own schema, `import/core/…`, which an import refuses unless
+    // that schema is a staging one — and the next import failed on it.
+    let schema = root
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_default();
     bail!(
         "nothing exported: {} is a schema folder of the import tree, where a table is written as \
          <table>.<format> — and these tables would be one file there:\n{}\n\
-         Export them one at a time with -n, or to -o {} to keep each under its schema",
+         An import loads each file here into {schema}.<table>: export into this folder, with -n, \
+         the one table whose rows that should be (a second export here overwrites the first). \
+         Outside import/ — the default export/ — each table keeps its own schema folder.",
         root.display(),
         shared.join("\n"),
-        root.parent().map(|p| p.display().to_string()).unwrap_or_default()
     )
 }
 
@@ -595,6 +610,31 @@ fn export_dir(root: &Path, table: &str) -> Result<std::path::PathBuf> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// Two tables that would share a file in an import schema folder were
+    /// refused with the advice to export to the folder above it, `-o import`,
+    /// "to keep each under its schema" — which writes `import/core/…`, a
+    /// folder the next import refuses unless `core` is a staging schema. The
+    /// refusal advises what an import can load.
+    #[test]
+    fn the_shared_file_refusal_advises_only_what_an_import_can_load() {
+        let core = Entity::new(EntityType::Table, "core.accounts");
+        let staging = Entity::new(EntityType::Table, "staging.accounts");
+        let root = PathBuf::from("/p/import/staging");
+        let err = refuse_shared_files(&[&core, &staging], &root).unwrap_err().to_string();
+        assert!(
+            err.contains("core.accounts") && err.contains("staging.accounts"),
+            "naming both: {err}"
+        );
+        assert!(
+            !err.contains("-o /p/import"),
+            "never into the import tree above the folder, whose other schema folders an import refuses: {err}"
+        );
+        assert!(
+            err.contains("-n"),
+            "and names the way that works — one table, by -n: {err}"
+        );
+    }
 
     #[test]
     fn format_from_ext_maps_known_extensions() {

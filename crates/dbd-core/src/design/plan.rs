@@ -44,7 +44,7 @@ pub enum ExecutionStep {
         migration_version: u32,
         scripts: Vec<(String, String)>,
     },
-    /// Run an altered entity's `.data.sql`. Its own step, after every schema
+    /// Run an altered or added entity's `.data.sql`. Its own step, after every schema
     /// change of the same version: a data script may read what another table
     /// gains in that version.
     MigrateData {
@@ -153,9 +153,9 @@ fn plan_current(valid_entities: &[&Entity]) -> ExecutionPlan {
 /// 0. the enum values it adds, committed before the rest of it runs (see
 ///    [`ExecutionStep::AddEnumValues`]);
 /// 1. its creates and schema changes (`.sql`), in dependency order;
-/// 2. its data scripts (`.data.sql`), in dependency order — after every schema
-///    change of the version, since one table's script may read what another
-///    table gains in the same version;
+/// 2. its data scripts (`.data.sql`) — of the tables it alters or adds — in
+///    dependency order, after every schema change of the version, since one
+///    table's script may read what another table gains in the same version;
 /// 3. its drops, of the tables in the run's scope;
 /// 4. the record that it ran.
 ///
@@ -260,8 +260,13 @@ fn plan_migrate(
             }
         }
 
-        // Data scripts, once the version's schema is in place.
-        for e in valid_entities.iter().filter(|e| names(&migration.altered, e)) {
+        // Data scripts, once the version's schema is in place — of the tables
+        // it alters and of those it adds: a `data.sql` seeding a table the
+        // version creates is that version's own, and never ran.
+        for e in valid_entities
+            .iter()
+            .filter(|e| names(&migration.altered, e) || names(&migration.added, e))
+        {
             let data_sql_path = migration_entity_sql_path(&migration.migration_dir, &e.name, ".data.sql");
             if data_sql_path.exists() {
                 steps.push(ExecutionStep::MigrateData {

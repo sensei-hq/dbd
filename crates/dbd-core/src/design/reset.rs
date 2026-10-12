@@ -54,7 +54,7 @@ impl Design {
 
         let marks = self.database_marks(adapter).await?;
         if !force {
-            Self::check_reset_guard(&marks)?;
+            self.check_reset_guard(&marks)?;
         }
 
         let roles_kept = self.roles_kept_by_reset(adapter, target, scope).await?;
@@ -102,7 +102,7 @@ impl Design {
     }
 
     /// The guard [`Design::reset`] checks unless forced: a database marked prod,
-    /// or one versioned by a released project, is not reset. `marks` are what
+    /// or one a project has versioned, is not reset. `marks` are what
     /// the database records (one dbd has never written to passes): this
     /// project's record or, after a rename, the one its old `project.name` left
     /// (see [`DatabaseMarks`]) — `--force` overrides either alike.
@@ -110,7 +110,12 @@ impl Design {
     /// Public so a preview refuses exactly where the real run does: `reset
     /// --dry-run` printed the whole plan for a prod database, and exited 0,
     /// while the real run refused it.
-    pub fn check_reset_guard(marks: &DatabaseMarks) -> Result<()> {
+    ///
+    /// A method, not an associated function, because the refusal calls this
+    /// project released only when `project.released` says so: a database
+    /// `init --from-db` captured is versioned with `released` never set, and
+    /// was refused as "a released project's database".
+    pub fn check_reset_guard(&self, marks: &DatabaseMarks) -> Result<()> {
         // Compared through the alias table: rows written before the CLI
         // normalised `-e` can say `production`.
         let is_prod = |m: &&crate::adapter::ProjectMeta| {
@@ -129,8 +134,13 @@ impl Design {
             (None, Some(row)) => (
                 row,
                 format!(
-                    "the database is versioned at v{} (a released project's database)",
-                    row.version
+                    "the database is versioned at v{}{}",
+                    row.version,
+                    if self.config.project.released {
+                        " (a released project's database)"
+                    } else {
+                        ""
+                    }
                 ),
                 format!("versioned this database at v{}", row.version),
             ),

@@ -252,6 +252,22 @@ pub trait DatabaseAdapter: Send + Sync {
         Ok(())
     }
 
+    /// The foreign keys between the database's own tables, each as
+    /// `(referencing table, referenced table)`, named as the database names
+    /// them.
+    ///
+    /// What an import orders its staging tables by when the design cannot:
+    /// a SQLite project's DDL is read verbatim, with no references, so the
+    /// import fell back to alphabetical order — loading a table before the
+    /// one it references, and emptying the referenced one first — and SQLite
+    /// enforces the keys on dbd's connections, so both failed. The database
+    /// is asked rather than the files because its keys are the ones that are
+    /// enforced. Default: none — a target whose design is read into a
+    /// structured model has its references from the design.
+    async fn foreign_keys(&self) -> Result<Vec<(String, String)>> {
+        Ok(Vec::new())
+    }
+
     /// Export a table's data to a file.
     ///
     /// `out_dir`:

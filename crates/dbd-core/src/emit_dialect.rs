@@ -211,12 +211,15 @@ impl Target {
         "--"
     }
 
-    /// Quote an identifier the way the target does.
+    /// Quote an identifier the way the target does, its closing quote
+    /// doubled inside the name — `` ` `` on MySQL, `]` on SQL Server, `"` on
+    /// SQLite. Wrapped as it was, a name holding one ended early: SQLite got
+    /// `"app_we"ird"`, and the script did not run.
     fn quote(self, name: &str) -> String {
         match self {
-            Self::MySql => format!("`{name}`"),
-            Self::TSql => format!("[{name}]"),
-            Self::Sqlite => format!("\"{name}\""),
+            Self::MySql => format!("`{}`", name.replace('`', "``")),
+            Self::TSql => format!("[{}]", name.replace(']', "]]")),
+            Self::Sqlite => format!("\"{}\"", name.replace('"', "\"\"")),
         }
     }
 

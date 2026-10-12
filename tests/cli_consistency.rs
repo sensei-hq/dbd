@@ -1406,6 +1406,77 @@ fn reset_accepts_the_targets_its_help_names_and_resets_a_sqlite_database() {
     );
 }
 
+// ── a SQLite import follows the foreign keys ────────────────────────────────
+
+/// SQLite enforces foreign keys on dbd's connections, and a SQLite project's
+/// DDL is read verbatim, with no references — so an import ordered `kid`
+/// before `parent` alphabetically and failed on `kid`'s key, both tables
+/// left empty, and a re-import emptied `parent` first and failed the same
+/// way. The import loads a referenced table first and empties it last, by the
+/// foreign keys the database itself reports; its preview lists that order.
+#[test]
+fn a_sqlite_import_of_tables_linked_by_a_foreign_key_loads_and_reloads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write(
+        dir,
+        "design.yaml",
+        &format!(
+            "project:\n  name: lite\nsource:\n  dialect: sqlite\ntarget:\n  sqlite:\n    url: sqlite://{}\nschemas: []\n",
+            dir.join("app.db").display()
+        ),
+    );
+    write(
+        dir,
+        "ddl/table/parent.ddl",
+        "CREATE TABLE IF NOT EXISTS parent (id INTEGER PRIMARY KEY, name TEXT);\n",
+    );
+    write(
+        dir,
+        "ddl/table/kid.ddl",
+        "CREATE TABLE IF NOT EXISTS kid (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent (id));\n",
+    );
+    write(dir, "import/parent.csv", "id,name\n1,a\n2,b\n");
+    write(dir, "import/kid.csv", "id,pid\n1,1\n2,2\n");
+
+    let o = dbd(dir, &["apply"]);
+    assert!(o.status.success(), "apply: {}{}", stdout(&o), stderr(&o));
+
+    let o = dbd(dir, &["import", "--dry-run"]);
+    assert!(o.status.success(), "import --dry-run: {}{}", stdout(&o), stderr(&o));
+    let preview = stdout(&o);
+    let at = |table: &str| preview.find(&format!("import {table} ")).unwrap_or(usize::MAX);
+    assert!(
+        at("parent") < at("kid"),
+        "the preview loads parent before the table referencing it: {preview}"
+    );
+
+    // Loaded into an empty pair, then reloaded over a populated one — which
+    // empties both first, `kid` before the `parent` its rows point at.
+    for run in ["first import", "re-import"] {
+        let o = dbd(dir, &["import"]);
+        assert!(o.status.success(), "{run}: {}{}", stdout(&o), stderr(&o));
+        let out = dir.join("out");
+        let o = dbd(dir, &["export", "-o", out.to_str().unwrap()]);
+        assert!(
+            o.status.success(),
+            "export after the {run}: {}{}",
+            stdout(&o),
+            stderr(&o)
+        );
+        assert_eq!(
+            fs::read_to_string(out.join("parent.csv")).unwrap(),
+            "id,name\n1,a\n2,b\n",
+            "parent after the {run}"
+        );
+        assert_eq!(
+            fs::read_to_string(out.join("kid.csv")).unwrap(),
+            "id,pid\n1,1\n2,2\n",
+            "kid after the {run}"
+        );
+    }
+}
+
 // ── a dry run creates nothing ───────────────────────────────────────────────
 
 /// A dry run asks the configured database for its guards — and the SQLite
@@ -1451,6 +1522,85 @@ fn a_dry_run_does_not_create_a_sqlite_database_file() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// `reconcile --dry-run` connected as its real run does, and the SQLite
+/// adapter creates a missing file on connect — so the preview left an empty
+/// database behind, where every other dry run opens only a file that is
+/// there. It now does the same, and with no file previews against an empty
+/// database — what the real run would create — refusing as the run refuses.
+#[test]
+fn reconcile_dry_run_does_not_create_a_sqlite_database_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let db = dir.join("not-yet.db");
+    write(
+        dir,
+        "design.yaml",
+        &format!(
+            "project:\n  name: lite\nsource:\n  dialect: sqlite\ntarget:\n  sqlite:\n    url: sqlite://{}\nschemas: []\n",
+            db.display()
+        ),
+    );
+    write(
+        dir,
+        "ddl/table/items.ddl",
+        "CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY);\n",
+    );
+
+    let dry = dbd(dir, &["reconcile", "--dry-run"]);
+    assert!(!db.exists(), "reconcile --dry-run created {}", db.display());
+    let real = dbd(dir, &["reconcile"]);
+    assert!(
+        !real.status.success() && !dry.status.success(),
+        "both refuse a SQLite project"
+    );
+    assert!(
+        stderr(&dry).contains("needs a structured model") && stderr(&real).contains("needs a structured model"),
+        "for the same reason — dry: {}\nreal: {}",
+        stderr(&dry),
+        stderr(&real)
+    );
+}
+
+/// `deploy --dry-run` printed "1 entities would be applied." and only then
+/// refused a pending migration's unresolved `-- TODO`, so a refused preview
+/// began by promising a plan. It refuses first, as `apply --dry-run` does.
+#[test]
+fn deploy_dry_run_refuses_an_unresolved_todo_before_listing_anything() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let config = |version: u32| {
+        format!(
+            "project:\n  name: lite\n  version: {version}\nsource:\n  dialect: sqlite\ntarget:\n  sqlite:\n    url: sqlite://{}\nschemas: []\n",
+            dir.join("app.db").display()
+        )
+    };
+    write(dir, "design.yaml", &config(1));
+    write(
+        dir,
+        "ddl/table/items.ddl",
+        "CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY);\n",
+    );
+    let o = dbd(dir, &["apply"]);
+    assert!(o.status.success(), "apply at v1: {}{}", stdout(&o), stderr(&o));
+
+    write(dir, "design.yaml", &config(2));
+    write(
+        dir,
+        "migrations/002/graph.json",
+        r#"{"fromVersion":1,"toVersion":2,"added":[],"altered":["items"],"dropped":[]}"#,
+    );
+    write(dir, "migrations/002/items.data.sql", "-- TODO: map the rows\n");
+
+    let o = dbd(dir, &["deploy", "--dry-run"]);
+    assert!(!o.status.success(), "the TODO is refused: {}{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("Unresolved TODO"), "{}", stderr(&o));
+    assert!(
+        !stdout(&o).contains("would be applied"),
+        "and nothing is listed before the refusal: {}",
+        stdout(&o)
+    );
 }
 
 // ── reset refuses a --target the connection is not ──────────────────────────
@@ -1596,4 +1746,150 @@ fn merge_from_a_scoped_dbml_document_never_calls_a_table_the_project_manages_ext
             .any(|l| l.contains("billing.invoices") && l.contains("external")),
         "a table the project does not build is still named: {said}"
     );
+}
+
+// ── merge keeps an authored table file's triggers ───────────────────────────
+
+/// A DBML document cannot hold a trigger, and `merge --from-dbml` rewrote the
+/// table files it changed from the document alone — so a trigger written in
+/// `notes.ddl` was deleted without a word, and so was the `DROP TRIGGER IF
+/// EXISTS` that keeps a constraint trigger re-runnable. A source that cannot
+/// hold triggers leaves the file's own in place.
+#[test]
+fn merge_from_dbml_keeps_the_triggers_written_in_a_table_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write(
+        dir,
+        "design.yaml",
+        "project:\n  name: trig\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    );
+    write(
+        dir,
+        "ddl/function/app/touch.ddl",
+        "set search_path to app;\ncreate or replace function touch() returns trigger language plpgsql \
+         as $$ begin new.updated_at = now(); return new; end; $$;\n",
+    );
+    write(
+        dir,
+        "ddl/table/app/notes.ddl",
+        "set search_path to app;\n\
+         create table if not exists notes (id int primary key, body text, updated_at timestamptz);\n\
+         create or replace trigger notes_touch before update on notes for each row execute function touch();\n\
+         drop trigger if exists notes_guard on notes;\n\
+         create constraint trigger notes_guard after insert on notes for each row execute function touch();\n",
+    );
+    write(
+        dir,
+        "notes.dbml",
+        "Table \"app\".\"notes\" {\n  \"id\" int [pk]\n  \"body\" text\n  \"updated_at\" timestamptz\n  \"extra\" text\n}\n",
+    );
+
+    let o = dbd(dir, &["merge", "--from-dbml", dir.join("notes.dbml").to_str().unwrap()]);
+    assert!(o.status.success(), "merge: {}{}", stdout(&o), stderr(&o));
+    let file = fs::read_to_string(dir.join("ddl/table/app/notes.ddl")).unwrap();
+    assert!(file.contains("\"extra\""), "the document's change is written: {file}");
+    for kept in [
+        "notes_touch",
+        "drop trigger if exists notes_guard",
+        "constraint trigger notes_guard",
+    ] {
+        assert!(file.to_lowercase().contains(kept), "the file keeps `{kept}`: {file}");
+    }
+    let o = dbd(dir, &["inspect"]);
+    assert!(
+        o.status.success(),
+        "the merged file still reads: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+}
+
+/// SQLite's introspection captured a table and its indexes and left its
+/// triggers out, so `merge` from a SQLite database rewrote a table file
+/// without the trigger written in it — and the database still had it. The
+/// trigger is captured into the file, as a PostgreSQL table's are.
+#[test]
+fn merge_from_a_sqlite_database_keeps_a_tables_trigger() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let url = format!("sqlite://{}", dir.join("app.db").display());
+    write(
+        dir,
+        "design.yaml",
+        &format!(
+            "project:\n  name: lite\nsource:\n  dialect: sqlite\ntarget:\n  sqlite:\n    url: {url}\nschemas: []\n"
+        ),
+    );
+    write(
+        dir,
+        "ddl/table/notes.ddl",
+        "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, body TEXT, n INTEGER DEFAULT 0);\n\
+         CREATE TRIGGER IF NOT EXISTS notes_bump AFTER UPDATE OF body ON notes \
+         BEGIN UPDATE notes SET n = n + 1 WHERE id = new.id; END;\n",
+    );
+    let o = dbd(dir, &["apply"]);
+    assert!(o.status.success(), "apply: {}{}", stdout(&o), stderr(&o));
+
+    let o = dbd(dir, &["merge", "-d", &url]);
+    assert!(o.status.success(), "merge: {}{}", stdout(&o), stderr(&o));
+    let file = fs::read_to_string(dir.join("ddl/table/notes.ddl")).unwrap();
+    assert!(
+        file.to_lowercase().contains("notes_bump") && file.to_lowercase().contains("set n = n + 1"),
+        "the file keeps its trigger: {file}"
+    );
+}
+
+/// The triggers a DBML merge keeps were written on their file's
+/// `SET search_path` — `on notes`, `execute function touch()` — and the
+/// rewritten file opened with the document's qualified `CREATE TABLE` and no
+/// path at all, so they would resolve on the session default: `notes` no
+/// longer depended on `app.touch`, and applying the file failed. Each kept
+/// trigger keeps the path it was written on.
+#[test]
+fn a_trigger_merge_from_dbml_keeps_still_resolves_on_its_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write(
+        dir,
+        "design.yaml",
+        "project:\n  name: trig\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    );
+    write(
+        dir,
+        "ddl/function/app/touch.ddl",
+        "set search_path to app;\ncreate or replace function touch() returns trigger language plpgsql \
+         as $$ begin return new; end; $$;\n",
+    );
+    write(
+        dir,
+        "ddl/table/app/notes.ddl",
+        "set search_path to app;\ncreate table if not exists notes (id int primary key);\n\
+         create or replace trigger notes_touch before update on notes for each row execute function touch();\n",
+    );
+    write(
+        dir,
+        "notes.dbml",
+        "Table \"app\".\"notes\" {\n  \"id\" int [pk]\n  \"extra\" text\n}\n",
+    );
+    let edge = |dir: &Path| -> bool {
+        let o = dbd(dir, &["graph"]);
+        assert!(o.status.success(), "graph: {}{}", stdout(&o), stderr(&o));
+        let graph: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+        graph["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["from"] == "app.notes" && e["to"] == "app.touch")
+    };
+    assert!(
+        edge(dir),
+        "before the merge, notes depends on the function its trigger fires"
+    );
+
+    let o = dbd(dir, &["merge", "--from-dbml", dir.join("notes.dbml").to_str().unwrap()]);
+    assert!(o.status.success(), "merge: {}{}", stdout(&o), stderr(&o));
+    let file = fs::read_to_string(dir.join("ddl/table/app/notes.ddl")).unwrap();
+    assert!(file.contains("\"extra\""), "the document's change is written: {file}");
+    assert!(edge(dir), "and after it, still: {file}");
 }

@@ -189,6 +189,39 @@ pub fn entity_path(entity: &Entity) -> PathBuf {
     p
 }
 
+/// Give each table and view in `entities` that carries no triggers the
+/// trigger statements its file under `root` already holds (see
+/// [`Entity::triggers`]), and return the files that could not be read for
+/// them because they do not parse.
+///
+/// For a merge from a source that cannot hold a trigger — a DBML document.
+/// Its entities have none, so the file each one rewrote lost the triggers
+/// written in it, without a word. A source that can hold them — a live
+/// database, whose introspection captures them — is the merge's truth about
+/// them, and is not passed through this.
+pub fn keep_authored_triggers(root: &Path, entities: &mut [Entity]) -> Vec<PathBuf> {
+    let mut unreadable = Vec::new();
+    for entity in entities
+        .iter_mut()
+        .filter(|e| matches!(e.entity_type, EntityType::Table | EntityType::View) && e.triggers.is_empty())
+    {
+        // The path `plan_from_entities` would write, and only one it would.
+        let bare = entity.name.rsplit('.').next().unwrap_or(&entity.name);
+        if !is_safe_segment(bare) || !entity.schema.as_deref().is_none_or(is_safe_segment) {
+            continue;
+        }
+        let rel = entity_path(entity);
+        let Ok(text) = crate::source_text::read_to_string(&root.join(&rel)) else {
+            continue;
+        };
+        match crate::parser::pg::tables::trigger_statements(&text) {
+            Some(triggers) => entity.triggers = triggers,
+            None => unreadable.push(rel),
+        }
+    }
+    unreadable
+}
+
 /// The entity kinds this command writes as DDL files (also the kinds orphan
 /// detection scans).
 ///
