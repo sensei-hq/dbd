@@ -9802,3 +9802,178 @@ async fn sql_null_json_null_and_an_omitted_key_each_survive_a_jsonl_round_trip()
     )
     .await;
 }
+
+// ── #7 Phase 2: each entity in a shared database has one owner ────────────────
+
+const SHOP_YAML: &str = "project:\n  name: shop\nsource:\n  dialect: postgresql\nschemas:\n  - app\n\
+    scopes:\n  orders_only:\n    includes: [app.orders, app.status]\n";
+
+const SHOP_FILES: &[(&str, &str)] = &[
+    (
+        "ddl/enum/app/status.ddl",
+        "do $$ begin create type app.status as enum ('open', 'paid'); \
+         exception when duplicate_object then null; end $$;\n",
+    ),
+    (
+        "ddl/table/app/orders.ddl",
+        "set search_path to app;\ncreate table if not exists orders (id int primary key, status app.status);\n",
+    ),
+    (
+        "ddl/view/app/order_ids.ddl",
+        "set search_path to app;\ncreate or replace view order_ids as select id from orders;\n",
+    ),
+    (
+        "ddl/function/app/total.ddl",
+        "set search_path to app;\ncreate or replace function total() returns bigint language sql as $$ select count(*) from app.orders $$;\n",
+    ),
+];
+
+/// `billing` declares `app.orders` too, and a table of its own, behind a hook.
+const BILLING_YAML: &str = "project:\n  name: billing\nsource:\n  dialect: postgresql\nschemas:\n  - app\n\
+    apply:\n  before:\n    - sql/mark.sql\n";
+
+const BILLING_FILES: &[(&str, &str)] = &[
+    (
+        "sql/mark.sql",
+        "create table if not exists public.billing_hook_ran (id integer);\n",
+    ),
+    (
+        "ddl/table/app/orders.ddl",
+        "set search_path to app;\ncreate table if not exists orders (id int primary key);\n",
+    ),
+    (
+        "ddl/table/app/invoices.ddl",
+        "set search_path to app;\ncreate table if not exists invoices (id int primary key);\n",
+    ),
+];
+
+fn owned_by(namespace: &str, schema: &str, name: &str, kind: &str, owner: &str) -> String {
+    format!(
+        "SELECT 1 FROM dbd.objects WHERE namespace = '{namespace}' AND schema = '{schema}' \
+         AND name = '{name}' AND kind = '{kind}' AND owner = '{owner}'"
+    )
+}
+
+/// A project's run claims every entity its whole design declares — the whole
+/// design, not the scope it ran under (#40): a scope narrows what is applied,
+/// never what the project owns. Tables, views, materialized views and
+/// sequences share Postgres's relation namespace; enums are types; functions
+/// and procedures are routines, by name (#7).
+#[tokio::test]
+async fn a_project_claims_every_entity_its_whole_design_declares() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "shop").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let shop = write_project(tmp.path(), SHOP_YAML, SHOP_FILES);
+
+    let orders_only = shop.resolve_scope(Some("orders_only"), None).unwrap();
+    shop.apply(&*adapter, None, false, Some(&orders_only), Progress::none())
+        .await
+        .expect("a scoped apply");
+
+    for (namespace, name, kind) in [
+        ("relation", "orders", "table"),
+        ("relation", "order_ids", "view"),
+        ("type", "status", "enum"),
+        ("routine", "total", "function"),
+    ] {
+        assert_catalog(
+            &*adapter,
+            true,
+            &owned_by(namespace, "app", name, kind, "shop"),
+            &format!("{namespace} app.{name} owned by shop"),
+        )
+        .await;
+    }
+}
+
+/// A second project declaring an entity the first owns is refused before
+/// anything runs — no hook, no DDL, no claim of its own — naming the entity
+/// and its owner. So are its reconcile and reset; and its dry run and its diff,
+/// which write nothing, refuse the same way (#7).
+#[tokio::test]
+async fn a_project_declaring_an_entity_another_owns_is_refused_before_anything_runs() {
+    let (_pg, url) = start_pg().await;
+    let shop_adapter = connect(&url, "shop").await.unwrap();
+    let billing_adapter = connect(&url, "billing").await.unwrap();
+    let shop_dir = tempfile::tempdir().unwrap();
+    let billing_dir = tempfile::tempdir().unwrap();
+    let shop = write_project(shop_dir.path(), SHOP_YAML, SHOP_FILES);
+    let billing = write_project(billing_dir.path(), BILLING_YAML, BILLING_FILES);
+    shop.apply(&*shop_adapter, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+
+    let refusal = |err: dbd_core::DbdError| {
+        let err = err.to_string();
+        assert!(
+            err.contains("relation app.orders is owned by \"shop\""),
+            "the refusal names the entity and its owner: {err}"
+        );
+    };
+    refusal(
+        billing
+            .apply(&*billing_adapter, None, false, None, Progress::none())
+            .await
+            .expect_err("billing's apply"),
+    );
+    refusal(
+        billing
+            .reconcile(&*billing_adapter, false, false, false, None, Progress::none())
+            .await
+            .expect_err("billing's reconcile"),
+    );
+    refusal(
+        billing
+            .reset(&*billing_adapter, "postgres", true, false, false, None)
+            .await
+            .expect_err("billing's reset"),
+    );
+    refusal(
+        billing
+            .apply(&*billing_adapter, None, true, None, Progress::none())
+            .await
+            .expect_err("billing's dry run"),
+    );
+    refusal(
+        billing
+            .diff_live(&*billing_adapter, None)
+            .await
+            .expect_err("billing's diff"),
+    );
+
+    assert_table_absent(&*billing_adapter, "public", "billing_hook_ran").await;
+    assert_table_absent(&*billing_adapter, "app", "invoices").await;
+    assert_table_exists(&*billing_adapter, "app", "orders").await;
+    assert_catalog(
+        &*billing_adapter,
+        false,
+        "SELECT 1 FROM dbd.objects WHERE owner = 'billing'",
+        "a claim of billing",
+    )
+    .await;
+}
+
+/// What no design declares — a table made by hand — is nobody's.
+#[tokio::test]
+async fn an_entity_no_design_declares_stays_unowned() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "shop").await.unwrap();
+    adapter
+        .execute_script("CREATE SCHEMA app; CREATE TABLE app.manual (id int);")
+        .await
+        .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let shop = write_project(tmp.path(), SHOP_YAML, SHOP_FILES);
+    shop.apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+
+    assert_catalog(
+        &*adapter,
+        false,
+        "SELECT 1 FROM dbd.objects WHERE schema = 'app' AND name = 'manual'",
+        "an owner of app.manual",
+    )
+    .await;
+}
