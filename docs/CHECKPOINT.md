@@ -6,17 +6,19 @@ PR #50 (`5e6ad4dc`). Phase 1 is on `develop`, unreleased.
 
 ## Done
 
-- Slices 1–2 merged into `feat/ownership`: `dbd.objects`/`dbd.uses`; keys and
-  uses as Postgres makes and resolves them; claim in the batch, or first for a
-  run that writes as it goes. Five review rounds, all fixed test-first; CI runs
-  `cli_live`. Embedded 198/198, `cli_live` 47/47, workspace 2002/0.
+- Slices 1–2 merged into `feat/ownership` (PR #50): registry, claim, uses.
+- Slice 3 (red `131689a3`, impl `f8c09c35`, docs): reconcile and diff hide
+  other owners' entities; `--prune` drops own undeclared (a) and unowned in an
+  unshared schema (b); unowned in a shared schema, or while a recorded owner
+  has not upgraded (no `owner` row in dbd.uses), kept and named unless
+  `--prune-unowned`; a successful run releases what is undeclared and gone.
+- Embedded 206/206, `cli_live` 48/48, workspace 2002/0, clippy, fmt, doc clean.
 
 ## Next
 
-    # slice 3: prune rule (a) owned + undeclared, rule (b) unowned in a schema
-    # no other owner uses; --prune-unowned naming each; release on a successful
-    # run of what is no longer declared and no longer exists; rule (b)
-    # suspended while an owner has not upgraded (meta row, no uses).
+    git push -u origin feat/ownership-prune   # PR into feat/ownership
+    # focused review; fix test-first; CI green; merge locally into feat/ownership;
+    # then slice 4: the uses guard (refuse dropping/altering what another uses).
 
 ## Open
 
@@ -28,6 +30,7 @@ PR #50 (`5e6ad4dc`). Phase 1 is on `develop`, unreleased.
 - A bare type of another project's is no use (dropped as a built-in).
 - An apply in one transaction runs `apply.before` hooks before its claim
   (documented in the spec). `dbd.objects` still allows namespace `type`, unused.
+- Docs slice (end of Phase 2) must cover `--prune-unowned` in the guides.
 - Phase 1 is releasable as 0.25.2 when asked.
 
 ## Known limits
