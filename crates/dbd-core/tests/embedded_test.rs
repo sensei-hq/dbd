@@ -645,6 +645,9 @@ async fn each_project_stages_its_json_imports_in_its_own_table() {
     let (_pg, url) = start_pg().await;
     let long_a = format!("{}-alpha", "p".repeat(40));
     let long_b = format!("{}-beta", "p".repeat(40));
+    // Two bytes a character: the cut that fits a name in must fall between them.
+    let wide_a = format!("{}-a", "é".repeat(30));
+    let wide_b = format!("{}-b", "é".repeat(30));
     let setup = connect(&url, "setup").await.unwrap();
     setup
         .execute_script(
@@ -668,7 +671,7 @@ async fn each_project_stages_its_json_imports_in_its_own_table() {
     entity.file = Some(path);
     entity.format = Some("jsonl".to_string());
 
-    for owner in ["a", "b", long_a.as_str(), long_b.as_str()] {
+    for owner in ["a", "b", &long_a, &long_b, &wide_a, &wide_b] {
         connect(&url, owner)
             .await
             .unwrap()
@@ -680,8 +683,8 @@ async fn each_project_stages_its_json_imports_in_its_own_table() {
     assert_catalog(
         &*setup,
         true,
-        "SELECT 1 WHERE (SELECT count(DISTINCT name) FROM public.staged) = 4",
-        "four staging tables, one per project",
+        "SELECT 1 WHERE (SELECT count(DISTINCT name) FROM public.staged) = 6",
+        "six staging tables, one per project",
     )
     .await;
     assert_catalog(
@@ -694,7 +697,7 @@ async fn each_project_stages_its_json_imports_in_its_own_table() {
     assert_catalog(
         &*setup,
         true,
-        "SELECT 1 WHERE (SELECT count(*) FROM app.people) = 4",
+        "SELECT 1 WHERE (SELECT count(*) FROM app.people) = 6",
         "a row from each import",
     )
     .await;
