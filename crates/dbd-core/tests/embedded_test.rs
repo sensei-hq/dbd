@@ -12130,3 +12130,172 @@ async fn a_diff_does_not_report_another_projects_table() {
         diff.changes
     );
 }
+
+/// Wait — at most `seconds` — until some other session waits on a lock;
+/// whether one did.
+async fn await_any_lock_waiter(adapter: &dyn dbd_core::DatabaseAdapter, seconds: u64) -> bool {
+    let probe = "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_stat_activity \
+                 WHERE wait_event_type = 'Lock' AND pid <> pg_backend_pid()) \
+                 THEN RAISE EXCEPTION 'no wait'; END IF; END $$";
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    while std::time::Instant::now() < deadline {
+        if adapter.execute_script(probe).await.is_ok() {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// A prune read a table as unowned, then dropped it — though another project
+/// had claimed it meanwhile: its data, gone. A prune claims what it drops,
+/// with the run's other claims and before any write, and keeps, naming the
+/// owner, what another project holds by then (#7).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_prune_keeps_a_table_another_project_claims_while_it_runs() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let watcher = connect(&url, "watcher").await.unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    let design = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1]);
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    shop.execute_script("CREATE TABLE app.tmp (id int); INSERT INTO app.tmp VALUES (1);")
+        .await
+        .unwrap();
+    // billing's claim, written and not yet committed when shop reads.
+    let holder = connect(&url, "billing").await.unwrap();
+    holder.begin_batch().await.unwrap();
+    holder
+        .execute_script(
+            "INSERT INTO dbd.objects (namespace, schema, name, kind, owner) \
+             VALUES ('relation', 'app', 'tmp', 'table', 'billing');",
+        )
+        .await
+        .unwrap();
+
+    let (pruned, ()) = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        tokio::join!(
+            design.reconcile(&*shop, false, false, true, None, Progress::none()),
+            async {
+                await_any_lock_waiter(&*watcher, 10).await;
+                holder.commit_batch().await.unwrap();
+            }
+        )
+    })
+    .await
+    .expect("neither may hang");
+
+    let plan = pruned.expect("shop's reconcile");
+    assert_table_exists(&*shop, "app", "tmp").await;
+    assert!(
+        plan.warnings
+            .iter()
+            .any(|w| w.contains("app.tmp") && w.contains("\"billing\"")),
+        "{:?}",
+        plan.warnings
+    );
+}
+
+/// Removing an enum value rewrites every column of that type, and one in
+/// another project's table — hidden from the run, which has no say over it —
+/// made the rewrite fail on every run, with Postgres's word for it, and a dry
+/// run said nothing. Refused before any write, dry run included, naming the
+/// column and its owner (#7).
+#[tokio::test]
+async fn an_enum_value_another_projects_column_holds_is_refused_naming_it() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let colour = |values: &str| {
+        (
+            "ddl/enum/app/colour.ddl",
+            format!("create type app.colour as enum ({values});\n"),
+        )
+    };
+    let (path, sql) = colour("'red', 'blue'");
+    named_project(sd.path(), "shop", "", &[(path, &sql)])
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    named_project(
+        bd.path(),
+        "billing",
+        "",
+        &[(
+            "ddl/table/app/inv.ddl",
+            "create table if not exists app.inv (id int primary key, c app.colour);\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    let (path, sql) = colour("'red'");
+    let design = named_project(sd.path(), "shop", "", &[(path, &sql)]);
+    for dry_run in [true, false] {
+        let err = design
+            .reconcile(&*shop, dry_run, true, false, None, Progress::none())
+            .await
+            .expect_err("billing's app.inv.c holds app.colour")
+            .to_string();
+        assert!(err.contains("\"billing\"") && err.contains("app.inv"), "{err}");
+    }
+    assert_catalog(
+        &*shop,
+        true,
+        "SELECT 1 FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname = 'colour' AND e.enumlabel = 'blue'",
+        "app.colour's 'blue', untouched",
+    )
+    .await;
+}
+
+/// A prune drops the table it decided on: `app."Report"` written unquoted is
+/// `app.report` — another project's, which a prune of shop's own `"Report"`
+/// dropped (#7).
+#[tokio::test]
+async fn a_prune_drops_the_mixed_case_table_it_names() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let report = (
+        "ddl/table/app/Report.ddl",
+        "create table if not exists app.\"Report\" (id int);\n",
+    );
+    named_project(sd.path(), "shop", "", &[ORDERS_OWNER_FILES[0], report])
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    named_project(
+        bd.path(),
+        "billing",
+        "",
+        &[(
+            "ddl/table/app/report.ddl",
+            "create table if not exists app.report (id int);\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    std::fs::remove_file(sd.path().join(report.0)).unwrap();
+    Design::from_config_with_dir(&sd.path().join("design.yaml"), "dev", Some(sd.path()))
+        .unwrap()
+        .reconcile(&*shop, false, false, true, None, Progress::none())
+        .await
+        .expect("shop's prune");
+    assert_table_exists(&*shop, "app", "report").await;
+    assert_table_absent(&*shop, "app", "Report").await;
+    assert_catalog(
+        &*shop,
+        false,
+        "SELECT 1 FROM dbd.objects WHERE schema = 'app' AND name = 'Report'",
+        "a claim of the pruned app.\"Report\"",
+    )
+    .await;
+}
