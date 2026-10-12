@@ -1150,7 +1150,7 @@ version: the older-project guard covers `apply` and `deploy`.
 **What reconcile compares** (against the introspected live schema): columns
 (name, type, nullability, default, identity), primary-key / unique constraints, **foreign
 keys**, secondary **indexes**, **CHECK** constraints and **column comments** — the same
-tables-and-enums model `dbd diff` reports on. Table comments are not compared. Bare enum types are schema-qualified to match introspection, and common type aliases are
+tables-and-enums model `dbd diff` reports on. Table comments are not compared. Bare enum types are schema-qualified to match introspection, and so is a type an extension installs outside `public`, however the DDL reached it (`citext` → `extensions.citext`, `vector(384)` → `extensions.vector(384)`); common type aliases are
 normalized (`int4` → `integer`, `timestamptz` → `timestamp with time zone`). Foreign keys are
 matched by shape (columns, referenced table/columns, actions), so the design's inline `references …`
 and the live DB's auto-named constraint reconcile to no change; a declared FK the live DB lacks is
@@ -1238,7 +1238,7 @@ The desired schema is parsed from your DDL; the live schema is introspected. dbd
 representation noise so only real drift is reported: type aliases and array/date-time
 spellings (`int4` → `integer`, `text[3]` → `text[]`, `time` → `time without time zone`),
 default casts (so a `nextval('s')` default matches the `nextval('s'::regclass)` Postgres
-reports), enum qualification, PK/UNIQUE-backing indexes (matched by the constraint's name, so a
+reports), enum and extension-type qualification (`citext` → `extensions.citext`), PK/UNIQUE-backing indexes (matched by the constraint's name, so a
 dropped index over a key's columns is still drift), FK `NO ACTION` defaults and
 auto-generated FK names, and CHECK-expression *spelling* via the Postgres parser — parens
 and case, `IN` ↔ `= ANY (ARRAY[…])`, casts on literals, `BETWEEN` ↔ the `>=`/`<=` pair

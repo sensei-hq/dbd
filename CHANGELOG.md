@@ -9,6 +9,28 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+### Fixed
+
+- **A type an extension installs outside the `search_path` is no longer
+  drift.** With pgvector or citext in an `extensions` schema, introspection
+  reads `extensions.vector(384)` where the DDL, reaching the schema through its
+  own `set search_path`, wrote `vector(384)`. Compared as text they differed,
+  so every `reconcile` after the first planned an `ALTER … TYPE` that changed
+  nothing — and failed, "cannot alter type of a column used by a view or rule",
+  once a view read the column. `dbd diff` reported the same false drift. Both
+  now spell an extension's type as the database does, a modifier and an array
+  included, and a real change to one emits `TYPE extensions.citext`, which
+  resolves wherever the session path points. A bare name the project's own
+  enum declares, or that two extensions own, is left as written. ([#41])
+
+### Library API
+
+- `DatabaseAdapter` gains `extension_types()`, the `(schema, name)` of each
+  type the database's extensions own. It has a default (none), so an adapter
+  that does not override it builds unchanged.
+
+[#41]: https://github.com/sensei-hq/dbd/issues/41
+
 ## [0.25.0] — 2026-10-12
 
 **Every command does what its documentation says, and every feature works the
