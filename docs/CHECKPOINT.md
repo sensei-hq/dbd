@@ -28,13 +28,12 @@ PR #50 (`5e6ad4dc`). Phase 1 is on `develop`, unreleased.
 - Pre-existing, outside #7: reconcile re-emits a mixed-case or quoted
   `nextval('App.Seq')` default every run (`canonical_default`) — needs an
   issue and a pg_get_expr probe first.
-- Declined: best-effort batch rollback error; dropping the old `dbd.import_tmp`.
+- Declined: best-effort batch rollback error; dropping the old `dbd.import_tmp`;
 - A bare type of another project's is no use (dropped as a built-in).
 - An apply in one transaction runs `apply.before` hooks before its claim
   (documented in the spec). `dbd.objects` still allows namespace `type`, unused.
 - Docs slice (end of Phase 2) must cover `--prune-unowned` in the guides.
-- Declined: migrating a `dbd.uses` CHECK made by an unreleased branch build
-  (no `owner` kind) — rebuild such databases; no release ever had the table.
+  migrating a branch build's `dbd.uses` CHECK (no `owner`) — rebuild those.
 - Phase 1 is releasable as 0.25.2 when asked.
 
 ## Known limits
