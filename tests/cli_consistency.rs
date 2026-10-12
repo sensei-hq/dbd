@@ -1668,3 +1668,95 @@ fn merge_from_a_scoped_dbml_document_never_calls_a_table_the_project_manages_ext
         "a table the project does not build is still named: {said}"
     );
 }
+
+// ── merge keeps an authored table file's triggers ───────────────────────────
+
+/// A DBML document cannot hold a trigger, and `merge --from-dbml` rewrote the
+/// table files it changed from the document alone — so a trigger written in
+/// `notes.ddl` was deleted without a word, and so was the `DROP TRIGGER IF
+/// EXISTS` that keeps a constraint trigger re-runnable. A source that cannot
+/// hold triggers leaves the file's own in place.
+#[test]
+fn merge_from_dbml_keeps_the_triggers_written_in_a_table_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write(
+        dir,
+        "design.yaml",
+        "project:\n  name: trig\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    );
+    write(
+        dir,
+        "ddl/function/app/touch.ddl",
+        "set search_path to app;\ncreate or replace function touch() returns trigger language plpgsql \
+         as $$ begin new.updated_at = now(); return new; end; $$;\n",
+    );
+    write(
+        dir,
+        "ddl/table/app/notes.ddl",
+        "set search_path to app;\n\
+         create table if not exists notes (id int primary key, body text, updated_at timestamptz);\n\
+         create or replace trigger notes_touch before update on notes for each row execute function touch();\n\
+         drop trigger if exists notes_guard on notes;\n\
+         create constraint trigger notes_guard after insert on notes for each row execute function touch();\n",
+    );
+    write(
+        dir,
+        "notes.dbml",
+        "Table \"app\".\"notes\" {\n  \"id\" int [pk]\n  \"body\" text\n  \"updated_at\" timestamptz\n  \"extra\" text\n}\n",
+    );
+
+    let o = dbd(dir, &["merge", "--from-dbml", dir.join("notes.dbml").to_str().unwrap()]);
+    assert!(o.status.success(), "merge: {}{}", stdout(&o), stderr(&o));
+    let file = fs::read_to_string(dir.join("ddl/table/app/notes.ddl")).unwrap();
+    assert!(file.contains("\"extra\""), "the document's change is written: {file}");
+    for kept in [
+        "notes_touch",
+        "drop trigger if exists notes_guard",
+        "constraint trigger notes_guard",
+    ] {
+        assert!(file.to_lowercase().contains(kept), "the file keeps `{kept}`: {file}");
+    }
+    let o = dbd(dir, &["inspect"]);
+    assert!(
+        o.status.success(),
+        "the merged file still reads: {}{}",
+        stdout(&o),
+        stderr(&o)
+    );
+}
+
+/// SQLite's introspection captured a table and its indexes and left its
+/// triggers out, so `merge` from a SQLite database rewrote a table file
+/// without the trigger written in it — and the database still had it. The
+/// trigger is captured into the file, as a PostgreSQL table's are.
+#[test]
+fn merge_from_a_sqlite_database_keeps_a_tables_trigger() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let url = format!("sqlite://{}", dir.join("app.db").display());
+    write(
+        dir,
+        "design.yaml",
+        &format!(
+            "project:\n  name: lite\nsource:\n  dialect: sqlite\ntarget:\n  sqlite:\n    url: {url}\nschemas: []\n"
+        ),
+    );
+    write(
+        dir,
+        "ddl/table/notes.ddl",
+        "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, body TEXT, n INTEGER DEFAULT 0);\n\
+         CREATE TRIGGER IF NOT EXISTS notes_bump AFTER UPDATE OF body ON notes \
+         BEGIN UPDATE notes SET n = n + 1 WHERE id = new.id; END;\n",
+    );
+    let o = dbd(dir, &["apply"]);
+    assert!(o.status.success(), "apply: {}{}", stdout(&o), stderr(&o));
+
+    let o = dbd(dir, &["merge", "-d", &url]);
+    assert!(o.status.success(), "merge: {}{}", stdout(&o), stderr(&o));
+    let file = fs::read_to_string(dir.join("ddl/table/notes.ddl")).unwrap();
+    assert!(
+        file.to_lowercase().contains("trigger notes_bump") && file.to_lowercase().contains("set n = n + 1"),
+        "the file keeps its trigger: {file}"
+    );
+}
