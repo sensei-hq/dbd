@@ -91,12 +91,12 @@ CREATE TABLE IF NOT EXISTS dbd.uses (
 
 The `relation` namespace covers tables, views, materialized views, sequences
 and foreign tables, which all share `pg_class`. A table and a view of the same
-name cannot both exist, so they cannot have two owners. Enums are keyed in
-`relation` too: Postgres gives every table, view and materialized view a row
-type of its own name, so a table and an enum of one name cannot both exist
-either. `type` is reserved for domains and composites, which dbd does not
-declare yet. `routine` is per name: dbd already drops every overload of a name
-together. Indexes, constraints, triggers, policies and comments
+name cannot both exist, so they cannot have two owners. Every type a design
+creates is keyed in `relation` too — an enum, and a composite, domain or range
+a file creates beside its entity: Postgres gives every table, view and
+materialized view a row type of its own name, so none of them can share a
+name with a type. `type` is left unused. `routine` is per name: dbd already
+drops every overload of a name together. Indexes, constraints, triggers, policies and comments
 belong to their table.
 
 **Schemas, extensions and roles are shared containers**, recorded in
@@ -105,23 +105,33 @@ other schema; it owns the entities it puts there.
 
 ### Rules
 
-**Claim (apply, deploy, reconcile).** Before any hook or DDL, the owner checks
-every entity its whole design declares. "Whole design" means the full design,
-never the scope (#40). A design declaring an entity held by another owner is
-refused with no DDL executed:
+**Claim (apply, deploy, reconcile, reset).** Before any hook or DDL, the owner
+checks every entity its whole design declares. "Whole design" means the full
+design, never the scope (#40). A design declaring an entity held by another
+owner is refused with no DDL executed:
 
 `relation app.orders is owned by "shop/billing"; owners sharing a database must not declare the same entity`
 
-The owner claims those entities, and records its uses, once its work is built.
-`apply` claims in the transaction its DDL runs in, so the claim commits with
-the work or not at all. `reconcile`'s writes commit as they run, so it claims
-in a transaction of its own just after them. A run that fails, or is killed,
-claims nothing, so there is nothing to give back. `reset` builds nothing: it
-checks, and claims nothing.
+When the owner claims those entities depends on whether its work can roll
+back:
 
-The primary key makes this atomic: of two concurrent first runs, exactly one
-wins. The other's claim finds the entity held, and in a batch its DDL rolls
-back with the claim.
+- `apply` in one transaction claims as its last step, in that transaction, so
+  the claim commits with the work or not at all. A run that fails, or is
+  killed, claims nothing. A version that adds enum values commits part-way;
+  the run claims before that commit too, so nothing commits unclaimed.
+- `reconcile`, `reset`, and an `apply` outside one transaction (`DBD_NO_TX`)
+  commit as they go. They claim, committed, after their last refusal and
+  before their first write, and keep the claim if they then fail: what the
+  design declares is the owner's, built yet or not. Claimed after its writes,
+  such a run could find an entity unowned while another owner was building
+  it, wait on that owner's lock, then write over — or drop — what that owner
+  had just claimed.
+
+Uses are recorded once the work is built.
+
+The primary key makes this atomic: of two concurrent first claims, exactly
+one wins. The other finds the entity held, and is refused before it writes —
+or, in an `apply` in one transaction, its DDL rolls back with the claim.
 
 **Prune.** `reconcile --prune` drops a live entity only when one of these holds:
 
@@ -162,10 +172,16 @@ depends on it, dbd refuses:
 
 `identity.users.email is used by "billing" (view billing.v_invoices); remove that use first`
 
+A call is a use of a routine; anything else — a read, a write, a column's type,
+a default's sequence — is a use of a relation. A name written bare is looked
+up along the referring entity's search path, as Postgres looks it up: the first
+schema holding it is the one used.
+
 This is the contract between owners. It plays the role an API plays between
 services.
 
-**Reset.** Reset drops only entities this owner owns. On top of that:
+**Reset.** Reset drops only entities this owner owns; it claims its design's
+entities before it drops any (see Claim). On top of that:
 
 - `--schemas` drops a schema only when it holds no entity owned by anyone else
   and no unowned entity.
@@ -200,10 +216,13 @@ There is one core function, so library embedders are protected too:
 
 ```rust
 pub(crate) async fn preflight(&self, adapter: &dyn DatabaseAdapter, mode: Preflight) -> Result<()>
-// Write — apply, deploy, reconcile, reset: heal → check, before any hook
-// Read — import, policies, refresh, --dry-run, diff: check only, no writes
+// Write — apply, deploy: heal → check, before any hook
+// Read — import, policies, refresh, --dry-run, diff, reconcile before it plans: check only, no writes
 pub(crate) async fn claim_built(&self, adapter: &dyn DatabaseAdapter) -> Result<()>
-// apply, deploy, reconcile, once built: claim → record uses
+// apply in one transaction: claim → record uses, in it, last — and before a part-way commit
+pub(crate) async fn claim_first(&self, adapter: &dyn DatabaseAdapter) -> Result<()>
+// reconcile, reset: heal → claim, committed, before the first write; an apply outside
+// one transaction claims there too, and each records its uses once built
 ```
 
 ---
