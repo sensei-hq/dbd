@@ -58,12 +58,18 @@ pub const SUPABASE_PROTECTED: &[&str] = &[
 /// which `apply` and `combine` take to mean "no DDL", skipping the entity.
 pub fn ddl_from_entity(entity: &Entity) -> Option<String> {
     match entity.entity_type {
-        EntityType::Schema => Some(format!("CREATE SCHEMA IF NOT EXISTS \"{}\";", entity.name)),
+        // Through `sql_quote::ident`: wrapped as it was, a schema named `s"`
+        // ended its own quoting and the apply failed.
+        EntityType::Schema => Some(format!(
+            "CREATE SCHEMA IF NOT EXISTS {};",
+            crate::sql_quote::ident(&entity.name)
+        )),
         EntityType::Extension => {
             let schema = entity.schema.as_deref().unwrap_or("public");
             Some(format!(
-                "CREATE EXTENSION IF NOT EXISTS \"{}\" WITH SCHEMA \"{}\";",
-                entity.name, schema
+                "CREATE EXTENSION IF NOT EXISTS {} WITH SCHEMA {};",
+                crate::sql_quote::ident(&entity.name),
+                crate::sql_quote::ident(schema)
             ))
         }
         EntityType::Role => Some(generate_role_script(entity)),
