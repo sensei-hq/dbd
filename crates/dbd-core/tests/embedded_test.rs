@@ -12378,3 +12378,122 @@ async fn a_failed_prune_unowned_run_leaves_no_claim() {
         plan.warnings
     );
 }
+
+/// Dropping a parent `CASCADE` drops the tables that inherit from it, and a
+/// prune that then dropped a child by name failed — and, dropping in one
+/// transaction, kept every table. A prune drops what is still there (#7).
+#[tokio::test]
+async fn a_prune_drops_an_inherited_family_in_one_run() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    let design = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1]);
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    let children: String = (1..=15)
+        .map(|i| format!("CREATE TABLE app.measurement_{i} () INHERITS (app.measurement);"))
+        .collect();
+    shop.execute_script(&format!("CREATE TABLE app.measurement (id int); {children}"))
+        .await
+        .unwrap();
+    design
+        .reconcile(&*shop, false, false, true, None, Progress::none())
+        .await
+        .expect("one prune drops the family");
+    assert_catalog(
+        &*shop,
+        false,
+        "SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = 'app' AND c.relname LIKE 'measurement%'",
+        "a table of the measurement family",
+    )
+    .await;
+}
+
+/// The prune's claim waits for a rival's in flight and then reads what the
+/// rival committed — at READ COMMITTED, whatever the database's default: at
+/// REPEATABLE READ the wait ended in a serialization failure, after the
+/// run's other writes had committed (#7).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_prune_keeps_a_rivals_table_whatever_the_databases_isolation() {
+    let (_pg, url) = start_pg().await;
+    connect(&url, "setup")
+        .await
+        .unwrap()
+        .execute_script("ALTER DATABASE testdb SET default_transaction_isolation = 'repeatable read';")
+        .await
+        .unwrap();
+    let shop = connect(&url, "shop").await.unwrap();
+    let watcher = connect(&url, "watcher").await.unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    let design = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1]);
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    shop.execute_script("CREATE TABLE app.tmp (id int);").await.unwrap();
+    let holder = connect(&url, "billing").await.unwrap();
+    holder.begin_batch().await.unwrap();
+    holder
+        .execute_script(
+            "INSERT INTO dbd.objects (namespace, schema, name, kind, owner) \
+             VALUES ('relation', 'app', 'tmp', 'table', 'billing');",
+        )
+        .await
+        .unwrap();
+
+    let (pruned, ()) = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        tokio::join!(
+            design.reconcile(&*shop, false, false, true, None, Progress::none()),
+            async {
+                await_any_lock_waiter(&*watcher, 10).await;
+                holder.commit_batch().await.unwrap();
+            }
+        )
+    })
+    .await
+    .expect("neither may hang");
+
+    let plan = pruned.expect("shop's reconcile");
+    assert_table_exists(&*shop, "app", "tmp").await;
+    assert!(
+        plan.warnings
+            .iter()
+            .any(|w| w.contains("app.tmp") && w.contains("\"billing\"")),
+        "{:?}",
+        plan.warnings
+    );
+}
+
+/// A prune that fails part-way rolls back the drops before it — and said
+/// nothing of them, so a table reported dropped was still there. The error
+/// says nothing was pruned (#7).
+#[tokio::test]
+async fn a_prune_that_fails_part_way_says_nothing_was_pruned() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    let design = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1]);
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    shop.execute_script(
+        "CREATE TABLE app.aa_legacy (id int); CREATE TABLE app.zz_blocked (id int); \
+         CREATE FUNCTION public.block_zz() RETURNS event_trigger LANGUAGE plpgsql AS $$ \
+         BEGIN IF EXISTS (SELECT 1 FROM pg_event_trigger_dropped_objects() WHERE object_name = 'zz_blocked') \
+         THEN RAISE EXCEPTION 'zz_blocked may not be dropped'; END IF; END $$; \
+         CREATE EVENT TRIGGER block_zz ON sql_drop EXECUTE FUNCTION public.block_zz();",
+    )
+    .await
+    .unwrap();
+    let err = design
+        .reconcile(&*shop, false, false, true, None, Progress::none())
+        .await
+        .expect_err("app.zz_blocked may not be dropped")
+        .to_string();
+    assert!(err.contains("nothing was pruned"), "{err}");
+    assert_table_exists(&*shop, "app", "aa_legacy").await;
+}
