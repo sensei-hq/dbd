@@ -2233,7 +2233,9 @@ async fn dry_runs_refuse_a_design_declaring_another_owners_entity() {
     for args in [
         &["apply", "--dry-run"][..],
         &["deploy", "--dry-run"],
-        &["reset", "--dry-run"],
+        // `--force` past the reset guard the owner's prod mark raises, as the
+        // real reset would need: ownership is what this preview must refuse on.
+        &["reset", "--dry-run", "--force"],
         &["import", "--dry-run"],
         &["policies", "--dry-run"],
     ] {
