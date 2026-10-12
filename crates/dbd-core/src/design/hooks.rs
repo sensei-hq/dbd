@@ -528,6 +528,86 @@ mod tests {
         );
     }
 
+    /// A project with schemas `app` (table `items`, and `notes` when
+    /// `notes_in_app`) and `core` (table `notes`), a scope `app_only` leaving
+    /// `core` out, `source.search_path` set to `search_path`, and `hook` as its
+    /// one `apply.after` script.
+    fn two_schema_hook_project(
+        search_path: &str,
+        notes_in_app: bool,
+        hook: &str,
+    ) -> (tempfile::TempDir, crate::design::Design) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let write = |rel: &str, body: &str| {
+            let path = dir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        };
+        write(
+            "design.yaml",
+            &format!(
+                "project:\n  name: t\nsource:\n  dialect: postgresql\n  search_path: {search_path}\n\
+                 schemas:\n  - app\n  - core\nscopes:\n  app_only:\n    includes: [app]\n\
+                 apply:\n  after:\n    - sql/hook.sql\n"
+            ),
+        );
+        write(
+            "ddl/table/app/items.ddl",
+            "set search_path to app;\ncreate table if not exists items (id int primary key);\n",
+        );
+        if notes_in_app {
+            write(
+                "ddl/table/app/notes.ddl",
+                "set search_path to app;\ncreate table if not exists notes (id int primary key);\n",
+            );
+        }
+        write(
+            "ddl/table/core/notes.ddl",
+            "set search_path to core;\ncreate table if not exists notes (id int primary key);\n",
+        );
+        write("sql/hook.sql", hook);
+        let design = crate::design::Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        (tmp, design)
+    }
+
+    /// Postgres resolves a bare name along the whole search_path — to the
+    /// first schema on it that holds the name — and the hook analysis read
+    /// only the path's first schema. On `[app, core]`, with `notes` only in
+    /// `core`, a hook naming `notes` bare was judged against `app.notes`,
+    /// which the design does not manage, so a scope leaving `core` out ran it,
+    /// and it failed. A path the hook sets itself is read the same way, and
+    /// each statement on the path in effect where it runs.
+    #[test]
+    fn a_hooks_bare_name_resolves_along_the_whole_search_path() {
+        for (search_path, hook) in [
+            ("[app, core]", "insert into notes values (1);\n"),
+            (
+                "[app]",
+                "set search_path to app, core;\ninsert into notes values (1);\n",
+            ),
+            (
+                "[app]",
+                "set search_path to app;\ninsert into items values (1);\n\
+                 set search_path to core;\ninsert into notes values (1);\n",
+            ),
+        ] {
+            let (_tmp, design) = two_schema_hook_project(search_path, false, hook);
+            let scope = design.resolve_scope(Some("app_only"), None).unwrap();
+            let skips = design.hook_skips(Some(&scope)).unwrap();
+            assert!(
+                skips.len() == 1 && skips[0].contains("core.notes"),
+                "path {search_path}, hook {hook:?}: skipped for core.notes, got {skips:?}"
+            );
+        }
+
+        // The first schema holding the name wins: with `notes` in `app` too,
+        // the hook writes `app.notes`, which the scope builds.
+        let (_tmp, design) = two_schema_hook_project("[app, core]", true, "insert into notes values (1);\n");
+        let scope = design.resolve_scope(Some("app_only"), None).unwrap();
+        assert_eq!(design.hook_skips(Some(&scope)).unwrap(), Vec::<String>::new());
+    }
+
     /// Measured against sensei's real realtime hook: its table names live in
     /// `array[…]` and a `format()` string, so no parser can see them. This is
     /// the case `writes:` exists for.
