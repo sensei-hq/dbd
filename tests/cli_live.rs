@@ -1616,7 +1616,8 @@ async fn a_dry_run_checks_every_guard_its_real_run_checks() {
 /// guard, and an unscoped apply passed the scope pin. Each — and the dry runs
 /// that check the same guards — must be refused, naming the project the
 /// database records and the likely rename. `--force` and
-/// `--allow-scope-change` are honoured as they are on the project's own mark.
+/// `--allow-scope-change` lift their guards as they do on the project's own
+/// mark, but not the old name's ownership of the objects.
 #[tokio::test]
 async fn a_renamed_project_is_refused_where_its_old_name_would_be() {
     let (pg, url) = start_pg().await;
@@ -1650,10 +1651,21 @@ async fn a_renamed_project_is_refused_where_its_old_name_would_be() {
     }
     assert_eq!(schemas_of(&pg, &url, "nodes"), "hub", "the reset dropped nothing");
 
-    let o = dbd(dir, &url, &["reset", "--scope", "hub", "--dry-run", "--force"]);
-    assert!(o.status.success(), "--force is honoured: {}", combined(&o));
-    let o = dbd(dir, &url, &["apply", "--dry-run", "--allow-scope-change"]);
-    assert!(o.status.success(), "--allow-scope-change is honoured: {}", combined(&o));
+    // `--force` and `--allow-scope-change` lift the guards they name — and no
+    // further: the database's objects are still owned by `scoped`, which a
+    // renamed project takes over only by adopting them (#7).
+    for args in [
+        &["reset", "--scope", "hub", "--dry-run", "--force"][..],
+        &["apply", "--dry-run", "--allow-scope-change"],
+    ] {
+        let o = dbd(dir, &url, args);
+        assert!(!o.status.success(), "{args:?}: {}", combined(&o));
+        assert!(
+            combined(&o).contains("is owned by \"scoped\""),
+            "{args:?} is refused for the objects scoped owns: {}",
+            combined(&o)
+        );
+    }
 }
 
 // ── init --from-db writes a project that applies ────────────────────────────
