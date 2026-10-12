@@ -32,6 +32,11 @@ jobs:
       - uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2
         with:
           tool: cargo-llvm-cov
+      # The CLI suite's brownfield database creates `uuid-ossp`, which the
+      # embedded PostgreSQL build loads from the system's libossp-uuid — not
+      # on the runner, so `CREATE EXTENSION "uuid-ossp"` failed to load it.
+      - name: install libossp-uuid (for the uuid-ossp extension)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libossp-uuid16
       # Mirrors the local gate (.githooks/pre-commit and `make bump`):
       # default features (postgres + sqlite + deploy). Doctests run separately
       # (llvm-cov skips them on stable), keeping the gate equal to
