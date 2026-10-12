@@ -4352,6 +4352,114 @@ async fn a_heal_folds_only_its_own_legacy_rows() {
     assert_table_absent(&*b, "public", "_dbd_migrations").await;
 }
 
+const LEGACY_META_ONLY_A: &str = "CREATE TABLE public._dbd_meta ( \
+    project varchar NOT NULL PRIMARY KEY, env varchar NOT NULL DEFAULT 'dev', \
+    version integer NOT NULL DEFAULT 0, \
+    created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now() ); \
+    INSERT INTO public._dbd_meta (project, env, version) VALUES ('a', 'prod', 4);";
+
+/// An older dbd records project `c` in the legacy table while `a` heals: `c`'s
+/// apply has inserted its row and not yet committed when `a`, having folded
+/// its own, finds the table empty — it cannot see an uncommitted row — and
+/// drops it, `c`'s row with it once `c` commits. Both runs succeed and `c` has
+/// lost its record (#7, H5). The heal locks a legacy table before reading it,
+/// so it waits for writers in flight and sees what they committed.
+#[tokio::test]
+async fn a_heal_keeps_a_legacy_row_another_project_commits_meanwhile() {
+    let (_pg, url) = start_pg().await;
+    let a = connect(&url, "a").await.unwrap();
+    let c = connect(&url, "c").await.unwrap();
+    a.execute_script(LEGACY_META_ONLY_A).await.unwrap();
+
+    c.begin_batch().await.unwrap();
+    c.execute_script("INSERT INTO public._dbd_meta (project, env, version) VALUES ('c', 'prod', 1);")
+        .await
+        .unwrap();
+    let heal = tokio::spawn(async move { a.heal_bookkeeping().await.map(|()| a) });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    c.commit_batch().await.unwrap();
+    let a = heal.await.unwrap().expect("a's heal");
+
+    assert_dbd_meta_version(&*a, "a", 4).await;
+    assert_catalog(
+        &*a,
+        true,
+        "SELECT 1 FROM public._dbd_meta WHERE project = 'c' AND version = 1",
+        "c in public._dbd_meta",
+    )
+    .await;
+}
+
+/// Dropping an emptied legacy table is housekeeping: a reader finds no rows in
+/// it either way. One something depends on — a view over it — cannot be
+/// dropped, and that failure rolled back the fold and failed the run, every
+/// run. The table stays instead, empty.
+#[tokio::test]
+async fn a_heal_keeps_an_emptied_legacy_table_it_cannot_drop() {
+    let (_pg, url) = start_pg().await;
+    let a = connect(&url, "a").await.unwrap();
+    a.execute_script(LEGACY_META_ONLY_A).await.unwrap();
+    a.execute_script("CREATE VIEW public.meta_view AS SELECT * FROM public._dbd_meta;")
+        .await
+        .unwrap();
+
+    a.heal_bookkeeping().await.expect("heal");
+
+    assert_dbd_meta_version(&*a, "a", 4).await;
+    assert_table_exists(&*a, "public", "_dbd_meta").await;
+    assert_catalog(
+        &*a,
+        false,
+        "SELECT 1 FROM public._dbd_meta",
+        "a row in public._dbd_meta",
+    )
+    .await;
+}
+
+/// Projects sharing a database may run as different roles. `c`'s older dbd
+/// owns a legacy table `a`'s role cannot read: `a` has nothing in it, but its
+/// heal and its reads — which look for its record in every bookkeeping table —
+/// failed on it, every run. A table the role cannot read holds nothing of its.
+#[tokio::test]
+async fn a_legacy_table_the_role_cannot_read_is_passed_over() {
+    let (pg, url) = start_pg().await;
+    let admin = connect(&url, "admin").await.unwrap();
+    admin
+        .execute_script(
+            "CREATE ROLE role_a LOGIN PASSWORD 'secret'; CREATE ROLE role_c; \
+             GRANT CREATE ON DATABASE testdb TO role_a; GRANT USAGE, CREATE ON SCHEMA public TO role_a; \
+             CREATE TABLE public._dbd_meta ( \
+               project varchar NOT NULL PRIMARY KEY, env varchar NOT NULL DEFAULT 'dev', \
+               version integer NOT NULL DEFAULT 0, \
+               created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now() ); \
+             INSERT INTO public._dbd_meta (project, env, version) VALUES ('c', 'prod', 2); \
+             ALTER TABLE public._dbd_meta OWNER TO role_c; REVOKE ALL ON public._dbd_meta FROM PUBLIC;",
+        )
+        .await
+        .unwrap();
+    let settings = pg.settings();
+    let a = connect(
+        &format!("postgresql://role_a:secret@{}:{}/testdb", settings.host, settings.port),
+        "a",
+    )
+    .await
+    .unwrap();
+
+    a.heal_bookkeeping().await.expect("a's heal");
+    a.set_project_meta("dev", 3, None).await.unwrap();
+    let meta = a.get_project_meta().await.unwrap().expect("a's record");
+    assert_eq!(meta.version, 3);
+    assert_eq!(a.get_db_version().await.unwrap(), 3);
+    a.other_projects_meta().await.expect("other projects");
+    assert_catalog(
+        &*admin,
+        true,
+        "SELECT 1 FROM public._dbd_meta WHERE project = 'c' AND version = 2",
+        "c in public._dbd_meta",
+    )
+    .await;
+}
+
 // ── heal_bookkeeping: move to `dbd` schema + fold legacy `public._dbd_*` ───────
 
 #[tokio::test]
