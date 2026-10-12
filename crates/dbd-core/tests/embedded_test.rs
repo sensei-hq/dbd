@@ -9866,8 +9866,8 @@ fn owned_by(namespace: &str, schema: &str, name: &str, kind: &str, owner: &str) 
 /// A project's run claims every entity its whole design declares — the whole
 /// design, not the scope it ran under (#40): a scope narrows what is applied,
 /// never what the project owns. Tables, views, materialized views and
-/// sequences share Postgres's relation namespace; enums are types; functions
-/// and procedures are routines, by name (#7).
+/// sequences share Postgres's relation namespace with enums — a table's row
+/// type is a type — and functions and procedures are routines, by name (#7).
 #[tokio::test]
 async fn a_project_claims_every_entity_its_whole_design_declares() {
     let (_pg, url) = start_pg().await;
@@ -9883,7 +9883,7 @@ async fn a_project_claims_every_entity_its_whole_design_declares() {
     for (namespace, name, kind) in [
         ("relation", "orders", "table"),
         ("relation", "order_ids", "view"),
-        ("type", "status", "enum"),
+        ("relation", "status", "enum"),
         ("routine", "total", "function"),
     ] {
         assert_catalog(
@@ -10231,13 +10231,17 @@ async fn a_refused_reconcile_claims_nothing() {
         .await
         .expect_err("dropping app.orders.total is destructive");
 
-    assert_catalog(
-        &*billing,
-        false,
-        "SELECT 1 FROM dbd.objects WHERE owner = 'billing'",
-        "a claim of billing",
-    )
-    .await;
+    // No registry at all is the plainest "nothing claimed": the refused run
+    // never reached its claim, nor the heal that would make one.
+    if catalog_holds(&*billing, "SELECT 1 WHERE to_regclass('dbd.objects') IS NOT NULL").await {
+        assert_catalog(
+            &*billing,
+            false,
+            "SELECT 1 FROM dbd.objects WHERE owner = 'billing'",
+            "a claim of billing",
+        )
+        .await;
+    }
 }
 
 /// Postgres gives every table a row type, so a table and an enum of one name
