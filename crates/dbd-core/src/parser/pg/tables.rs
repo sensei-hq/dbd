@@ -116,6 +116,17 @@ fn extract(parsed: &pg_query::ParseResult, default_schema: &str) -> Extract<(Tab
             }
             Some(NodeEnum::CommentStmt(c)) => record_comment(c, &mut comments),
             Some(NodeEnum::AlterTableStmt(alter)) => alters.push(alter),
+            // A trigger kept beside its table fires a function the table now
+            // depends on. Skipping the statement left no edge, so apply could
+            // run the trigger before that function existed.
+            Some(NodeEnum::CreateTrigStmt(trigger)) => {
+                if let Some(pair) =
+                    common::qualify_name_source(&string_list(&trigger.funcname).join("."), default_schema)
+                    && !functions.contains(&pair)
+                {
+                    functions.push(pair);
+                }
+            }
             _ => {}
         }
     }
@@ -170,6 +181,77 @@ fn extract(parsed: &pg_query::ParseResult, default_schema: &str) -> Extract<(Tab
         references,
         warnings,
     ))
+}
+
+/// The triggers a table file declares beside its table, by name.
+///
+/// The model keeps none — [`extract`] turns a trigger into a `Calls` edge to
+/// the routine it fires and nothing more, since apply only needs the order. A
+/// consumer that must account for every statement in the file, as `dbd emit`
+/// reports everything it leaves out, reads them back from the source here, the
+/// way it reads a sequence's options (`sequences::sequence_options`).
+pub(crate) fn trigger_names(sql: &str) -> Vec<String> {
+    let Ok(parsed) = pg_query::parse(sql) else {
+        return Vec::new();
+    };
+    parsed
+        .protobuf
+        .stmts
+        .iter()
+        .filter_map(|s| match s.stmt.as_ref()?.node.as_ref()? {
+            NodeEnum::CreateTrigStmt(t) => Some(t.trigname.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The statements of a table or view file that are about its triggers, as the
+/// file wrote them — `CREATE [CONSTRAINT] TRIGGER`, the `DROP TRIGGER IF
+/// EXISTS` that keeps a constraint trigger re-runnable, and `COMMENT ON
+/// TRIGGER` — each with the comment lines written above it, in file order,
+/// and each preceded by the `SET search_path` it ran on when that changed
+/// since the last one kept. `None` when the file does not parse.
+///
+/// For a rewrite of the file from a source that cannot hold a trigger — a
+/// DBML document — which would otherwise drop them (see
+/// [`crate::reverse::keep_authored_triggers`]). The path comes with them
+/// because a trigger names its table and function as the file's path
+/// resolves them, and the rewritten file's own statements are qualified and
+/// set none.
+pub(crate) fn trigger_statements(sql: &str) -> Option<Vec<String>> {
+    use protobuf::ObjectType;
+    let parsed = pg_query::parse(sql).ok()?;
+    let text_of = |raw: &protobuf::RawStmt| -> Option<String> {
+        let start = usize::try_from(raw.stmt_location).ok()?.min(sql.len());
+        // `stmt_len` 0 means "to the end of the script".
+        let end = match usize::try_from(raw.stmt_len).unwrap_or(0) {
+            0 => sql.len(),
+            len => (start + len).min(sql.len()),
+        };
+        let text = sql.get(start..end)?.trim();
+        (!text.is_empty()).then(|| text.to_string())
+    };
+    let mut kept = Vec::new();
+    // The last `SET search_path` (or `RESET`) not yet written ahead of a kept
+    // statement.
+    let mut path: Option<String> = None;
+    for raw in &parsed.protobuf.stmts {
+        let about_a_trigger = match raw.stmt.as_ref().and_then(|s| s.node.as_ref()) {
+            Some(NodeEnum::VariableSetStmt(set)) if set.name.eq_ignore_ascii_case("search_path") => {
+                path = text_of(raw);
+                continue;
+            }
+            Some(NodeEnum::CreateTrigStmt(_)) => true,
+            Some(NodeEnum::DropStmt(d)) => d.remove_type() == ObjectType::ObjectTrigger,
+            Some(NodeEnum::CommentStmt(c)) => c.objtype() == ObjectType::ObjectTrigger,
+            _ => false,
+        };
+        if about_a_trigger && let Some(text) = text_of(raw) {
+            kept.extend(path.take());
+            kept.push(text);
+        }
+    }
+    Some(kept)
 }
 
 /// A `RangeVar` as a qualified name, defaulting the schema like Postgres does.
@@ -263,13 +345,14 @@ fn process_create_table(
     for elt in &create.table_elts {
         match elt.node.as_ref() {
             Some(NodeEnum::ColumnDef(col_def)) => {
-                let (col, checks) = extract_column(col_def, default_schema, references, functions)?;
+                let (col, lifted) = extract_column(col_def, default_schema, references, functions)?;
                 columns.push(col);
                 // Postgres promotes a column-level CHECK to a table constraint,
                 // and introspection reports it as one. Dropping it would make
                 // every inline CHECK read as a live-only constraint reconcile
-                // offers to delete.
-                constraints.extend(checks);
+                // offers to delete. So with a named inline key, or an inline
+                // UNIQUE NULLS NOT DISTINCT (see `extract_column`).
+                constraints.extend(lifted);
             }
             Some(NodeEnum::Constraint(_)) => {}
             // The only other element Postgres's grammar allows here is
@@ -300,7 +383,7 @@ fn process_create_table(
 ///
 /// A composite `PRIMARY KEY (a, b)` therefore lands twice — as a table-level
 /// constraint *and* as `is_pk` on each member — which is the exact shape
-/// `reconcile`'s `lift_pk_unique_keep_others` and `pk_unique_col_sets` read.
+/// `reconcile`'s `lift_pk_unique_keep_others` reads.
 fn mark_pk_columns(columns: &mut [ColumnDef], pk_cols: &[String]) {
     for col in columns {
         if pk_cols.contains(&col.name) {
@@ -310,7 +393,19 @@ fn mark_pk_columns(columns: &mut [ColumnDef], pk_cols: &[String]) {
     }
 }
 
-/// One column, plus any column-level `CHECK`s, which belong to the table.
+/// One column, plus the table-level constraints its own clauses amount to:
+/// every column-level `CHECK`, which belongs to the table, and a key the
+/// column's flags cannot carry whole.
+///
+/// `is_pk` and `is_unique` hold that the column is a key, and nothing else
+/// about it. An inline `constraint u_pk primary key` or `constraint u_email_uq
+/// unique` lost its name, so `emit` and the DBML wrote the key unnamed; an
+/// inline `unique nulls not distinct` lost the clause, so the design read as a
+/// plain UNIQUE against the database it built. Each becomes the table-level
+/// constraint it is equivalent to — the shape `constraint u_pk primary key
+/// (id)` already parses to: a primary key keeps `is_pk` beside its constraint,
+/// a UNIQUE is the constraint alone. A key with neither a name nor the clause
+/// stays a flag, as before.
 fn extract_column(
     col_def: &protobuf::ColumnDef,
     default_schema: &str,
@@ -324,6 +419,13 @@ fn extract_column(
         .ok_or_else(|| format!("column {name:?} has no type"))?;
     let data_type =
         type_text(type_name).ok_or_else(|| format!("column {name:?}: dbd could not render its type back to SQL"))?;
+    // The column's type is a dependency when the project declares it (an
+    // enum). `pg_catalog` spells a built-in outright; a bare built-in such as
+    // `text` is recorded too and dropped when it resolves to nothing.
+    let type_names = string_list(&type_name.names);
+    if type_names.first().map(String::as_str) != Some("pg_catalog") {
+        references.extend(uses_ref(&type_names.join("."), default_schema));
+    }
 
     let mut nullable = true;
     let mut is_pk = false;
@@ -331,31 +433,56 @@ fn extract_column(
     let mut identity = None;
     let mut generated: Option<String> = None;
     let mut default_value = None;
-    let mut inline_fk = None;
-    let mut checks = Vec::new();
+    let mut inline_fk: Option<ForeignKey> = None;
+    let mut lifted = Vec::new();
+    // Whether the constraint before an attribute node (`DEFERRABLE`, …) was
+    // the `REFERENCES` — the one it then modifies.
+    let mut after_references = false;
 
     for node in &col_def.constraints {
         let Some(NodeEnum::Constraint(c)) = node.node.as_ref() else {
             return Err(format!("column {name:?} carries an unreadable constraint"));
         };
         use protobuf::ConstrType::*;
+        let is_attribute = matches!(
+            c.contype(),
+            ConstrAttrDeferrable | ConstrAttrNotDeferrable | ConstrAttrDeferred | ConstrAttrImmediate
+        );
+        let modifies_references = is_attribute && after_references;
+        if !is_attribute {
+            after_references = c.contype() == ConstrForeign;
+        }
         match c.contype() {
             ConstrPrimary => {
                 is_pk = true;
                 nullable = false;
+                if let Some(constraint) = constraint_name(c) {
+                    lifted.push(TableConstraint::PrimaryKey {
+                        name: Some(constraint),
+                        columns: vec![name.clone()],
+                    });
+                }
             }
-            ConstrUnique => is_unique = true,
+            ConstrUnique if c.conname.is_empty() && !c.nulls_not_distinct => is_unique = true,
+            ConstrUnique => lifted.push(TableConstraint::Unique {
+                name: constraint_name(c),
+                columns: vec![name.clone()],
+                nulls_not_distinct: c.nulls_not_distinct,
+            }),
             ConstrNotnull => nullable = false,
             ConstrNull => nullable = true,
             ConstrDefault => {
                 let rendered = constraint_expr(c, &name, "DEFAULT")?;
                 collect_function_refs(&rendered, default_schema, functions);
+                if let Some(sequence) = c.raw_expr.as_deref().and_then(common::nextval_sequence) {
+                    references.extend(uses_ref(&sequence, default_schema));
+                }
                 default_value = Some(rendered);
             }
             ConstrCheck => {
                 let rendered = constraint_expr(c, &name, "CHECK")?;
                 collect_function_refs(&rendered, default_schema, functions);
-                checks.push(TableConstraint::Check {
+                lifted.push(TableConstraint::Check {
                     name: constraint_name(c),
                     expression: rendered,
                 });
@@ -398,8 +525,25 @@ fn extract_column(
                 collect_function_refs(&rendered, default_schema, functions);
                 generated = Some(rendered);
             }
-            // Deferrability modifiers carry no payload of their own.
-            ConstrAttrDeferrable | ConstrAttrNotDeferrable | ConstrAttrDeferred | ConstrAttrImmediate => {}
+            // In a column definition, `DEFERRABLE` and `INITIALLY …` arrive as
+            // constraint nodes of their own, after the constraint they modify.
+            // A `REFERENCES` is the only one the model can hold them for.
+            ConstrAttrDeferrable | ConstrAttrNotDeferrable | ConstrAttrDeferred | ConstrAttrImmediate => {
+                if let Some(fk) = inline_fk.as_mut().filter(|_| modifies_references) {
+                    match c.contype() {
+                        ConstrAttrDeferrable => fk.deferrable = true,
+                        ConstrAttrNotDeferrable => {
+                            fk.deferrable = false;
+                            fk.initially_deferred = false;
+                        }
+                        ConstrAttrDeferred => {
+                            fk.deferrable = true;
+                            fk.initially_deferred = true;
+                        }
+                        _ => fk.initially_deferred = false,
+                    }
+                }
+            }
             other => {
                 return Err(format!(
                     "column {name:?} has a {other:?} constraint dbd cannot represent"
@@ -408,12 +552,25 @@ fn extract_column(
         }
     }
 
-    // SERIAL is sugar for an integer plus an owned sequence; it is NOT an
-    // IDENTITY column, so it leaves `identity` alone.
+    // SERIAL is sugar for `integer NOT NULL DEFAULT nextval(…)` on an owned
+    // sequence. It is NOT an IDENTITY column, so it leaves `identity` alone —
+    // and it is not a primary key either: only a declared PRIMARY KEY is.
     if data_type.to_uppercase().contains("SERIAL") {
-        is_pk = true;
         nullable = false;
     }
+
+    // `COLLATE "C"`, spelled as introspection spells it (see
+    // `ColumnDef::collation`); `default` is no collation at all.
+    let collation = col_def
+        .coll_clause
+        .as_ref()
+        .map(|clause| string_list(&clause.collname))
+        .and_then(|parts| match parts.as_slice() {
+            [name] | [_, name] if name == "default" => None,
+            [name] => Some(crate::entity::collation_sql(None, name)),
+            [schema, name] => Some(crate::entity::collation_sql(Some(schema), name)),
+            _ => None,
+        });
 
     let column = ColumnDef {
         name,
@@ -426,8 +583,9 @@ fn extract_column(
         generated,
         comment: None,
         inline_fk,
+        collation,
     };
-    Ok((column, checks))
+    Ok((column, lifted))
 }
 
 /// One table-level constraint.
@@ -466,6 +624,10 @@ fn extract_table_constraint(
                 ..fk
             }))
         }
+        ConstrExclusion => Ok(TableConstraint::Exclude {
+            name: constraint_name(c),
+            definition: exclusion_definition(c, default_schema, functions)?,
+        }),
         other => Err(format!("this table has a {other:?} constraint dbd cannot represent")),
     }
 }
@@ -509,6 +671,14 @@ fn extract_foreign_key(
         ref_columns: string_list(&c.pk_attrs),
         on_delete: fk_action(&c.fk_del_action),
         on_update: fk_action(&c.fk_upd_action),
+        // `f` is MATCH FULL; `s` (SIMPLE) is the default and what an omitted
+        // clause parses to.
+        match_full: c.fk_matchtype == "f",
+        // A table-level key carries its `DEFERRABLE` / `INITIALLY DEFERRED`
+        // here. A column-level `REFERENCES` gets them as constraint nodes of
+        // their own that follow it — see `extract_column`.
+        deferrable: c.deferrable || c.initdeferred,
+        initially_deferred: c.initdeferred,
     })
 }
 
@@ -593,26 +763,12 @@ pub(super) fn extract_index(
         let Some(NodeEnum::IndexElem(elem)) = param.node.as_ref() else {
             return Err(format!("index {label:?} has an unreadable key"));
         };
-        // An empty `name` means the key is an expression, held in `expr`.
-        let (name, is_expression) = if elem.name.is_empty() {
-            let expr = elem
-                .expr
-                .as_ref()
-                .ok_or_else(|| format!("index {label:?} has a key that is neither column nor expression"))?;
-            let rendered = expr_text(expr)
-                .ok_or_else(|| format!("index {label:?}: dbd could not render an expression key back to SQL"))?;
-            collect_function_refs(&rendered, default_schema, functions);
-            (parenthesize_key(expr, rendered), true)
-        } else {
-            (elem.name.clone(), false)
-        };
-        columns.push(IndexColumn {
-            name,
-            is_expression,
-            order: sort_order(elem.ordering),
-            nulls_first: nulls_first(elem.nulls_ordering),
-            opclass: (!elem.opclass.is_empty()).then(|| string_list(&elem.opclass).join(".")),
-        });
+        columns.push(index_column(
+            elem,
+            &format!("index {label:?}"),
+            default_schema,
+            functions,
+        )?);
     }
 
     let mut include = Vec::with_capacity(ix.index_including_params.len());
@@ -674,6 +830,123 @@ pub(super) fn extract_index(
     })
 }
 
+/// One key of an index or an exclusion constraint: a column, or an expression
+/// over columns, with its operator class, direction and NULLS placement.
+/// `owner` names what it belongs to, for the error when a key cannot be read.
+fn index_column(
+    elem: &protobuf::IndexElem,
+    owner: &str,
+    default_schema: &str,
+    functions: &mut Vec<(String, SchemaSource)>,
+) -> Extract<IndexColumn> {
+    // An empty `name` means the key is an expression, held in `expr`.
+    let (name, is_expression) = if elem.name.is_empty() {
+        let expr = elem
+            .expr
+            .as_ref()
+            .ok_or_else(|| format!("{owner} has a key that is neither column nor expression"))?;
+        let rendered =
+            expr_text(expr).ok_or_else(|| format!("{owner}: dbd could not render an expression key back to SQL"))?;
+        collect_function_refs(&rendered, default_schema, functions);
+        (parenthesize_key(expr, rendered), true)
+    } else {
+        (elem.name.clone(), false)
+    };
+    Ok(IndexColumn {
+        name,
+        is_expression,
+        order: sort_order(elem.ordering),
+        nulls_first: nulls_first(elem.nulls_ordering),
+        opclass: (!elem.opclass.is_empty()).then(|| string_list(&elem.opclass).join(".")),
+    })
+}
+
+/// An `EXCLUDE` constraint's definition — everything after `EXCLUDE` — as
+/// valid SQL, rendered from the statement in the order Postgres's grammar
+/// takes it: `USING <method> (<key> WITH <operator>, …)`, then `INCLUDE`,
+/// `WITH`, `USING INDEX TABLESPACE`, `WHERE`, `DEFERRABLE`.
+///
+/// Rendered piece by piece rather than through libpg_query's deparser, which
+/// writes `WHERE` before `INCLUDE` and `WITH` — SQL Postgres refuses. An
+/// omitted method is written as the `btree` Postgres gives it, as
+/// `pg_get_constraintdef` writes it.
+fn exclusion_definition(
+    c: &protobuf::Constraint,
+    default_schema: &str,
+    functions: &mut Vec<(String, SchemaSource)>,
+) -> Extract<String> {
+    let owner = format!(
+        "exclusion constraint {:?}",
+        constraint_name(c).unwrap_or_else(|| "<unnamed>".to_string())
+    );
+    let unreadable = || format!("{owner} has an element dbd cannot read");
+    let mut elements = Vec::with_capacity(c.exclusions.len());
+    for pair in &c.exclusions {
+        // Each element is a two-item list: the key, then its operator's name.
+        let Some(NodeEnum::List(pair)) = pair.node.as_ref() else {
+            return Err(unreadable());
+        };
+        let [key, operator] = pair.items.as_slice() else {
+            return Err(unreadable());
+        };
+        let (Some(NodeEnum::IndexElem(key)), Some(NodeEnum::List(operator))) =
+            (key.node.as_ref(), operator.node.as_ref())
+        else {
+            return Err(unreadable());
+        };
+        let operator = match string_list(&operator.items).as_slice() {
+            [op] => op.clone(),
+            qualified => format!("OPERATOR({})", qualified.join(".")),
+        };
+        let column = index_column(key, &owner, default_schema, functions)?;
+        elements.push(format!("{} WITH {operator}", crate::emit::emit_index_column(&column)));
+    }
+    let method = if c.access_method.is_empty() {
+        "btree"
+    } else {
+        &c.access_method
+    };
+    let mut sql = format!("USING {method} ({})", elements.join(", "));
+    let include = string_list(&c.including);
+    if !include.is_empty() {
+        let quoted: Vec<String> = include.iter().map(|col| crate::sql_quote::ident(col)).collect();
+        sql.push_str(&format!(" INCLUDE ({})", quoted.join(", ")));
+    }
+    if !c.options.is_empty() {
+        let mut options = Vec::with_capacity(c.options.len());
+        for option in &c.options {
+            let Some(NodeEnum::DefElem(def)) = option.node.as_ref() else {
+                return Err(format!("{owner} has an unreadable storage parameter"));
+            };
+            let value = def
+                .arg
+                .as_ref()
+                .and_then(|a| scalar_text(a))
+                .ok_or_else(|| format!("{owner}: storage parameter {:?} has an unreadable value", def.defname))?;
+            options.push(format!("{} = {value}", def.defname.to_lowercase()));
+        }
+        sql.push_str(&format!(" WITH ({})", options.join(", ")));
+    }
+    if !c.indexspace.is_empty() {
+        sql.push_str(&format!(
+            " USING INDEX TABLESPACE {}",
+            crate::sql_quote::ident(&c.indexspace)
+        ));
+    }
+    if let Some(predicate) = c.where_clause.as_ref() {
+        let rendered =
+            expr_text(predicate).ok_or_else(|| format!("{owner}: dbd could not render its WHERE back to SQL"))?;
+        collect_function_refs(&rendered, default_schema, functions);
+        sql.push_str(&format!(" WHERE ({rendered})"));
+    }
+    if c.initdeferred {
+        sql.push_str(" DEFERRABLE INITIALLY DEFERRED");
+    } else if c.deferrable {
+        sql.push_str(" DEFERRABLE");
+    }
+    Ok(sql)
+}
+
 /// Postgres's grammar requires an index key that is not a bare function call to
 /// be parenthesized, and `IndexColumn::name` is emitted as written — so the
 /// parens have to be part of it or the generated `CREATE INDEX` is a syntax
@@ -705,6 +978,17 @@ fn nulls_first(nulls_ordering: i32) -> Option<bool> {
         x if x == SortByNulls::SortbyNullsLast as i32 => Some(false),
         _ => None,
     }
+}
+
+/// A [`RefKind::Uses`] reference to `name`, qualified like every other.
+fn uses_ref(name: &str, default_schema: &str) -> Option<Ref> {
+    let (name, schema_source) = super::common::qualify_name_source(name, default_schema)?;
+    Some(Ref {
+        name,
+        kind: RefKind::Uses,
+        schema_source,
+        unresolved: false,
+    })
 }
 
 /// The `String` values of a node list — key lists, comment object paths and
@@ -784,7 +1068,19 @@ fn type_text(type_name: &protobuf::TypeName) -> Option<String> {
     let rendered = rendered
         .strip_prefix(&format!("CREATE TABLE {FRAME} ({FRAME} "))?
         .strip_suffix(')')?;
-    Some(without_typmod_spaces(rendered))
+    Some(without_typmod_spaces(without_catalog(rendered)))
+}
+
+/// Postgres's grammar names every SQL-standard type through `pg_catalog`, and
+/// its deparser writes most of them back bare (`int`, `varchar(30)`) — but not
+/// `json`, `bit` or `bit varying`, which come out as `pg_catalog.json`,
+/// `pg_catalog.bit(3)` and `pg_catalog.varbit(5)`. Kept, the qualification made
+/// `emit` miss its `json` mapping (MySQL got `VARCHAR(255)`) and spelled the
+/// type that way in DBML. A type named through `pg_catalog` is the same type
+/// bare, as `reconcile::canonical_type` already treats it, so the comparisons
+/// that strip it there see no change.
+fn without_catalog(rendered: &str) -> &str {
+    rendered.strip_prefix("pg_catalog.").unwrap_or(rendered)
 }
 
 /// Postgres's deparser writes a type-modifier list as `numeric(10, 2)`, but
@@ -893,6 +1189,19 @@ mod tests {
         );
     }
 
+    /// Postgres's grammar names `json`, `bit` and `bit varying` through
+    /// `pg_catalog`, and its deparser — unlike for `int` or `varchar` — writes
+    /// the qualification back out. Kept, `json` reached `emit` as
+    /// `pg_catalog.json`, matched no mapping, and became `VARCHAR(255)` on
+    /// MySQL; the DBML document spelled it that way too. The same type reads
+    /// as its own name, as `jsonb` always did.
+    #[test]
+    fn a_type_postgres_names_through_pg_catalog_comes_back_unqualified() {
+        let d = def("create table t (a json, b json[], c JSON, d bit(3), e bit varying(5), f jsonb);");
+        let types: Vec<&str> = d.columns.iter().map(|c| c.data_type.as_str()).collect();
+        assert_eq!(types, vec!["json", "json[]", "json", "bit(3)", "varbit(5)", "jsonb"]);
+    }
+
     /// `format_type` — what introspection reports — spells a type modifier list
     /// without spaces, so a deparsed `numeric(10, 2)` would read as permanent
     /// drift against the very same column in the database.
@@ -934,16 +1243,34 @@ mod tests {
         assert_eq!(d.columns[2].identity, None);
     }
 
+    /// `serial` is `integer NOT NULL DEFAULT nextval(…)` — no primary key. Marking
+    /// it one put a key in the model that the database never has: reconcile then
+    /// planned `ADD PRIMARY KEY (seq_no)` beside the real one, and every real
+    /// run failed with "multiple primary keys"; DBML, the viewer and `emit`
+    /// showed a composite key that does not exist.
+    #[test]
+    fn a_serial_column_is_not_a_primary_key_unless_declared_one() {
+        let d = def("create table t (id uuid primary key, seq_no serial, label text);");
+        let seq_no = d.columns.iter().find(|c| c.name == "seq_no").expect("seq_no");
+        assert!(!seq_no.is_pk, "serial alone declares no key");
+        assert!(!seq_no.nullable, "serial is NOT NULL");
+        let pk: Vec<&str> = d.columns.iter().filter(|c| c.is_pk).map(|c| c.name.as_str()).collect();
+        assert_eq!(pk, vec!["id"]);
+
+        let declared = def("create table u (id serial primary key);");
+        assert!(declared.columns[0].is_pk, "a serial declared as the key still is one");
+    }
+
     /// SERIAL is sugar for an integer plus an owned sequence, not an IDENTITY
-    /// column — so it must not set `identity`. The `is_pk` it does set mirrors
-    /// the sqlparser incumbent, which reconcile's snapshot shape depends on.
+    /// column — so it must not set `identity`. Nor is it a key: see
+    /// `a_serial_column_is_not_a_primary_key_unless_declared_one`.
     #[test]
     fn serial_is_not_an_identity_column() {
         let d = def("create table t (a serial, b bigserial);");
         assert_eq!(d.columns[0].identity, None);
         assert!(!d.columns[0].nullable);
-        assert!(d.columns[0].is_pk);
-        assert!(d.columns[1].is_pk);
+        assert!(!d.columns[0].is_pk);
+        assert!(!d.columns[1].is_pk);
     }
 
     /// `GENERATED ALWAYS AS (expr) STORED` is a computed column, not an identity
@@ -1009,6 +1336,34 @@ mod tests {
         assert!(e.refers_to("other.parent"), "got {:?}", e.refers().collect::<Vec<_>>());
     }
 
+    /// In a column definition, `DEFERRABLE` and `INITIALLY DEFERRED` arrive as
+    /// constraint nodes of their own after the `REFERENCES` they modify, where
+    /// a table-level key carries them inside its own node. Ignored, a column's
+    /// deferred key read as an immediate one — a difference from the database
+    /// `diff` would then report forever. One after a `UNIQUE` modifies the
+    /// `UNIQUE`, not a key before it. `MATCH FULL` is the key's own.
+    #[test]
+    fn an_inline_fk_keeps_its_deferrability_and_match() {
+        let d = def("set search_path to app;\n\
+             create table t (\n\
+               a int references parent (id) deferrable initially deferred\n\
+             , b int references parent (id) deferrable\n\
+             , c int references parent (id) match full\n\
+             , d int references parent (id) unique deferrable\n\
+             , e int references parent (id)\n\
+             );");
+        let fk = |i: usize| d.columns[i].inline_fk.as_ref().expect("inline FK");
+        assert!(fk(0).deferrable && fk(0).initially_deferred, "{:?}", fk(0));
+        assert!(fk(1).deferrable && !fk(1).initially_deferred, "{:?}", fk(1));
+        assert!(fk(2).match_full && !fk(2).deferrable, "{:?}", fk(2));
+        assert!(
+            !fk(3).deferrable,
+            "DEFERRABLE after UNIQUE is the UNIQUE's: {:?}",
+            fk(3)
+        );
+        assert!(!fk(4).deferrable && !fk(4).match_full, "{:?}", fk(4));
+    }
+
     /// `references parent` with no column list targets the parent's primary key;
     /// the incumbent records `id`, and reconcile's FK shape compares against it.
     #[test]
@@ -1055,8 +1410,8 @@ mod tests {
     // ── 3. Table-level constraints ──────────────────────────────────────────
 
     /// A composite key must produce BOTH the table-level constraint AND `is_pk`
-    /// on each member column: `lift_pk_unique_keep_others` and
-    /// `pk_unique_col_sets` in `reconcile` read exactly that shape.
+    /// on each member column: `lift_pk_unique_keep_others` in `reconcile`
+    /// reads exactly that shape.
     #[test]
     fn a_composite_primary_key_is_both_a_constraint_and_a_per_column_flag() {
         let d = def("create table t (a uuid not null, b uuid not null, c int, primary key (a, b));");
@@ -1315,14 +1670,11 @@ mod tests {
     /// dbd cannot read is absent from the desired snapshot, reads as an orphan,
     /// and `--prune` DROPs it. Anything unextractable therefore has to error.
     #[test]
-    fn a_constraint_dbd_cannot_represent_errors_rather_than_dropping_silently() {
-        let e = parse(
-            "create table t (id int primary key, r int4range,\
-             exclude using gist (r with &&));",
-        );
+    fn a_clause_dbd_cannot_represent_errors_rather_than_dropping_silently() {
+        let e = parse("create table t (id int primary key, like other_table including defaults);");
         assert!(
             !e.errors.is_empty(),
-            "an EXCLUDE constraint must not be dropped silently"
+            "the columns a LIKE clause copies must not be dropped silently"
         );
         assert!(
             e.table_def.is_none(),

@@ -43,7 +43,7 @@ pub struct ReconcilePlan {
     /// Materialized views present in the design but absent from the DB. Reconcile
     /// CREATEs these (Postgres has no `CREATE OR REPLACE MATERIALIZED VIEW`);
     /// carried separately from `added` because they use a different code path
-    /// (`matview_create_sql` + hash sentinel) and are detected during `--dry-run`
+    /// (`matview_create_sql`, then its stamp) and are detected during `--dry-run`
     /// so the preview can list them.
     pub matview_creates: Vec<String>,
     /// Materialized views live with a `v1` (unversioned) hash sentinel — written
@@ -60,9 +60,35 @@ pub struct ReconcilePlan {
     /// (see [`plan_index_convergence`]). Whole-table drops are separate — see
     /// [`Self::dropped`] — and gated by pruning, not by this flag.
     pub destructive: bool,
+    /// What makes the plan [`Self::destructive`], one line each —
+    /// `"app.a: drops column gone"` — for a refusal to name. Only those: the
+    /// refusal used to list every altered table, a column added as much as one
+    /// dropped.
+    pub destructive_changes: Vec<String>,
+    /// The enum type swaps the plan makes (see [`plan_enum_recreation`]), with
+    /// the columns each moves — what the caller checks against the live
+    /// database for a materialized view that would block one.
+    pub enum_swaps: Vec<EnumSwap>,
+}
+
+/// One enum's type swap: the values it loses and the `(table, column)` pairs
+/// (`schema.table`) moved onto the new type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumSwap {
+    pub enum_name: String,
+    pub removed: Vec<String>,
+    pub columns: Vec<(String, String)>,
 }
 
 impl ReconcilePlan {
+    /// Record a change gated behind `--allow-destructive`, once.
+    fn mark_destructive(&mut self, change: String) {
+        self.destructive = true;
+        if !self.destructive_changes.contains(&change) {
+            self.destructive_changes.push(change);
+        }
+    }
+
     /// No structural changes to make.
     pub fn is_empty(&self) -> bool {
         self.added.is_empty()
@@ -487,7 +513,14 @@ fn canonical_datetime(s: &str) -> Option<String> {
 /// comes back `now()`, `coalesce(…)` comes back `COALESCE(…)`. Comparing those
 /// textually made reconcile emit a `SET DEFAULT` that Postgres immediately
 /// re-spelled, so the next diff reported the same change — forever.
-fn canonical_default(raw: &str, data_type: &str) -> String {
+pub(crate) fn canonical_default(raw: &str, data_type: &str) -> String {
+    // Postgres keeps `nextval('s')`'s argument as an OID and reports it as
+    // `nextval('s'::regclass)`; a design without the cast read as a changed
+    // default on every run. Both sides take the reported form — valid SQL with
+    // the same meaning, as everything this returns must be (it is emitted).
+    if let Some(sequence) = crate::parser::pg::common::nextval_sequence_of(raw.trim()) {
+        return format!("nextval('{}'::regclass)", sequence.replace('\'', "''"));
+    }
     let base = fold_unquoted_case(strip_trailing_cast(raw.trim()).trim());
     canonical_default_for_type(&base, data_type).unwrap_or(base)
 }
@@ -726,13 +759,13 @@ pub fn qualified_entity_name(entity: &Entity) -> String {
 pub fn plan_reconcile(live: &Snapshot, desired: &Snapshot) -> ReconcilePlan {
     let diffs = diff::diff(live, desired);
     let warnings = diff::migration_warnings(&diffs);
-    let destructive = diffs.iter().any(has_column_drop);
-
     let mut plan = ReconcilePlan {
         warnings,
-        destructive,
         ..Default::default()
     };
+    for change in diffs.iter().flat_map(dropped_fields) {
+        plan.mark_destructive(change);
+    }
 
     for d in &diffs {
         match &d.action {
@@ -764,12 +797,28 @@ pub fn plan_reconcile(live: &Snapshot, desired: &Snapshot) -> ReconcilePlan {
     plan
 }
 
-/// Whether a diff drops a column or constraint from an existing table — the
-/// data-loss case gated by `allow_destructive`. Whole-object drops are handled
-/// separately via pruning.
-fn has_column_drop(d: &MigrationDiff) -> bool {
-    matches!(&d.action, DiffAction::Change(changes)
-        if changes.iter().any(|c| matches!(c.action, ChangeAction::Drop(_))))
+/// What a diff drops from an existing table or enum — a column, a constraint,
+/// an enum value: the data-loss cases gated by `allow_destructive` — one line
+/// each, for [`ReconcilePlan::destructive_changes`]. Whole-object drops are
+/// handled separately via pruning.
+fn dropped_fields(d: &MigrationDiff) -> Vec<String> {
+    use crate::diff::FieldType;
+    let DiffAction::Change(changes) = &d.action else {
+        return Vec::new();
+    };
+    changes
+        .iter()
+        .filter(|c| matches!(c.action, ChangeAction::Drop(_)))
+        .map(|c| {
+            let kind = match c.field_type {
+                FieldType::Column => "column",
+                FieldType::Constraint => "constraint",
+                FieldType::Index => "index",
+                FieldType::EnumValue => "enum value",
+            };
+            format!("{}: drops {kind} {}", d.entity_name, c.field_name)
+        })
+        .collect()
 }
 
 // ── Foreign-key convergence (issue #8) ──────────────────────
@@ -787,6 +836,9 @@ struct FkShape {
     ref_columns: Vec<String>,
     on_delete: Option<FkAction>,
     on_update: Option<FkAction>,
+    match_full: bool,
+    deferrable: bool,
+    initially_deferred: bool,
 }
 
 /// The name-agnostic shape of an FK for cross-representation matching.
@@ -806,6 +858,11 @@ fn fk_shape(fk: &ForeignKey) -> FkShape {
         ref_columns: fk.ref_columns.clone(),
         on_delete: norm_action(fk.on_delete),
         on_update: norm_action(fk.on_update),
+        match_full: fk.match_full,
+        // `INITIALLY DEFERRED` implies `DEFERRABLE`; one spelled without the
+        // other is the same key.
+        deferrable: fk.deferrable || fk.initially_deferred,
+        initially_deferred: fk.initially_deferred,
     }
 }
 
@@ -874,7 +931,7 @@ pub fn plan_fk_convergence(plan: &mut ReconcilePlan, live: &Snapshot, desired: &
                     fk.clone(),
                 )))),
             });
-            plan.destructive = true;
+            plan.mark_destructive(format!("{qname}: drops foreign key ({})", fk.columns.join(", ")));
         }
 
         // Adds: a design FK missing from the live DB (unnamed → Postgres auto-names).
@@ -1027,7 +1084,10 @@ pub fn plan_check_convergence(plan: &mut ReconcilePlan, live: &Snapshot, desired
                 field_type: FieldType::Constraint,
                 action: ChangeAction::Drop(Box::new(FieldDetail::Constraint((*con).clone()))),
             });
-            plan.destructive = true;
+            plan.mark_destructive(format!(
+                "{qname}: drops CHECK constraint {}",
+                name.as_deref().unwrap_or_default()
+            ));
         }
 
         // Adds: a design CHECK the live DB lacks. An unnamed one is emitted
@@ -1044,6 +1104,84 @@ pub fn plan_check_convergence(plan: &mut ReconcilePlan, live: &Snapshot, desired
             continue;
         }
 
+        let diff = MigrationDiff {
+            entity_name: qname.clone(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(changes),
+        };
+        let sql = diff::generate_migration_sql(std::slice::from_ref(&diff));
+        if sql.trim().is_empty() {
+            continue;
+        }
+        merge_altered_sql(plan, &qname, sql);
+    }
+}
+
+// ── EXCLUDE convergence ─────────────────────────────────────
+
+/// Converge `EXCLUDE` constraints into an existing reconcile `plan`, as
+/// [`plan_check_convergence`] does CHECKs: [`canonicalize`] strips them, so
+/// they are matched here from the RAW snapshots by their definition read back
+/// through [`crate::sql_expr::canonical_exclusion`] — Postgres auto-names an
+/// unnamed one (`<table>_<columns>_excl`), so a name cannot be the identity.
+/// One the design declares and the database lacks is added; one the database
+/// has and the design dropped is removed by its live name, destructively.
+pub fn plan_exclusion_convergence(plan: &mut ReconcilePlan, live: &Snapshot, desired: &Snapshot) {
+    use crate::diff::{FieldChange, FieldDetail, FieldType};
+
+    fn exclusions(t: &TableSnapshot) -> Vec<(String, &TableConstraint)> {
+        t.table_constraints
+            .iter()
+            .filter_map(|con| match con {
+                TableConstraint::Exclude { definition, .. } => Some((
+                    crate::sql_expr::canonical_exclusion(definition).unwrap_or_else(|| definition.clone()),
+                    con,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    let live_by_name: HashMap<String, &TableSnapshot> = live
+        .tables
+        .iter()
+        .map(|t| (format!("{}.{}", t.schema, t.name), t))
+        .collect();
+    for dt in &desired.tables {
+        let qname = format!("{}.{}", dt.schema, dt.name);
+        let Some(lt) = live_by_name.get(&qname) else {
+            continue;
+        };
+        let desired_ex = exclusions(dt);
+        let live_ex = exclusions(lt);
+        let desired_keys: HashSet<&str> = desired_ex.iter().map(|(k, _)| k.as_str()).collect();
+        let live_keys: HashSet<&str> = live_ex.iter().map(|(k, _)| k.as_str()).collect();
+
+        let mut changes: Vec<FieldChange> = Vec::new();
+        for (key, con) in live_ex.iter().filter(|(k, _)| !desired_keys.contains(k.as_str())) {
+            let TableConstraint::Exclude { name: Some(_), .. } = con else {
+                plan.warnings.push(format!(
+                    "EXCLUDE {key} on {qname} is not in the design but has no constraint name — drop it manually"
+                ));
+                continue;
+            };
+            changes.push(FieldChange {
+                field_name: format!("ex:{key}"),
+                field_type: FieldType::Constraint,
+                action: ChangeAction::Drop(Box::new(FieldDetail::Constraint((*con).clone()))),
+            });
+            plan.destructive = true;
+        }
+        for (key, con) in desired_ex.iter().filter(|(k, _)| !live_keys.contains(k.as_str())) {
+            changes.push(FieldChange {
+                field_name: format!("ex:{key}"),
+                field_type: FieldType::Constraint,
+                action: ChangeAction::Add(Box::new(FieldDetail::Constraint((*con).clone()))),
+            });
+        }
+        if changes.is_empty() {
+            continue;
+        }
         let diff = MigrationDiff {
             entity_name: qname.clone(),
             entity_type: EntityType::Table,
@@ -1139,7 +1277,7 @@ fn merge_altered_sql(plan: &mut ReconcilePlan, entity_name: &str, sql: String) {
 /// A fixed suffix rather than a generated one: the whole recreation runs in a
 /// single implicit transaction, so the name exists only inside it, and a fixed
 /// name is what an operator reading a failed run's SQL can act on.
-const ENUM_RECREATE_SUFFIX: &str = "__dbd_old";
+pub(crate) const ENUM_RECREATE_SUFFIX: &str = "__dbd_old";
 
 /// Converge an enum whose declared value set **lost** a member.
 ///
@@ -1151,27 +1289,54 @@ const ENUM_RECREATE_SUFFIX: &str = "__dbd_old";
 /// The convergent form is the type-swap Postgres does leave open:
 ///
 /// ```text
-/// DROP VIEW   … ;                 -- managed dependents, deepest first
+/// DROP VIEW   … ;                 -- managed views over the column, deepest first
+/// DROP INDEX  … ;                 -- indexes whose WHERE or expression reads it
 /// ALTER TABLE … DROP DEFAULT;     -- the default is typed against the old type
 /// ALTER TYPE  … RENAME TO x__dbd_old;
 /// CREATE TYPE … AS ENUM (…);      -- exactly the declared values, in order
 /// ALTER TABLE … TYPE … USING c::text::…;
 /// ALTER TABLE … SET DEFAULT …;
+/// CREATE INDEX …;                 -- the dropped indexes, against the new type
 /// DROP TYPE   x__dbd_old;
 /// ```
+///
+/// `ALTER COLUMN … TYPE` rebuilds every index on the column from its stored
+/// definition, and one that compares the column with an enum literal is stored
+/// as `mood <> 'bad'::app.mood` — after the rename, a comparison with the old
+/// type, which fails with `operator does not exist: mood <> mood__dbd_old` and
+/// names no index. So an index whose predicate or expression key reads the
+/// column is dropped first and created after, as the design declares it when it
+/// declares one of that name, else as it was. The indexes come from the tables
+/// of `live` and `desired`: a canonicalized snapshot has none (`canonicalize`
+/// strips them), so a caller passes ones that carry them — see
+/// `with_indexes_of`.
 ///
 /// Every failure this can hit is a *loud* one, inside the single implicit
 /// transaction `execute_script` runs the batch in: a row holding a removed value
 /// fails the `USING` cast, a default naming a removed value fails the
-/// `SET DEFAULT`, and an unmanaged dependent view fails the `ALTER … TYPE`.
-/// None of them can half-apply, and all of them name the object.
+/// `SET DEFAULT`, an unmanaged dependent view fails the `ALTER … TYPE`, and a
+/// routine whose *signature* uses the type follows the rename and so fails the
+/// final `DROP TYPE` (`function app.p(app.x__dbd_old) depends on type …`).
+/// None of them can half-apply, and all of them name the object. Tables and
+/// routines that merely *reference* the enum's table are never dropped: only a
+/// view over the column stands in the way of the swap.
 ///
-/// The one case it declines is a dependent **materialized view**: dbd never
-/// auto-drops one (a `DROP … CASCADE` would repopulate it and take its dependents
-/// with it), so recreation is reported as blocked rather than attempted.
+/// A dependent **materialized view** is the one blocker it does not clear:
+/// dbd never drops one (a `DROP … CASCADE` would repopulate it and take its
+/// dependents with it). Whether one blocks is a fact about the database — one
+/// dropped by hand blocks nothing, one the design does not declare still does —
+/// so the swap is recorded in [`ReconcilePlan::enum_swaps`] with the columns it
+/// moves, and the caller asks the database before any write (see
+/// `Design::reconcile`). Deciding from the design meant a matview declared
+/// there blocked forever: dropped by hand as told, it was re-created by the
+/// same run, and the next declined again.
 ///
-/// Dropped views are not re-created here — reconcile's pass C re-applies every
-/// managed view on every run, which is exactly what restores them.
+/// The type's comment is carried from the type renamed aside to its
+/// replacement (`enum_comment_carry`); it used to go with the old type.
+///
+/// Dropped views are not re-created here — reconcile re-applies every managed
+/// view on every run, after the enum and tables it depends on, which is exactly
+/// what restores them.
 pub fn plan_enum_recreation(
     plan: &mut ReconcilePlan,
     live: &Snapshot,
@@ -1208,30 +1373,18 @@ pub fn plan_enum_recreation(
 
         let columns = enum_columns(live, &qname);
         let roots: HashSet<String> = columns.iter().map(|c| c.table.clone()).collect();
-
-        // A matview over an affected table blocks the swap and dbd will not drop
-        // it. Say so, and plan nothing — a partial script would fail mid-batch
-        // with a Postgres message that names the view but not the cause.
-        let dependents = dependent_entities(desired_entities, &roots);
-        let blocking: Vec<&str> = dependents
-            .iter()
-            .filter(|(_, e)| e.entity_type == EntityType::MaterializedView)
-            .map(|(_, e)| e.name.as_str())
+        // The views over the columns' tables, which the swap drops and the
+        // write pass re-creates. Materialized views are left to the caller's
+        // live check: `DROP VIEW` fails on one that exists.
+        let dependents: Vec<(usize, &Entity)> = dependent_views(desired_entities, &roots)
+            .into_iter()
+            .filter(|(_, e)| e.entity_type == EntityType::View)
             .collect();
-        if !blocking.is_empty() {
-            plan.warnings.push(format!(
-                "{qname}: cannot drop enum value{} {} — materialized view{} {} depend{} on a column of this type, \
-                 and dbd never drops a materialized view. Drop {} by hand, re-run reconcile, then re-create {}",
-                if removed.len() == 1 { "" } else { "s" },
-                removed.join(", "),
-                if blocking.len() == 1 { "" } else { "s" },
-                blocking.join(", "),
-                if blocking.len() == 1 { "s" } else { "" },
-                blocking.join(", "),
-                if blocking.len() == 1 { "it" } else { "them" },
-            ));
-            continue;
-        }
+        plan.enum_swaps.push(EnumSwap {
+            enum_name: qname.clone(),
+            removed: removed.iter().map(|v| v.to_string()).collect(),
+            columns: columns.iter().map(|c| (c.table.clone(), c.column.clone())).collect(),
+        });
 
         let old_type = format!("{qname}{ENUM_RECREATE_SUFFIX}");
         let mut lines: Vec<String> = vec![format!(
@@ -1241,9 +1394,21 @@ pub fn plan_enum_recreation(
         )];
 
         // Deepest dependents first: a view over a view has to go before the view
-        // it selects from.
+        // it selects from. Every dependent left is a plain view, so `DROP VIEW`
+        // is the right keyword.
         for (_, e) in &dependents {
             lines.push(format!("DROP VIEW IF EXISTS {};", qualified_entity_name(e)));
+        }
+
+        let rebuilt = indexes_to_rebuild(live, &columns);
+        for (table, ix) in &rebuilt {
+            if let Some(name) = &ix.name {
+                lines.push(format!(
+                    "DROP INDEX IF EXISTS {}.{};",
+                    crate::sql_quote::ident(&table.schema),
+                    crate::sql_quote::ident(name)
+                ));
+            }
         }
 
         for c in columns.iter().filter(|c| c.default_value.is_some()) {
@@ -1261,6 +1426,7 @@ pub fn plan_enum_recreation(
             "CREATE TYPE {qname} AS ENUM ({});",
             de.values.iter().map(|v| literal(v)).collect::<Vec<_>>().join(", ")
         ));
+        lines.push(enum_comment_carry(&qname, &old_type));
 
         for c in &columns {
             // An array column cannot cast element-wise through the scalar text
@@ -1270,9 +1436,13 @@ pub fn plan_enum_recreation(
             } else {
                 (format!("{}::text", c.column), qname.clone())
             };
-            lines.push(format!(
-                "ALTER TABLE {} ALTER COLUMN {} TYPE {to} USING {via}::{to};",
-                c.table, c.column
+            lines.push(column_type_swap(
+                &format!(
+                    "ALTER TABLE {} ALTER COLUMN {} TYPE {to} USING {via}::{to};",
+                    c.table, c.column
+                ),
+                &format!("{}.{}", c.table, c.column),
+                &qname,
             ));
         }
 
@@ -1283,6 +1453,23 @@ pub fn plan_enum_recreation(
                     c.table, c.column
                 ));
             }
+        }
+
+        for (table, live_ix) in &rebuilt {
+            // The design's definition when it declares one of that name: the
+            // live one may compare with a value this swap just removed.
+            let ix = desired
+                .tables
+                .iter()
+                .find(|d| d.schema == table.schema && d.name == table.name)
+                .and_then(|d| d.indexes.iter().find(|d| d.name.is_some() && d.name == live_ix.name))
+                .unwrap_or(live_ix);
+            let qtable = format!(
+                "{}.{}",
+                crate::sql_quote::ident(&table.schema),
+                crate::sql_quote::ident(&table.name)
+            );
+            lines.push(crate::emit::emit_index_sql(ix, &qtable, &table.name, false));
         }
 
         lines.push(format!("DROP TYPE {old_type};"));
@@ -1302,8 +1489,111 @@ pub fn plan_enum_recreation(
 
         // Losing a value can reject rows the table already holds, so this is
         // gated behind `--allow-destructive` like any other data-losing change.
-        plan.destructive = true;
+        // `plan_reconcile` named the dropped values already, from the diff.
+        for value in &removed {
+            let change = format!("{qname}: drops enum value {value}");
+            plan.mark_destructive(change);
+        }
     }
+}
+
+/// `alter` — one column's `ALTER … TYPE … USING` in an enum swap — wrapped so
+/// a row holding a removed value fails naming the column.
+///
+/// The cast fails with `invalid input value for enum app.mood: "meh"`, which
+/// names neither table nor column, and the step reporting it is the enum's —
+/// one swap moves columns in every table using the type. The wrapper adds the
+/// column and what to do, and keeps the SQLSTATE; it runs inside the same
+/// implicit transaction, so the failure still leaves nothing half-applied.
+fn column_type_swap(alter: &str, column: &str, enum_name: &str) -> String {
+    // The message is a RAISE format string inside a `$$` body: `%` is its
+    // placeholder and `'` closes it.
+    let escape = |s: &str| s.replace('\'', "''").replace('%', "%%");
+    format!(
+        "DO $$ BEGIN\n  {alter}\nEXCEPTION WHEN invalid_text_representation THEN\n  \
+         RAISE EXCEPTION '{} holds a value {} no longer has (%) — update those rows first', SQLERRM \
+         USING ERRCODE = 'invalid_text_representation';\nEND $$;",
+        escape(column),
+        escape(enum_name),
+    )
+}
+
+/// Copy the comment of `old_type` — the enum renamed aside by a type swap — to
+/// `qname`, its replacement, so the swap does not lose it.
+///
+/// Read from the database rather than the design: an enum's comment is not
+/// part of any snapshot or diff, so the one it had is the one to keep. A type
+/// with no comment copies `NULL`, which sets none.
+pub(crate) fn enum_comment_carry(qname: &str, old_type: &str) -> String {
+    use crate::sql_quote::literal;
+    let (schema, name) = crate::entity::split_qualified_name(qname);
+    format!(
+        "DO $$ BEGIN\n  EXECUTE format('COMMENT ON TYPE %I.%I IS %L', {}, {}, \
+         obj_description(to_regtype({}), 'pg_type'));\nEND $$;",
+        literal(schema.as_deref().unwrap_or(DEFAULT_SCHEMA)),
+        literal(&name),
+        literal(old_type),
+    )
+}
+
+/// The live indexes an enum swap over `columns` has to drop and create again —
+/// those whose `WHERE` predicate or expression key reads one of the columns
+/// (see [`plan_enum_recreation`]) — with their table, in table then index order
+/// so the SQL is byte-stable run to run.
+///
+/// Taken from `live` alone: what blocks the swap is what the database has.
+fn indexes_to_rebuild<'a>(
+    live: &'a Snapshot,
+    columns: &[EnumColumn],
+) -> Vec<(&'a TableSnapshot, &'a crate::entity::IndexDef)> {
+    let mut out = Vec::new();
+    for t in &live.tables {
+        let qtable = format!("{}.{}", t.schema, t.name);
+        let read: Vec<&str> = columns
+            .iter()
+            .filter(|c| c.table == qtable)
+            .map(|c| c.column.as_str())
+            .collect();
+        if read.is_empty() {
+            continue;
+        }
+        out.extend(indexes_reading_columns(t, &read).into_iter().map(|ix| (t, ix)));
+    }
+    out.sort_by(|a, b| (&a.0.schema, &a.0.name, &a.1.name).cmp(&(&b.0.schema, &b.0.name, &b.1.name)));
+    out
+}
+
+/// The indexes on `table` whose `WHERE` predicate or expression key reads any
+/// of `columns` — the ones Postgres cannot rebuild across an enum type swap of
+/// those columns. Shared by reconcile's swap and the migration `dbd snapshot`
+/// writes for the same change.
+pub(crate) fn indexes_reading_columns<'a>(
+    table: &'a TableSnapshot,
+    columns: &[&str],
+) -> Vec<&'a crate::entity::IndexDef> {
+    let reads = |expr: &str| columns.iter().any(|c| crate::sql_expr::reads_column(expr, c));
+    table
+        .indexes
+        .iter()
+        .filter(|ix| {
+            ix.predicate.as_deref().is_some_and(reads) || ix.columns.iter().any(|k| k.is_expression && reads(&k.name))
+        })
+        .collect()
+}
+
+/// `canonical` with each table's indexes taken from the same table in `raw`.
+///
+/// Reconcile diffs canonicalized snapshots, and `canonicalize` strips indexes
+/// (they converge separately, from the raw ones). [`plan_enum_recreation`]
+/// reads columns in their canonical form but has to see the indexes too.
+pub(crate) fn with_indexes_of(canonical: &Snapshot, raw: &Snapshot) -> Snapshot {
+    let mut out = canonical.clone();
+    for t in &mut out.tables {
+        if let Some(r) = raw.tables.iter().find(|r| r.schema == t.schema && r.name == t.name) {
+            t.indexes = r.indexes.clone();
+        }
+    }
+    out
 }
 
 /// A live column whose type is the enum being recreated.
@@ -1341,13 +1631,27 @@ fn enum_columns(live: &Snapshot, qname: &str) -> Vec<EnumColumn> {
     out
 }
 
-/// Managed entities that transitively depend on any of `roots`, deepest first.
+/// Managed views and materialized views over any of `roots` — directly, or
+/// through another such view — deepest first.
+///
+/// Only a view is a dependent here. `ALTER COLUMN … TYPE` is refused while a
+/// view (or rule) selects the column; nothing else dbd manages blocks it. A
+/// table with a foreign key to a root and a routine whose body reads one hold
+/// no dependency on the column, so they are neither returned nor walked
+/// through: every transitive referrer used to come back, and the caller
+/// emitted each as `DROP VIEW` — failing on the first table (`"order_notes" is
+/// not a view`), and naming tables and routines that must never be dropped.
 ///
 /// Depth is the longest path from a root, so a view over a view sorts ahead of
 /// the view it selects from — which is the order they have to be dropped in.
 /// The iteration is bounded by the entity count so a `refers` cycle terminates
 /// rather than spinning.
-fn dependent_entities<'a>(entities: &'a [Entity], roots: &HashSet<String>) -> Vec<(usize, &'a Entity)> {
+pub(crate) fn dependent_views<'a>(entities: &'a [Entity], roots: &HashSet<String>) -> Vec<(usize, &'a Entity)> {
+    let views: Vec<&Entity> = entities
+        .iter()
+        .filter(|e| matches!(e.entity_type, EntityType::View | EntityType::MaterializedView))
+        .collect();
+
     // A `refers` entry may or may not be schema-qualified, so each entity is
     // reachable under both spellings — matching how `build_dependency_map`
     // compares refs against `Entity::name` verbatim.
@@ -1358,9 +1662,9 @@ fn dependent_entities<'a>(entities: &'a [Entity], roots: &HashSet<String>) -> Ve
         }
     }
 
-    for _ in 0..entities.len() {
+    for _ in 0..views.len() {
         let mut changed = false;
-        for e in entities {
+        for e in &views {
             let qname = qualified_entity_name(e);
             let schema = e.schema.clone().unwrap_or_else(|| DEFAULT_SCHEMA.to_string());
             let deepest = e
@@ -1380,8 +1684,8 @@ fn dependent_entities<'a>(entities: &'a [Entity], roots: &HashSet<String>) -> Ve
         }
     }
 
-    let mut out: Vec<(usize, &Entity)> = entities
-        .iter()
+    let mut out: Vec<(usize, &Entity)> = views
+        .into_iter()
         .filter_map(|e| depth.get(&qualified_entity_name(e)).map(|d| (*d, e)))
         .filter(|(d, _)| *d > 0)
         .collect();
@@ -1452,7 +1756,7 @@ pub fn plan_index_convergence(plan: &mut ReconcilePlan, live: &Snapshot, desired
         {
             if let Some(name) = &ix.name {
                 lines.push(format!("DROP INDEX IF EXISTS \"{}\".\"{}\";", dt.schema, name));
-                plan.destructive = true;
+                plan.mark_destructive(format!("{}.{}: drops index {name}", dt.schema, dt.name));
             }
         }
 
@@ -1551,47 +1855,14 @@ fn index_shape(ix: &crate::entity::IndexDef, cols: &crate::sql_expr::CoercibleCo
     }
 }
 
-/// The column-name sets (ordered, lowercased) that a table's PRIMARY KEY / UNIQUE
-/// constraints cover — from both inline column flags and table-level constraints.
-/// Used to drop PK/UNIQUE-backing indexes from index convergence.
-///
-/// A column's `is_pk` flag only contributes a single-column set when the table has
-/// NO table-level PRIMARY KEY, exactly as [`lift_pk_unique_keep_others`] treats it
-/// and for the same reason: the SQL parser emits a composite `primary key (a, b)`
-/// BOTH as a table constraint AND as an `is_pk` flag on each member column. Taking
-/// those flags at face value invents backing sets `[a]` and `[b]` that no index
-/// backs, which suppressed a declared single-column index on a composite-PK member
-/// (`create index on memory_links(child_id)`) from convergence — so `dbd diff` kept
-/// asking for an index reconcile refused to create.
-fn pk_unique_col_sets(t: &TableSnapshot) -> HashSet<Vec<String>> {
-    let mut sets: HashSet<Vec<String>> = HashSet::new();
-    let has_table_pk = t
-        .table_constraints
-        .iter()
-        .any(|c| matches!(c, TableConstraint::PrimaryKey { .. }));
-    for c in &t.columns {
-        if (c.is_pk && !has_table_pk) || c.is_unique {
-            sets.insert(vec![c.name.to_lowercase()]);
-        }
-    }
-    for con in &t.table_constraints {
-        match con {
-            TableConstraint::PrimaryKey { columns, .. } | TableConstraint::Unique { columns, .. } => {
-                sets.insert(columns.iter().map(|s| s.to_lowercase()).collect());
-            }
-            _ => {}
-        }
-    }
-    sets
-}
-
 /// A table's secondary indexes: every index EXCEPT those merely backing a
-/// PRIMARY KEY / UNIQUE constraint (introspection reports those, the parsed
-/// design does not — matching by covered columns). Mirrors the suppression in
-/// `schema_diff::normalize_for_diff`, including its rule that a partial or
-/// expression index is always a real index, never constraint backing.
+/// PRIMARY KEY / UNIQUE constraint (a live snapshot may carry those, the
+/// parsed design never does — matched by the constraint's name, which its
+/// backing index bears). Mirrors the suppression in
+/// `schema_diff::normalize_for_diff` through the same
+/// [`crate::schema_diff::backs_a_constraint`].
 fn secondary_indexes(t: &TableSnapshot) -> Vec<&crate::entity::IndexDef> {
-    let backing = pk_unique_col_sets(t);
+    let backing = crate::schema_diff::constraint_backing_keys(&t.table_constraints, str::to_lowercase);
     t.indexes
         .iter()
         .filter(|ix| {
@@ -1628,6 +1899,10 @@ pub struct ReconcileComplete {
     /// write — to a live object, during what looks like a routine reconcile —
     /// is visible in the summary rather than folded into an unrelated count.
     pub restamped: u32,
+    /// `apply.before` hook scripts run.
+    pub before_scripts: u32,
+    /// `apply.after` hook scripts run.
+    pub after_scripts: u32,
 }
 
 // ── Materialized-view convergence (Task 13) ──────────────────
@@ -1641,10 +1916,11 @@ pub struct ReconcileComplete {
 // drops it deliberately, after which `apply`/reconcile recreates it (snapshots
 // exclude matviews, so migrations can't recreate one).
 //
-// Drift is detected by stamping a deterministic hash of the DESIGN onto the live
-// object as a `dbd:hash=…` comment sentinel (matview comments are otherwise
-// unused) at CREATE time, then comparing the stored hash to a freshly computed
-// one on later runs. The hash is over the design, not Postgres's deparsed
+// Drift is detected by recording a deterministic hash of the DESIGN as a
+// `dbd:hash=…` stamp for the live object at CREATE time — in the bookkeeping
+// schema (`DatabaseAdapter::stamp_matview`), not the view's comment, which is
+// its author's — then comparing the stored hash to a freshly computed one on
+// later runs. The hash is over the design, not Postgres's deparsed
 // `pg_matviews.definition`, so it is exact and deparser-independent.
 
 /// What a reconcile should do with one design materialized view.
@@ -1705,9 +1981,8 @@ pub(crate) fn matview_hash(entity: &Entity) -> String {
     format!("{:x}", hasher.finalize())[..16].to_string()
 }
 
-/// `COMMENT ON MATERIALIZED VIEW "s"."n" IS 'dbd:hash=v2:<hash>';` for the
-/// sentinel. `qualified` is `schema.name` (unqualified → `public`); single
-/// quotes in the payload are doubled so the literal stays well-formed.
+/// The drift stamp for `hash`: `dbd:hash=v2:<hash>`, recorded through
+/// [`crate::adapter::DatabaseAdapter::stamp_matview`].
 ///
 /// Versioned (`v2:`) because the hash input is the matview's `writes[0]`, so
 /// any change to what that field holds changes every stamp already written.
@@ -1716,10 +1991,8 @@ pub(crate) fn matview_hash(entity: &Entity) -> String {
 /// tells users to `DROP … CASCADE`. See [`Sentinel`] and
 /// [`decide_matview_action`] for how an unversioned (`v1`) stamp is handled:
 /// re-stamped silently, never read as a drift signal.
-pub(crate) fn matview_hash_comment_sql(qualified: &str, hash: &str) -> String {
-    let (schema, name) = qualified.split_once('.').unwrap_or((DEFAULT_SCHEMA, qualified));
-    let payload = format!("dbd:hash=v2:{hash}").replace('\'', "''");
-    format!("COMMENT ON MATERIALIZED VIEW \"{schema}\".\"{name}\" IS '{payload}';")
+pub(crate) fn matview_stamp(hash: &str) -> String {
+    format!("dbd:hash=v2:{hash}")
 }
 
 /// A parsed `dbd:hash` stamp.
@@ -1741,7 +2014,7 @@ pub(crate) enum Sentinel {
 
 /// Extract the sentinel from a `dbd:hash=…` comment, or `None` when the
 /// comment is absent or carries no such sentinel. Inverse of
-/// [`matview_hash_comment_sql`]'s payload; tolerant of trailing text after the
+/// [`matview_stamp`]'s payload; tolerant of trailing text after the
 /// token.
 pub(crate) fn parse_dbd_hash(comment: Option<&str>) -> Option<Sentinel> {
     let rest = comment?.split("dbd:hash=").nth(1)?;
@@ -1763,18 +2036,27 @@ pub(crate) fn parse_dbd_hash(comment: Option<&str>) -> Option<Sentinel> {
 }
 
 /// `CREATE MATERIALIZED VIEW … WITH DATA;` (+ any index statements, via
-/// [`crate::emit::emit_entity`]) followed by the hash-sentinel comment.
-pub(crate) fn matview_create_sql(entity: &Entity, hash: &str) -> String {
-    let create = crate::emit::emit_entity(entity).unwrap_or_default();
-    let comment = matview_hash_comment_sql(&qualified_matview_name(entity), hash);
-    format!("{create}\n{comment}")
+/// [`crate::emit::emit_entity`]). The caller records its stamp separately.
+pub(crate) fn matview_create_sql(entity: &Entity) -> String {
+    crate::emit::emit_entity(entity).unwrap_or_default()
 }
 
-/// `schema.name` for an entity, defaulting the schema to `public`.
-fn qualified_matview_name(entity: &Entity) -> String {
-    let schema = entity.schema.as_deref().unwrap_or(DEFAULT_SCHEMA);
-    let name = entity.name.rsplit('.').next().unwrap_or(&entity.name);
-    format!("{schema}.{name}")
+/// Whether a deployed materialized view (`live`, as introspected) is the
+/// design's: the same query and the same index key set.
+///
+/// The queries are compared as libpg_query parse trees, deparsed — so layout,
+/// keyword case and the formatter's leading commas do not count, while any
+/// difference in what the query does does. Postgres prints a deployed
+/// definition its own way (qualified names, explicit casts), so a hand-written
+/// body often reads differently from it; that is a `false`, which leaves the
+/// matview unverified rather than vouching for it.
+pub(crate) fn same_matview_definition(design: &Entity, live: &Entity) -> bool {
+    fn canonical(e: &Entity) -> Option<String> {
+        let body = e.body.first()?.trim().trim_end_matches(';');
+        pg_query::deparse(&pg_query::parse(body).ok()?.protobuf).ok()
+    }
+    matview_index_keys(design) == matview_index_keys(live)
+        && canonical(design).is_some_and(|d| canonical(live).is_some_and(|l| l == d))
 }
 
 /// Normalize a matview's `SELECT` body for a stable hash input: first `body`
@@ -1822,6 +2104,7 @@ mod tests {
             generated: None,
             comment: None,
             inline_fk: None,
+            collation: None,
         }
     }
 
@@ -2824,7 +3107,9 @@ mod tests {
     }
 
     /// The index that genuinely backs a composite PRIMARY KEY is still suppressed —
-    /// introspection reports it, the design never declares it.
+    /// should a live snapshot report it, the design never declares it. A backing
+    /// index carries its constraint's name (Postgres names it so), and a live
+    /// constraint always has one.
     #[test]
     fn index_convergence_still_ignores_composite_pk_backing_index() {
         let mut live_t = table(
@@ -2833,7 +3118,7 @@ mod tests {
             vec![col("parent_id", "uuid"), col("child_id", "uuid")],
         );
         live_t.table_constraints.push(TableConstraint::PrimaryKey {
-            name: None,
+            name: Some("memory_links_pkey".to_string()),
             columns: vec!["parent_id".to_string(), "child_id".to_string()],
         });
         let mut desired_t = live_t.clone();
@@ -2848,6 +3133,33 @@ mod tests {
         assert!(
             plan.is_empty() && !plan.destructive,
             "a PK-backing index must never be dropped as an orphan; got {plan:?}"
+        );
+    }
+
+    /// A design index over the primary key's columns is an index of its own.
+    /// Suppressed as constraint backing on both sides, one dropped from the
+    /// database was never re-created. The live constraint is named, as
+    /// introspection names it; the design's is not.
+    #[test]
+    fn index_convergence_recreates_a_dropped_index_over_the_primary_key_columns() {
+        let mut desired_t = table("app", "t", vec![col("id", "integer")]);
+        desired_t.table_constraints.push(TableConstraint::PrimaryKey {
+            name: None,
+            columns: vec!["id".to_string()],
+        });
+        let mut live_t = desired_t.clone();
+        live_t.table_constraints = vec![TableConstraint::PrimaryKey {
+            name: Some("t_pkey".to_string()),
+            columns: vec!["id".to_string()],
+        }];
+        desired_t.indexes.push(idx("t_id_idx", &["id"], false));
+
+        let mut plan = ReconcilePlan::default();
+        plan_index_convergence(&mut plan, &snap(vec![live_t]), &snap(vec![desired_t]));
+
+        assert!(
+            plan.altered.first().is_some_and(|a| a.sql.contains("\"t_id_idx\"")),
+            "the dropped index is re-created; got {plan:?}"
         );
     }
 
@@ -3796,11 +4108,10 @@ mod tests {
     /// hash.
     #[test]
     fn v2_stamp_round_trips() {
-        let sql = matview_hash_comment_sql("a.m", "deadbeefcafe0001");
-        assert!(sql.contains("dbd:hash=v2:deadbeefcafe0001"), "got: {sql}");
-        let payload = sql.split_once("IS '").unwrap().1.trim_end_matches("';");
+        let stamp = matview_stamp("deadbeefcafe0001");
+        assert_eq!(stamp, "dbd:hash=v2:deadbeefcafe0001");
         assert_eq!(
-            parse_dbd_hash(Some(payload)),
+            parse_dbd_hash(Some(&stamp)),
             Some(Sentinel::V2("deadbeefcafe0001".to_string()))
         );
     }
@@ -3829,13 +4140,13 @@ mod tests {
         assert_eq!(parse_dbd_hash(Some("dbd:hash=")), None, "empty hash → None");
     }
 
-    /// A create carries both the `CREATE MATERIALIZED VIEW … WITH DATA` and the
-    /// v2 hash sentinel comment.
+    /// A create is the `CREATE MATERIALIZED VIEW … WITH DATA` alone — the stamp
+    /// is recorded apart, and the view's comment is left to its author.
     #[test]
-    fn matview_create_sql_has_create_and_comment() {
-        let sql = matview_create_sql(&mv("a.m", "SELECT 1 AS x"), "abc123");
+    fn matview_create_sql_creates_and_leaves_the_comment_alone() {
+        let sql = matview_create_sql(&mv("a.m", "SELECT 1 AS x"));
         assert!(sql.contains("CREATE MATERIALIZED VIEW IF NOT EXISTS \"a\".\"m\" AS SELECT 1 AS x WITH DATA;"));
-        assert!(sql.contains("COMMENT ON MATERIALIZED VIEW \"a\".\"m\" IS 'dbd:hash=v2:abc123';"));
+        assert!(!sql.contains("COMMENT ON"), "{sql}");
     }
 
     /// A v1 stamp means "written by a dbd that hashed the old body contract",
@@ -3916,6 +4227,7 @@ mod enum_recreation_tests {
             generated: None,
             comment: None,
             inline_fk: None,
+            collation: None,
         }
     }
 
@@ -4055,10 +4367,72 @@ mod enum_recreation_tests {
         );
     }
 
+    /// `ALTER COLUMN … TYPE` rebuilds every index on the column from its stored
+    /// definition. One whose `WHERE` or expression key compares the column with
+    /// a literal of the enum — stored as `'bad'::app.mood` — is re-read after the
+    /// rename as a comparison with the *old* type, and the swap failed with
+    /// `operator does not exist: mood <> mood__dbd_old`, naming no index. Those
+    /// are dropped before the swap and created again after it; an index that
+    /// does not read the column is left alone.
+    #[test]
+    fn an_index_reading_the_column_is_rebuilt_around_the_swap() {
+        use crate::entity::{IndexColumn, IndexDef};
+        let index = |name: &str, key: &str, is_expression: bool, predicate: Option<&str>| IndexDef {
+            name: Some(name.to_string()),
+            columns: vec![IndexColumn {
+                name: key.to_string(),
+                is_expression,
+                ..Default::default()
+            }],
+            predicate: predicate.map(str::to_string),
+            ..Default::default()
+        };
+        let mut people = table(
+            "app",
+            "people",
+            vec![col("id", "integer", None), col("mood", "app.mood", None)],
+        );
+        // Spelled as introspection reports them (`pg_get_expr`, `pg_get_indexdef`).
+        people.indexes = vec![
+            index("people_not_bad", "id", false, Some("(mood <> 'bad'::app.mood)")),
+            index("people_is_ok", "(mood = 'ok'::app.mood)", true, None),
+            index("people_by_id", "id", false, Some("(id > 0)")),
+        ];
+        let live = snap(vec![people], vec![enum_snap("app", "mood", &["ok", "meh", "bad"])]);
+        let desired = snap(
+            vec![table(
+                "app",
+                "people",
+                vec![col("id", "integer", None), col("mood", "app.mood", None)],
+            )],
+            vec![enum_snap("app", "mood", &["ok", "bad"])],
+        );
+        let mut plan = ReconcilePlan::default();
+        plan_enum_recreation(&mut plan, &live, &desired, &[]);
+        let sql = &plan.altered[0].sql;
+
+        let swap = sql
+            .find("ALTER TABLE app.people ALTER COLUMN mood TYPE")
+            .expect("type swap");
+        for name in ["people_not_bad", "people_is_ok"] {
+            let drop = sql
+                .find(&format!("DROP INDEX IF EXISTS \"app\".\"{name}\";"))
+                .unwrap_or_else(|| panic!("{name} is dropped:\n{sql}"));
+            let create = sql
+                .find(&format!("INDEX \"{name}\" ON \"app\".\"people\""))
+                .unwrap_or_else(|| panic!("{name} is created again:\n{sql}"));
+            assert!(drop < swap && swap < create, "{name} around the swap:\n{sql}");
+        }
+        assert!(
+            !sql.contains("people_by_id"),
+            "an index that does not read the column is left alone:\n{sql}"
+        );
+    }
+
     /// A view over the affected table blocks `ALTER TABLE … ALTER COLUMN … TYPE`
     /// ("cannot alter type of a column used by a view or rule"). Managed views are
-    /// dropped first and re-created by reconcile's pass C, which re-applies every
-    /// view on every run anyway. Transitive dependents count: a view over a view.
+    /// dropped first and re-created by reconcile's write pass, which re-applies
+    /// every view on every run anyway. Transitive dependents count: a view over a view.
     #[test]
     fn managed_views_over_the_affected_table_are_dropped_first() {
         let live = snap(
@@ -4091,12 +4465,63 @@ mod enum_recreation_tests {
         );
     }
 
-    /// dbd never auto-drops a materialized view — a `DROP … CASCADE` would
-    /// repopulate it and take its dependents with it. So a matview over the
-    /// affected table is the one case recreation cannot do, and it must say so
-    /// rather than emit SQL Postgres will reject halfway through.
+    /// Only a view stands in the way of `ALTER COLUMN … TYPE`. A table with a
+    /// foreign key to the affected table, and a routine whose body reads it, do
+    /// not — Postgres records no dependency on the column for either — and they
+    /// must never be dropped: every dependent used to be emitted as `DROP VIEW`,
+    /// which failed with `"order_notes" is not a view` and would have destroyed a
+    /// table's rows had it been the right keyword. Nor does a view or matview
+    /// over such a table depend on the column, so neither is dropped or blocks.
     #[test]
-    fn a_dependent_materialized_view_refuses_loudly_instead_of_half_applying() {
+    fn only_views_over_the_affected_table_are_dropped_never_tables_or_routines() {
+        let live = snap(
+            vec![table("app", "t", vec![col("c", "app.colour", None)])],
+            vec![enum_snap("app", "colour", &["red", "green", "blue"])],
+        );
+        let desired = snap(
+            vec![table("app", "t", vec![col("c", "app.colour", None)])],
+            vec![enum_snap("app", "colour", &["red", "green"])],
+        );
+        let entities = vec![
+            entity(EntityType::Table, "app.t", &[]),
+            entity(EntityType::Table, "app.notes", &["app.t"]),
+            entity(EntityType::Procedure, "app.p", &["app.t"]),
+            entity(EntityType::Function, "app.f", &["app.t"]),
+            entity(EntityType::View, "app.v", &["app.t"]),
+            entity(EntityType::View, "app.notes_v", &["app.notes"]),
+            entity(EntityType::MaterializedView, "app.notes_mv", &["app.notes"]),
+        ];
+        let mut plan = ReconcilePlan::default();
+        plan_enum_recreation(&mut plan, &live, &desired, &entities);
+
+        assert!(
+            plan.warnings.iter().all(|w| !w.contains("app.notes_mv")),
+            "a matview over a referencing table does not depend on the column: {:?}",
+            plan.warnings
+        );
+        let sql = &plan
+            .altered
+            .iter()
+            .find(|s| s.entity_name == "app.colour")
+            .expect("the recreation is planned")
+            .sql;
+        let drops: Vec<&str> = sql.lines().filter(|l| l.starts_with("DROP ")).collect();
+        assert_eq!(
+            drops,
+            vec!["DROP VIEW IF EXISTS app.v;", "DROP TYPE app.colour__dbd_old;"],
+            "only the view over the column may be dropped:\n{sql}"
+        );
+    }
+
+    /// Whether a materialized view blocks the swap is a fact about the
+    /// database: one dropped by hand blocks nothing, and one the design does
+    /// not declare still does. The design's matviews decided it, so dropping
+    /// the matview as told and re-running declined again, forever. The planner
+    /// now plans the swap and records the columns it moves, which the caller
+    /// checks against the live database (`Design::reconcile`); and it never
+    /// emits `DROP VIEW` for a matview, which fails on one that exists.
+    #[test]
+    fn a_design_matview_over_the_column_is_left_to_the_live_check() {
         let live = snap(
             vec![table("app", "t", vec![col("c", "app.colour", None)])],
             vec![enum_snap("app", "colour", &["red", "green", "blue"])],
@@ -4108,20 +4533,26 @@ mod enum_recreation_tests {
         let entities = vec![
             entity(EntityType::Table, "app.t", &[]),
             entity(EntityType::MaterializedView, "app.mv", &["app.t"]),
+            entity(EntityType::View, "app.v", &["app.t"]),
         ];
         let mut plan = ReconcilePlan::default();
         plan_enum_recreation(&mut plan, &live, &desired, &entities);
 
-        assert!(
-            plan.altered.iter().all(|s| s.entity_name != "app.colour"),
-            "no partial recreation may be planned"
-        );
-        assert!(
-            plan.warnings
-                .iter()
-                .any(|w| w.contains("app.mv") && w.contains("app.colour")),
-            "the blocked recreation must be reported; got {:?}",
-            plan.warnings
+        let sql = &plan
+            .altered
+            .iter()
+            .find(|s| s.entity_name == "app.colour")
+            .expect("the swap is planned")
+            .sql;
+        assert!(sql.contains("DROP VIEW IF EXISTS app.v;"), "{sql}");
+        assert!(!sql.contains("app.mv"), "a matview is never dropped by the swap: {sql}");
+        assert_eq!(
+            plan.enum_swaps,
+            vec![EnumSwap {
+                enum_name: "app.colour".to_string(),
+                removed: vec!["blue".to_string()],
+                columns: vec![("app.t".to_string(), "c".to_string())],
+            }]
         );
     }
 

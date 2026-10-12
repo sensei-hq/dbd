@@ -15,14 +15,18 @@ use crate::snapshot;
 use crate::snapshot::PendingMigration;
 
 mod apply;
+mod env_guard;
 mod hooks;
 mod import;
+mod marks;
 mod plan;
 mod reconcile;
 mod reset;
 mod scope;
 
+pub use marks::DatabaseMarks;
 pub use plan::{ApplyStrategy, ExecutionPlan, ExecutionStep, build_execution_plan};
+pub use reset::{KeptRole, ResetComplete};
 
 /// Summary passed to the `on_complete` callback of `apply()`.
 #[derive(Debug, Clone, Default)]
@@ -46,16 +50,106 @@ pub struct ApplyComplete {
     /// [`ImportComplete::warnings`]: an apply that skipped the script setting up
     /// Realtime must say so, not report a clean success.
     pub warnings: Vec<String>,
+    /// For a [`ApplyStrategy::Fresh`] run: whether the database was already
+    /// built before it — dbd had applied it without a version, or the design's
+    /// objects were already there. A database with no recorded version is not
+    /// necessarily empty, and calling this run a fresh install said it was.
+    /// Always `false` for the other strategies.
+    pub previously_built: bool,
+}
+
+/// The pending migrations a run would execute against one database, from
+/// [`Design::pending_migration_preview`] — what `apply --dry-run` lists.
+#[derive(Debug, Clone, Default)]
+pub struct MigrationPreview {
+    /// The version the database records (0: none).
+    pub from_version: u32,
+    /// The version the design is at.
+    pub to_version: u32,
+    /// The migration steps the run takes, in the order it takes them. Empty
+    /// when the run migrates nothing.
+    pub steps: Vec<MigrationStepPreview>,
+    /// The versions the run records as applied. Not empty with `steps` empty
+    /// for a scoped run that none of the pending migrations touch: it runs
+    /// nothing for them, and still records them and moves the database on.
+    pub recorded: Vec<u32>,
+}
+
+/// One migration step of a run, for a preview.
+#[derive(Debug, Clone)]
+pub struct MigrationStepPreview {
+    /// The migration it belongs to.
+    pub version: u32,
+    /// The entity it acts on.
+    pub entity: String,
+    pub action: MigrationAction,
+    /// The statements of the files the step runs, in order. Empty for
+    /// [`MigrationAction::Create`], which runs the entity's own DDL.
+    pub statements: Vec<PlannedStatement>,
+    /// `false` for a drop of a table this database does not have: the run
+    /// skips it.
+    pub runs: bool,
+}
+
+/// What a migration step does to its entity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationAction {
+    /// A migration added it; its DDL creates it.
+    Create,
+    /// A migration adds values to it (an enum); they run, and commit, before
+    /// the rest of the version.
+    EnumValues,
+    /// A migration altered it; its `.sql` runs.
+    Migrate,
+    /// A migration altered or added it; its `.data.sql` runs, after every
+    /// schema change of the same version.
+    Data,
+    /// A migration dropped it; its drop script runs where it still exists.
+    Drop,
+}
+
+/// One statement a migration file runs, as a preview shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedStatement {
+    /// The statement on one line, shortened when long.
+    pub text: String,
+    /// Whether it destroys something — a `DROP`, a `TRUNCATE`, or an `ALTER
+    /// TABLE` dropping a column or constraint — read from the parse tree.
+    pub drops: bool,
 }
 
 /// Running tallies accumulated while executing an apply plan's steps. Folded
 /// into [`ApplyComplete`] once the plan finishes.
+///
+/// `applied` and `migrated` count entities, as [`ApplyComplete`] says they do,
+/// not steps: an entity a migration adds is created and may then be migrated
+/// and re-applied, and one altered by two pending migrations runs two
+/// migration files. Counted per step, a design of 35 entities reported "36
+/// applied".
 #[derive(Default)]
 struct ApplyCounts {
     applied: u32,
     migrated: u32,
     created: u32,
     dropped: u32,
+    counted_applied: std::collections::HashSet<String>,
+    counted_migrated: std::collections::HashSet<String>,
+}
+
+impl ApplyCounts {
+    /// Count `entity` as applied, once however many steps applied it.
+    fn applied(&mut self, entity: &str) {
+        if self.counted_applied.insert(entity.to_string()) {
+            self.applied += 1;
+        }
+    }
+
+    /// Count `entity` as migrated, once however many migration files it ran.
+    fn migrated(&mut self, entity: &str) {
+        if self.counted_migrated.insert(entity.to_string()) {
+            self.migrated += 1;
+        }
+    }
 }
 
 /// Summary passed to the `on_complete` callback of `import_data()`.
@@ -73,10 +167,25 @@ pub struct ImportComplete {
     pub warnings: Vec<String>,
 }
 
+/// What [`Design::apply_grants`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GrantsOutcome {
+    /// The design declares no grants, so nothing ran.
+    #[default]
+    None,
+    /// The grant script ran.
+    Applied,
+    /// The design declares grants but the target has no SQL grant model
+    /// (SQLite, Convex), so they were skipped rather than fed SQL it cannot run.
+    Unsupported,
+}
+
 /// Combined summary passed to the `on_complete` callback of `deploy()`.
 #[derive(Debug, Clone, Default)]
 pub struct DeployComplete {
     pub apply: ApplyComplete,
+    /// Whether the design's grants ran, between the schema and the data.
+    pub grants: GrantsOutcome,
     pub import: ImportComplete,
     /// Outcome of the RLS policy phase. Failures here are non-fatal — they are
     /// reported as warnings and the deploy still succeeds.
@@ -94,19 +203,26 @@ impl DeployComplete {
     pub fn warnings(&self) -> Vec<String> {
         let mut out = self.apply.warnings.clone();
         out.extend(self.import.warnings.iter().cloned());
-        out.extend(
-            self.policies
-                .failed
-                .iter()
-                .map(|(file, err)| format!("policy not applied: {} — {err}", file.display())),
-        );
-        out.extend(
-            self.policies
-                .skipped
-                .iter()
-                .map(|(file, why)| format!("policy skipped: {} — {why}", file.display())),
-        );
+        out.extend(self.policy_warnings());
         out
+    }
+
+    /// The policy phase's share of [`Self::warnings`]: one line per failed
+    /// policy file, then one per policy a scope excluded. Apart, so a caller
+    /// reporting phase by phase can print them after the policy phase's own
+    /// line rather than before it.
+    pub fn policy_warnings(&self) -> Vec<String> {
+        let failed = self
+            .policies
+            .failed
+            .iter()
+            .map(|(file, err)| format!("policy not applied: {} — {err}", file.display()));
+        let skipped = self
+            .policies
+            .skipped
+            .iter()
+            .map(|(file, why)| format!("policy skipped: {} — {why}", file.display()));
+        failed.chain(skipped).collect()
     }
 }
 
@@ -167,14 +283,16 @@ fn ensure_reconcile_not_destructive(plan: &crate::reconcile::ReconcilePlan, allo
     if !plan.destructive || allow_destructive {
         return Ok(());
     }
+    // What is destructive, and only that: listing every altered table named
+    // ones that merely gained a column.
     let details: String = plan
-        .altered
+        .destructive_changes
         .iter()
-        .map(|s| format!("  {}", s.entity_name))
+        .map(|change| format!("  {change}"))
         .collect::<Vec<_>>()
         .join("\n");
     Err(DbdError::Config(format!(
-        "reconcile would make destructive changes (dropped columns, constraints, or indexes) on:\n{details}\n\
+        "reconcile would make destructive changes:\n{details}\n\
          Re-run with --allow-destructive to proceed."
     )))
 }
@@ -244,9 +362,12 @@ fn hide_declared(
 /// An entry with write-targets is kept only if ALL targets are in scope;
 /// a proc-less entry is kept if its staging table is in scope.
 ///
-/// Public so CLI previews (`import --dry-run`, `deploy`'s non-empty guard) can
-/// filter the plan identically to how `import_data` filters it internally —
-/// one source of truth for the predicate.
+/// Superseded: it cannot see whether the design declares the staging table, so
+/// it kept an import whose staging table the scope never built.
+#[deprecated(
+    since = "0.25.0",
+    note = "use Design::scoped_import_plan, which also requires a declared staging table and says why an entry was skipped"
+)]
 pub fn import_entry_in_scope(
     entry: &ImportPlanEntry,
     working_set: &std::collections::HashSet<String>,
@@ -275,7 +396,14 @@ pub struct Report {
     /// reported, because a file that no scope builds is how a broken file goes
     /// unnoticed. Always empty without a scope, or under `all`.
     pub out_of_scope_issues: Vec<Entity>,
+    /// Entities with warnings that the active scope builds — all of them
+    /// without a scope, or under `all`.
     pub warnings: Vec<Entity>,
+    /// Entities with warnings that the active scope excludes, kept apart like
+    /// [`Self::out_of_scope_issues`]: listed and counted as the scope's, a
+    /// warning in a file the scope never builds read as something to fix
+    /// before the scoped run.
+    pub out_of_scope_warnings: Vec<Entity>,
     pub gaps: Vec<crate::scope::ScopeGap>,
 }
 
@@ -283,9 +411,12 @@ pub struct Report {
 #[derive(Debug, Clone)]
 pub struct ImportPlanEntry {
     pub table: Entity,
-    /// Procedure that reads from this staging table (matched by reads analysis).
+    /// The loader CALLed once the data files are loaded (picked by
+    /// `Design::import_plan`). A table with two data files has it on its first
+    /// entry only — it is called once, over the rows of both.
     pub procedure: Option<String>,
-    /// Config tables the procedure writes to.
+    /// The tables the table's loader writes — on every entry of the table, so a
+    /// scope judges its data files alike.
     pub writes: Vec<String>,
 }
 
@@ -320,6 +451,34 @@ pub(crate) fn policy_target(file: &Path, project_dir: &Path) -> Option<String> {
     Some(format!("{schema}.{table}"))
 }
 
+/// Which policy files a run under `scope` applies and which it skips, read from
+/// `policies/` without a database.
+///
+/// `applied` here means *would apply*: nothing is executed, so `failed` is
+/// always empty. This is the filter [`apply_policies`] itself runs, exposed so
+/// a preview lists what the run will do. `dbd policies --dry-run` used to list
+/// every file under `policies/` whatever the scope, promising a policy on a
+/// table the plane does not have.
+pub fn plan_policies(
+    project_dir: &Path,
+    scope: Option<(&str, &std::collections::HashSet<String>)>,
+) -> Result<PolicyReport> {
+    let mut report = PolicyReport::default();
+    for file in crate::scanner::scan_policies(project_dir)? {
+        if let Some((scope_name, working_set)) = scope
+            && let Some(target) = policy_target(&file, project_dir)
+            && !working_set.contains(&target)
+        {
+            report
+                .skipped
+                .push((file, format!("{target} is outside scope '{scope_name}'")));
+        } else {
+            report.applied.push(file);
+        }
+    }
+    Ok(report)
+}
+
 /// Apply RLS policy files from the policies/ directory.
 ///
 /// Files are executed in alphabetical order. Failed files are logged and skipped.
@@ -336,32 +495,20 @@ pub async fn apply_policies(
     dry_run: bool,
     scope: Option<(&str, &std::collections::HashSet<String>)>,
 ) -> Result<PolicyReport> {
-    let files = crate::scanner::scan_policies(project_dir)?;
+    let plan = plan_policies(project_dir, scope)?;
+    if dry_run {
+        return Ok(plan);
+    }
     let mut report = PolicyReport {
         applied: Vec::new(),
         failed: Vec::new(),
-        skipped: Vec::new(),
+        skipped: plan.skipped,
     };
 
     // Canonicalize the project root once so path-traversal checks are reliable.
     let canon_root = project_dir.canonicalize().unwrap_or_else(|_| project_dir.to_path_buf());
 
-    for file in &files {
-        if let Some((scope_name, working_set)) = scope
-            && let Some(target) = policy_target(file, project_dir)
-            && !working_set.contains(&target)
-        {
-            report
-                .skipped
-                .push((file.clone(), format!("{target} is outside scope '{scope_name}'")));
-            continue;
-        }
-
-        if dry_run {
-            report.applied.push(file.clone());
-            continue;
-        }
-
+    for file in &plan.applied {
         // Guard: every policy file must resolve within the project directory.
         let canon_file = match file.canonicalize() {
             Ok(p) => p,
@@ -451,6 +598,9 @@ pub struct Design {
     /// compare structure must refuse rather than compare nothing and report a
     /// match.
     parser: crate::parser::ParserChoice,
+    /// `source.search_path`, resolved: the path a migration or hook script
+    /// that states none of its own runs on, and its bare names are read on.
+    search_path: Option<Vec<crate::entity::PathEntry>>,
     /// `source.dialect` as the project wrote it.
     ///
     /// Kept beside [`Self::parser`] because a refusal has to name what the
@@ -459,6 +609,11 @@ pub struct Design {
     /// they typed.
     dialect: String,
 }
+
+/// The phrase [`warn_if_no_search_path`] reports with, so
+/// [`Design::search_path_warnings`] finds its warnings among an entity's
+/// others without a second copy of the rule.
+const NO_SEARCH_PATH: &str = "states no `SET search_path`";
 
 /// Report a DDL file that states no `SET search_path` of its own.
 ///
@@ -479,6 +634,13 @@ fn warn_if_no_search_path(entity: &mut Entity, relative: &std::path::Path) {
     if entity.schema_path.stated() || !entity.entity_type.has_schema() {
         return;
     }
+    // A file that did not parse has no path the parser could record — its
+    // `SET search_path` may be its first line — so "states no SET
+    // search_path" beside its parse error was false. The parse error is the
+    // finding.
+    if !entity.errors.is_empty() {
+        return;
+    }
     // A dialect with no schema path at all has nothing to warn about. T-SQL
     // resolves an unqualified name against the connecting user's default
     // schema and MySQL has no schemas — neither has a `search_path`, and
@@ -493,12 +655,45 @@ fn warn_if_no_search_path(entity: &mut Entity, relative: &std::path::Path) {
         _ => "PostgreSQL's session default (\"$user\", public) — set source.search_path to choose".to_string(),
     };
     entity.warnings.push(format!(
-        "{} states no `SET search_path`; unqualified names resolved against {resolved_against}",
+        "{} {NO_SEARCH_PATH}; unqualified names resolved against {resolved_against}",
         relative.display()
     ));
 }
 
 impl Design {
+    /// The environment this design was loaded for (`-e`): what a run records
+    /// in the database, and what picks its `import/<env>/` data.
+    pub fn env(&self) -> &str {
+        &self.env
+    }
+
+    /// Every DDL file a run under `scope` — narrowed to the entity `name`
+    /// selects, if any — executes that states no `SET search_path`, as a
+    /// warning naming the path its unqualified names were resolved against:
+    /// what `apply` and `deploy` print before they run.
+    ///
+    /// `inspect` counted these and nothing else said them, though the design
+    /// is that a forgotten path is never silent: a file the run executes on a
+    /// path nobody wrote into it is how an object lands in a schema nobody
+    /// chose.
+    pub fn search_path_warnings(&self, name: Option<&str>, scope: Option<&ResolvedScope>) -> Result<Vec<String>> {
+        let entities = match scope {
+            Some(s) => self.scoped_entities(s)?,
+            None => self.entities.clone(),
+        };
+        let named = match name {
+            Some(n) => Some(self.resolve_name(n, scope)?.name.clone()),
+            None => None,
+        };
+        Ok(entities
+            .iter()
+            .filter(|e| named.as_ref().is_none_or(|n| &e.name == n))
+            .flat_map(|e| &e.warnings)
+            .filter(|w| w.contains(NO_SEARCH_PATH))
+            .cloned()
+            .collect())
+    }
+
     /// Which reader this project's DDL was read by.
     ///
     /// Exposed because it decides what a caller may ask for: only a reader
@@ -785,8 +980,24 @@ impl Design {
             env: env.to_string(),
             validated: false,
             parser: parser_choice,
+            search_path: project_search_path,
             dialect: dialect_label,
         })
+    }
+
+    /// `source.search_path`, resolved — `None` when the project sets none.
+    /// What a migration or hook script stating no path of its own runs on.
+    pub(crate) fn script_search_path(&self) -> Option<&[crate::entity::PathEntry]> {
+        self.search_path.as_deref()
+    }
+
+    /// Where the hooks are read from, and the path they run on.
+    pub(in crate::design) fn hook_source(&self) -> hooks::HookSource<'_> {
+        hooks::HookSource {
+            dir: &self.project_dir,
+            search_path: self.script_search_path(),
+            entities: &self.entities,
+        }
     }
 
     /// Access the parsed config.
@@ -927,9 +1138,17 @@ impl Design {
             if entity.entity_type == EntityType::External {
                 continue;
             }
-            // Check file exists for file-based entities
+            // Check file exists for file-based entities. A scanned file's path
+            // already starts with the project directory (the scan is rooted
+            // there), so joining it on again doubled a relative `-s proj` into
+            // `proj/proj/ddl/…` and reported every file missing. Only a path
+            // not already under it is resolved against it.
             if let Some(ref file) = entity.file {
-                let full_path = self.project_dir.join(file);
+                let full_path = if file.starts_with(&self.project_dir) {
+                    file.clone()
+                } else {
+                    self.project_dir.join(file)
+                };
                 if !full_path.exists() {
                     entity.errors.push(format!("File not found: {}", file.display()));
                 }
@@ -967,15 +1186,18 @@ impl Design {
         // report agrees with what a run would actually refuse on. Reporting an
         // out-of-scope parse error as blocking sends people to fix a file the
         // scoped run never reads.
-        let (issues, out_of_scope_issues) = match scope {
+        let ((issues, out_of_scope_issues), (warnings, out_of_scope_warnings)) = match scope {
             Some(s) if !s.is_all => match self.working_set(s) {
-                Ok(ws) => all_issues.into_iter().partition(|e| Self::entity_in_scope(e, s, &ws)),
+                Ok(ws) => (
+                    all_issues.into_iter().partition(|e| Self::entity_in_scope(e, s, &ws)),
+                    warnings.into_iter().partition(|e| Self::entity_in_scope(e, s, &ws)),
+                ),
                 // Working set unavailable: treat every error as blocking. The
                 // conservative direction — a spurious error is a nuisance, a
                 // hidden one is the failure this reporting exists to prevent.
-                Err(_) => (all_issues, Vec::new()),
+                Err(_) => ((all_issues, Vec::new()), (warnings, Vec::new())),
             },
-            _ => (all_issues, Vec::new()),
+            _ => ((all_issues, Vec::new()), (warnings, Vec::new())),
         };
 
         let gaps = match scope {
@@ -988,6 +1210,7 @@ impl Design {
             issues,
             out_of_scope_issues,
             warnings,
+            out_of_scope_warnings,
             gaps,
         }
     }
@@ -1002,11 +1225,14 @@ impl Design {
             Some(s) => self.scoped_entities(s)?,
             None => self.entities.clone(),
         };
+        // The script is for this project's own engine, so dbd's generated
+        // statements are written in its dialect too (see `combined_ddl`).
+        let dialect = crate::parser::Dialect::from_label(&self.dialect).unwrap_or_default();
         let combined: Vec<String> = entities
             .iter()
             .filter(|e| e.errors.is_empty())
             .filter(|e| e.entity_type != EntityType::External)
-            .filter_map(script::ddl_from_entity)
+            .filter_map(|e| script::combined_ddl(e, dialect))
             .collect();
 
         std::fs::write(file, combined.join("\n"))?;
@@ -1016,7 +1242,22 @@ impl Design {
     /// Get the dependency graph for visualization. `name` narrows to one entity's
     /// subgraph; `scope` filters to that scope's working set (`None` ⇒ full set).
     pub fn graph(&self, name: Option<&str>, scope: Option<&ResolvedScope>) -> Result<dependency::GraphResult> {
-        let graphable = crate::scope::is_scopable;
+        // An unknown or out-of-scope name produced an empty graph — a valid
+        // document, indistinguishable from an entity with no dependencies. So
+        // did an `external:` one: dbd has no DDL for it, so it is no node of
+        // the graph, and `inspect -n` and `apply -n` refuse it alike.
+        if let Some(n) = name
+            && self.resolve_name(n, scope)?.entity_type == EntityType::External
+        {
+            return Err(DbdError::Config(format!(
+                "{n} is declared `external:` — dbd has no DDL for it, so it has no place in the dependency \
+                 graph; it only resolves references to it"
+            )));
+        }
+        // A file dbd could not parse is left out, as `dbd graph` tells the user
+        // it is (`Design::unparsed`): kept as a node, it sat in a layer and at
+        // the end of an edge although nothing about it was read.
+        let graphable = |e: &Entity| crate::scope::is_scopable(e) && e.errors.is_empty();
         let non_meta: Vec<Entity> = match scope {
             Some(s) => {
                 let ws = self.working_set(s)?;
@@ -1352,16 +1593,21 @@ mod tests {
         }
     }
 
+    /// The marks of a database whose only record is `m`, this project's.
+    fn own(m: &crate::adapter::ProjectMeta) -> DatabaseMarks {
+        DatabaseMarks::of_own("p", Some(m.clone()))
+    }
+
     #[test]
     fn scope_guard_allows_matching_scope() {
         let m = meta_with_scope(Some("public"));
-        assert!(Design::check_scope_guard(Some(&m), "public", false).is_ok());
+        assert!(Design::check_scope_guard(&own(&m), "public", false).is_ok());
     }
 
     #[test]
     fn scope_guard_blocks_mismatch() {
         let m = meta_with_scope(Some("public"));
-        let err = Design::check_scope_guard(Some(&m), "internal", false).unwrap_err();
+        let err = Design::check_scope_guard(&own(&m), "internal", false).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("public") && msg.contains("internal"), "msg was: {msg}");
     }
@@ -1369,14 +1615,14 @@ mod tests {
     #[test]
     fn scope_guard_unpinned_never_blocks() {
         let m = meta_with_scope(None);
-        assert!(Design::check_scope_guard(Some(&m), "internal", false).is_ok());
-        assert!(Design::check_scope_guard(None, "internal", false).is_ok());
+        assert!(Design::check_scope_guard(&own(&m), "internal", false).is_ok());
+        assert!(Design::check_scope_guard(&DatabaseMarks::of_own("p", None), "internal", false).is_ok());
     }
 
     #[test]
     fn scope_guard_allow_scope_change_bypasses() {
         let m = meta_with_scope(Some("public"));
-        assert!(Design::check_scope_guard(Some(&m), "internal", true).is_ok());
+        assert!(Design::check_scope_guard(&own(&m), "internal", true).is_ok());
     }
 
     #[test]
@@ -1470,6 +1716,69 @@ mod tests {
         assert!(!graph.nodes.is_empty());
         assert!(graph.nodes.iter().all(|n| !n.name.starts_with("staging.")));
         assert!(graph.nodes.iter().any(|n| n.name.starts_with("config.")));
+    }
+
+    /// `dbd graph` said a file it could not parse "is left out" — and kept its
+    /// entity in `nodes`, in `layers`, and at the end of an edge. The graph now
+    /// leaves it out as the message says: no node, no layer entry, no edge to
+    /// it, whole or scoped.
+    #[test]
+    fn graph_leaves_out_an_entity_whose_file_does_not_parse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\nschemas:\n  - app\nscopes:\n  app_only:\n    includes: [app]\n",
+        )
+        .unwrap();
+        for (name, sql) in [
+            ("good", "create table if not exists app.good (id int primary key);\n"),
+            (
+                "bad",
+                "create table if not exists app.bad (id int primary key,, oops;\n",
+            ),
+            (
+                "child",
+                "create table if not exists app.child (id int primary key, bad_id int references app.bad (id));\n",
+            ),
+        ] {
+            std::fs::write(dir.join(format!("ddl/table/app/{name}.ddl")), sql).unwrap();
+        }
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let all = design.resolve_scope(None, None).unwrap();
+        let scoped = design.resolve_scope(Some("app_only"), None).unwrap();
+        for (label, graph) in [
+            ("unscoped", design.graph(None, None).unwrap()),
+            ("all", design.graph(None, Some(&all)).unwrap()),
+            ("scoped", design.graph(None, Some(&scoped)).unwrap()),
+        ] {
+            let names: Vec<&str> = graph.nodes.iter().map(|n| n.name.as_str()).collect();
+            assert!(
+                names.contains(&"app.good") && names.contains(&"app.child"),
+                "{label}: {names:?}"
+            );
+            assert!(!names.contains(&"app.bad"), "{label}: no node for app.bad: {names:?}");
+            assert!(
+                graph.layers.iter().flatten().all(|n| n != "app.bad"),
+                "{label}: no layer holds app.bad: {:?}",
+                graph.layers
+            );
+            assert!(
+                graph.edges.iter().all(|e| e.from != "app.bad" && e.to != "app.bad"),
+                "{label}: no edge reaches app.bad"
+            );
+        }
+        assert_eq!(
+            design
+                .unparsed(&all)
+                .unwrap()
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["app.bad"],
+            "and it is the one named as left out"
+        );
     }
 
     #[tokio::test]
@@ -1571,6 +1880,49 @@ import:
             .filter_map(|s| s.lines().next())
             .filter_map(|l| l.strip_prefix("-- MARK ").map(|m| m.to_string()))
             .collect()
+    }
+
+    /// A project at v1 applied to a database at v2 — a branch checked out
+    /// behind the database it points at — planned as "current", re-applied
+    /// v1's DDL over v2's schema, and reported "Already up to date (v2)".
+    /// It is refused before anything runs, hooks included, naming both
+    /// versions; the run, its dry run and a deploy alike.
+    #[tokio::test]
+    async fn an_older_project_is_refused_on_a_newer_database() {
+        let tmp = hooks_project();
+        let design = load_project(tmp.path(), "dev");
+        assert_eq!(design.config().project.version, Some(1));
+
+        for dry_run in [false, true] {
+            let mock = MockAdapter::new().with_meta("dev", 2);
+            let err = design
+                .apply(&mock, None, dry_run, None, Progress::none())
+                .await
+                .expect_err("a v1 project must not apply to a v2 database");
+            let msg = err.to_string();
+            assert!(
+                matches!(err, DbdError::SafetyGuard(_)),
+                "a guard, like scope and prod: {msg}"
+            );
+            assert!(msg.contains("v2") && msg.contains("v1"), "naming both versions: {msg}");
+            assert!(markers_run(&mock).is_empty(), "no hook ran (dry run {dry_run})");
+            assert!(mock.applied.lock().unwrap().is_empty(), "no entity was applied");
+            assert!(mock.scripts.lock().unwrap().is_empty(), "no script ran");
+        }
+
+        let mock = MockAdapter::new().with_meta("dev", 2);
+        let err = design.deploy(&mock, false, None, |_| {}).await.expect_err("nor deploy");
+        assert!(matches!(err, DbdError::SafetyGuard(_)), "{err}");
+        assert!(mock.scripts.lock().unwrap().is_empty() && mock.imported.lock().unwrap().is_empty());
+
+        // The database's own version, and an older one, still apply.
+        for db in [1, 0] {
+            let mock = MockAdapter::new().with_meta("dev", db);
+            design
+                .apply(&mock, None, false, None, Progress::none())
+                .await
+                .unwrap_or_else(|e| panic!("a v{db} database takes a v1 project: {e}"));
+        }
     }
 
     /// The gap this feature exists to close: `dbd apply` calls `Design::apply`
@@ -1894,12 +2246,23 @@ import:
 
     #[tokio::test]
     async fn apply_repins_scope_on_current_strategy() {
-        // A DB already at/above the latest version takes the Current strategy,
-        // whose plan has no SetVersion step. The scope must still be (re)pinned.
-        let config_path = fixture_dir().join("design.yaml");
-        let design = Design::from_config(&config_path, "dev").unwrap();
-        // db_version 99 >= any fixture latest_version → Current strategy.
-        let mock = MockAdapter::new().with_meta("dev", 99).with_scope("public");
+        // A DB already at the latest version takes the Current strategy, whose
+        // plan has no SetVersion step. The scope must still be (re)pinned. (A
+        // DB *above* the design's version is refused by the version guard.)
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("ddl/table/app")).unwrap();
+        std::fs::write(
+            tmp.path().join("design.yaml"),
+            "project:\n  name: t\n  version: 7\nschemas:\n  - app\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("ddl/table/app/t.ddl"),
+            "set search_path to app;\ncreate table if not exists t (id integer primary key);\n",
+        )
+        .unwrap();
+        let design = load_project(tmp.path(), "dev");
+        let mock = MockAdapter::new().with_meta("dev", 7).with_scope("public");
         let resolved = design.resolve_scope(None, None).unwrap();
 
         design
@@ -1908,9 +2271,152 @@ import:
             .unwrap();
 
         let meta = mock.get_project_meta().await.unwrap().expect("meta");
-        // Re-pinned to the applied scope, and the version was preserved (not downgraded).
+        // Re-pinned to the applied scope, and the version was preserved.
         assert_eq!(meta.scope.as_deref(), Some(resolved.name.as_str()));
-        assert_eq!(meta.version, 99);
+        assert_eq!(meta.version, 7);
+    }
+
+    /// `reset --clean` drops what the project installs: every role the design
+    /// declares — `target.roles` and `ddl/role/` alike (only the first were
+    /// dropped) — and the extensions its scope admits. A scope whose
+    /// `extensions: []` installs none must drop none; every extension went.
+    #[test]
+    fn reset_drops_every_declared_role_and_only_the_scopes_extensions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for d in ["ddl/table/app", "ddl/role"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\nschemas:\n  - app\ntarget:\n  postgres:\n    url: $DATABASE_URL\n\
+             \x20   roles:\n      - name: from_target\n    extensions:\n      - pgcrypto\n\
+             scopes:\n  hub:\n    includes: [app]\n    extensions: []\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("ddl/role/from_file.ddl"), "create role from_file;\n").unwrap();
+        std::fs::write(
+            dir.join("ddl/table/app/t.ddl"),
+            "set search_path to app;\ncreate table if not exists t (id integer primary key);\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+
+        let all = design.reset_script("postgres", true, true, None).unwrap().unwrap();
+        assert!(all.contains("DROP ROLE IF EXISTS \"from_target\""), "{all}");
+        assert!(
+            all.contains("DROP ROLE IF EXISTS \"from_file\""),
+            "a ddl/role role is the project's too: {all}"
+        );
+        assert!(all.contains("DROP EXTENSION IF EXISTS \"pgcrypto\""), "{all}");
+
+        let hub = design.resolve_scope(Some("hub"), None).unwrap();
+        let scoped = design
+            .reset_script("postgres", true, true, Some(&hub))
+            .unwrap()
+            .unwrap();
+        assert!(
+            !scoped.contains("DROP EXTENSION"),
+            "hub installs no extension: {scoped}"
+        );
+    }
+
+    /// A scoped reset must not reach past its scope, and `CASCADE` is how it
+    /// did: dropping an in-scope enum took an out-of-scope table's column with
+    /// it. Not one statement of a scoped reset cascades — schemas and
+    /// extensions included — while the full reset keeps its `CASCADE`.
+    #[test]
+    fn a_scoped_reset_script_never_cascades() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for d in ["ddl/table/app", "ddl/enum/app"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\nschemas:\n  - app\ntarget:\n  postgres:\n    url: $DATABASE_URL\n\
+             \x20   extensions:\n      - pgcrypto\n\
+             scopes:\n  moods:\n    includes: [app.mood]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/enum/app/mood.ddl"),
+            "create type app.mood as enum ('a');\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/app/t.ddl"),
+            "set search_path to app;\ncreate table if not exists t (id integer primary key, m app.mood);\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+
+        let moods = design.resolve_scope(Some("moods"), None).unwrap();
+        let scoped = design
+            .reset_script("postgres", true, true, Some(&moods))
+            .unwrap()
+            .unwrap();
+        assert!(scoped.contains("DROP TYPE IF EXISTS \"app\".\"mood\""), "{scoped}");
+        assert!(!scoped.contains("CASCADE"), "a scoped reset never cascades: {scoped}");
+
+        let all = design.reset_script("postgres", true, true, None).unwrap().unwrap();
+        assert!(all.contains("CASCADE"), "the full reset still does: {all}");
+    }
+
+    /// A role the design granted on a schema cannot be dropped while it holds
+    /// the grant: `role "app_writer" cannot be dropped because some objects
+    /// depend on it — privileges for schema app, default privileges …`, and the
+    /// whole default reset rolled back. Reset revokes what dbd granted — the
+    /// `schemas:` grants and the target's `grants:`, default privileges
+    /// included — on every schema that survives, before it drops the role. A
+    /// schema `--schemas` drops takes its grants with it, and a role the design
+    /// does not declare is not dropped, so neither needs a revoke.
+    #[test]
+    fn reset_revokes_the_designs_grants_on_surviving_schemas_before_dropping_its_roles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\nschemas:\n  - app:\n      grants:\n        app_writer: [usage, select, insert]\n\
+             \x20       web_anon: [usage, select]\n\
+             target:\n  postgres:\n    url: $DATABASE_URL\n    roles:\n      - name: app_writer\n      - name: app_reader\n\
+             \x20   grants:\n      app:\n        app_reader: [usage, select]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/app/t.ddl"),
+            "set search_path to app;\ncreate table if not exists t (id integer primary key);\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+
+        let sql = design.reset_script("postgres", false, false, None).unwrap().unwrap();
+        for (role, perms) in [("app_writer", "SELECT, INSERT"), ("app_reader", "SELECT")] {
+            let drop = sql
+                .find(&format!("DROP ROLE IF EXISTS \"{role}\""))
+                .unwrap_or_else(|| panic!("{role} is dropped: {sql}"));
+            for revoke in [
+                format!("REVOKE USAGE ON SCHEMA \"app\" FROM \"{role}\";"),
+                format!("REVOKE {perms} ON ALL TABLES IN SCHEMA \"app\" FROM \"{role}\";"),
+                format!("ALTER DEFAULT PRIVILEGES IN SCHEMA \"app\" REVOKE {perms} ON TABLES FROM \"{role}\";"),
+            ] {
+                let at = sql
+                    .find(&revoke)
+                    .unwrap_or_else(|| panic!("missing `{revoke}`:\n{sql}"));
+                assert!(at < drop, "`{revoke}` must run before {role} is dropped:\n{sql}");
+            }
+        }
+        assert!(
+            !sql.contains("FROM \"web_anon\""),
+            "a role the design does not declare is not dropped, so its grants stay:\n{sql}"
+        );
+
+        let clean = design.reset_script("postgres", true, false, None).unwrap().unwrap();
+        assert!(
+            !clean.contains("REVOKE"),
+            "`--schemas` drops app, and its grants with it:\n{clean}"
+        );
     }
 
     #[tokio::test]
@@ -1924,6 +2430,480 @@ import:
         assert!(result.unwrap_err().to_string().contains("prod"));
     }
 
+    /// `combine` writes the script `apply` would run. Apply keeps `public` on
+    /// every path a file's own `SET search_path` sets (so an extension installed
+    /// there resolves); combine wrote the files as they were, and `psql -f
+    /// init.sql` failed where apply succeeded. The file's own statement is
+    /// still written exactly as it is — `public` comes from a statement of its
+    /// own after it.
+    #[test]
+    fn combine_writes_the_search_path_apply_uses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        std::fs::write(dir.join("design.yaml"), "project:\n  name: t\nschemas:\n  - app\n").unwrap();
+        let file =
+            "set search_path to app;\ncreate table if not exists t (id uuid primary key default uuid_generate_v4());\n";
+        std::fs::write(dir.join("ddl/table/app/t.ddl"), file).unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let out = dir.join("init.sql");
+        design.combine(&out, None).unwrap();
+        let sql = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(
+            search_path_per_table(&sql).get("t").map(Vec::as_slice),
+            Some(["app".to_string(), "public".to_string()].as_slice()),
+            "the table runs on the file's path, then public:\n{sql}"
+        );
+        assert!(
+            sql.contains("set search_path to app;\n"),
+            "the file's own statement is not rewritten:\n{sql}"
+        );
+    }
+
+    /// The `set search_path to …;` rewrite matched text anywhere, up to the next
+    /// `;`. Supabase's advice for a `SECURITY DEFINER` function is a `SET
+    /// search_path = ''` clause; with `to` it became `'' as $$ select 1, public;`
+    /// and the function failed with `column "public" does not exist`. A string
+    /// literal or a function body quoting the statement was altered the same
+    /// way. Only a top-level `SET search_path` statement is one, and none of
+    /// the text — clause, literal, body — is touched.
+    #[test]
+    fn combine_leaves_every_search_path_text_but_a_statement_as_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/function/app")).unwrap();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        std::fs::write(dir.join("design.yaml"), "project:\n  name: t\nschemas:\n  - app\n").unwrap();
+        let files = [
+            (
+                "ddl/function/app/secure.ddl",
+                "create or replace function app.secure() returns int\n\
+                 language sql security definer set search_path = ''\nas $$ select 1; $$;\n",
+            ),
+            (
+                "ddl/function/app/secure_to.ddl",
+                "create or replace function app.secure_to() returns int\n\
+                 language sql security definer set search_path to ''\nas $$ select 2; $$;\n",
+            ),
+            (
+                "ddl/function/app/greet.ddl",
+                "create or replace function app.greet() returns text\n\
+                 language plpgsql set search_path to app\nas $$ begin return 'g; ok'; end; $$;\n",
+            ),
+            (
+                "ddl/table/app/notes.ddl",
+                "create table if not exists app.notes (id int primary key, \
+                 body text default 'set search_path to x; y', \
+                 note text default E'set search_path to x;\\' y');\n",
+            ),
+        ];
+        for (rel, sql) in files {
+            std::fs::write(dir.join(rel), sql).unwrap();
+        }
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let out = dir.join("init.sql");
+        design.combine(&out, None).unwrap();
+        let sql = std::fs::read_to_string(&out).unwrap();
+        for (rel, text) in files {
+            assert!(sql.contains(text.trim_end()), "{rel} is written byte for byte:\n{sql}");
+        }
+        assert!(pg_query::parse(&sql).is_ok(), "the script parses:\n{sql}");
+    }
+
+    /// The search path each `CREATE TABLE` in `sql` runs under: the args of the
+    /// last `SET search_path` before it, keyed by the table's bare name. Read
+    /// from libpg_query's tree, so a spelling change cannot pass or fail it.
+    fn search_path_per_table(sql: &str) -> std::collections::HashMap<String, Vec<String>> {
+        use pg_query::NodeEnum;
+        let parsed = pg_query::parse(sql).expect("combined SQL parses");
+        let mut path: Vec<String> = Vec::new();
+        let mut out = std::collections::HashMap::new();
+        for stmt in &parsed.protobuf.stmts {
+            match stmt.stmt.as_ref().and_then(|s| s.node.as_ref()) {
+                Some(NodeEnum::VariableSetStmt(set)) if set.name.eq_ignore_ascii_case("search_path") => {
+                    path = set
+                        .args
+                        .iter()
+                        .filter_map(|a| match a.node.as_ref() {
+                            Some(NodeEnum::AConst(c)) => match c.val.as_ref() {
+                                Some(pg_query::protobuf::a_const::Val::Sval(s)) => Some(s.sval.clone()),
+                                _ => None,
+                            },
+                            _ => None,
+                        })
+                        .collect();
+                }
+                Some(NodeEnum::CreateStmt(create)) => {
+                    let table = create.relation.as_ref().map(|r| r.relname.clone()).unwrap_or_default();
+                    out.insert(table, path.clone());
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// `source.search_path` is the path the parser resolves a file with no
+    /// `SET search_path` against, so `ddl/table/app/a.ddl` holding a bare
+    /// `create table a` was read as `app.a`. Nothing ran it there: the script
+    /// carried the file as written, the table landed wherever the session
+    /// pointed (`public`), and `diff` then reported `+ create app.a` forever.
+    /// The combined script must run each such file on the project's path —
+    /// with `public` after it, as a file's own path gets — and leave a file
+    /// that states its own path alone.
+    #[test]
+    fn combine_runs_a_file_with_no_search_path_on_the_projects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\nsource:\n  dialect: postgresql\n  search_path: [app]\nschemas:\n  - app\n  - other\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/app/a.ddl"),
+            "create table if not exists a (id int primary key);\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("ddl/table/other")).unwrap();
+        std::fs::write(
+            dir.join("ddl/table/other/b.ddl"),
+            "set search_path to other;\ncreate table if not exists b (id int primary key);\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let out = dir.join("init.sql");
+        design.combine(&out, None).unwrap();
+        let sql = std::fs::read_to_string(&out).unwrap();
+
+        let paths = search_path_per_table(&sql);
+        assert_eq!(
+            paths.get("a").map(Vec::as_slice),
+            Some(["app".to_string(), "public".to_string()].as_slice()),
+            "a pathless file runs on source.search_path, then public:\n{sql}"
+        );
+        assert_eq!(
+            paths.get("b").map(Vec::as_slice),
+            Some(["other".to_string(), "public".to_string()].as_slice()),
+            "a file's own path still wins:\n{sql}"
+        );
+    }
+
+    /// A scope that keeps an extension but excludes the schema it installs into
+    /// contradicts itself: `inspect` passed it and apply failed with `schema
+    /// "ext" does not exist`. Refused where the scope is resolved, so every
+    /// command says so.
+    #[test]
+    fn a_scope_that_excludes_its_extensions_schema_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/core")).unwrap();
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\nschemas:\n  - core\n  - ext\n\
+             target:\n  postgres:\n    url: $DATABASE_URL\n    extensions:\n      - name: citext\n        schema: ext\n\
+             scopes:\n  contradicts:\n    includes: [core]\n    excludes: [ext]\n  consistent:\n    includes: [core]\n\
+             \x20   excludes: [ext]\n    extensions: []\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/core/t.ddl"),
+            "set search_path to core;\ncreate table if not exists t (id integer primary key);\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let err = design.resolve_scope(Some("contradicts"), None).unwrap_err().to_string();
+        assert!(
+            err.contains("'citext' installs into 'ext'"),
+            "names the extension and its schema: {err}"
+        );
+        // Said once: the message read "its extension 'citext' (installs into
+        // 'ext') installs into".
+        assert_eq!(err.matches("installs into").count(), 1, "{err}");
+        design
+            .resolve_scope(Some("consistent"), None)
+            .expect("excluding the schema is fine when the scope installs no extension into it");
+    }
+
+    /// An extension installed `WITH SCHEMA x` needs `x`. Every scope keeps the
+    /// extension (unless its `extensions:` allowlist says otherwise) but only
+    /// kept the schemas its own entities live in, so any scope without `x`
+    /// failed with `schema "x" does not exist`.
+    #[test]
+    fn a_scope_keeps_the_schema_its_extensions_install_into() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/core")).unwrap();
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\nschemas:\n  - core\n  - extensions\n\
+             target:\n  postgres:\n    url: $DATABASE_URL\n    extensions:\n      - name: pgcrypto\n        schema: extensions\n\
+             scopes:\n  core_only:\n    includes: [core]\n  bare:\n    includes: [core]\n    extensions: []\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/core/t.ddl"),
+            "set search_path to core;\ncreate table if not exists t (id integer primary key);\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let names = |scope: &str| -> Vec<String> {
+            let s = design.resolve_scope(Some(scope), None).unwrap();
+            design
+                .scoped_entities(&s)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.name)
+                .collect()
+        };
+        assert!(
+            names("core_only").contains(&"extensions".to_string()),
+            "{:?}",
+            names("core_only")
+        );
+        assert!(
+            !names("bare").contains(&"extensions".to_string()),
+            "a scope installing no extension needs no extension schema: {:?}",
+            names("bare")
+        );
+    }
+
+    /// A scope skips a hook only for what the design manages outside it. A hook
+    /// touching an `external:` table — or one it creates itself — was skipped
+    /// under every named scope, because the working set never holds such names;
+    /// the apply then failed on the schema that hook was there to prepare.
+    #[tokio::test]
+    async fn a_scoped_apply_runs_hooks_that_touch_only_what_the_design_does_not_manage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for d in ["ddl/table/app", "ddl/table/billing", "sql"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\nschemas:\n  - app\n  - billing\nexternal:\n  - name: auth.users\n\
+             apply:\n  before:\n    - sql/auth.sql\n    - sql/billing.sql\n\
+             scopes:\n  app_only:\n    includes: [app]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("sql/auth.sql"),
+            "create schema if not exists auth;\ncreate table if not exists auth.users (id uuid primary key);\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("sql/billing.sql"),
+            "insert into billing.invoices (id) values (1);\n",
+        )
+        .unwrap();
+        for (schema, table) in [("app", "items"), ("billing", "invoices")] {
+            std::fs::write(
+                dir.join(format!("ddl/table/{schema}/{table}.ddl")),
+                format!("set search_path to {schema};\ncreate table if not exists {table} (id integer primary key);\n"),
+            )
+            .unwrap();
+        }
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let scope = design.resolve_scope(Some("app_only"), None).unwrap();
+        let mock = MockAdapter::new();
+        design
+            .apply(&mock, None, false, Some(&scope), Progress::none())
+            .await
+            .unwrap();
+
+        let scripts = mock.scripts.lock().unwrap().join("\n");
+        assert!(scripts.contains("auth.users"), "the external's hook runs: {scripts}");
+        assert!(
+            !scripts.contains("billing.invoices"),
+            "a hook on a managed table outside the scope does not: {scripts}"
+        );
+    }
+
+    /// A trigger written in a table's file fires a function the table then
+    /// depends on. The parser skipped `CREATE TRIGGER`, so no edge existed:
+    /// `inspect` said all was well and apply ran the trigger before the
+    /// function it executes existed.
+    #[test]
+    fn a_trigger_in_a_table_file_makes_the_table_depend_on_its_function() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for d in ["ddl/function/core", "ddl/table/core"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        std::fs::write(dir.join("design.yaml"), "project:\n  name: t\nschemas:\n  - core\n").unwrap();
+        std::fs::write(
+            dir.join("ddl/function/core/touch_updated_at.ddl"),
+            "create or replace function core.touch_updated_at() returns trigger language plpgsql as $$\n\
+             begin new.updated_at := now(); return new; end; $$;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/core/items.ddl"),
+            "set search_path to core;\n\
+             create table if not exists items (id integer primary key, updated_at timestamptz);\n\
+             create trigger items_touch before update on items for each row execute function core.touch_updated_at();\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let items = design
+            .entities()
+            .iter()
+            .find(|e| e.name == "core.items")
+            .expect("items");
+        let refers: Vec<&str> = items.refers().collect();
+        assert!(refers.contains(&"core.touch_updated_at"), "{refers:?}");
+    }
+
+    /// A table depends on the enum a column is typed with and on the sequence a
+    /// default draws from. Neither was recorded, so a scope could leave them out
+    /// with no gap reported, and apply failed on a type that did not exist.
+    /// A built-in type (`text`) names nothing in the project and is no warning.
+    #[test]
+    fn a_table_depends_on_its_column_enum_and_default_sequence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for d in ["ddl/enum/core", "ddl/sequence/core", "ddl/table/sales"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\nschemas:\n  - core\n  - sales\n\
+             scopes:\n  orders_only:\n    includes: [sales.orders]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/enum/core/order_status.ddl"),
+            "create type core.order_status as enum ('open', 'paid');\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/sequence/core/invoice_seq.ddl"),
+            "create sequence if not exists core.invoice_seq;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/sales/orders.ddl"),
+            "set search_path to sales;\ncreate table if not exists orders (\n  id integer primary key\n\
+             , status core.order_status not null\n, invoice_no integer default nextval('core.invoice_seq'::regclass)\n\
+             , note text\n);\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let orders = design
+            .entities()
+            .iter()
+            .find(|e| e.name == "sales.orders")
+            .expect("orders");
+        let refers: Vec<&str> = orders.refers().collect();
+        assert!(refers.contains(&"core.order_status"), "the column's enum: {refers:?}");
+        assert!(
+            refers.contains(&"core.invoice_seq"),
+            "the default's sequence: {refers:?}"
+        );
+        assert!(
+            orders.warnings.iter().all(|w| !w.contains("Unresolved")),
+            "a built-in type is not an unresolved reference: {:?}",
+            orders.warnings
+        );
+
+        let scope = design.resolve_scope(Some("orders_only"), None).unwrap();
+        let err = design.check_scope_gaps(&scope).unwrap_err().to_string();
+        assert!(err.contains("core.order_status"), "the missing enum is a gap: {err}");
+    }
+
+    /// A sequence belongs to its schema like a table does. `is_scopable` left
+    /// sequences out, so every scope dropped them — even one that only
+    /// excludes another schema — and the table whose default draws from one
+    /// failed to apply.
+    #[test]
+    fn a_scope_keeps_the_sequences_of_the_schemas_it_keeps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for d in ["ddl/sequence/app", "ddl/table/app", "ddl/table/staging"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\nschemas:\n  - app\n  - staging\n\
+             scopes:\n  no_staging:\n    excludes: [staging]\n  app_only:\n    includes: [app]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/sequence/app/item_seq.ddl"),
+            "set search_path to app;\ncreate sequence if not exists item_seq;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/app/items.ddl"),
+            "set search_path to app;\ncreate table if not exists items (id integer primary key default nextval('app.item_seq'));\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/staging/raw.ddl"),
+            "set search_path to staging;\ncreate table if not exists raw (line text);\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        for name in ["no_staging", "app_only"] {
+            let scope = design.resolve_scope(Some(name), None).unwrap();
+            let names: Vec<String> = design
+                .scoped_entities(&scope)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.name)
+                .collect();
+            assert!(
+                names.contains(&"app.item_seq".to_string()),
+                "{name} keeps app's sequence: {names:?}"
+            );
+            assert!(!names.contains(&"staging.raw".to_string()), "{name}: {names:?}");
+        }
+    }
+
+    /// A role, or an extension declared without `schema:`, lives in no schema.
+    /// `managed_schemas` mapped both to `public`, so a design with either made
+    /// `public` managed and `reconcile --prune` dropped tables there that the
+    /// design never declared.
+    #[test]
+    fn roles_and_schemaless_extensions_make_no_schema_managed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\nschemas:\n  - app\ntarget:\n  postgres:\n    url: $DATABASE_URL\n    \
+             roles:\n      - name: r1\n    extensions:\n      - plpgsql\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/app/items.ddl"),
+            "set search_path to app;\ncreate table if not exists items (id integer primary key);\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let desired = design.entities_in_scope(None, None, None);
+        let managed = Design::managed_schemas(&desired);
+        assert_eq!(
+            managed,
+            std::collections::HashSet::from(["app".to_string()]),
+            "only the schema the design declares is managed"
+        );
+    }
+
+    /// `-e production` was recorded verbatim before the CLI normalised it, and
+    /// such a row is still a prod database — it must not slip past the guard.
+    #[tokio::test]
+    async fn reset_blocked_when_the_database_says_production() {
+        let config_path = fixture_dir().join("design.yaml");
+        let design = Design::from_config(&config_path, "prod").unwrap();
+        let mock = MockAdapter::new().with_meta("production", 0);
+
+        let result = design.reset(&mock, "postgres", false, false, false, None).await;
+        assert!(result.is_err(), "a database marked `production` must block reset");
+        assert!(result.unwrap_err().to_string().contains("prod"));
+    }
+
     #[tokio::test]
     async fn reset_blocked_after_v1() {
         let config_path = fixture_dir().join("design.yaml");
@@ -1932,7 +2912,7 @@ import:
 
         let result = design.reset(&mock, "postgres", false, false, false, None).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("migrations"));
+        assert!(result.unwrap_err().to_string().contains("versioned at v1"));
     }
 
     #[tokio::test]
@@ -2220,36 +3200,83 @@ import:
         );
     }
 
-    /// A `--name` that matches no staging file is a typo, and must not look
-    /// like an empty-but-healthy import.
+    /// A `-n` that names nothing is a typo. The import reported it as a
+    /// warning and carried on — exiting 0 and running every `import.after`
+    /// hook — so a mistyped name still ran the project's loader script. It is
+    /// refused before anything runs, in the words every other command uses for
+    /// a name that matches nothing.
     #[tokio::test]
-    async fn import_warns_when_name_filter_matches_nothing() {
+    async fn an_unknown_import_name_is_refused_before_anything_runs() {
         let config_path = fixture_dir().join("design.yaml");
         let design = Design::from_config(&config_path, "dev").unwrap();
+        assert!(
+            !design.config().import.after.is_empty(),
+            "precondition: the fixture declares an import.after hook"
+        );
 
         let mock = MockAdapter::new();
-        let mut summary: Option<ImportComplete> = None;
-        design
-            .import_data(
-                &mock,
-                Some("staging.does_not_exist"),
-                true,
-                None,
-                Progress {
-                    on_start: |_: &str| {},
-                    on_done: |_: &str, _: Option<&str>| {},
-                    on_complete: |s| summary = Some(s),
-                },
-            )
+        let err = design
+            .import_data(&mock, Some("staging.does_not_exist"), false, None, Progress::none())
             .await
-            .unwrap();
+            .expect_err("an unknown -n must be refused");
 
-        let summary = summary.expect("import must always report a summary");
-        assert_eq!(summary.tables, 0);
         assert!(
-            summary.warnings.iter().any(|w| w.contains("does_not_exist")),
-            "an unmatched --name must be reported: {:?}",
-            summary.warnings
+            err.to_string().contains("no entity named 'staging.does_not_exist'"),
+            "{err}"
+        );
+        assert!(
+            mock.scripts.lock().unwrap().is_empty(),
+            "nothing may run — no truncate, no CALL, no import.after hook: {:?}",
+            mock.scripts.lock().unwrap()
+        );
+        assert!(mock.imported.lock().unwrap().is_empty(), "no data file may load");
+    }
+
+    /// The plan every preview prints is refused the same way, so a dry run
+    /// cannot accept a name the real run refuses.
+    #[test]
+    fn an_unknown_import_name_is_refused_by_the_plan() {
+        let design = Design::from_config(&fixture_dir().join("design.yaml"), "dev").unwrap();
+        let err = design
+            .scoped_import_plan(Some("staging.does_not_exist"), None)
+            .expect_err("an unknown -n must be refused");
+        assert!(
+            err.to_string().contains("no entity named 'staging.does_not_exist'"),
+            "{err}"
+        );
+    }
+
+    /// A table the design declares but has no data file for selects nothing to
+    /// load either. "No entity named" would be false, so the refusal says what
+    /// is actually missing.
+    #[test]
+    fn an_import_name_without_a_data_file_is_refused_naming_what_is_missing() {
+        let design = Design::from_config(&fixture_dir().join("design.yaml"), "dev").unwrap();
+        assert!(
+            design.entities().iter().any(|e| e.name == "config.lookups"),
+            "precondition: config.lookups is a declared table"
+        );
+        let err = design
+            .scoped_import_plan(Some("config.lookups"), None)
+            .expect_err("a name with no data file selects nothing");
+        let msg = err.to_string();
+        assert!(msg.contains("config.lookups") && msg.contains("no data file"), "{msg}");
+    }
+
+    /// The wrong-`-e` case: the file exists, under another env's folder. The
+    /// refusal names it, since that is the one thing that tells the user what
+    /// to change.
+    #[test]
+    fn an_import_name_whose_file_belongs_to_another_env_says_which_file() {
+        let tmp = project_with_import_files(&[("dev/staging/seed.csv", "id\n1\n")]);
+        let design = load_project(tmp.path(), "prod");
+        let err = design
+            .scoped_import_plan(Some("staging.seed"), None)
+            .expect_err("a file of another env is not this run's to load");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("import/dev/staging/seed.csv") && msg.contains("'prod'"),
+            "{msg}"
         );
     }
 
@@ -2384,6 +3411,202 @@ import:
         assert!(!plan.steps.iter().any(|s| matches!(s, ExecutionStep::SetVersion(_))));
     }
 
+    /// A table a migration drops is gone from the design, so it is in no
+    /// scope's working set — a named scope never ran its drop, while the
+    /// migration was still recorded as applied. It belongs to a scope that
+    /// occupies its schema, as it did while it existed.
+    #[test]
+    fn a_scoped_migrate_runs_the_drop_of_a_table_in_its_schema() {
+        let entities = vec![test_entity("app.users")];
+        let ws: std::collections::HashSet<String> = ["app", "app.users"].map(String::from).into();
+        let drops = |plan: &ExecutionPlan| -> Vec<String> {
+            plan.steps
+                .iter()
+                .filter_map(|s| match s {
+                    ExecutionStep::DropEntity { entity_name, .. } => Some(entity_name.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let ours = vec![test_migration(1, 2, vec![], vec![], vec!["app.legacy"])];
+        let plan = build_execution_plan(&entities, 1, 2, &ours, Some(&ws));
+        assert_eq!(drops(&plan), vec!["app.legacy"]);
+
+        let theirs = vec![test_migration(1, 2, vec![], vec![], vec!["billing.old"])];
+        let plan = build_execution_plan(&entities, 1, 2, &theirs, Some(&ws));
+        assert!(
+            drops(&plan).is_empty(),
+            "a schema the scope does not occupy is not its to drop in"
+        );
+    }
+
+    /// The drop a snapshot writes is the drop apply runs. `dbd snapshot` writes a
+    /// dropped table's statement to `<schema>/<table>.sql`; apply looked for
+    /// `<table>.drop.sql`, found nothing, and still counted the drop and
+    /// recorded the migration — the table outlived its removal from the design
+    /// on every database. Driven through the real snapshot, not a hand-written
+    /// file, so the two sides cannot disagree about the name again.
+    #[tokio::test]
+    async fn a_table_removed_from_the_design_is_dropped_by_the_next_apply() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        let config = dir.join("design.yaml");
+        std::fs::write(&config, "project:\n  name: t\nschemas:\n  - app\n").unwrap();
+        for t in ["users", "legacy"] {
+            std::fs::write(
+                dir.join(format!("ddl/table/app/{t}.ddl")),
+                format!("set search_path to app;\ncreate table if not exists {t} (id integer primary key);\n"),
+            )
+            .unwrap();
+        }
+        let load = || Design::from_config_with_dir(&config, "dev", Some(dir)).unwrap();
+        crate::snapshot::create_snapshot(load().entities(), dir, &config, "baseline").unwrap();
+        std::fs::remove_file(dir.join("ddl/table/app/legacy.ddl")).unwrap();
+        crate::snapshot::create_snapshot(load().entities(), dir, &config, "drop legacy").unwrap();
+
+        let design = load();
+        assert_eq!(design.config().project.version, Some(2), "the second snapshot is v2");
+        let mock = MockAdapter::new()
+            .with_meta("dev", 1)
+            .with_known_entities(["app.legacy"]);
+        design.apply(&mock, None, false, None, Progress::none()).await.unwrap();
+
+        let scripts = mock.scripts.lock().unwrap().join("\n");
+        assert!(
+            scripts.contains("DROP TABLE"),
+            "the v2 drop of app.legacy runs: {scripts}"
+        );
+    }
+
+    /// A version's data scripts ran only for the tables it altered, so a
+    /// `data.sql` seeding a table the same version adds never ran — and was
+    /// not listed in the preview either — while the version was recorded as
+    /// applied. It is the version's own data script: it runs after the
+    /// version's creates, with the rest of its data scripts, and is listed.
+    #[tokio::test]
+    async fn a_data_script_for_a_table_its_version_adds_runs_after_the_create() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        let config = dir.join("design.yaml");
+        std::fs::write(&config, "project:\n  name: t\nschemas:\n  - app\n").unwrap();
+        let table = |t: &str| {
+            std::fs::write(
+                dir.join(format!("ddl/table/app/{t}.ddl")),
+                format!("set search_path to app;\ncreate table if not exists {t} (id integer primary key);\n"),
+            )
+            .unwrap();
+        };
+        let load = || Design::from_config_with_dir(&config, "dev", Some(dir)).unwrap();
+        table("users");
+        crate::snapshot::create_snapshot(load().entities(), dir, &config, "baseline").unwrap();
+        table("kinds");
+        crate::snapshot::create_snapshot(load().entities(), dir, &config, "add kinds").unwrap();
+        std::fs::create_dir_all(dir.join("migrations/002/app")).unwrap();
+        std::fs::write(
+            dir.join("migrations/002/app/kinds.data.sql"),
+            "insert into kinds (id) values (1) on conflict do nothing;\n",
+        )
+        .unwrap();
+
+        let design = load();
+        assert_eq!(design.config().project.version, Some(2), "the second snapshot is v2");
+        let mock = MockAdapter::new().with_meta("dev", 1);
+        let preview = design.pending_migration_preview(&mock, None, None).await.unwrap();
+        assert!(
+            preview
+                .steps
+                .iter()
+                .any(|s| s.entity == "app.kinds" && s.action == MigrationAction::Data && s.version == 2),
+            "the preview lists the data script of app.kinds: {:?}",
+            preview.steps
+        );
+
+        let mut started: Vec<String> = Vec::new();
+        design
+            .apply(
+                &mock,
+                None,
+                false,
+                None,
+                Progress {
+                    on_start: |d: &str| started.push(d.to_string()),
+                    on_done: |_: &str, _: Option<&str>| {},
+                    on_complete: |_| {},
+                },
+            )
+            .await
+            .unwrap();
+        let scripts = mock.scripts.lock().unwrap().clone();
+        assert!(
+            scripts.iter().any(|s| s.contains("insert into kinds")),
+            "its data script runs: {scripts:#?}"
+        );
+        let at = |step: &str| started.iter().position(|d| d.starts_with(step));
+        let created = at("table:app.kinds").unwrap_or_else(|| panic!("app.kinds is created: {started:#?}"));
+        let seeded = at("migrate data table:app.kinds").unwrap_or_else(|| panic!("its data step: {started:#?}"));
+        assert!(created < seeded, "after the create: {started:#?}");
+    }
+
+    /// A migration's drop runs only where the table still exists. Generated
+    /// drops are a bare `DROP TABLE … CASCADE`, so a database whose scope never
+    /// had the table would fail on it now that a scope runs the drops in its
+    /// schemas.
+    #[tokio::test]
+    async fn a_migration_drop_runs_only_where_the_table_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for d in ["ddl/table/app", "migrations/002/app"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\n  version: 2\nschemas:\n  - app\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/app/users.ddl"),
+            "set search_path to app;\ncreate table if not exists users (id integer primary key);\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("migrations/002/graph.json"),
+            r#"{"fromVersion":1,"toVersion":2,"added":[],"altered":[],"dropped":["app.legacy"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("migrations/002/app/legacy.drop.sql"),
+            "DROP TABLE app.legacy CASCADE;\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let ran_drop = |mock: &MockAdapter| {
+            mock.scripts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|s| s.contains("DROP TABLE app.legacy"))
+        };
+
+        let never_had_it = MockAdapter::new().with_meta("dev", 1);
+        design
+            .apply(&never_had_it, None, false, None, Progress::none())
+            .await
+            .unwrap();
+        assert!(!ran_drop(&never_had_it), "no table, no drop");
+
+        let has_it = MockAdapter::new()
+            .with_meta("dev", 1)
+            .with_known_entities(["app.legacy"]);
+        design
+            .apply(&has_it, None, false, None, Progress::none())
+            .await
+            .unwrap();
+        assert!(ran_drop(&has_it), "the table is there, so it is dropped");
+    }
+
     // ── A3: Behind by one version ─────────────────────────
 
     #[test]
@@ -2491,6 +3714,161 @@ import:
             })
             .collect();
         assert!(dropped.contains(&("config.legacy", 2)));
+    }
+
+    /// The refusal of a destructive reconcile listed every altered table under
+    /// "dropped columns, constraints, or indexes" — here `app.b`, which only
+    /// gains a column. It lists what is destructive, and what each drops.
+    #[test]
+    fn the_destructive_refusal_lists_only_what_is_destructive() {
+        use crate::snapshot::{Snapshot, TableSnapshot};
+        let column = |name: &str| crate::entity::ColumnDef {
+            name: name.to_string(),
+            data_type: "text".to_string(),
+            nullable: true,
+            default_value: None,
+            is_pk: false,
+            is_unique: false,
+            identity: None,
+            generated: None,
+            comment: None,
+            inline_fk: None,
+            collation: None,
+        };
+        let table = |name: &str, columns: &[&str]| TableSnapshot {
+            name: name.to_string(),
+            schema: "app".to_string(),
+            columns: columns.iter().map(|c| column(c)).collect(),
+            indexes: vec![],
+            table_constraints: vec![],
+        };
+        let snap = |tables: Vec<TableSnapshot>| Snapshot {
+            version: 0,
+            description: String::new(),
+            timestamp: String::new(),
+            tables,
+            enums: vec![],
+        };
+        let live = snap(vec![table("a", &["id", "gone"]), table("b", &["id"])]);
+        let desired = snap(vec![table("a", &["id"]), table("b", &["id", "added"])]);
+
+        let plan = crate::reconcile::plan_reconcile(&live, &desired);
+        let err = ensure_reconcile_not_destructive(&plan, false).unwrap_err().to_string();
+
+        assert!(err.contains("app.a") && err.contains("gone"), "{err}");
+        assert!(
+            !err.contains("app.b"),
+            "a table only gaining a column is not destructive: {err}"
+        );
+    }
+
+    /// A database versioned at v4 by a fresh install has no migration
+    /// recorded, but `reset` refused it as one with "applied migrations".
+    #[test]
+    fn reset_refuses_a_versioned_database_saying_it_is_versioned() {
+        let meta = crate::adapter::ProjectMeta {
+            project: "p".to_string(),
+            env: "dev".to_string(),
+            version: 4,
+            scope: None,
+            applied_at: None,
+        };
+        let marks = crate::design::DatabaseMarks::of_own("p", Some(meta));
+        let design = Design::from_config(&fixture_dir().join("design.yaml"), "dev").unwrap();
+        let err = design.check_reset_guard(&marks).unwrap_err().to_string();
+        assert!(err.contains("versioned at v4"), "{err}");
+        assert!(!err.contains("applied migrations"), "{err}");
+    }
+
+    /// `reset` refused any versioned database as "a released project's
+    /// database" — a database `init --from-db` captured is versioned with
+    /// `released` never set. It says "versioned at vN", and calls the project
+    /// released only when `project.released` says so.
+    #[tokio::test]
+    async fn reset_calls_a_versioned_database_released_only_when_the_project_is() {
+        for released in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let config = tmp.path().join("design.yaml");
+            std::fs::write(
+                &config,
+                format!("project:\n  name: test\n  version: 3\n  released: {released}\nschemas:\n  - app\n"),
+            )
+            .unwrap();
+            let design = Design::from_config_with_dir(&config, "dev", Some(tmp.path())).unwrap();
+            let mock = MockAdapter::new().with_meta("dev", 3);
+            let err = design
+                .reset(&mock, "postgres", false, false, false, None)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("versioned at v3"), "{err}");
+            assert_eq!(
+                err.contains("released"),
+                released,
+                "released: {released} — the refusal says so only when it is: {err}"
+            );
+        }
+    }
+
+    /// The position of the first step `matches` picks out, for asserting order.
+    fn step_at(plan: &ExecutionPlan, matches: impl Fn(&ExecutionStep) -> bool) -> usize {
+        plan.steps
+            .iter()
+            .position(matches)
+            .unwrap_or_else(|| panic!("no such step in {:#?}", plan.steps))
+    }
+
+    /// Migrations ran entity by entity: every pending migration of `t`, then
+    /// every one of `u`, in dependency order. So v3's change to `t` ran before
+    /// v2's change to `u`, and a v3 script reading what v2 adds failed on a
+    /// jump that a stepwise upgrade survived. Each version now runs whole, and
+    /// is recorded, before the next one starts.
+    #[test]
+    fn each_pending_version_runs_whole_before_the_next() {
+        let entities = vec![test_entity("s.t"), test_entity("s.u")];
+        let migrations = vec![
+            test_migration(1, 2, vec![], vec!["s.u"], vec![]),
+            test_migration(2, 3, vec![], vec!["s.t"], vec![]),
+        ];
+
+        let plan = build_execution_plan(&entities, 1, 3, &migrations, None);
+
+        let v2_u = step_at(
+            &plan,
+            |s| matches!(s, ExecutionStep::MigrateEntity { entity_name, migration_version: 2, .. } if entity_name == "s.u"),
+        );
+        let v2_recorded = step_at(&plan, |s| {
+            matches!(s, ExecutionStep::RecordMigration { version: 2, .. })
+        });
+        let v3_t = step_at(
+            &plan,
+            |s| matches!(s, ExecutionStep::MigrateEntity { entity_name, migration_version: 3, .. } if entity_name == "s.t"),
+        );
+        assert!(v2_u < v2_recorded && v2_recorded < v3_t, "{:#?}", plan.steps);
+    }
+
+    /// v2 drops a table and v5 adds it back. The create of v5 ran first — a
+    /// no-op over the old table — and v2's drop after it, so the run ended at
+    /// v5 with no table.
+    #[test]
+    fn a_later_versions_create_runs_after_an_earlier_versions_drop() {
+        let entities = vec![test_entity("app.counters")];
+        let migrations = vec![
+            test_migration(1, 2, vec![], vec![], vec!["app.counters"]),
+            test_migration(4, 5, vec!["app.counters"], vec![], vec![]),
+        ];
+
+        let plan = build_execution_plan(&entities, 1, 5, &migrations, None);
+
+        let dropped = step_at(
+            &plan,
+            |s| matches!(s, ExecutionStep::DropEntity { entity_name, migration_version: 2, .. } if entity_name == "app.counters"),
+        );
+        let created = step_at(
+            &plan,
+            |s| matches!(s, ExecutionStep::CreateEntity(n) if n == "app.counters"),
+        );
+        assert!(dropped < created, "{:#?}", plan.steps);
     }
 
     // ════════════════════════════════════════════════════════
@@ -2663,6 +4041,93 @@ import:
                 .any(|s| matches!(s, ExecutionStep::RecordMigration { version: 2, .. }))
         );
         assert!(plan.steps.iter().any(|s| matches!(s, ExecutionStep::SetVersion(2))));
+    }
+
+    /// A scope's working set names the schemas and tables it builds; roles and
+    /// extensions are never in it, because they are always on (see
+    /// `entity_in_scope`). The entities handed to the plan have already been
+    /// through that rule — and a fresh install applies every one of them — but
+    /// the migrate plan filtered them by the working set again, so under a scope
+    /// a new role was never created and a new extension never installed, and the
+    /// first table using the extension's type failed (`type "citext" does not
+    /// exist`).
+    #[test]
+    fn a_scoped_migration_applies_the_roles_and_extensions_the_scope_keeps() {
+        let role = Entity::new(EntityType::Role, "app_writer");
+        let extension = Entity::new(EntityType::Extension, "citext");
+        let entities = vec![role, extension, test_entity("app.emails")];
+        let migrations = vec![test_migration(1, 2, vec!["app.emails"], vec![], vec![])];
+        let working_set: std::collections::HashSet<String> = ["app", "app.emails"].map(String::from).into();
+
+        let plan = build_execution_plan(&entities, 1, 2, &migrations, Some(&working_set));
+
+        let applied: Vec<&str> = plan
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                ExecutionStep::ApplyEntity(n) | ExecutionStep::CreateEntity(n) => Some(n.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(applied.contains(&"app_writer"), "the role is created: {applied:?}");
+        assert!(applied.contains(&"citext"), "the extension is installed: {applied:?}");
+        let emails = applied.iter().position(|n| *n == "app.emails").unwrap();
+        let citext = applied.iter().position(|n| *n == "citext").unwrap();
+        assert!(citext < emails, "before the table that uses it: {applied:?}");
+    }
+
+    /// `applied` counts entities: "Entities whose DDL was applied", of which
+    /// `created` is a subset. A migration's new entity runs `CreateEntity` and
+    /// then `ApplyEntity`, and both counted it — a design of 3 entities reported
+    /// "4 applied", one more than it has.
+    #[tokio::test]
+    async fn a_migration_counts_each_entity_it_applies_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for d in ["ddl/table/app", "migrations/002"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\n  version: 2\nschemas:\n  - app\n",
+        )
+        .unwrap();
+        for t in ["users", "audit"] {
+            std::fs::write(
+                dir.join(format!("ddl/table/app/{t}.ddl")),
+                format!("set search_path to app;\ncreate table if not exists {t} (id integer primary key);\n"),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            dir.join("migrations/002/graph.json"),
+            r#"{"fromVersion":1,"toVersion":2,"added":["app.audit"],"altered":[],"dropped":[]}"#,
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let entities = design.entities_to_apply(None, None).unwrap().len() as u32;
+
+        let mock = MockAdapter::new().with_meta("dev", 1);
+        let mut summary = None;
+        design
+            .apply(
+                &mock,
+                None,
+                false,
+                None,
+                Progress {
+                    on_start: |_: &str| {},
+                    on_done: |_: &str, _: Option<&str>| {},
+                    on_complete: |s| summary = Some(s),
+                },
+            )
+            .await
+            .unwrap();
+
+        let s = summary.expect("a successful apply reports a summary");
+        assert_eq!(s.strategy, ApplyStrategy::Migrate);
+        assert_eq!(s.applied, entities, "each of the {entities} entities counted once");
+        assert_eq!(s.created, 1, "the one the migration adds");
     }
 
     // ── data.sql TODO blocking ────────────────────────────
@@ -2998,6 +4463,92 @@ import:
             "policy file must be applied by the export"
         );
         assert!(summary.policies.failed.is_empty());
+    }
+
+    /// `Design::deploy` applies the schema grants `dbd apply` does. They lived
+    /// only in the CLI's apply handler, so `dbd deploy` — and every embedder —
+    /// got a schema with no grants and no warning.
+    #[tokio::test]
+    async fn deploy_applies_schema_grants_like_apply() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("design.yaml"),
+            "project:\n  name: test\nschemas:\n  - app:\n      grants:\n        app_user: [usage, select]\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&tmp.path().join("design.yaml"), "dev", Some(tmp.path())).unwrap();
+        let mock = MockAdapter::new().with_schema_grants();
+        design.deploy(&mock, false, None, |_| {}).await.unwrap();
+
+        let scripts = mock.scripts.lock().unwrap().join("\n");
+        assert!(
+            scripts.contains("GRANT USAGE ON SCHEMA \"app\" TO \"app_user\""),
+            "deploy must apply the schema grants: {scripts}"
+        );
+        assert!(scripts.contains("GRANT SELECT ON ALL TABLES IN SCHEMA \"app\" TO \"app_user\""));
+    }
+
+    /// Grants follow the scope: a scoped deploy grants only on the schemas it
+    /// builds. Granting on all of them failed on a schema the scope never
+    /// created — after the entities were applied and the database pinned.
+    #[tokio::test]
+    async fn a_scoped_deploy_grants_only_on_the_schemas_it_builds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for d in ["ddl/table/core", "ddl/table/staging"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: test\nschemas:\n  - core:\n      grants:\n        reader: [usage]\n\
+             \x20 - staging:\n      grants:\n        loader: [usage]\n\
+             scopes:\n  staging_only:\n    includes: [staging]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/core/t.ddl"),
+            "set search_path to core;\ncreate table if not exists t (id integer primary key);\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/staging/raw.ddl"),
+            "set search_path to staging;\ncreate table if not exists raw (line text);\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let scope = design.resolve_scope(Some("staging_only"), None).unwrap();
+        let mock = MockAdapter::new().with_schema_grants();
+        design.deploy(&mock, false, Some(&scope), |_| {}).await.unwrap();
+
+        let scripts = mock.scripts.lock().unwrap().join("\n");
+        assert!(
+            scripts.contains("ON SCHEMA \"staging\""),
+            "the scope's schema is granted: {scripts}"
+        );
+        assert!(
+            !scripts.contains("\"core\""),
+            "a schema the scope did not build is not: {scripts}"
+        );
+    }
+
+    /// A target with no grant model is skipped, not fed SQL it cannot run.
+    #[tokio::test]
+    async fn deploy_skips_grants_on_a_target_without_a_grant_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("design.yaml"),
+            "project:\n  name: test\nschemas:\n  - app:\n      grants:\n        app_user: [usage]\n",
+        )
+        .unwrap();
+        let design = Design::from_config_with_dir(&tmp.path().join("design.yaml"), "dev", Some(tmp.path())).unwrap();
+        let mock = MockAdapter::new();
+        design.deploy(&mock, false, None, |_| {}).await.unwrap();
+
+        let scripts = mock.scripts.lock().unwrap().join("\n");
+        assert!(
+            !scripts.contains("GRANT"),
+            "no grant SQL for a target without grants: {scripts}"
+        );
     }
 
     /// A deploy with nothing to import must still report a summary — the zero
@@ -3668,7 +5219,76 @@ import:
         assert_eq!(report.gaps[0].required_by, "config.lookup_values");
     }
 
+    /// An import loads its file into a staging table, then a procedure moves the
+    /// rows into its targets — so under a scope it runs only where both exist.
+    /// The rule checked the targets alone, so a scope without the (declared)
+    /// staging table kept the import and failed on a table never created; and
+    /// a skip blamed the staging table even when a target was the one outside.
     #[test]
+    fn a_scoped_import_needs_its_staging_table_and_its_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for d in [
+            "ddl/table/config",
+            "ddl/table/staging",
+            "ddl/procedure/staging",
+            "import/staging",
+        ] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\nschemas:\n  - config\n  - staging\nimport:\n  staging: [staging]\n\
+             scopes:\n  targets_only:\n    includes: [config]\n  staging_only:\n    includes: [staging]\n\
+             \x20 both:\n    includes: [config, staging]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/config/lookups.ddl"),
+            "set search_path to config;\ncreate table if not exists lookups (name text primary key);\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/staging/lookups.ddl"),
+            "set search_path to staging;\ncreate table if not exists lookups (name text);\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/procedure/staging/import_lookups.ddl"),
+            "set search_path to staging;\ncreate or replace procedure import_lookups() language plpgsql as $$\n\
+             begin insert into config.lookups(name) select name from staging.lookups; end; $$;\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("import/staging/lookups.csv"), "name\nalpha\n").unwrap();
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let plan = |scope: &str| {
+            // `report`, the default: under `include` the procedure's write to
+            // config.lookups would legitimately pull the target in.
+            let s = design.resolve_scope(Some(scope), None).unwrap();
+            design.scoped_import_plan(None, Some(&s)).unwrap()
+        };
+
+        let (kept, skips) = plan("targets_only");
+        assert!(kept.is_empty(), "no staging table, no import");
+        assert!(
+            skips.iter().any(|w| w.contains("staging.lookups is outside")),
+            "{skips:?}"
+        );
+
+        let (kept, skips) = plan("staging_only");
+        assert!(kept.is_empty(), "no target, no import");
+        assert!(
+            skips.iter().any(|w| w.contains("config.lookups is outside")),
+            "{skips:?}"
+        );
+
+        let (kept, skips) = plan("both");
+        assert_eq!(kept.len(), 1, "{skips:?}");
+        assert!(skips.is_empty(), "{skips:?}");
+    }
+
+    #[test]
+    #[allow(deprecated)]
     fn import_entry_in_scope_predicate() {
         use std::collections::HashSet;
         let mut entry = ImportPlanEntry {

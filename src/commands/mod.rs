@@ -58,15 +58,30 @@ fn command_honors_scope(command: &Commands) -> bool {
     }
 }
 
-/// Say so when `--scope` was passed to a command that ignores it.
-fn warn_if_scope_ignored(command: &Commands, scope: Option<&str>) {
-    let Some(name) = scope else { return };
+/// Say so when `--scope` or `--deps` was passed to a command that ignores it.
+///
+/// `--deps` only means anything to a scope — it decides whether a scope's
+/// dependency gaps are errors or are pulled in — so a command that ignores the
+/// scope ignores it too, and accepting it in silence reads the same way an
+/// ignored `--scope` did.
+fn warn_if_scope_ignored(command: &Commands, scope: Option<&str>, deps: Option<dbd_core::config::DepsPolicy>) {
     if command_honors_scope(command) {
         return;
     }
-    output::warn(&format!(
-        "--scope {name} ignored: this command operates on the whole design, not a scope"
-    ));
+    if let Some(name) = scope {
+        output::warn(&format!(
+            "--scope {name} ignored: this command operates on the whole design, not a scope"
+        ));
+    }
+    if let Some(policy) = deps {
+        let policy = match policy {
+            dbd_core::config::DepsPolicy::Report => "report",
+            dbd_core::config::DepsPolicy::Include => "include",
+        };
+        output::warn(&format!(
+            "--deps {policy} ignored: this command operates on the whole design, not a scope"
+        ));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -81,7 +96,16 @@ pub async fn run(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    warn_if_scope_ignored(command, scope);
+    warn_if_scope_ignored(command, scope, deps);
+    // `deploy` downloads a GitHub source; nothing else does. Several commands
+    // write into the project (snapshot, release, format, inspect --fix), and a
+    // downloaded tree is a cache — so the rest take a local path only.
+    if !matches!(command, Commands::Deploy { .. }) && dbd_core::github::is_github_source(source) {
+        anyhow::bail!(
+            "`{source}` looks like a GitHub source, and only `dbd deploy` fetches one. \
+             For other commands, clone the repository and pass its local path to --source."
+        );
+    }
     match command {
         Commands::Inspect { name, fix, from_db } => {
             schema::cmd_inspect(
@@ -159,12 +183,14 @@ pub async fn run(
                     config,
                     env,
                     project_dir,
+                    database_url,
                     name.as_deref(),
                     file.as_deref(),
                     scope,
                     deps,
                     verbosity,
                 )
+                .await
             } else {
                 data::cmd_import(
                     config,
@@ -202,7 +228,7 @@ pub async fn run(
                 env,
                 project_dir,
                 database_url,
-                target,
+                target.as_deref(),
                 opts,
                 scope,
                 deps,
@@ -221,7 +247,7 @@ pub async fn run(
 
         Commands::Migrate { status } => {
             if *status {
-                migration::cmd_migrate_status(config, database_url, project_dir, verbosity).await
+                migration::cmd_migrate_status(config, env, database_url, project_dir, verbosity).await
             } else {
                 output::info(
                     verbosity,
@@ -237,9 +263,12 @@ pub async fn run(
             clear_cache,
             allow_scope_change,
         } => {
+            // `config` is `--source` joined with `-c`; deploy resolves the source
+            // itself (it may be a GitHub ref), so it takes `-c` back off.
+            let config_name = config.strip_prefix(source).unwrap_or(config);
             project::cmd_deploy(
                 source,
-                config,
+                config_name,
                 env,
                 database_url,
                 *dry_run,
@@ -304,7 +333,10 @@ pub async fn run(
             dry_run,
         } => {
             if let Some(dbml_path) = from_dbml {
-                if target != "postgres" {
+                // DBML is PostgreSQL-shaped and names no platform, so both
+                // PostgreSQL targets are the caller's to choose. This used to
+                // accept `postgres` alone while saying Supabase was supported.
+                if !matches!(target.as_str(), "postgres" | "supabase") {
                     anyhow::bail!(
                         "--target {target} is not supported with --from-dbml; \
                          reverse-engineering supports Postgres/Supabase only"
@@ -314,6 +346,8 @@ pub async fn run(
                     only: schemas.clone(),
                     exclude: exclude_schemas.clone(),
                     all: *all_schemas,
+                    // Decided from the source by the command (see `SchemaSelect::supabase`).
+                    supabase: false,
                 };
                 return reverse::cmd_init_from_dbml(
                     project_dir,
@@ -321,20 +355,24 @@ pub async fn run(
                     env,
                     config,
                     name.as_deref(),
+                    target,
                     *version,
                     sel,
                     *dry_run,
                 );
             }
             if let Some(s) = from_db {
-                // The reverse dialect is derived from the connection URL scheme
-                // (postgres:// → postgres, sqlite://`/`file: → sqlite), so the
-                // `--target` flag does not gate `--from-db`.
+                // The reverse dialect is derived from the database itself — the
+                // URL scheme (sqlite://`/`file: → sqlite), then Supabase's own
+                // schemas (→ supabase, else postgres) — so the `--target` flag
+                // does not gate `--from-db`.
                 let _ = target;
                 let sel = dbd_core::reverse::SchemaSelect {
                     only: schemas.clone(),
                     exclude: exclude_schemas.clone(),
                     all: *all_schemas,
+                    // Decided from the source by the command (see `SchemaSelect::supabase`).
+                    supabase: false,
                 };
                 // Fix 1: thread database_url so the global -d flag is honoured.
                 // Precedence: explicit --from-db URL > global -d/$DATABASE_URL.
@@ -373,6 +411,8 @@ pub async fn run(
                 only: schemas.clone(),
                 exclude: exclude_schemas.clone(),
                 all: *all_schemas,
+                // Decided from the source by the command (see `SchemaSelect::supabase`).
+                supabase: false,
             };
             if let Some(dbml_path) = from_dbml {
                 // DBML is always foreign — no connection, no version-safety gate.
@@ -446,9 +486,26 @@ pub async fn run(
 
 pub(super) fn format_apply_summary(s: &ApplyComplete) -> String {
     let entities = match s.strategy {
+        // Version 0 is no version. A project without `project.version` plans
+        // every apply as `Fresh` (its database records version 0), so this
+        // said "Fresh install at v0" on every run — naming a version that does
+        // not exist, and a fresh install that usually was not one.
+        ApplyStrategy::Fresh if s.to_version == 0 => format!(
+            "{} entities applied (no project.version — the database is not versioned).",
+            s.applied
+        ),
+        // The database had no version but was not empty — built before the
+        // project had one, typically. Its objects were applied over in place.
+        ApplyStrategy::Fresh if s.previously_built => format!(
+            "v{} recorded on a database that was already built but had no version — {} entities applied.",
+            s.to_version, s.applied
+        ),
         ApplyStrategy::Fresh => {
             format!("Fresh install at v{} — {} entities applied.", s.to_version, s.applied)
         }
+        // A batch adapter reports version 0 whatever the project's version, so
+        // neither "up to date" nor a version can be claimed from it.
+        ApplyStrategy::Current if s.from_version == 0 => format!("{} entities applied.", s.applied),
         ApplyStrategy::Current => {
             format!(
                 "Already up to date (v{}) — {} entities applied.",
@@ -496,7 +553,12 @@ pub(super) fn format_deploy_summary(s: &dbd_core::design::DeployComplete) -> Str
             n => format!(", {n} skipped (out of scope)"),
         }
     );
-    format!("{apply_line} {import_line} {policy_line}")
+    let grants = match s.grants {
+        dbd_core::design::GrantsOutcome::Applied => " Grants applied.",
+        dbd_core::design::GrantsOutcome::Unsupported => " Grants skipped (target has no grant model).",
+        dbd_core::design::GrantsOutcome::None => "",
+    };
+    format!("{apply_line}{grants} {import_line} {policy_line}")
 }
 
 // ── Database adapter ──────────────────────────────────────────────────────────
@@ -507,15 +569,38 @@ pub(super) async fn get_adapter(
 ) -> Result<Box<dyn dbd_core::DatabaseAdapter>> {
     let design_config = dbd_core::config::read(config).context("Failed to read config")?;
 
-    let url = match database_url {
+    // An exported-but-empty `$DATABASE_URL` reaches here as `-d ""` (clap reads
+    // the variable for `-d`); it names no database, so the target's URL is
+    // asked instead, as `configured_database_url` does.
+    let url = match database_url.filter(|u| !u.is_empty()) {
         Some(u) => u.to_string(),
         None => {
             let target = design_config.get_target(None).context("No target configured")?;
-            target
+            let configured = target
                 .url
                 .clone()
-                .map(|u| resolve_env_vars(&u))
-                .context("No database URL — set DATABASE_URL or configure target.url in design.yaml")?
+                .context("No database URL — set DATABASE_URL or configure target.url in design.yaml")?;
+            let url = resolve_env_vars(&configured);
+            // A `$VAR` the environment does not have comes back as itself, and
+            // the driver then reported `relative URL without a base` — true of
+            // the string `$DATABASE_URL`, and no help to someone who forgot to
+            // export it. Say which variable, and how to supply it.
+            if let Some(var) = configured.strip_prefix('$') {
+                let state = if url == configured {
+                    Some("not set")
+                } else if url.is_empty() {
+                    Some("empty")
+                } else {
+                    None
+                };
+                if let Some(state) = state {
+                    anyhow::bail!(
+                        "target.url is ${var}, but {var} is {state} — export {var}=postgres://user:password@host:5432/database, \
+                         or pass the URL with -d <url>"
+                    );
+                }
+            }
+            url
         }
     };
 
@@ -523,6 +608,198 @@ pub(super) async fn get_adapter(
     dbd_core::connect(&url, project)
         .await
         .context("Failed to connect to database")
+}
+
+/// The database a connecting command would reach, or `None` when nothing
+/// names one: `-d`/`DATABASE_URL`, else the default target's `url` with a
+/// `$VAR` resolved from the environment — the URL [`get_adapter`] connects to.
+/// An unset `$VAR`, or an empty value, names nothing.
+///
+/// For the commands that work offline but must ask a database that exists:
+/// `reset --dry-run` previews without one, and checks its guards against one.
+pub(super) fn configured_database_url(config: &Path, database_url: Option<&str>) -> Result<Option<String>> {
+    let usable = |u: &str| !u.is_empty() && !u.starts_with('$');
+    if let Some(u) = database_url.filter(|u| usable(u)) {
+        return Ok(Some(u.to_string()));
+    }
+    let design_config = dbd_core::config::read(config).context("Failed to read config")?;
+    Ok(design_config
+        .get_target(None)
+        .and_then(|t| t.url.as_deref())
+        .map(resolve_env_vars)
+        .filter(|u| usable(u)))
+}
+
+/// The database a dry run asks, when one is configured — see
+/// [`configured_database_url`] — or `None`, and the dry run stays offline.
+///
+/// A dry run writes nothing, but a preview of a run the database would refuse
+/// is a false promise: with a database to ask, every dry run checks the
+/// guards its real run checks, and `apply`/`deploy` read the version their
+/// pending migrations start from. Named for `reset --dry-run`, which did this
+/// first; a configured database that cannot be reached is an error, as it is
+/// for the run. It opens only a database that exists: a SQLite file that is
+/// not there yet is not created — the preview made one — and reads as none.
+pub(super) async fn dry_run_adapter(
+    config: &Path,
+    database_url: Option<&str>,
+) -> Result<Option<Box<dyn dbd_core::DatabaseAdapter>>> {
+    let Some(url) = configured_database_url(config, database_url)? else {
+        return Ok(None);
+    };
+    let project = dbd_core::config::read(config)
+        .context("Failed to read config")?
+        .project
+        .name;
+    dbd_core::connect_existing(&url, &project)
+        .await
+        .context("Failed to connect to database")
+}
+
+/// The scope guard for a command that never re-pins the database — `policies`,
+/// `refresh`, `import` and `export` — so it has no `--allow-scope-change` to
+/// offer: the way through is the pinned scope, or re-pointing the database with
+/// `apply` first. `consequence` says what running another scope here would do.
+/// The decision is [`dbd_core::Design::check_scope_guard`]'s — the pin of this
+/// project's record, or of the one a renamed `project.name` left; only the
+/// way out differs.
+pub(super) async fn check_pinned_scope(
+    adapter: &dyn dbd_core::DatabaseAdapter,
+    design: &dbd_core::Design,
+    resolved: &dbd_core::ResolvedScope,
+    consequence: &str,
+) -> Result<()> {
+    let marks = design.database_marks(adapter).await?;
+    if let Some((pinned, by)) = dbd_core::Design::conflicting_pin(&marks, &resolved.name) {
+        anyhow::bail!(
+            "scope guard: this database is pinned to scope '{pinned}'{by}, but you requested '{}'.\n\
+             {}{consequence}\n\
+             → re-run with --scope {pinned}, or re-point the database with `dbd apply --scope {} \
+             --allow-scope-change` first.",
+            resolved.name,
+            marks.rename_note(),
+            resolved.name
+        );
+    }
+    Ok(())
+}
+
+/// The pin of a database pinned to another scope than `resolved` — the
+/// scope, and `" by project 'x'"` when the pin is a renamed project's old
+/// record (see [`dbd_core::design::DatabaseMarks`]) — or `None` when the pin
+/// is the run's own, or there is none.
+///
+/// For the read-only commands, `diff` and `migrate --status`: they write
+/// nothing, so a pin is noted, never refused. They said nothing of it, and an
+/// unscoped diff of a scoped database listed what the scope does not build
+/// as missing with no word of why.
+pub(super) async fn other_scope_pin(
+    adapter: &dyn dbd_core::DatabaseAdapter,
+    design: &dbd_core::Design,
+    resolved: &dbd_core::ResolvedScope,
+) -> Result<Option<(String, String)>> {
+    let marks = design.database_marks(adapter).await?;
+    Ok(dbd_core::Design::conflicting_pin(&marks, &resolved.name).map(|(pinned, by)| (pinned.to_string(), by)))
+}
+
+/// Say so when a run that records the environment promoted the database from
+/// dev to prod. `before` are the database's marks read before the run, `env`
+/// the run's.
+///
+/// `-e` defaults to prod, so a run without it promotes a dev database. That is
+/// allowed — it only tightens what `reset` allows — but it was silent, and
+/// every later `-e dev` run is refused with no word of what changed.
+pub(super) fn note_promotion(before: &dbd_core::design::DatabaseMarks, env: &str) {
+    let is = |value: &str, wanted: &str| dbd_core::config::normalize_env(Some(value)).is_ok_and(|e| e == wanted);
+    if before.own.as_ref().is_some_and(|own| is(&own.env, "dev")) && is(env, "prod") {
+        output::warn(
+            "This database was marked dev and is now marked prod: this run is -e prod, the default when -e is \
+             not given. dbd never re-marks a prod database dev, so later -e dev runs are refused — to keep it \
+             dev, rebuild it: `dbd reset --force`, then run with -e dev.",
+        );
+    }
+}
+
+/// Print the pending migrations a run would execute: each step under its
+/// version, then the statements it runs, a destructive one marked `⚠`.
+pub(super) fn print_migration_preview(verbosity: Verbosity, preview: &dbd_core::design::MigrationPreview) {
+    use dbd_core::design::MigrationAction;
+    // Versions spelled as the run's own summary spells them (`Migrated v1 → v3`).
+    // A scoped run whose pending migrations touch nothing in its scope still
+    // records them: the preview said "No pending migration to run", and the
+    // run then said "Migrated v4 → v7".
+    if preview.steps.is_empty() && !preview.recorded.is_empty() {
+        let versions: Vec<String> = preview.recorded.iter().map(|v| format!("v{v}")).collect();
+        output::info(
+            verbosity,
+            &format!(
+                "Pending migrations, v{} → v{} ({}): nothing in them runs in this scope; the run records \
+                 them and moves the database to v{}.",
+                preview.from_version,
+                preview.to_version,
+                versions.join(", "),
+                preview.to_version
+            ),
+        );
+        return;
+    }
+    if preview.steps.is_empty() {
+        output::info(
+            verbosity,
+            &format!(
+                "No pending migration to run (database at {}, design at v{}).",
+                match preview.from_version {
+                    0 => "no recorded version".to_string(),
+                    v => format!("v{v}"),
+                },
+                preview.to_version
+            ),
+        );
+        return;
+    }
+    output::info(
+        verbosity,
+        &format!(
+            "Pending migrations, v{} → v{} — the run executes these first:",
+            preview.from_version, preview.to_version
+        ),
+    );
+    for step in &preview.steps {
+        let action = match step.action {
+            MigrationAction::Create => "create",
+            MigrationAction::EnumValues => "add values to",
+            MigrationAction::Migrate => "migrate",
+            MigrationAction::Data => "migrate data of",
+            MigrationAction::Drop => "drop",
+        };
+        let note = match (step.action, step.runs) {
+            (MigrationAction::Create, _) => " (from its DDL)",
+            (MigrationAction::EnumValues, _) => " (committed before the rest of the version)",
+            (MigrationAction::Drop, false) => " — not in this database, so skipped",
+            _ => "",
+        };
+        output::info(
+            verbosity,
+            &format!("  v{} {action} {}{note}", step.version, step.entity),
+        );
+        for statement in &step.statements {
+            let mark = if statement.drops { "⚠ " } else { "" };
+            output::info(verbosity, &format!("      {mark}{}", statement.text));
+        }
+    }
+}
+
+/// For a dry run with no database: pending migrations start from the version
+/// the database records, so they cannot be listed. Said only for a project that
+/// has migrations at all.
+pub(super) fn note_unlisted_migrations(verbosity: Verbosity, project_dir: &Path) {
+    if !dbd_core::snapshot::pending_migrations(0, project_dir).is_empty() {
+        output::info(
+            verbosity,
+            "No database to read the recorded version from, so pending migrations are not listed \
+             — pass -d <url>, or set target.url, to list them.",
+        );
+    }
 }
 
 fn resolve_env_vars(s: &str) -> String {
@@ -572,6 +849,58 @@ pub(super) fn safe_read(root: &Path, file: &Path) -> Result<String> {
     let canon = safe_canonicalize_within(root, file)?;
     std::fs::read_to_string(&canon) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         .with_context(|| format!("Failed to read {}", file.display()))
+}
+
+/// Apply the design's grants under `scope` and say what happened — the step
+/// `dbd apply` and `dbd reconcile` both end with, so the two grant and report
+/// alike (`Design::deploy` runs the same `apply_grants`).
+pub(super) async fn apply_and_report_grants(
+    design: &dbd_core::Design,
+    adapter: &dyn dbd_core::DatabaseAdapter,
+    scope: &dbd_core::ResolvedScope,
+    verbosity: Verbosity,
+) -> Result<()> {
+    match design
+        .apply_grants(adapter, Some(scope))
+        .await
+        .context("Failed to apply grants")?
+    {
+        dbd_core::design::GrantsOutcome::Applied => {
+            output::info(verbosity, "Applied grants.");
+            output::detail(verbosity, "  NOTIFY pgrst, 'reload config'");
+        }
+        dbd_core::design::GrantsOutcome::Unsupported => {
+            output::info(verbosity, "Skipping schema grants (target has no grant model).");
+        }
+        dbd_core::design::GrantsOutcome::None => {}
+    }
+    Ok(())
+}
+
+/// Format one DDL file — rewriting it when `write` — in the encoding it was
+/// saved in; whether it needed formatting. Shared by `format` and
+/// `inspect --fix`, so the two cannot disagree about a file.
+///
+/// Read by `source_text` exactly as the project load reads it (UTF-16 behind a
+/// BOM included), so a file the load reads is never one this cannot.
+pub(super) fn format_in_place(
+    root: &Path,
+    file: &Path,
+    config: &dbd_core::config::FormatConfig,
+    write: bool,
+) -> Result<bool> {
+    let canon = safe_canonicalize_within(root, file)?;
+    let (content, encoding) = dbd_core::source_text::read_with_encoding(&canon)
+        .with_context(|| format!("Failed to read {}", file.display()))?;
+    let formatted = dbd_core::formatter::format_ddl(&content, config);
+    if content == formatted {
+        return Ok(false);
+    }
+    if write {
+        std::fs::write(&canon, encoding.encode(&formatted)) // nosemgrep: path validated by safe_canonicalize_within
+            .with_context(|| format!("Failed to write {}", file.display()))?;
+    }
+    Ok(true)
 }
 
 pub(super) fn safe_write(root: &Path, file: &Path, contents: &str) -> Result<()> {
@@ -636,6 +965,23 @@ pub(crate) mod testutil {
     pub(crate) fn copy_fixture_project() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
         copy_dir(&fixtures(), tmp.path()).unwrap();
+        tmp
+    }
+
+    /// [`copy_fixture_project`] with the fixture's `url: $DATABASE_URL`
+    /// removed, for a dry run that must find no database. A dry run asks the
+    /// database when one is configured — for its scope pin and its version —
+    /// and a `$DATABASE_URL` set in the shell running the tests would otherwise
+    /// give it one.
+    pub(crate) fn offline_fixture_project() -> tempfile::TempDir {
+        let tmp = copy_fixture_project();
+        let config = tmp.path().join("design.yaml");
+        let yaml = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            yaml.contains("    url: $DATABASE_URL\n"),
+            "the fixture names its URL so"
+        );
+        std::fs::write(&config, yaml.replace("    url: $DATABASE_URL\n", "")).unwrap();
         tmp
     }
 }
@@ -715,6 +1061,27 @@ mod tests {
         assert!(migrate.contains("0 dropped"), "expected dropped count in: {migrate}");
     }
 
+    /// A project with no `project.version` is not at "v0": it has no version.
+    /// Every apply of one is a `Fresh` plan (its database records version 0),
+    /// so every apply said "Fresh install at v0" — a version that does not exist.
+    #[test]
+    fn an_unversioned_apply_does_not_claim_a_version() {
+        let s = ApplyComplete {
+            strategy: ApplyStrategy::Fresh,
+            from_version: 0,
+            to_version: 0,
+            applied: 3,
+            ..Default::default()
+        };
+        let out = format_apply_summary(&s);
+        assert!(!out.contains("v0"), "there is no v0: {out}");
+        assert!(out.contains("3 entities"), "the count is still reported: {out}");
+        assert!(
+            out.contains("project.version"),
+            "and the reason there is no version: {out}"
+        );
+    }
+
     #[test]
     fn format_import_summary_reports_counts() {
         let s = ImportComplete {
@@ -741,6 +1108,7 @@ mod tests {
     fn format_deploy_summary_combines_apply_import_and_policies() {
         let s = dbd_core::design::DeployComplete {
             apply: apply_complete(ApplyStrategy::Fresh),
+            grants: dbd_core::design::GrantsOutcome::Applied,
             import: ImportComplete {
                 tables: 2,
                 procedures: 1,
@@ -754,6 +1122,7 @@ mod tests {
         };
         let out = format_deploy_summary(&s);
         assert!(out.contains("Fresh") && out.contains("table"));
+        assert!(out.contains("Grants applied"), "grants phase must be reported: {out}");
         assert!(
             out.contains("1 policy file(s) applied"),
             "policy phase must be reported: {out}"
@@ -847,6 +1216,34 @@ mod tests {
     }
 
     /// The `run` dispatcher routes a non-DB command (Doctor) to its handler.
+    /// Only `deploy` downloads a GitHub source. Any other command given one
+    /// says so, instead of failing to read `owner/repo/design.yaml` from disk.
+    #[tokio::test]
+    async fn a_github_source_outside_deploy_is_refused_with_the_way_out() {
+        use crate::cli::Commands;
+        let source = "sensei-hq/no-such-local-dir/database";
+        let err = run(
+            &Commands::Inspect {
+                name: None,
+                fix: false,
+                from_db: false,
+            },
+            &Path::new(source).join("design.yaml"),
+            "dev",
+            None,
+            Path::new(source),
+            source,
+            None,
+            None,
+            Verbosity::Normal,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("dbd deploy"), "names the command that can: {err}");
+        assert!(err.contains("clone"), "and the way out: {err}");
+    }
+
     #[tokio::test]
     async fn run_dispatches_non_db_command() {
         use crate::cli::Commands;
@@ -973,7 +1370,7 @@ mod tests {
     #[tokio::test]
     async fn run_dispatches_import_dry_run_without_a_database() {
         use crate::cli::Commands;
-        let tmp = testutil::copy_fixture_project();
+        let tmp = testutil::offline_fixture_project();
         run_in_copy(
             &Commands::Import {
                 name: None,
@@ -986,14 +1383,23 @@ mod tests {
         .unwrap();
     }
 
-    /// `dbd reset --dry-run` likewise returns before any adapter is built.
+    /// `dbd reset --dry-run` likewise needs no database when none is configured.
+    /// The copy's `url: $DATABASE_URL` is removed so a variable set in the shell
+    /// running the tests cannot give it one.
     #[tokio::test]
     async fn run_dispatches_reset_dry_run_without_a_database() {
         use crate::cli::Commands;
         let tmp = testutil::copy_fixture_project();
+        let config = tmp.path().join("design.yaml");
+        let yaml = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            yaml.contains("    url: $DATABASE_URL\n"),
+            "the fixture names its URL so"
+        );
+        std::fs::write(&config, yaml.replace("    url: $DATABASE_URL\n", "")).unwrap();
         run_in_copy(
             &Commands::Reset {
-                target: "dev".to_string(),
+                target: None,
                 dry_run: true,
                 force: false,
                 schemas: false,
@@ -1172,6 +1578,51 @@ mod tests {
         assert!(
             !dir.join("design.yaml").exists(),
             "--dry-run must not write design.yaml"
+        );
+    }
+
+    /// The dispatcher's own refusal said reverse-engineering "supports
+    /// Postgres/Supabase", then refused `--target supabase`. DBML carries no
+    /// platform, so the target is the caller's to give, and it reaches
+    /// `design.yaml`.
+    #[tokio::test]
+    async fn init_from_dbml_accepts_a_supabase_target() {
+        use crate::cli::Commands;
+        let src = testutil::copy_fixture_project();
+        let dbml = src.path().join("schema.dbml");
+        run_in_copy(&Commands::Dbml { file: dbml.clone() }, &src).await.unwrap();
+
+        let dest = tempfile::tempdir().unwrap();
+        let dir = dest.path();
+        run(
+            &Commands::Init {
+                name: Some("from_dbml".to_string()),
+                target: "supabase".to_string(),
+                from_db: None,
+                from_dbml: Some(dbml),
+                version: 1,
+                schemas: Vec::new(),
+                exclude_schemas: Vec::new(),
+                all_schemas: false,
+                roles: false,
+                dry_run: false,
+            },
+            &dir.join("design.yaml"),
+            "dev",
+            None,
+            dir,
+            dir.to_str().unwrap(),
+            None,
+            None,
+            Verbosity::Normal,
+        )
+        .await
+        .expect("--target supabase is a target --from-dbml supports");
+
+        let written = std::fs::read_to_string(dir.join("design.yaml")).unwrap();
+        assert!(
+            written.contains("  supabase:\n"),
+            "the target reaches design.yaml: {written}"
         );
     }
 

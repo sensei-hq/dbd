@@ -4,6 +4,9 @@ import { fileURLToPath } from 'node:url';
 
 export default defineConfig({
   plugins: [svelte()],
+  // Tests read the repository's own docs (`docs/guide/*.md`, `CHANGELOG.md`) to
+  // check the site against them, so the repo root has to be importable.
+  server: { fs: { allow: ['..'] } },
   test: {
     environment: 'jsdom',
     include: ['src/lib/**/*.test.ts'],

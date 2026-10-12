@@ -5,8 +5,11 @@
 use crate::entity::Entity;
 
 /// Quote a SQL identifier.
+/// A quoted identifier, its quotes doubled — through the one quoting rule.
+/// Wrapped without doubling, a name holding `"` ended early and the file
+/// did not parse.
 fn q(ident: &str) -> String {
-    format!("\"{ident}\"")
+    crate::sql_quote::ident(ident)
 }
 
 /// Bare (unqualified) name from a possibly-qualified entity name (`schema.name` → `name`).
@@ -15,14 +18,26 @@ fn bare(name: &str) -> &str {
 }
 
 /// Whether a column type is one of the Postgres `serial` pseudo-types.
-fn is_serial_type(ty: &str) -> bool {
+pub(crate) fn is_serial_type(ty: &str) -> bool {
     matches!(
         ty.trim().to_ascii_lowercase().as_str(),
         "serial" | "bigserial" | "smallserial" | "serial2" | "serial4" | "serial8"
     )
 }
 
-/// `CREATE TYPE "schema"."name" AS ENUM ('a', 'b');`
+/// `CREATE TYPE "schema"."name" AS ENUM ('a', 'b');` inside Postgres's guard
+/// for a conditional `CREATE TYPE`, then its `COMMENT ON TYPE` when it has one
+/// — the comment the parser reads back from the file.
+///
+/// # Re-runnable
+///
+/// Postgres has no `CREATE TYPE … IF NOT EXISTS`; the `DO … EXCEPTION WHEN
+/// duplicate_object` block is its idiom for one, and the enum parser reads the
+/// statement inside it. Bare, the file failed the second time it ran — `psql
+/// -f` over a reversed project applied back to the database it came from, for
+/// one — while every other file reverse writes runs twice (see
+/// [`emit_table`]). Like `CREATE TABLE IF NOT EXISTS`, the guard leaves an
+/// existing type as it is. `COMMENT ON` runs twice on its own.
 pub fn emit_enum(entity: &Entity) -> String {
     let schema = entity.schema.as_deref().unwrap_or("public");
     let name = bare(&entity.name);
@@ -32,10 +47,25 @@ pub fn emit_enum(entity: &Entity) -> String {
         .map(|v| format!("'{}'", v.name.replace('\'', "''")))
         .collect::<Vec<_>>()
         .join(", ");
-    format!("CREATE TYPE {}.{} AS ENUM ({});", q(schema), q(name), values)
+    let qname = format!("{}.{}", q(schema), q(name));
+    let create = format!("CREATE TYPE {qname} AS ENUM ({values});");
+    let tag = dollar_tag(&create);
+    let mut out = format!("DO {tag} BEGIN\n  {create}\nEXCEPTION WHEN duplicate_object THEN NULL;\nEND {tag};");
+    if let Some(comment) = &entity.comment {
+        out.push_str(&format!("\nCOMMENT ON TYPE {qname} IS '{}';", esc(comment)));
+    }
+    out
 }
 
-/// `CREATE TABLE "schema"."name" ( … );` + `CREATE INDEX …;` + `COMMENT ON …;`
+/// `CREATE TABLE IF NOT EXISTS "schema"."name" ( … );` + `CREATE INDEX IF NOT
+/// EXISTS …;` + `COMMENT ON …;`
+///
+/// # Re-runnable
+///
+/// Every statement can run against a database that already has the table:
+/// reverse output is applied back to the database it was read from (the
+/// documented brownfield path), and `dbd apply` re-runs each file on every
+/// apply. Without `IF NOT EXISTS` that failed with `already exists`.
 ///
 /// # Serial / identity columns
 ///
@@ -46,24 +76,32 @@ pub fn emit_enum(entity: &Entity) -> String {
 /// emitted as `"name" <type> GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY` with
 /// any default dropped (identity columns are implicitly `NOT NULL`).
 ///
-/// # What is intentionally NOT re-emitted
+/// # Column-level keys
 ///
-/// Column-only `is_pk`/`is_unique` and `inline_fk` are not re-emitted: the Postgres
+/// Column-only `is_pk` and `inline_fk` are not re-emitted: the Postgres
 /// introspector decomposes these into table-level constraints, so re-emitting them
 /// here would produce duplicate DDL.
+///
+/// A column's own `is_unique` *is* emitted, as an inline `UNIQUE`, unless a
+/// single-column table-level `UNIQUE` on that column already says it. The
+/// introspector never sets the flag, so its output is unchanged; but the DBML
+/// parser carries a column's `[unique]` only there, and dropping it made
+/// `init --from-dbml` rebuild a table that accepted the duplicates the design
+/// refuses.
 pub fn emit_table(entity: &Entity) -> String {
     let schema = entity.schema.as_deref().unwrap_or("public");
     let name = bare(&entity.name);
     let qname = format!("{}.{}", q(schema), q(name));
     let Some(def) = &entity.table_def else {
-        return format!("CREATE TABLE {qname} ();");
+        return format!("CREATE TABLE IF NOT EXISTS {qname} ();");
     };
 
     let mut lines: Vec<String> = Vec::new();
 
     // Columns
     for c in &def.columns {
-        lines.push(emit_column_line(c));
+        let unique = c.is_unique && !has_single_column_unique(&def.constraints, &c.name);
+        lines.push(emit_column_line(c, unique));
     }
 
     // Table-level constraints
@@ -76,14 +114,14 @@ pub fn emit_table(entity: &Entity) -> String {
     } else {
         format!("\n{}\n", lines.join(",\n"))
     };
-    let mut out = format!("CREATE TABLE {qname} ({body});");
+    let mut out = format!("CREATE TABLE IF NOT EXISTS {qname} ({body});");
 
     // Indexes — every entry in def.indexes is emitted as-is. Filtering of
     // implicit PK/UNIQUE-backing indexes happens upstream in the introspector,
     // not here.
     for ix in &def.indexes {
         out.push('\n');
-        out.push_str(&emit_index_sql(ix, &qname, name, false));
+        out.push_str(&emit_index_sql(ix, &qname, name, true));
     }
 
     // Comments
@@ -96,7 +134,18 @@ pub fn emit_table(entity: &Entity) -> String {
             out.push_str(&emit_column_comment_sql(&qname, &c.name, c.comment.as_deref()));
         }
     }
+    push_triggers(&mut out, entity);
     out
+}
+
+/// Append `entity`'s triggers, each terminated with one `;` — after the
+/// table or view, where an authored file keeps them (see [`Entity::triggers`]).
+fn push_triggers(out: &mut String, entity: &Entity) {
+    for trigger in &entity.triggers {
+        out.push('\n');
+        out.push_str(trigger.trim_end().trim_end_matches(';').trim_end());
+        out.push(';');
+    }
 }
 
 /// Render `COMMENT ON COLUMN <qname>."<column>" IS …;`.
@@ -110,8 +159,26 @@ pub fn emit_column_comment_sql(qname: &str, column: &str, comment: Option<&str>)
     }
 }
 
-/// Render one column definition line (indented, no trailing comma).
-fn emit_column_line(c: &crate::entity::ColumnDef) -> String {
+/// Whether a table-level `UNIQUE` covers exactly `column`.
+fn has_single_column_unique(constraints: &[crate::entity::TableConstraint], column: &str) -> bool {
+    constraints.iter().any(|con| {
+        matches!(con, crate::entity::TableConstraint::Unique { columns, .. }
+            if columns.len() == 1 && columns[0] == column)
+    })
+}
+
+/// Render one column definition line (indented, no trailing comma), with an
+/// inline `UNIQUE` when `unique`.
+fn emit_column_line(c: &crate::entity::ColumnDef, unique: bool) -> String {
+    let mut line = column_definition(c);
+    if unique {
+        line.push_str(" UNIQUE");
+    }
+    line
+}
+
+/// One column's name, type and generation/nullability/default clauses.
+fn column_definition(c: &crate::entity::ColumnDef) -> String {
     // Serial columns are sugar (int + owned sequence). Emit just the serial
     // type — the implied NOT NULL and DEFAULT nextval(...) are re-created by
     // Postgres on apply, so re-emitting them would be redundant/wrong.
@@ -120,6 +187,9 @@ fn emit_column_line(c: &crate::entity::ColumnDef) -> String {
     }
 
     let mut col = format!("  {} {}", q(&c.name), c.data_type);
+    if let Some(collation) = &c.collation {
+        col.push_str(&format!(" COLLATE {collation}"));
+    }
 
     // Identity columns are implicitly NOT NULL and carry no default — emit the
     // GENERATED … AS IDENTITY clause and skip the default.
@@ -151,22 +221,35 @@ fn emit_column_line(c: &crate::entity::ColumnDef) -> String {
 
 /// Render one table-level constraint line (indented, no trailing comma).
 /// Foreign keys default to the table's own `schema` when no `ref_schema` is set.
+///
+/// Every key keeps its name. The name is the constraint's identity to
+/// anything that catches its violation or drops it by name; left out, a fresh
+/// apply names it as Postgres would (`people_region_id_fkey`), which is a
+/// different constraint to all of them.
 fn emit_table_constraint_line(con: &crate::entity::TableConstraint, schema: &str) -> String {
     use crate::entity::TableConstraint;
+    // `CONSTRAINT "name" ` before the key, or nothing for an unnamed one.
+    let named = |name: &Option<String>| match name {
+        Some(name) => format!("CONSTRAINT {} ", q(name)),
+        None => String::new(),
+    };
     match con {
-        TableConstraint::PrimaryKey { columns, .. } => {
-            format!("  PRIMARY KEY ({})", quote_cols(columns))
+        TableConstraint::PrimaryKey { name, columns } => {
+            format!("  {}PRIMARY KEY ({})", named(name), quote_cols(columns))
         }
         // `NULLS NOT DISTINCT` precedes the column list, mirroring the index
         // emitter. Dropping it here would make every emitted/reverse-engineered
-        // DDL file declare a weaker constraint than the database holds.
+        // DDL file declare a weaker constraint than the database holds. The
+        // name is kept, as a CHECK's is: a constraint DBML carried back under
+        // its own name was rebuilt as `<table>_<cols>_key`.
         TableConstraint::Unique {
+            name,
             columns,
             nulls_not_distinct,
-            ..
         } => {
             format!(
-                "  UNIQUE{} ({})",
+                "  {}UNIQUE{} ({})",
+                named(name),
                 if *nulls_not_distinct { " NULLS NOT DISTINCT" } else { "" },
                 quote_cols(columns)
             )
@@ -174,23 +257,18 @@ fn emit_table_constraint_line(con: &crate::entity::TableConstraint, schema: &str
         TableConstraint::ForeignKey(fk) => {
             let ref_schema = fk.ref_schema.as_deref().unwrap_or(schema);
             let mut s = format!(
-                "  FOREIGN KEY ({}) REFERENCES {}.{} ({})",
+                "  {}FOREIGN KEY ({}) REFERENCES {}.{} ({})",
+                named(&fk.name),
                 quote_cols(&fk.columns),
                 q(ref_schema),
                 q(&fk.ref_table),
                 quote_cols(&fk.ref_columns),
             );
-            if let Some(a) = fk.on_delete {
-                s.push_str(&format!(" ON DELETE {}", fk_action_sql(a)));
-            }
-            if let Some(a) = fk.on_update {
-                s.push_str(&format!(" ON UPDATE {}", fk_action_sql(a)));
-            }
+            push_fk_clauses(&mut s, fk);
             s
         }
-        TableConstraint::Check { expression, .. } => {
-            format!("  CHECK ({expression})")
-        }
+        TableConstraint::Check { name, expression } => format!("  {}CHECK ({expression})", named(name)),
+        TableConstraint::Exclude { name, definition } => format!("  {}EXCLUDE {definition}", named(name)),
     }
 }
 
@@ -235,8 +313,9 @@ pub(crate) fn emit_index_column(c: &crate::entity::IndexColumn) -> String {
 ///
 /// `table_name` is the bare table name used to synthesize an index name when
 /// the index has none. `if_not_exists` adds the `IF NOT EXISTS` clause so the
-/// statement is idempotent on re-apply — matviews set it (their whole DDL is
-/// re-applied by `dbd apply`); tables keep their existing exact output.
+/// statement is idempotent on re-apply — table and matview files set it (their
+/// whole DDL is re-applied by `dbd apply`); a migration's index, which runs
+/// once, does not.
 pub fn emit_index_sql(ix: &crate::entity::IndexDef, qname: &str, table_name: &str, if_not_exists: bool) -> String {
     let cols = ix.columns.iter().map(emit_index_column).collect::<Vec<_>>().join(", ");
     let unique = if ix.unique { "UNIQUE " } else { "" };
@@ -274,12 +353,52 @@ pub fn emit_index_sql(ix: &crate::entity::IndexDef, qname: &str, table_name: &st
     sql
 }
 
+/// A dollar-quote tag that does not occur in `body`: `$$`, or `$dbd$`,
+/// `$dbd1$`, … when a label carries the plain one. A tag the body contains
+/// would close the quote early.
+fn dollar_tag(body: &str) -> String {
+    if !body.contains("$$") {
+        return "$$".to_string();
+    }
+    (0..)
+        .map(|n| {
+            if n == 0 {
+                "$dbd$".to_string()
+            } else {
+                format!("$dbd{n}$")
+            }
+        })
+        .find(|tag| !body.contains(tag.as_str()))
+        .expect("an unbounded sequence of tags has one the body lacks")
+}
+
 fn quote_cols(cols: &[String]) -> String {
     cols.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ")
 }
 
 fn esc(s: &str) -> String {
     s.replace('\'', "''")
+}
+
+/// Everything a foreign key says after its referenced columns, in the order
+/// Postgres's grammar takes it: `MATCH FULL`, the referential actions, then
+/// `DEFERRABLE [INITIALLY DEFERRED]`. Shared with the migration and reconcile
+/// SQL, so a key is written the same wherever dbd writes one.
+pub(crate) fn push_fk_clauses(sql: &mut String, fk: &crate::entity::ForeignKey) {
+    if fk.match_full {
+        sql.push_str(" MATCH FULL");
+    }
+    if let Some(a) = fk.on_delete {
+        sql.push_str(&format!(" ON DELETE {}", fk_action_sql(a)));
+    }
+    if let Some(a) = fk.on_update {
+        sql.push_str(&format!(" ON UPDATE {}", fk_action_sql(a)));
+    }
+    if fk.initially_deferred {
+        sql.push_str(" DEFERRABLE INITIALLY DEFERRED");
+    } else if fk.deferrable {
+        sql.push_str(" DEFERRABLE");
+    }
 }
 
 fn fk_action_sql(a: crate::entity::FkAction) -> &'static str {
@@ -293,13 +412,14 @@ fn fk_action_sql(a: crate::entity::FkAction) -> &'static str {
     }
 }
 
-/// `CREATE SEQUENCE "schema"."name" …;`
+/// `CREATE SEQUENCE IF NOT EXISTS "schema"."name" …;`
 ///
 /// The fully-rendered statement is carried verbatim in `entity.body[0]` (set by
-/// the introspector, which reconstructs it from `pg_sequences`/`pg_sequence`). We
-/// emit that text, trimmed of any trailing whitespace/`;` and re-terminated with a
-/// single `;`. Falls back to a bare `CREATE SEQUENCE "s"."n";` when no body was
-/// captured.
+/// the introspector, which reconstructs it from `pg_sequences`/`pg_sequence`,
+/// `IF NOT EXISTS` included). We emit that text, trimmed of any trailing
+/// whitespace/`;` and re-terminated with a single `;`. Falls back to a bare
+/// `CREATE SEQUENCE IF NOT EXISTS "s"."n";` when no body was captured —
+/// re-runnable, for the reason given on [`emit_table`].
 pub fn emit_sequence(entity: &Entity) -> String {
     if let Some(body) = entity.body.first() {
         let body = body.trim().trim_end_matches(';').trim_end();
@@ -309,17 +429,24 @@ pub fn emit_sequence(entity: &Entity) -> String {
     }
     let schema = entity.schema.as_deref().unwrap_or("public");
     let name = bare(&entity.name);
-    format!("CREATE SEQUENCE {}.{};", q(schema), q(name))
+    format!("CREATE SEQUENCE IF NOT EXISTS {}.{};", q(schema), q(name))
 }
 
-/// `CREATE VIEW "schema"."name" AS <definition>;`
+/// `CREATE OR REPLACE VIEW "schema"."name" AS <definition>;`
 /// The view body is carried in `entity.body[0]` (set by the introspector).
+/// `OR REPLACE` keeps it re-runnable, for the reason given on [`emit_table`].
 pub fn emit_view(entity: &Entity) -> String {
     let schema = entity.schema.as_deref().unwrap_or("public");
     let name = bare(&entity.name);
     let body = entity.body.first().map(String::as_str).unwrap_or("SELECT 1");
     let body = body.trim().trim_end_matches(';');
-    format!("CREATE VIEW {}.{} AS {body};", q(schema), q(name))
+    let qname = format!("{}.{}", q(schema), q(name));
+    let mut out = format!("CREATE OR REPLACE VIEW {qname} AS {body};");
+    if let Some(comment) = &entity.comment {
+        out.push_str(&format!("\nCOMMENT ON VIEW {qname} IS '{}';", esc(comment)));
+    }
+    push_triggers(&mut out, entity);
+    out
 }
 
 /// `CREATE MATERIALIZED VIEW IF NOT EXISTS "schema"."name" AS <definition> WITH DATA;`
@@ -346,6 +473,12 @@ pub fn emit_matview(entity: &Entity) -> String {
             out.push('\n');
             out.push_str(&emit_index_sql(ix, &qname, name, true));
         }
+    }
+    if let Some(comment) = &entity.comment {
+        out.push_str(&format!(
+            "\nCOMMENT ON MATERIALIZED VIEW {qname} IS '{}';",
+            esc(comment)
+        ));
     }
     out
 }
@@ -379,7 +512,9 @@ pub fn emit_entity(entity: &Entity) -> Option<String> {
     // emitter entirely. Re-terminate with a single trailing `;`.
     if let Some(raw) = &entity.raw_ddl {
         let body = raw.trim_end().trim_end_matches(';').trim_end();
-        return Some(format!("{body};"));
+        let mut out = format!("{body};");
+        push_triggers(&mut out, entity);
+        return Some(out);
     }
     match entity.entity_type {
         EntityType::Schema | EntityType::Extension | EntityType::Role => crate::script::ddl_from_entity(entity),
@@ -411,9 +546,12 @@ mod tests {
                 note: None,
             },
         ];
+        // Guarded: Postgres has no `CREATE TYPE … IF NOT EXISTS`, and a bare
+        // one fails the second time the file runs.
         assert_eq!(
             emit_enum(&e),
-            "CREATE TYPE \"shop\".\"order_status\" AS ENUM ('pending', 'paid');"
+            "DO $$ BEGIN\n  CREATE TYPE \"shop\".\"order_status\" AS ENUM ('pending', 'paid');\n\
+             EXCEPTION WHEN duplicate_object THEN NULL;\nEND $$;"
         );
     }
 
@@ -435,6 +573,7 @@ mod tests {
                     generated: None,
                     comment: Some("Order PK".into()),
                     inline_fk: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "customer_id".into(),
@@ -447,6 +586,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "total_cents".into(),
@@ -459,6 +599,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
             ],
             constraints: vec![
@@ -494,12 +635,14 @@ mod tests {
         let sql = emit_table(&e);
 
         // Sanity on the emitted text:
-        assert!(sql.contains("CREATE TABLE \"shop\".\"orders\""));
+        assert!(sql.contains("CREATE TABLE IF NOT EXISTS \"shop\".\"orders\""));
         assert!(sql.contains("\"id\" uuid NOT NULL"));
         assert!(sql.contains("\"total_cents\" integer NOT NULL DEFAULT 0"));
         assert!(sql.contains("PRIMARY KEY (\"id\")"));
         assert!(sql.contains("FOREIGN KEY (\"customer_id\") REFERENCES \"shop\".\"customers\" (\"id\")"));
-        assert!(sql.contains("CREATE INDEX \"orders_customer_id_idx\" ON \"shop\".\"orders\" (\"customer_id\");"));
+        assert!(sql.contains(
+            "CREATE INDEX IF NOT EXISTS \"orders_customer_id_idx\" ON \"shop\".\"orders\" (\"customer_id\");"
+        ));
         assert!(sql.contains("COMMENT ON COLUMN \"shop\".\"orders\".\"id\" IS 'Order PK';"));
 
         // Round-trip: emitted DDL re-parses to a TableDef with the same structure.
@@ -548,6 +691,9 @@ mod tests {
         );
     }
 
+    /// `OR REPLACE`, as every emitted statement is re-runnable: reverse output
+    /// is applied back to the database it came from (the brownfield path), and
+    /// a plain `CREATE VIEW` failed there with `already exists`.
     #[test]
     fn emits_view() {
         let mut e = Entity::new(EntityType::View, "shop.active_orders");
@@ -556,7 +702,7 @@ mod tests {
         let sql = emit_view(&e);
         assert_eq!(
             sql,
-            "CREATE VIEW \"shop\".\"active_orders\" AS SELECT * FROM shop.orders WHERE status = 'paid';"
+            "CREATE OR REPLACE VIEW \"shop\".\"active_orders\" AS SELECT * FROM shop.orders WHERE status = 'paid';"
         );
     }
 
@@ -650,6 +796,105 @@ mod tests {
         assert!(emit_entity(&p).unwrap().ends_with("$$;"));
     }
 
+    /// A quote in a name is doubled, as SQL writes it. Wrapped as it was,
+    /// `"we"ird"` ended the name early and the table file did not parse —
+    /// reached through `init --from-dbml` from a DBML name `"we\"ird"`.
+    #[test]
+    fn a_quote_in_a_name_is_doubled_and_reads_back() {
+        let ddl = "create table app.t (\"we\"\"ird\" int primary key, \"back\\slash\" text);\n\
+                   create index t_w on app.t (\"we\"\"ird\");";
+        let path = std::path::Path::new("ddl/table/app/t.ddl");
+        let entity = crate::parser::parse_entity(path, ddl).unwrap();
+        let emitted = emit_table(&entity);
+        let reparsed = crate::parser::parse_entity(path, &emitted).unwrap_or_else(|e| panic!("{e}\n{emitted}"));
+        assert!(
+            reparsed.errors.is_empty(),
+            "the emitted DDL parses: {:?}\n{emitted}",
+            reparsed.errors
+        );
+        let def = reparsed.table_def.unwrap();
+        let columns: Vec<&str> = def.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(columns, ["we\"ird", "back\\slash"], "{emitted}");
+        assert_eq!(def.indexes[0].columns[0].name, "we\"ird", "{emitted}");
+    }
+
+    /// A CHECK keeps the name it was given. Written unnamed, `init --from-dbml`
+    /// and `init --from-db` rebuilt `qty_positive` as Postgres's own
+    /// `t_qty_check` — a different constraint to anything that names it.
+    #[test]
+    fn a_named_check_round_trips_with_its_name() {
+        let ddl = "create table app.t (\n  qty int constraint qty_positive check (qty > 0),\n  code text check (length(code) < 10)\n);";
+        let path = std::path::Path::new("ddl/table/app/t.ddl");
+        let entity = crate::parser::parse_entity(path, ddl).unwrap();
+
+        let reparsed = crate::parser::parse_entity(path, &emit_table(&entity)).unwrap();
+        let checks: Vec<Option<String>> = reparsed
+            .table_def
+            .unwrap()
+            .constraints
+            .into_iter()
+            .filter_map(|c| match c {
+                crate::entity::TableConstraint::Check { name, .. } => Some(name),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(checks, [Some("qty_positive".to_string()), None]);
+    }
+
+    /// A key's name is its identity to whatever catches a violation of it, and
+    /// `init --from-db` dropped every one but a CHECK's: a fresh apply named
+    /// `people_region_fk` `people_region_id_fkey`, and a custom primary-key
+    /// or unique name likewise became Postgres's own.
+    #[test]
+    fn named_keys_round_trip_with_their_names() {
+        let ddl = "create table app.people (\n  id int,\n  code text,\n  region_id int,\n  \
+                   constraint people_pk primary key (id),\n  constraint people_code_uq unique (code),\n  \
+                   constraint people_region_fk foreign key (region_id) references app.regions (id)\n);";
+        let path = std::path::Path::new("ddl/table/app/people.ddl");
+        let entity = crate::parser::parse_entity(path, ddl).unwrap();
+
+        let reparsed = crate::parser::parse_entity(path, &emit_table(&entity)).unwrap();
+        let names: Vec<Option<String>> = reparsed
+            .table_def
+            .unwrap()
+            .constraints
+            .into_iter()
+            .map(|c| match c {
+                crate::entity::TableConstraint::PrimaryKey { name, .. }
+                | crate::entity::TableConstraint::Unique { name, .. }
+                | crate::entity::TableConstraint::Check { name, .. }
+                | crate::entity::TableConstraint::Exclude { name, .. } => name,
+                crate::entity::TableConstraint::ForeignKey(fk) => fk.name,
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                Some("people_pk".to_string()),
+                Some("people_code_uq".to_string()),
+                Some("people_region_fk".to_string())
+            ]
+        );
+    }
+
+    /// An enum's `COMMENT ON TYPE` was read by the parser and dropped by the
+    /// emitter, so `init --from-db` lost it — as a view's comment once was.
+    #[test]
+    fn an_enums_comment_is_emitted() {
+        let mut e = Entity::new(EntityType::Enum, "app.mood");
+        e.enum_values = vec![EnumValue {
+            name: "happy".into(),
+            note: None,
+        }];
+        e.comment = Some("how a person's day went".into());
+        assert_eq!(
+            emit_enum(&e),
+            "DO $$ BEGIN\n  CREATE TYPE \"app\".\"mood\" AS ENUM ('happy');\n\
+             EXCEPTION WHEN duplicate_object THEN NULL;\nEND $$;\n\
+             COMMENT ON TYPE \"app\".\"mood\" IS 'how a person''s day went';"
+        );
+    }
+
     #[test]
     fn emit_entity_dispatches_by_type() {
         let s = Entity::new(EntityType::Schema, "shop");
@@ -691,11 +936,12 @@ mod tests {
         assert_eq!(emit_entity(&e).as_deref(), Some(sql.as_str()));
     }
 
+    /// `IF NOT EXISTS`, for the same brownfield re-apply as `emits_view`.
     #[test]
     fn emits_sequence_fallback_without_body() {
         let mut e = Entity::new(EntityType::Sequence, "app.counter");
         e.schema = Some("app".into());
-        assert_eq!(emit_sequence(&e), "CREATE SEQUENCE \"app\".\"counter\";");
+        assert_eq!(emit_sequence(&e), "CREATE SEQUENCE IF NOT EXISTS \"app\".\"counter\";");
     }
 
     /// A computed column must carry its `GENERATED … STORED` clause into the
@@ -720,6 +966,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "tsv".into(),
@@ -732,6 +979,7 @@ mod tests {
                     generated: Some("to_tsvector('english', coalesce(content, ''))".into()),
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
             ],
             constraints: vec![],
@@ -769,6 +1017,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
                 // identity column (ALWAYS): emit GENERATED ALWAYS AS IDENTITY, no default.
                 ColumnDef {
@@ -782,6 +1031,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
                 // standalone-referencing column: keep its real type + nextval default.
                 ColumnDef {
@@ -795,6 +1045,7 @@ mod tests {
                     generated: None,
                     comment: None,
                     inline_fk: None,
+                    collation: None,
                 },
             ],
             constraints: vec![TableConstraint::PrimaryKey {
@@ -828,6 +1079,44 @@ mod tests {
         );
     }
 
+    /// A column's own UNIQUE — which is how both the DDL parser and the DBML
+    /// parser carry one — must reach the emitted DDL, once: not again when a
+    /// table-level UNIQUE on that column already says it.
+    #[test]
+    fn emit_table_writes_a_columns_own_unique_once() {
+        use crate::entity::{ColumnDef, TableConstraint, TableDef};
+
+        let column = |name: &str| ColumnDef {
+            name: name.into(),
+            data_type: "text".into(),
+            nullable: true,
+            default_value: None,
+            is_pk: false,
+            is_unique: true,
+            identity: None,
+            generated: None,
+            comment: None,
+            inline_fk: None,
+            collation: None,
+        };
+        let mut e = Entity::new(EntityType::Table, "app.people");
+        e.table_def = Some(TableDef {
+            columns: vec![column("email"), column("handle")],
+            constraints: vec![TableConstraint::Unique {
+                name: None,
+                columns: vec!["handle".into()],
+                nulls_not_distinct: false,
+            }],
+            indexes: vec![],
+            comments: Default::default(),
+        });
+
+        let sql = emit_table(&e);
+        assert!(sql.contains("\"email\" text UNIQUE"), "got:\n{sql}");
+        assert!(!sql.contains("\"handle\" text UNIQUE"), "got:\n{sql}");
+        assert!(sql.contains("UNIQUE (\"handle\")"), "got:\n{sql}");
+    }
+
     #[test]
     fn emit_table_identity_by_default() {
         use crate::entity::{ColumnDef, IdentityKind, TableDef};
@@ -846,6 +1135,7 @@ mod tests {
                 generated: None,
                 comment: None,
                 inline_fk: None,
+                collation: None,
             }],
             constraints: vec![],
             indexes: vec![],
@@ -873,6 +1163,7 @@ mod tests {
             generated: None,
             comment: None,
             inline_fk: None,
+            collation: None,
         };
         let idx = |name: &str, col: &str, ty: Option<IndexType>| IndexDef {
             name: Some(name.into()),
@@ -904,24 +1195,24 @@ mod tests {
         // tsvector column would be invalid as a plain btree, so the access method
         // must survive reverse-engineering.
         assert!(
-            sql.contains("CREATE INDEX \"docs_tags_idx\" ON \"app\".\"docs\" USING gin (\"tags\");"),
+            sql.contains("CREATE INDEX IF NOT EXISTS \"docs_tags_idx\" ON \"app\".\"docs\" USING gin (\"tags\");"),
             "got:\n{sql}"
         );
         assert!(
-            sql.contains("CREATE INDEX \"docs_body_idx\" ON \"app\".\"docs\" USING gist (\"body\");"),
+            sql.contains("CREATE INDEX IF NOT EXISTS \"docs_body_idx\" ON \"app\".\"docs\" USING gist (\"body\");"),
             "got:\n{sql}"
         );
         assert!(
-            sql.contains("CREATE INDEX \"docs_n_brin_idx\" ON \"app\".\"docs\" USING brin (\"n\");"),
+            sql.contains("CREATE INDEX IF NOT EXISTS \"docs_n_brin_idx\" ON \"app\".\"docs\" USING brin (\"n\");"),
             "got:\n{sql}"
         );
         assert!(
-            sql.contains("CREATE INDEX \"docs_n_hash_idx\" ON \"app\".\"docs\" USING hash (\"n\");"),
+            sql.contains("CREATE INDEX IF NOT EXISTS \"docs_n_hash_idx\" ON \"app\".\"docs\" USING hash (\"n\");"),
             "got:\n{sql}"
         );
         // btree (None) emits no USING clause.
         assert!(
-            sql.contains("CREATE INDEX \"docs_n_btree_idx\" ON \"app\".\"docs\" (\"n\");"),
+            sql.contains("CREATE INDEX IF NOT EXISTS \"docs_n_btree_idx\" ON \"app\".\"docs\" (\"n\");"),
             "got:\n{sql}"
         );
     }

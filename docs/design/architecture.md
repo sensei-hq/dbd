@@ -264,7 +264,9 @@ for e in &parsed.entities {
 ```
 
 Resolution is deliberately a second phase: each entity carries its references as
-written, provisionally qualified against `search_paths[0]`, and
+written, provisionally qualified against `search_paths[0]` — the path in effect at the
+entity's CREATE: the last `SET search_path` the file states before it, else the first the
+file states — and
 `references::resolve_references` re-resolves them once every file is read. The
 per-file parse touches no shared state, so the scan parallelises and a bare `t`
 that could be `a.t` or `b.t` stays undecided until the whole set is known.
@@ -373,6 +375,14 @@ keeps things a simpler one would discard:
 - operator classes, `INCLUDE` payloads, `NULLS NOT DISTINCT`, partial-index
   predicates and access-method storage parameters — each of which distinguishes
   two indexes that would otherwise compare equal
+- a column's collation, a foreign key's `DEFERRABLE`/`INITIALLY DEFERRED` and
+  `MATCH FULL`, and `EXCLUDE` constraints (0.25) — before which introspection
+  read an exclusion constraint as a plain gist index and the rest not at all,
+  so a reversed project weakened the database with an empty diff. What the
+  model still cannot hold (`NOT VALID`, `UNLOGGED`, inheritance, partitioning)
+  is named when a database is reversed, never dropped silently; and every
+  object an extension owns is left out of introspection, since the project
+  does not own it.
 
 A table dbd cannot read structurally is an **error**, not a partial result.
 Every other entity type may degrade; this one may not, because a table with no
@@ -601,6 +611,37 @@ pub trait DatabaseAdapter: Send + Sync {
     async fn clear_project_migrations(&self) -> Result<()>;
 }
 ```
+
+> **Current implementation note (0.25).** The trait in
+> `crates/dbd-core/src/adapter/mod.rs` is the record; this sketch is the original design.
+> 0.25 adds one required method, `forget_project_meta` — a `reset` of everything the
+> database was built with (the all-scope, or the scope it is pinned to) deletes the
+> database's record of the project (env, version, scope pin), which is what lets a database
+> marked prod by mistake be rebuilt as dev — and several with defaults, each so a run can
+> ask the database rather than assume: `existing_objects` (what `reset` reports it dropped,
+> read before and after, since every drop is `IF EXISTS`), `roles_held_elsewhere` (the
+> roles another database on the server still uses, which `reset` keeps), `live_matviews`
+> (a deployed matview's definition and index keys, so `apply` can stamp a brownfield one
+> that is the design's), `stamp_matview`/`forget_matview_stamps` (the drift stamp, kept in
+> `dbd.matview_stamps`, out of the matview's comment), `truncate_table`/`truncate_tables`
+> (the import's truncate — Postgres empties every staging table in one `TRUNCATE` and names
+> a table outside the import that holds a key to one; the default goes one at a time,
+> referencing table first, `DELETE FROM` on SQLite, nothing on Convex), `foreign_keys`
+> (the keys between the database's own tables — SQLite reports them from
+> `pragma_foreign_key_list`, since its verbatim DDL gives the design no references, and
+> `Design::live_import_plan` orders the loads and the truncate by them; none by default),
+> `matviews_reading_columns` (what blocks reconcile's enum swap, asked of the database
+> rather than the design), `other_projects_meta` (the records the guards read for a renamed
+> `project.name` — see the bookkeeping notes below), `execute_project_script` (a migration
+> or hook run on a search path, since it may name tables bare — a migration on the path
+> its entity's CREATE runs on, the last `SET search_path` its DDL file states before it) and
+> `dependencies`
+> (`pg_depend`, read so `init --from-db --schema` can say what the capture needs from
+> outside). `export_data` writes into the directory its caller passes, which the CLI makes
+> `<root>/<schema>/` — the layout `import/` reads — or, for `-o` naming a schema folder of
+> the project's `import/` tree, that folder itself. The Postgres adapter's constructor makes
+> one probe connection bounded at 5 seconds before it builds the pool, so an unreachable
+> server fails fast naming `host:port`; sqlx alone retried for 30 seconds.
 
 ### Parser trait
 
@@ -932,8 +973,10 @@ Import ordering is more complex than entity ordering. It combines two dependency
 
 ```
 1. For each staging import table:
-   - Find target config table (match by base name across schemas)
-   - Find import procedure (procedure that reads this staging table)
+   - Find its one loader among the procedures that read it:
+     the one named import_<table>; else the only one reading no other
+     staging table; else the only one no other table claimed (preferring
+     one that writes a same-named table). A tie is refused before the run.
    - Identify config tables the procedure writes to
 
 2. Build call-graph dependencies:
@@ -951,7 +994,18 @@ tables that procedure **writes** — which is what the ordering turns on. A
 staging table whose procedure writes a table another procedure reads must load
 first, and only the write set says so.
 
-> `build_import_plan` in `crates/dbd-core/src/design/import.rs`.
+A procedure loads at most one table and is called once per import: matching
+used to take the first procedure that read a staging table, so a loader that
+joined a second staging table was matched to both, ran twice, and the second
+table's own loader never ran. The loaders are decided over every data file at
+once, so a `-n` run calls the one a full run would; a table with two data files
+is two entries and one call. Only procedures are candidates — the step is
+`CALL`, which Postgres refuses for a function.
+
+> `Design::import_plan` and `Design::import_loaders` in
+> `crates/dbd-core/src/design/import.rs`; `Design::check_import_plan` holds the
+> refusals every import path makes first (a `-n` loading nothing,
+> `import.staging`, a loader tie).
 
 ### SQL parsing — `sqlparser-rs` (pure Rust, no regex fallback)
 
@@ -975,9 +1029,18 @@ first, and only the write set says so.
 > not a Postgres subset, so a real SQLite grammar would have been new work
 > regardless of which crate was chosen here.
 >
-> `sqlparser-rs` remains a dependency, for `dbd format` and enum-candidate
-> detection. It no longer reads DDL. The rest of this section is kept as the
-> original record.
+> `sqlparser-rs` remains a dependency, for `dbd format`'s layout and enum-candidate
+> detection. It no longer reads DDL, and since 0.25 the formatter no longer trusts it
+> either: statement boundaries come from libpg_query, and a layout is kept only if
+> libpg_query parses it to the same tree with every literal, body, quoted name and
+> comment byte-for-byte unchanged. Each literal and quoted name in sqlparser's layout
+> is given back its written spelling before that check. Keyword case is decided per
+> token from libpg_query's keyword category: a word the grammar could read as a name
+> is quoted in place, and keeps its case if the statement still deparses the same, so
+> a column named `name` or `level` is left alone. The hand-written keyword list stays,
+> for text libpg_query cannot parse and for type names the grammar reads as names
+> (`text`, `uuid`); its words are recased even where they name a column. The rest of
+> this section is kept as the original record.
 
 **`sqlparser-rs`** (Apache DataFusion) is the parser. It replaces both `pg_query` (C FFI) and the regex fallbacks from the Node.js version.
 
@@ -1615,6 +1678,19 @@ Scenario: Multi-version catch-up
   And _dbd_migrations has entries for v2, v3, v4
 ```
 
+> **Current implementation note (0.25).** Each version runs whole before the next — its
+> creates and `.sql` alters in dependency order, then the `.data.sql` scripts of the tables
+> it alters or adds (`migration.altered` or `migration.added` — one seeding a table it adds
+> never ran before), then its drops, then its `RecordMigration` — and every entity re-applies after the last
+> (`design::plan::plan_migrate`). The plan ran entity by entity before: a jump ran a later
+> version's change ahead of an earlier version's change to another table, which a stepwise
+> upgrade never does. A version's `ALTER TYPE … ADD VALUE` statements run at its head as
+> `IF NOT EXISTS` (`ExecutionStep::AddEnumValues`) and the batch commits after them, since
+> Postgres refuses a value inside the transaction that added it; the run is one
+> transaction except at those commit points, and the version before is recorded first.
+> A named `apply -n` refuses while migrations are pending, rather than record versions it
+> did not run.
+
 #### Scenario 10: Deploy from GitHub source
 
 End-to-end deploy from a remote source.
@@ -1686,6 +1762,11 @@ Scenario: Dev reset blocked after v1
   And database unchanged
 ```
 
+> **Current implementation note (0.25).** The message is "reset is blocked — the database
+> is versioned at v1", with "(a released project's database)" after it only when
+> `project.released` is set: the guard reads the recorded version, and a fresh install
+> records its version having run no migration.
+
 ```gherkin
 Scenario: Dev reset after v1 with an explicit override
   Given _dbd_meta has env = "dev", version = 1
@@ -1737,6 +1818,21 @@ Scenario: Environment mismatch warning
   And _dbd_meta.env NOT overwritten (database's recorded env is authoritative)
 ```
 
+> **Current implementation note (0.25).** The mismatch is refused, not warned about.
+> Before 0.25 neither the warning nor the "not overwritten" half held: the run proceeded
+> and its upsert re-marked the database dev, which lifted the reset guard below and let
+> `import/dev/` seed data into production. `Design::check_env_guard(marks, env)` now
+> returns `DbdError::SafetyGuard` for any run whose env is not prod against a database
+> marked prod (`production` rows included), before anything is written; `Design::apply`,
+> `deploy`, `reconcile` and `import_data` call it, and so do the CLI's ad-hoc `import -n -f`
+> and every dry run of those given a database. It is one-way — a dev database may be
+> promoted to prod, which only tightens what reset allows, and the CLI says when a run did
+> — and has no override: the case it bites is a dev database first built without `-e` (so
+> marked prod), and the way out is to rebuild it, which a reset of everything the database
+> was built with (the all-scope, or its pinned scope) allows by forgetting the row
+> (`DatabaseAdapter::forget_project_meta`). A flag would unguard a real production
+> database as easily.
+
 #### Scenario 18: Reset guard works for embedded consumers
 
 ```gherkin
@@ -1750,7 +1846,7 @@ Scenario: Reset guard works for embedded consumers
 
 ### Reset safety model
 
-`reset` drops schemas with CASCADE — it's irreversible. The guard is **database-side**: the `_dbd_meta` table records the environment, and reset checks it before proceeding.
+`reset` drops schemas with CASCADE — it's irreversible. The guard is **database-side**: the `_dbd_meta` table records the environment, and reset checks it before proceeding. (In 0.25 reset is entity-level by default, and only a full reset cascades: a scoped reset drops without `CASCADE`, all or nothing, because a cascade reaches past the scope — see the note below.)
 
 #### `_dbd_meta` table
 
@@ -1787,6 +1883,20 @@ ON CONFLICT (project) DO UPDATE
   SET env = EXCLUDED.env, version = EXCLUDED.version, updated_at = now();
 ```
 
+(Since 0.25 the upsert can only move `env` from dev to prod: a dev run against a row
+that says prod is refused by `Design::check_env_guard` before it reaches the upsert, and a
+reset under the all-scope or the pinned scope deletes the row rather than leaving it to be
+overwritten. A project older than the row's `version` is refused too, by
+`Design::check_version_guard`, so `apply` never writes a lower version over a higher one.)
+
+(The row is keyed on `project`, so a renamed `project.name` found no row and every guard
+passed — a prod database's tables dropped by a `reset` with no `--force`. Since 0.25 the
+guards read `DatabaseMarks` (`Design::database_marks`): this project's row, or — when it
+has none and the database holds any of the design's tables, views, matviews, enums or
+sequences — every other project's row (`DatabaseAdapter::other_projects_meta`), and a
+refusal names that project. The objects tell a rename from a second project sharing the
+database: each of two such projects has its own row.)
+
 After a snapshot is applied, version is updated:
 
 ```sql
@@ -1822,6 +1932,35 @@ reset called
 **Dev free-reset mode:** During initial development (before v1 snapshot), the schema is in flux. `dbd apply -e dev` sets `env = "dev"` in `_dbd_meta`, and reset is unrestricted. Once the first snapshot is taken and applied (version becomes >= 1), the dev database has graduated — reset requires `--force` from that point on.
 
 **Prod is always protected:** Even at version 0, a prod database may have data loaded outside of dbd. Reset always requires `--force`.
+
+> **Current implementation note (0.25).** The guard is the method
+> `design.check_reset_guard(&marks)` — a method because its refusal reads
+> `project.released` — public so `dbd reset --dry-run` runs it too whenever a database is configured (`-d`,
+> `DATABASE_URL`, or a `target.url` that resolves) — a preview of a reset the real run
+> would refuse is a false promise; with no database configured the dry run stays an
+> offline preview. The scope pin is checked beside it by the CLI. Reset is
+> entity-level by default (`--schemas`/`--extensions` opt into `DROP SCHEMA`/`DROP
+> EXTENSION`), and its `--target` defaults to the design's first target key, not
+> `supabase` as the sketch below shows. Before dropping the design's roles it revokes
+> exactly what `apply` granted them — `DesignConfig::effective_schema_grants()`, the one
+> definition both sides read — on every schema that survives, because Postgres refuses
+> to drop a role that still holds a privilege; anything else the role holds fails the
+> reset with an error naming it, and dbd never runs `DROP OWNED BY`. A role another
+> database on the server holds anything in is kept (`roles_kept_by_reset`, from
+> `DatabaseAdapter::roles_held_elsewhere`) and named, its grants here still revoked —
+> roles are server-wide, and dropping one breaks the database that still uses it. It also
+> deletes the `dbd.matview_stamps` rows of the matviews it dropped, and a reset of
+> everything the database was built with — the `all` scope, or the scope its row pins
+> (a design's `default:` scope builds and resets under that) — deletes the meta row itself
+> (`forget_project_meta`), so the next apply records the database afresh. A `--target`
+> that is not the kind of database the connection reaches is refused by the CLI before it
+> connects. A scoped reset drops without `CASCADE`, in one block that
+> is all or nothing, and refuses naming the out-of-scope dependents: a cascade from an
+> in-scope enum took an out-of-scope table's column with it. `--target` takes
+> `postgres`, `supabase` or `sqlite`; on SQLite the reset drops tables and views in one
+> transaction with foreign keys deferred. `Design::reset` returns `ResetComplete` — the
+> `(kind, name)` objects it dropped, read from the database before and after
+> (`existing_objects`), since every drop is `IF EXISTS` — which `dbd reset` prints.
 
 **Library API:**
 
@@ -2013,7 +2152,7 @@ compiles all three.
 
 The Node.js version shells out to `psql` for data import/export (`\copy`). The Rust version uses `sqlx` natively:
 
-- **Import:** `COPY table FROM STDIN WITH (FORMAT csv, HEADER true)` — stream file contents directly via `sqlx::raw_sql` + `PgCopyIn`
+- **Import:** `COPY table (cols…) FROM STDIN WITH (FORMAT csv)` — the header row is read first (RFC 4180, by the reader every SQL adapter shares) and turned into the column list, and only the rows after it are streamed via `PgCopyIn`. `HEADER true` only skipped the header, so a file loaded by position into whatever columns came first; a header column the table lacks is now refused instead.
 - **Export:** `COPY (SELECT * FROM table) TO STDOUT WITH (FORMAT csv, HEADER true)` — stream rows to file via `PgCopyOut`
 
 This eliminates the `psql` runtime dependency entirely. The binary is fully standalone.
@@ -2079,6 +2218,14 @@ Ref: "config"."lookup_values"."lookup_id" > "config"."lookups"."id"
 ```
 
 #### DBML syntax rules for the generator
+
+> **Current implementation note (0.25).** A name that is not a plain word is written as a
+> DBML quoted name, its `\` and `"` escaped as DBML's lexer reads them; an enum column's
+> type is DBML's reference to the enum — `"app"."mo\"od"`, both parts quoted when either
+> needs it, or a bare `app.mood` — and the reader takes a qualified quoted
+> type, or one naming an enum the document declares, as that enum and any other quoted
+> type as its own SQL text. One quote-aware scanner splits settings, commas, colons, Ref
+> operators, dots and tuples, so a `"` inside a `'…'` setting is text.
 
 **Strings and quoting:**
 - Identifiers with special chars or reserved words: double quotes (`"column"`)

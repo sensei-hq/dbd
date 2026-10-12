@@ -290,3 +290,68 @@ async fn diff_refuses_a_verbatim_project_instead_of_reporting_in_sync() {
         "diff must refuse a project it cannot structurally compare, not report no drift"
     );
 }
+
+/// `dbd reset` on SQLite ran PostgreSQL's drops (`"public"."authors" CASCADE`)
+/// and failed on the first, so a SQLite database could never be reset. It
+/// drops the project's views and tables — a child before the parent its
+/// foreign key references, since SQLite enforces them and has no CASCADE —
+/// and keeps dbd's own bookkeeping.
+#[tokio::test]
+async fn reset_drops_a_sqlite_projects_tables_and_views() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    for (rel, sql) in [
+        (
+            "ddl/table/authors.ddl",
+            "CREATE TABLE IF NOT EXISTS authors (id INTEGER PRIMARY KEY, name TEXT NOT NULL);\n",
+        ),
+        (
+            "ddl/table/books.ddl",
+            "CREATE TABLE IF NOT EXISTS books (id INTEGER PRIMARY KEY, author_id INTEGER REFERENCES authors(id));\n",
+        ),
+        (
+            "ddl/view/named.ddl",
+            "CREATE VIEW IF NOT EXISTS named AS SELECT id, name FROM authors;\n",
+        ),
+    ] {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, sql).unwrap();
+    }
+    // Unversioned, so the applied-migrations guard is not what is tested.
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: roundtrip\n\nsource:\n  dialect: sqlite\n\ntarget:\n  sqlite:\n    url: $DATABASE_URL\n\nschemas: []\n",
+    )
+    .unwrap();
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load");
+
+    let db = dbd_core::connect("sqlite::memory:", "roundtrip")
+        .await
+        .expect("connect");
+    design
+        .apply(&*db, None, false, None, dbd_core::design::Progress::none())
+        .await
+        .expect("apply");
+    db.execute_script(
+        "INSERT INTO authors (id, name) VALUES (1, 'a'); INSERT INTO books (id, author_id) VALUES (1, 1);",
+    )
+    .await
+    .expect("rows a foreign key holds on to");
+
+    design
+        .reset(&*db, "sqlite", false, false, false, None)
+        .await
+        .expect("a SQLite reset");
+
+    assert_eq!(db.list_entities().await.unwrap(), Vec::<String>::new());
+    // The bookkeeping tables are dbd's, not the project's: they survive, while
+    // a full reset forgets the project's row in them.
+    db.execute_script("SELECT 1 FROM _dbd_meta LIMIT 0")
+        .await
+        .expect("dbd's bookkeeping is not the project's to drop");
+    assert!(
+        db.get_project_meta().await.unwrap().is_none(),
+        "a full reset forgets the database's record of the project"
+    );
+}

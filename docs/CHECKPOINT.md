@@ -1,37 +1,31 @@
 # Checkpoint
 
-**Slice:** #7 design at rev 3 (proposed). Website/docs audit done; fixes not started.
-Spec: `docs/superpowers/specs/2026-10-06-multi-project-isolation-design.md`.
+**Slice:** 0.25.0 release candidate — PR #44 (`fix/audit-bugs` → `develop`).
 
 ## Done
 
-- #7 rev 3: entity-level ownership (`dbd.objects`, `dbd.uses`), no special
-  schemas, workspaces with one root manifest (`modules:` block,
-  `database/<module>/` folders), `dbd split --from-scopes` for sensei.
-- Audit of the guides, llms files, SKILL.md and site pages against 0.24.1.
-
-## Remaining
-
-- #7: approval of the 5 decisions in the spec, then phase 1 (patch).
-- Audit, code bugs (each test-first): `-e production` passes the reset prod
-  guard; `reset --target` ignores the design's target; `deploy` skips grants
-  and ignores `-c`; `emit` drops FKs/CHECKs/indexes unreported;
-  `GITHUB_TOKEN` is never read.
-- Audit, docs: ~20 wrong statements; new guides (scopes, targets, access
-  control, import/export, viewer, embedding); home page cards.
+- Three full audits plus a focused verification; every confirmed defect fixed
+  test-first and merged into `fix/audit-bugs`. CHANGELOG `[Unreleased]`, guides,
+  README, llms, both SKILL.md, both pattern-verifier copies and the site match
+  the code. Older defects for 0.25.1 are in `docs/BACKLOG.md`.
+- History rewritten (2026-10-12): every author, committer and tagger is
+  Jerry Thomas <me@jerrythomas.name>; branch and tag trees unchanged. Force-
+  pushed with leases: main (incl. the 10 unpulled v0.24.1 release commits,
+  rewritten), develop, fix/audit-bugs, 5 other branches, 84 tags. Backup:
+  `~/Developer/dbd-backup-2026-10-12-pre-author-rewrite.bundle`.
+- CI's `cargo doc` step failed on nine public docs linking private items;
+  fixed (`c04b60f3`); `cargo doc --workspace --no-deps --all-features`, fmt and
+  `cargo audit` clean locally.
 
 ## Next
 
-    # on approval: fix/reset-env-guard off develop, red test first
+    gh pr checks 44 --watch    # CI green → human review → merge to develop
 
-## Open questions
+## Open (user)
 
-- Fix code or docs for each mismatch? Recommended: code for the 6 bugs above,
-  docs for the rest.
-- The release checklist cites `the_website_copies_match_the_docs`; no such
-  test exists (site content is gitignored and regenerated at build).
+- Review and merge PR #44; then main and the 0.25.0 release (approval needed).
 
-## Known-broken / upstream
+## Known limits
 
-- The 6 code bugs above.
-- History has no views or routines: snapshots hold tables and enums only.
+- CHANGELOG Known limitations; `docs/BACKLOG.md` (0.25.1).
+- Local `make _check-ci` does not run `cargo doc`; CI does (once per push).

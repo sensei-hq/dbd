@@ -70,7 +70,26 @@ pub async fn cmd_diff(
 ) -> Result<()> {
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
+    // On stderr under --json: stdout is the document, and a pipeline parses it.
+    let (kept, total) = design.scope_counts(&resolved)?;
+    match output::scope_line(&resolved, kept, total) {
+        Some(line) if json => eprintln!("{line}"),
+        Some(line) => output::always(&line),
+        None => {}
+    }
     let adapter = get_adapter(config, database_url).await?;
+    if let Some((pinned, by)) = super::other_scope_pin(&*adapter, &design, &resolved).await? {
+        let note = format!(
+            "note: this database is pinned to scope '{pinned}'{by}; this diff compares scope '{}', so what \
+             '{pinned}' does not build reads as missing — `--scope {pinned}` compares what it was built with.",
+            resolved.name
+        );
+        if json {
+            eprintln!("{note}");
+        } else {
+            output::always(&note);
+        }
+    }
 
     let diff = design
         .diff_live(&*adapter, Some(&resolved))

@@ -20,6 +20,10 @@ pub fn cmd_graph(
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
     let resolved = design.resolve_scope(scope, deps)?;
     let graph = design.graph(name, Some(&resolved))?;
+    // A file dbd could not parse is missing from the nodes, as it is from the
+    // DBML and the diagram, and is named the same way — on stderr, which
+    // `left_out_unparsed` writes to, so stdout stays the JSON document.
+    output::left_out_unparsed(&design.unparsed(&resolved)?);
 
     let json = serde_json::json!({
         "nodes": graph.nodes.iter().map(|n| serde_json::json!({
@@ -37,15 +41,16 @@ pub fn cmd_graph(
     });
 
     output::always(&serde_json::to_string_pretty(&json)?);
-    output::detail(
-        verbosity,
-        &format!(
+    // On stderr: printed after the document on stdout, the count made
+    // `dbd graph -v | jq` fail to parse.
+    if verbosity.is_verbose() {
+        eprintln!(
             "{} nodes, {} edges, {} layers",
             graph.nodes.len(),
             graph.edges.len(),
             graph.layers.len()
-        ),
-    );
+        );
+    }
     Ok(())
 }
 
@@ -64,10 +69,15 @@ pub fn cmd_dbml(
     // entities that deploy under this scope. The all-scope keeps everything.
     let resolved = design.resolve_scope(scope, deps)?;
     let entities = design.scoped_entities(&resolved)?;
-    output::scope_filtered(&resolved, entities.len(), design.entities().len());
+    let (kept, total) = design.scope_counts(&resolved)?;
+    output::scope_filtered(&resolved, kept, total);
+    output::left_out_unparsed(&design.unparsed(&resolved)?);
 
     let docs = dbd_core::dbml::generate_all(&dbd_core::dbml::DbmlMultiParams {
         entities: &entities,
+        // The whole design, not the scope: a stub for an out-of-scope parent
+        // takes its column types from here.
+        design_entities: design.entities(),
         project_name: &design.config().project.name,
         database_type: &design.config().source.dialect,
         project_note: design.config().project.note.as_deref(),
@@ -112,17 +122,24 @@ pub fn cmd_doctor(config: &Path, fix: bool, verbosity: Verbosity) -> Result<()> 
     let plural_dirs = dbd_core::doctor::detect_plural_ddl_dirs(project_dir);
     // Misfiled view/matview DDL — detection only; the fix is a manual move.
     let mismatches = dbd_core::doctor::detect_ddl_type_mismatches(project_dir);
+    // Extension/schema files the scanner does not read — detection only; the
+    // fix is a design.yaml entry, named for each.
+    let parsed_config = dbd_core::config::read(config).ok();
+    let declared_files = dbd_core::doctor::detect_declared_kind_files(project_dir, parsed_config.as_ref());
 
     let auto_fixable = config_issues.len() + stale_files.len() + plural_dirs.len();
-    let total_issues = auto_fixable + mismatches.len();
+    let by_hand = mismatches.len() + declared_files.len();
+    let total_issues = auto_fixable + by_hand;
 
+    // doctor counts issues, not entities: the shared entity summary printed
+    // "0 entities — no issues" here on a project full of tables.
     if total_issues == 0 {
         output::info(verbosity, "No issues found — project is up to date.");
-        output::summary(0, 0, 0);
         return Ok(());
     }
 
     report_doctor_issues(&config_issues, &stale_files, &plural_dirs, &mismatches);
+    report_declared_kind_files(&declared_files);
 
     if !fix {
         if auto_fixable > 0 {
@@ -131,7 +148,10 @@ pub fn cmd_doctor(config: &Path, fix: bool, verbosity: Verbosity) -> Result<()> 
         if !mismatches.is_empty() {
             output::always("Misfiled DDL files must be moved manually (see above).");
         }
-        output::summary(total_issues, 0, 0);
+        if !declared_files.is_empty() {
+            output::always("Extension and schema files must be replaced by hand (see above).");
+        }
+        output::always(&format!("\n{} found.", issues(total_issues)));
         return Ok(());
     }
 
@@ -158,9 +178,58 @@ pub fn cmd_doctor(config: &Path, fix: bool, verbosity: Verbosity) -> Result<()> 
             output::always(&format!("  - {} → {}", m.path.display(), m.suggested_path.display()));
         }
     }
-    output::summary(mismatches.len(), 0, fixed);
+    if !declared_files.is_empty() {
+        output::always(&format!(
+            "\n{} left unchanged — replace by hand (see above).",
+            files(declared_files.len(), "extension/schema file")
+        ));
+    }
+    output::always(&format!("\n{} fixed, {by_hand} left to fix by hand.", issues(fixed)));
 
     Ok(())
+}
+
+/// `1 <what>` / `N <what>s`.
+fn files(n: usize, what: &str) -> String {
+    format!("{n} {what}{}", if n == 1 { "" } else { "s" })
+}
+
+/// Print each `ddl/extension/` and `ddl/schema/` file with the design.yaml
+/// entry that replaces it.
+fn report_declared_kind_files(found: &[dbd_core::doctor::DeclaredKindFile]) {
+    use dbd_core::doctor::DeclaredKind;
+    if found.is_empty() {
+        return;
+    }
+    output::always(&format!(
+        "\nFound {} dbd does not read (design.yaml declares extensions and schemas):",
+        files(found.len(), "DDL file")
+    ));
+    for f in found {
+        let fix = match (f.kind, f.declared) {
+            (DeclaredKind::Extension, true) => format!(
+                "`{}` is already in the target's extensions: list — delete the file",
+                f.name
+            ),
+            (DeclaredKind::Extension, false) => {
+                let entry = match &f.schema {
+                    None => format!("`{}`", f.name),
+                    Some(schema) => format!("`{{ name: {}, schema: {schema} }}`", f.name),
+                };
+                format!("add {entry} to the target's extensions: list in design.yaml, then delete the file")
+            }
+            (DeclaredKind::Schema, true) => format!("`{}` is already listed under schemas: — delete the file", f.name),
+            (DeclaredKind::Schema, false) => {
+                format!("list `{}` under schemas: in design.yaml, then delete the file", f.name)
+            }
+        };
+        output::always(&format!("  - {} → {fix}", f.path.display()));
+    }
+}
+
+/// `1 issue` / `N issues`.
+fn issues(n: usize) -> String {
+    format!("{n} issue{}", if n == 1 { "" } else { "s" })
 }
 
 /// Print the config / stale-file / plural-folder issues doctor detected.
@@ -257,20 +326,24 @@ fn fix_stale_files(stale_files: &[dbd_core::doctor::StaleFile], verbosity: Verbo
 }
 
 /// Migrate plural DDL folders to their singular canonical form, returning how
-/// many moves succeeded.
+/// many folders were migrated in full.
+///
+/// A folder is one issue — that is how `doctor` finds and reports it — so it
+/// is one fixed, however many files moving it took. Counting the moves, doctor
+/// found "2 issues" and fixed "4". A folder any of whose files failed to move
+/// is not fixed.
 fn fix_plural_dirs(plural_dirs: &[dbd_core::doctor::PluralDdlDir], verbosity: Verbosity) -> usize {
     use dbd_core::doctor::DdlMoveOutcome;
     let mut fixed = 0;
     for d in plural_dirs {
+        let mut all_moved = true;
         for outcome in dbd_core::doctor::migrate_plural_ddl_dir(d) {
             match outcome {
                 DdlMoveOutcome::RenamedDir { from, to } => {
                     output::info(verbosity, &format!("Renamed {} → {}", from.display(), to.display()));
-                    fixed += 1;
                 }
                 DdlMoveOutcome::MovedFile { from, to } => {
                     output::info(verbosity, &format!("Moved {} → {}", from.display(), to.display()));
-                    fixed += 1;
                 }
                 DdlMoveOutcome::BackedUp {
                     winner,
@@ -285,12 +358,15 @@ fn fix_plural_dirs(plural_dirs: &[dbd_core::doctor::PluralDdlDir], verbosity: Ve
                         loser.display(),
                         backup.display()
                     ));
-                    fixed += 1;
                 }
                 DdlMoveOutcome::Error { path, error } => {
                     output::always(&format!("Failed to migrate {}: {error}", path.display()));
+                    all_moved = false;
                 }
             }
+        }
+        if all_moved {
+            fixed += 1;
         }
     }
     fixed
@@ -317,7 +393,7 @@ pub fn cmd_init(project_dir: &Path, name: &str, target: &str, verbosity: Verbosi
 #[allow(clippy::too_many_arguments)]
 pub async fn cmd_deploy(
     source: &str,
-    _config_name: &Path,
+    config_name: &Path,
     env: &str,
     database_url: Option<&str>,
     dry_run: bool,
@@ -339,67 +415,116 @@ pub async fn cmd_deploy(
         .await
         .context("Failed to resolve source")?;
 
-    let config_path = project_dir.join("design.yaml");
+    // `config_name` is `-c` relative to the source, so it names the same file
+    // in a downloaded GitHub tree as in a local one.
+    let config_path = project_dir.join(config_name);
     if !config_path.exists() {
-        anyhow::bail!("No design.yaml found in {}", project_dir.display());
+        anyhow::bail!("No {} found in {}", config_name.display(), project_dir.display());
     }
 
     let mut design = Design::from_config_with_dir(&config_path, env, Some(&project_dir))
         .context("Failed to load design from source")?;
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
+    // What the scope builds, not what the design declares: a scoped deploy
+    // never touches the rest, so the whole-design tally described a run that
+    // does not happen. Named for the run as for its preview.
+    let (kept, total) = design.scope_counts(&resolved)?;
+    output::scope_filtered(&resolved, kept, total);
+    // Each file its apply executes on a path it does not state, as `apply`
+    // says it — a forgotten search_path is never silent.
+    for warning in design.search_path_warnings(None, Some(&resolved))? {
+        output::warn(&warning);
+    }
 
     if dry_run {
-        // Surface the same gap/closure errors a real deploy would.
-        design.check_scope_gaps(&resolved).context("scope check failed")?;
+        // The real deploy's own gate (it runs `Design::apply`): scope gaps and
+        // closure, the extension allowlist, and the refusal of a file that did
+        // not parse. The preview used to tally "1 errors" and exit 0 over a
+        // design the deploy refuses.
+        let to_apply = design.entities_to_apply(None, Some(&resolved))?.len();
+        // With a database to ask, refuse where the deploy refuses: the scope
+        // pin, then its apply's environment and version guards — the import's
+        // environment guard is the same one.
+        let adapter = super::dry_run_adapter(&config_path, database_url).await?;
+        if let Some(adapter) = &adapter {
+            let marks = design.database_marks(&**adapter).await?;
+            Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
+            design.check_apply_guards(&marks)?;
+        }
+        // The migrations its apply phase executes first, built before anything
+        // is printed: it refuses where the run does — an unresolved `-- TODO`
+        // in a pending data script — and a refused preview should not list a
+        // plan first, as this one listed its entity count.
+        let preview = match &adapter {
+            Some(adapter) => Some(
+                design
+                    .pending_migration_preview(&**adapter, None, Some(&resolved))
+                    .await?,
+            ),
+            None => None,
+        };
+        // The hooks the run would skip, decided as the run decides them.
+        for skip in design.hook_skips(Some(&resolved))? {
+            output::warn(&skip);
+        }
+
         let report = design.report(None, Some(&resolved));
         if !resolved.is_all {
-            for gap in &report.gaps {
-                output::always(&format!(
-                    "✗ dependency gap: {} requires {} (out of scope)\n    chain: {}",
-                    gap.required_by,
-                    gap.missing,
-                    gap.chain.join(" → ")
-                ));
-            }
+            output::scope_gaps(&resolved, &report.gaps);
         }
-        output::info(
-            verbosity,
-            &format!(
-                "{} entities found, {} errors, {} warnings",
-                design.entities().len(),
-                report.issues.len(),
-                report.warnings.len(),
-            ),
-        );
+        output::info(verbosity, &format!("{to_apply} entities would be applied."));
+        // The migrations its apply phase executes first, as `apply --dry-run` lists them.
+        match &preview {
+            Some(preview) => super::print_migration_preview(verbosity, preview),
+            None => super::note_unlisted_migrations(verbosity, &project_dir),
+        }
 
         // Preview the import the same way the real run reports it: always state
         // the file count — including zero — and why anything was left out.
-        let ws = design.working_set(&resolved)?;
-        let import_plan: Vec<_> = design
-            .import_plan(None)
-            .into_iter()
-            .filter(|e| dbd_core::design::import_entry_in_scope(e, &ws, resolved.is_all))
-            .collect();
+        let (import_plan, skips) = design.scoped_import_plan(None, Some(&resolved))?;
         output::info(
             verbosity,
             &format!("{} data file(s) would be imported.", import_plan.len()),
         );
-        for warning in design.import_warnings(None) {
+        for warning in design.import_warnings(None).into_iter().chain(skips) {
+            output::warn(&warning);
+        }
+        // The import's `import.after` hooks, judged as `import --dry-run` and
+        // the real deploy judge them.
+        let (_, after_skips) = design.import_after_preview(Some(&resolved))?;
+        for warning in after_skips {
             output::warn(&warning);
         }
 
-        let policy_files = dbd_core::scanner::scan_policies(&project_dir)?;
+        // The policy phase's own scope filter, counted the way the real
+        // deploy's summary counts it.
+        let policy_ws = super::schema::policy_working_set(&design, &resolved)?;
+        let policies =
+            dbd_core::design::plan_policies(&project_dir, policy_ws.as_ref().map(|(n, ws)| (n.as_str(), ws)))?;
         output::info(
             verbosity,
-            &format!("{} policy file(s) would be applied.", policy_files.len()),
+            &format!(
+                "{} policy file(s) would be applied{}.",
+                policies.applied.len(),
+                match policies.skipped.len() {
+                    0 => String::new(),
+                    n => format!(", {n} skipped (out of scope)"),
+                }
+            ),
         );
         output::info(verbosity, "[dry-run] No changes applied.");
         return Ok(());
     }
 
     let adapter = get_adapter(&config_path, database_url).await?;
-    let meta = adapter.get_project_meta().await?;
-    Design::check_scope_guard(meta.as_ref(), &resolved.name, allow_scope_change)?;
+    let marks = design.database_marks(&*adapter).await?;
+    Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
+
+    // Said before the run, not in its summary: a deploy that fails never
+    // prints one, and a skipped hook is often why it failed.
+    for skip in design.hook_skips(Some(&resolved))? {
+        output::warn(&skip);
+    }
 
     // Delegate to the library's `Design::deploy` — apply + import + policies —
     // so `dbd deploy` and an embedder calling the crate run the same pipeline.
@@ -422,18 +547,25 @@ pub async fn cmd_deploy(
         spinner.finish();
         result.context("Deploy failed")?;
     }
+    super::note_promotion(&marks, design.env());
 
     let summary = summary.unwrap_or_default();
+    // Non-fatal diagnostics — skipped imports and failed policy files — are
+    // always surfaced, regardless of verbosity. A deploy that quietly loaded
+    // nothing is the failure mode this reporting exists to prevent. Each in the
+    // order its phase ran — schema, data, policies — so nothing reads as having
+    // happened before what it followed.
+    // The apply phase's warnings are the hook skips, already said before it.
+    for warning in &summary.import.warnings {
+        output::warn(warning);
+    }
     if !summary.policies.applied.is_empty() {
         output::info(
             verbosity,
             &format!("Applied {} policy file(s).", summary.policies.applied.len()),
         );
     }
-    // Non-fatal diagnostics — skipped imports and failed policy files — are
-    // always surfaced, regardless of verbosity. A deploy that quietly loaded
-    // nothing is the failure mode this reporting exists to prevent.
-    for warning in summary.warnings() {
+    for warning in summary.policy_warnings() {
         output::warn(&warning);
     }
     output::info(verbosity, &format_deploy_summary(&summary));
@@ -468,27 +600,104 @@ pub async fn cmd_reconcile(
     }
 
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
-    let adapter = get_adapter(config, database_url).await?;
+    let (kept, total) = design.scope_counts(&resolved)?;
+    output::scope_filtered(&resolved, kept, total);
+    // A dry run writes nothing, and the SQLite adapter creates a missing file
+    // on connect — the preview left an empty database behind. So it opens only
+    // a database that is there, as every other dry run does. Only a SQLite
+    // file reads as not there, and what the real run would reconcile against
+    // is then an empty database: an in-memory one is that, and leaves no file.
+    // With no database configured at all, the preview needs one as the run
+    // does, and says how to name it.
+    let configured = super::configured_database_url(config, database_url)?;
+    let adapter = match configured {
+        Some(url) if dry_run => {
+            let project = &design.config().project.name;
+            match dbd_core::connect_existing(&url, project)
+                .await
+                .context("Failed to connect to database")?
+            {
+                Some(adapter) => adapter,
+                None => dbd_core::connect("sqlite::memory:", project)
+                    .await
+                    .context("Failed to open an empty database to preview against")?,
+            }
+        }
+        _ => get_adapter(config, database_url).await?,
+    };
+    reconcile_with_adapter(
+        &*adapter,
+        &design,
+        &resolved,
+        dry_run,
+        allow_destructive,
+        prune,
+        allow_scope_change,
+        verbosity,
+    )
+    .await
+}
+
+/// The body of `dbd reconcile`, with the adapter supplied rather than connected.
+///
+/// Split out so what a run decides against a given database — the scope guard
+/// above all — is testable against a mock without a live one.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn reconcile_with_adapter(
+    adapter: &dyn dbd_core::DatabaseAdapter,
+    design: &Design,
+    resolved: &dbd_core::ResolvedScope,
+    dry_run: bool,
+    allow_destructive: bool,
+    prune: bool,
+    allow_scope_change: bool,
+    verbosity: Verbosity,
+) -> Result<()> {
+    // Guarded before the dry run, not after it. The preview connects anyway, so
+    // it can see the pin, and a plan for a run the guard will refuse is a
+    // preview of something that cannot happen. (`reset --dry-run` asks the
+    // same of a configured database; with none configured it previews the
+    // plan alone, having no pin to read.)
+    let marks = design.database_marks(adapter).await?;
+    Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
+
+    // The hooks the run skips, said before it — a run that fails prints no
+    // summary, and a skipped hook is often why it failed.
+    for skip in design.hook_skips(Some(resolved))? {
+        output::warn(&skip);
+    }
 
     if dry_run {
         let plan = design
             .reconcile(
-                &*adapter,
+                adapter,
                 true,
                 allow_destructive,
                 prune,
-                Some(&resolved),
+                Some(resolved),
                 Progress::none(),
             )
             .await
             .context("Reconcile planning failed")?;
         print_reconcile_plan(&plan, prune, verbosity);
+        // The run goes on to the apply hooks and the grants; a preview of it
+        // that stops at the schema changes leaves them out.
+        for hook in design.apply_hooks_to_run(Some(resolved))? {
+            output::info(verbosity, &format!("  run {hook}"));
+        }
+        let grants = design.grants_to_apply(Some(resolved))?;
+        if !grants.is_empty() {
+            if adapter.supports_schema_grants() {
+                for line in grants {
+                    output::info(verbosity, &format!("  grant on {line}"));
+                }
+            } else {
+                output::info(verbosity, "  Skipping schema grants (target has no grant model).");
+            }
+        }
         output::info(verbosity, "[dry-run] No changes applied.");
         return Ok(());
     }
-
-    let meta = adapter.get_project_meta().await?;
-    Design::check_scope_guard(meta.as_ref(), &resolved.name, allow_scope_change)?;
 
     output::info(verbosity, "Reconciling schema to design...");
     let mut summary = None;
@@ -496,11 +705,11 @@ pub async fn cmd_reconcile(
         let spinner = output::StepSpinner::new(verbosity);
         let result = design
             .reconcile(
-                &*adapter,
+                adapter,
                 false,
                 allow_destructive,
                 prune,
-                Some(&resolved),
+                Some(resolved),
                 Progress {
                     on_start: |desc: &str| spinner.start(desc),
                     on_done: |desc: &str, err: Option<&str>| spinner.done(desc, err),
@@ -511,6 +720,7 @@ pub async fn cmd_reconcile(
         spinner.finish();
         result.context("Reconcile failed")?
     };
+    super::note_promotion(&marks, design.env());
 
     for w in &plan.warnings {
         output::always(&format!("⚠ {w}"));
@@ -526,14 +736,22 @@ pub async fn cmd_reconcile(
         }
     }
     if let Some(s) = summary {
+        let hooks = match s.before_scripts + s.after_scripts {
+            0 => String::new(),
+            n => format!(", {n} hook script(s) run"),
+        };
         output::info(
             verbosity,
             &format!(
-                "Reconciled — {} created, {} altered, {} re-applied, {} re-stamped, {} pruned.",
+                "Reconciled — {} created, {} altered, {} re-applied, {} re-stamped, {} pruned{hooks}.",
                 s.created, s.altered, s.reapplied, s.restamped, s.dropped
             ),
         );
     }
+
+    // As after `dbd apply`: the design's grants are part of the database it
+    // describes, and a reconciled one had none.
+    super::apply_and_report_grants(design, adapter, resolved, verbosity).await?;
     Ok(())
 }
 
@@ -597,8 +815,18 @@ fn reconcile_plan_lines(plan: &dbd_core::ReconcilePlan, prune: bool, verbosity: 
     lines
 }
 
-/// Release the current version: write a baseline snapshot and set the released
-/// flag, locking the project into the snapshot/migration workflow.
+/// Release the current version: set the released flag, locking the project into
+/// the snapshot/migration workflow — writing the baseline snapshot first when
+/// the project has none.
+///
+/// A greenfield project reaches release with no snapshots: it was iterated with
+/// `reconcile`, and release cuts its baseline. A brownfield one does not —
+/// `init --from-db` writes the baseline as it creates the project, and `merge`
+/// snapshots each import — but neither sets `released`. Release used to refuse
+/// any project with snapshots, so a brownfield project could never be released
+/// and `reconcile` stayed enabled on it for good. Its history is already the
+/// record, so it is released at the version that history reached; writing a
+/// second baseline over it would discard the versions it already has.
 pub fn cmd_release(
     config: &Path,
     env: &str,
@@ -611,16 +839,14 @@ pub fn cmd_release(
     if design.config().project.released {
         anyhow::bail!("Project is already released.");
     }
-    if dbd_core::snapshot::has_snapshots(project_dir) {
-        anyhow::bail!(
-            "Snapshots already exist — the project is already on the migration track. \
-             Use `dbd snapshot` for subsequent versions."
-        );
-    }
 
     let error_count = design.entities().iter().filter(|e| !e.errors.is_empty()).count();
     if error_count > 0 {
         anyhow::bail!("Design has {error_count} entity error(s); fix them before releasing (run `dbd inspect`).");
+    }
+
+    if dbd_core::snapshot::has_snapshots(project_dir) {
+        return release_at_latest_snapshot(&design, config, project_dir, name, verbosity);
     }
 
     let version = design.config().project.version();
@@ -632,6 +858,60 @@ pub fn cmd_release(
     output::always(&format!(
         "✓ Released v{version} — baseline snapshot written; `reconcile` is now disabled."
     ));
+    output::info(
+        verbosity,
+        "Next changes: edit the design → `dbd snapshot` → `dbd apply`.",
+    );
+    Ok(())
+}
+
+/// Release a project whose snapshots already exist, at the version they reached.
+///
+/// Released at version N means the design *is* snapshot N, so a change no
+/// snapshot captured is refused rather than shipped unversioned: `dbd snapshot`
+/// records it, and the release then lands on that version.
+fn release_at_latest_snapshot(
+    design: &Design,
+    config: &Path,
+    project_dir: &Path,
+    name: Option<&str>,
+    verbosity: Verbosity,
+) -> Result<()> {
+    let latest = dbd_core::snapshot::latest_snapshot(project_dir)
+        .context("Failed to read the latest snapshot")?
+        .context("snapshots/ lists a version but none could be read")?;
+    let version = latest.version;
+
+    // The version apply migrates to is `project.version`; releasing at a
+    // snapshot version it does not name would release one version and deploy
+    // another.
+    if let Some(declared) = design.config().project.version
+        && declared != version
+    {
+        anyhow::bail!(
+            "design.yaml says project.version {declared}, but the latest snapshot is v{version} — \
+             set project.version to {version} (or restore the missing snapshots) before releasing."
+        );
+    }
+
+    let pending = dbd_core::snapshot::prepare_multi_snapshot(design.entities(), Some(&latest), version + 1, "release");
+    let captured = pending.snapshots.len() == 1 && pending.snapshots[0].no_changes;
+    if !captured {
+        anyhow::bail!(
+            "the design has changes since snapshot v{version} that no snapshot records — \
+             capture them with `dbd snapshot`, then run `dbd release` again."
+        );
+    }
+
+    dbd_core::config::set_released(config, true).context("Failed to set released flag")?;
+    output::always(&format!(
+        "✓ Released v{version} — the existing snapshots are its history, so no baseline was written; \
+         `reconcile` is now disabled."
+    ));
+    if name.is_some() {
+        // `--name` describes the baseline snapshot, and there is none to write.
+        output::warn("--name not used: this project's baseline snapshot already exists.");
+    }
     output::info(
         verbosity,
         "Next changes: edit the design → `dbd snapshot` → `dbd apply`.",
@@ -710,6 +990,50 @@ mod tests {
         cmd_dbml(&cfg, "dev", proj.path(), &out, None, None, Verbosity::Normal).unwrap();
     }
 
+    /// Under `--scope`, a Ref to a table the scope leaves out still needs that
+    /// table in the document: a Ref to an undefined table is a DBML error, and
+    /// the guide promises a stub. The fixture's `incomplete` scope keeps only
+    /// `config.lookup_values`, which references `config.lookups` (in the design,
+    /// out of scope — so its stub carries the real `uuid`) and
+    /// `config.categories` (declared nowhere — so its type is unknown).
+    #[test]
+    fn dbml_under_a_scope_stubs_every_referenced_table_it_leaves_out() {
+        let proj = testutil::copy_fixture_project();
+        let cfg = proj.path().join("design.yaml");
+        let out = proj.path().join("scoped.dbml");
+        cmd_dbml(
+            &cfg,
+            "dev",
+            proj.path(),
+            &out,
+            Some("incomplete"),
+            None,
+            Verbosity::Normal,
+        )
+        .unwrap();
+        let dbml = std::fs::read_to_string(&out).unwrap();
+
+        let stub = |table: &str| -> String {
+            let header = format!("Table {table} {{");
+            let start = dbml
+                .find(&header)
+                .unwrap_or_else(|| panic!("no stub for {table}:\n{dbml}"));
+            let body = &dbml[start..];
+            body[..body.find('}').unwrap()].to_string()
+        };
+        let lookups = stub("\"config\".\"lookups\"");
+        assert!(
+            lookups.contains("\"id\" uuid"),
+            "an out-of-scope design table keeps its real type:\n{dbml}"
+        );
+        assert!(
+            !lookups.contains("\"name\""),
+            "a stub shows only the referenced columns:\n{dbml}"
+        );
+        // Nothing defines it, so its key is typed like the column referencing it.
+        assert!(stub("\"config\".\"categories\"").contains("\"id\" uuid"), "{dbml}");
+    }
+
     /// A missing config bails with an actionable "not found" error.
     #[test]
     fn doctor_bails_when_config_missing() {
@@ -736,10 +1060,10 @@ mod tests {
     /// so it never opens a DB connection.
     #[tokio::test]
     async fn deploy_dry_run_from_local_source() {
-        let src = testutil::fixtures();
+        let src = testutil::offline_fixture_project();
         cmd_deploy(
-            src.to_str().unwrap(),
-            &testutil::fixture_config(),
+            src.path().to_str().unwrap(),
+            Path::new("design.yaml"),
             "dev",
             None,
             /*dry_run*/ true,
@@ -759,13 +1083,12 @@ mod tests {
     /// error. Guards against the regression where deploy silently skipped RLS.
     #[tokio::test]
     async fn deploy_dry_run_includes_policies() {
-        let proj = testutil::copy_fixture_project();
+        let proj = testutil::offline_fixture_project();
         std::fs::create_dir_all(proj.path().join("policies")).unwrap();
         std::fs::write(proj.path().join("policies").join("secrets.sql"), "-- rls policy\n").unwrap();
-        let cfg = proj.path().join("design.yaml");
         cmd_deploy(
             proj.path().to_str().unwrap(),
-            &cfg,
+            Path::new("design.yaml"),
             "dev",
             None,
             /*dry_run*/ true,
@@ -795,18 +1118,59 @@ mod tests {
         );
     }
 
-    /// A project with a `snapshots/` dir but no `released` flag set is already
-    /// on the migration track — `release` refuses even before checking for
-    /// entity errors.
-    #[test]
-    fn release_refuses_when_snapshots_exist_without_released_flag() {
+    /// A fixture copy shaped like `init --from-db` leaves it: a baseline
+    /// snapshot at v1 and `project.version: 1`, but no `released` flag.
+    fn brownfield_project() -> tempfile::TempDir {
         let proj = testutil::copy_fixture_project();
-        std::fs::create_dir_all(proj.path().join("snapshots")).unwrap();
-        std::fs::write(proj.path().join("snapshots").join("001.json"), "{}").unwrap();
+        let cfg = proj.path().join("design.yaml");
+        let design = Design::from_config_with_dir(&cfg, "dev", Some(proj.path())).unwrap();
+        dbd_core::snapshot::create_baseline_snapshot(design.entities(), proj.path(), &cfg, "init from database", 1)
+            .unwrap();
+        proj
+    }
+
+    /// `init --from-db` and `merge` write snapshots without setting
+    /// `released`, and `release` refused any project with snapshots — so a
+    /// brownfield project could never be released, and `reconcile` stayed
+    /// enabled on it for good. Its baseline already exists: release marks the
+    /// project released at that version, and writes no second baseline.
+    #[test]
+    fn a_brownfield_project_is_released_at_its_snapshot_version() {
+        let proj = brownfield_project();
         let cfg = proj.path().join("design.yaml");
 
-        let err = cmd_release(&cfg, "dev", proj.path(), None, Verbosity::Normal).unwrap_err();
-        assert!(err.to_string().contains("Snapshots already exist"), "got: {err}");
+        cmd_release(&cfg, "dev", proj.path(), None, Verbosity::Normal).expect("a brownfield project can be released");
+
+        let config = dbd_core::config::read(&cfg).unwrap();
+        assert!(config.project.released, "the project is marked released");
+        assert_eq!(config.project.version, Some(1), "at the version its snapshots reached");
+        let versions: Vec<u32> = dbd_core::snapshot::list_snapshots(proj.path())
+            .iter()
+            .map(|s| s.version)
+            .collect();
+        assert_eq!(versions, vec![1], "no second baseline is written over the history");
+    }
+
+    /// Releasing at the snapshot version is only true if the snapshot is the
+    /// design. A change no snapshot captured would ship unversioned, so the
+    /// release refuses and says how to capture it.
+    #[test]
+    fn a_brownfield_release_refuses_changes_no_snapshot_captured() {
+        let proj = brownfield_project();
+        let cfg = proj.path().join("design.yaml");
+        std::fs::write(
+            proj.path().join("ddl/table/config/added_later.ddl"),
+            "set search_path to config;\ncreate table if not exists added_later (id integer primary key);\n",
+        )
+        .unwrap();
+
+        let err = cmd_release(&cfg, "dev", proj.path(), None, Verbosity::Normal)
+            .expect_err("an uncaptured change must not be released as v1");
+        assert!(err.to_string().contains("dbd snapshot"), "names the way out: {err}");
+        assert!(
+            !dbd_core::config::read(&cfg).unwrap().project.released,
+            "and the project stays unreleased"
+        );
     }
 
     /// A design with an entity parse error refuses to release — releasing a
@@ -851,14 +1215,66 @@ mod tests {
         assert!(err.to_string().contains("released"), "got: {err}");
     }
 
+    /// A dry run that connects must refuse the way the real run does. On a
+    /// database pinned to `all`, `reconcile --dry-run --scope config_only`
+    /// printed a plan and exited 0 — a preview of a run that cannot happen,
+    /// since the real run refuses on the scope guard before planning.
+    #[tokio::test]
+    async fn reconcile_dry_run_refuses_a_database_pinned_to_another_scope() {
+        let design =
+            Design::from_config_with_dir(&testutil::fixture_config(), "dev", Some(&testutil::fixtures())).unwrap();
+        let resolved = design.resolve_scope(Some("config_only"), None).unwrap();
+        let mock = dbd_core::adapter::mock::MockAdapter::new().with_scope("all");
+
+        let err = reconcile_with_adapter(
+            &mock,
+            &design,
+            &resolved,
+            /*dry_run*/ true,
+            /*allow_destructive*/ false,
+            /*prune*/ false,
+            /*allow_scope_change*/ false,
+            Verbosity::Normal,
+        )
+        .await
+        .expect_err("the dry run must refuse a database pinned to another scope");
+        assert!(
+            err.to_string().contains("pinned to scope 'all'"),
+            "with the real run's reason: {err}"
+        );
+    }
+
+    /// The guard's own escape hatch reaches the dry run too, so a re-point can
+    /// be previewed before it is made.
+    #[tokio::test]
+    async fn reconcile_dry_run_previews_a_re_point_when_allowed() {
+        let design =
+            Design::from_config_with_dir(&testutil::fixture_config(), "dev", Some(&testutil::fixtures())).unwrap();
+        let resolved = design.resolve_scope(Some("config_only"), None).unwrap();
+        let mock = dbd_core::adapter::mock::MockAdapter::new().with_scope("all");
+
+        reconcile_with_adapter(
+            &mock,
+            &design,
+            &resolved,
+            /*dry_run*/ true,
+            /*allow_destructive*/ false,
+            /*prune*/ false,
+            /*allow_scope_change*/ true,
+            Verbosity::Normal,
+        )
+        .await
+        .unwrap();
+    }
+
     /// `deploy --clear-cache` clears the local download cache before the rest
     /// of the (local, no-DB) dry-run flow proceeds.
     #[tokio::test]
     async fn deploy_clears_cache_before_dry_run() {
-        let src = testutil::fixtures();
+        let src = testutil::offline_fixture_project();
         cmd_deploy(
-            src.to_str().unwrap(),
-            &testutil::fixture_config(),
+            src.path().to_str().unwrap(),
+            Path::new("design.yaml"),
             "dev",
             None,
             /*dry_run*/ true,
@@ -873,6 +1289,29 @@ mod tests {
         .unwrap();
     }
 
+    /// `-c` names the config file inside the source, for deploy as for every
+    /// other command. Deploy read `design.yaml` whatever `-c` said.
+    #[tokio::test]
+    async fn deploy_reads_the_config_named_by_dash_c() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("staging.yaml"), "project:\n  name: other\n").unwrap();
+        cmd_deploy(
+            src.path().to_str().unwrap(),
+            Path::new("staging.yaml"),
+            "dev",
+            None,
+            /*dry_run*/ true,
+            /*no_cache*/ true,
+            /*clear_cache*/ false,
+            /*allow_scope_change*/ false,
+            None,
+            None,
+            Verbosity::Normal,
+        )
+        .await
+        .expect("deploy -c staging.yaml must read staging.yaml");
+    }
+
     /// A source directory that exists but has no `design.yaml` is a clear,
     /// actionable error — resolved entirely from the local filesystem.
     #[tokio::test]
@@ -880,7 +1319,7 @@ mod tests {
         let empty = tempfile::tempdir().unwrap();
         let err = cmd_deploy(
             empty.path().to_str().unwrap(),
-            &testutil::fixture_config(),
+            Path::new("design.yaml"),
             "dev",
             None,
             /*dry_run*/ true,
@@ -900,12 +1339,18 @@ mod tests {
     /// the whole point of `include`), but `deploy --dry-run` still surfaces the
     /// gap as an FYI — exercising the gap-reporting loop that a `Report`-policy
     /// gap never reaches (it bails earlier, in `check_scope_gaps`).
+    ///
+    /// Run on a copy without the staging data files: `incomplete_auto` builds
+    /// the loaders' targets but not the loaders, so a deploy that loads those
+    /// files is refused before it applies anything — not the path under test.
     #[tokio::test]
     async fn deploy_dry_run_reports_gap_for_scope_with_include_deps() {
-        let src = testutil::fixtures();
+        // Offline (no URL to reach), and without the staging data files.
+        let src = testutil::offline_fixture_project();
+        std::fs::remove_dir_all(src.path().join("import/staging")).unwrap();
         cmd_deploy(
-            src.to_str().unwrap(),
-            &testutil::fixture_config(),
+            src.path().to_str().unwrap(),
+            Path::new("design.yaml"),
             "dev",
             None,
             /*dry_run*/ true,
@@ -1052,6 +1497,7 @@ mod tests {
             }],
             warnings: vec!["enum value dropped".to_string()],
             destructive: true,
+            ..Default::default()
         };
 
         let pruned = reconcile_plan_lines(&plan, true, Verbosity::Normal).join("\n");

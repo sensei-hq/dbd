@@ -208,3 +208,74 @@ fn a_utf16_ddl_file_does_not_fail_the_whole_project_load() {
     assert!(wide.errors.is_empty(), "and read cleanly: {:?}", wide.errors);
     assert!(wide.table_def.is_some(), "with its structure intact");
 }
+
+// ── Every later reader of the file ──────────────────────────────────────────
+
+/// A project with one table, its DDL written the way SSMS writes it.
+fn utf16_project(dialect: &str, ddl_rel: &str, ddl: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::write(
+        d.join("design.yaml"),
+        format!("project:\n  name: ssms\n\nsource:\n  dialect: {dialect}\n\nschemas:\n  - app\n"),
+    )
+    .unwrap();
+    let path = d.join(ddl_rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, utf16le(ddl)).unwrap();
+    dir
+}
+
+/// Loading decoded the file, but `apply` read it a second time with
+/// `read_to_string`, got an error, and took it for an entity with no DDL — so
+/// the table was skipped and the apply reported success.
+#[tokio::test]
+async fn a_utf16_ddl_file_applies() {
+    use dbd_core::Design;
+    use dbd_core::design::Progress;
+
+    let dir = utf16_project(
+        "sqlite",
+        "ddl/table/wide.ddl",
+        "CREATE TABLE wide (id INTEGER PRIMARY KEY);\n",
+    );
+    let design = Design::from_config(&dir.path().join("design.yaml"), "dev").expect("load");
+    assert!(
+        design.entities().iter().any(|e| e.name == "wide"),
+        "precondition: the load decodes the file"
+    );
+
+    let adapter = dbd_core::connect("sqlite::memory:", "ssms").await.expect("connect");
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply");
+
+    let tables = adapter.list_entities().await.unwrap();
+    assert!(
+        tables.contains(&"wide".to_string()),
+        "the UTF-16 table must be created, not skipped: {tables:?}"
+    );
+}
+
+/// `combine` read each file again the same way, and left the UTF-16 one out of
+/// the script without a word.
+#[test]
+fn a_utf16_ddl_file_combines() {
+    use dbd_core::Design;
+
+    let dir = utf16_project(
+        "postgresql",
+        "ddl/table/app/wide.ddl",
+        "set search_path to app;\ncreate table wide (id int primary key);\n",
+    );
+    let design = Design::from_config(&dir.path().join("design.yaml"), "dev").expect("load");
+    let out = dir.path().join("combined.sql");
+    design.combine(&out, None).expect("combine");
+
+    let script = std::fs::read_to_string(&out).unwrap();
+    assert!(
+        script.contains("create table wide (id int primary key);"),
+        "the UTF-16 table must be in the combined script, decoded: {script:?}"
+    );
+}

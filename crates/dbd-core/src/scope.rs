@@ -35,10 +35,15 @@ pub struct ScopeGap {
 }
 
 /// Entity types a scope can select (schemas handled separately via auto-add).
+///
+/// Sequences included: one belongs to its schema like a table does. Leaving
+/// them out dropped every sequence from every scope, so a table whose default
+/// draws from one could not be applied under any scope.
 pub(crate) fn is_scopable(e: &Entity) -> bool {
     matches!(
         e.entity_type,
         EntityType::Enum
+            | EntityType::Sequence
             | EntityType::Table
             | EntityType::View
             | EntityType::MaterializedView
@@ -141,6 +146,32 @@ fn add_present_schemas(set: &mut HashSet<String>, all_entities: &[Entity]) {
     }
 }
 
+/// Add the `CREATE SCHEMA` entity for the schema each kept extension installs
+/// into (`WITH SCHEMA x`). A scope keeps every extension its `extensions:`
+/// allowlist admits, but [`add_present_schemas`] only sees the schemas its own
+/// entities live in — so without this, any scope lacking `x` failed with
+/// `schema "x" does not exist`. A schema the scope excludes by name stays out.
+fn add_extension_schemas(
+    set: &mut HashSet<String>,
+    all_entities: &[Entity],
+    allow: Option<&HashSet<String>>,
+    excluded: &HashSet<String>,
+) {
+    for ext in all_entities.iter().filter(|e| e.entity_type == EntityType::Extension) {
+        if allow.is_some_and(|a| !a.contains(&ext.name)) {
+            continue;
+        }
+        let Some(sch) = ext.schema.as_ref() else { continue };
+        if !excluded.contains(sch)
+            && all_entities
+                .iter()
+                .any(|e| e.entity_type == EntityType::Schema && &e.name == sch)
+        {
+            set.insert(sch.clone());
+        }
+    }
+}
+
 /// BFS from the in-scope roots along `refers` edges into managed, non-external
 /// entities. Returns (visited, parent) where `parent` maps node → predecessor.
 /// Self-refs, externals, and unresolved (non-managed) targets are not traversed.
@@ -187,15 +218,19 @@ fn traverse(
 /// Whether an entity named `qualified` (`schema.name`) — in today's design or long
 /// gone — falls in `resolved`.
 ///
-/// An entity the design still has is in scope exactly when resolution put it
-/// there, which accounts for excludes and the `deps` closure. A name the design no
-/// longer has cannot be resolved, so it is matched against the scope's own
-/// includes and excludes instead: the changelog of a table dropped three versions
-/// ago stays in the scope that table was in. `existing` is every entity name the
-/// design has now.
+/// An entity the design still has is in scope exactly when it is in
+/// `working_set` — the scope's working set (`Design::working_set`), which
+/// accounts for excludes and, under `deps: include`, the dependency closure.
+/// `resolved.entities` alone is the scope *before* that closure, and asking it
+/// left out every table `include` pulled in. A name the design no longer has
+/// cannot be resolved, so it is matched against the scope's own includes and
+/// excludes instead: the changelog of a table dropped three versions ago stays in
+/// the scope that table was in. `existing` is every entity name the design has
+/// now.
 pub fn admits(
     scopes: &IndexMap<String, ScopeEntry>,
     resolved: &ResolvedScope,
+    working_set: &HashSet<String>,
     existing: &HashSet<String>,
     qualified: &str,
 ) -> bool {
@@ -203,7 +238,7 @@ pub fn admits(
         return true;
     }
     if existing.contains(qualified) {
-        return resolved.entities.contains(qualified);
+        return working_set.contains(qualified);
     }
     let Some(ScopeEntry::Spec(spec)) = scopes.get(&resolved.name) else {
         return true;
@@ -244,9 +279,19 @@ pub fn resolve(
         Some(n) => match scopes.get(n) {
             Some(e) => (n.to_string(), Some(e)),
             None => {
-                let avail: Vec<&str> = scopes.keys().map(|s| s.as_str()).collect();
+                // `all` always exists, so it leads the list rather than being
+                // spliced onto it — joined the other way, a design with no
+                // scopes printed "Available: all, " and a list that never came.
+                let avail: Vec<&str> = std::iter::once("all")
+                    .chain(scopes.keys().map(String::as_str))
+                    .collect();
+                let none_defined = if scopes.is_empty() {
+                    " (design.yaml defines no `scopes:`)"
+                } else {
+                    ""
+                };
                 return Err(DbdError::Config(format!(
-                    "unknown scope '{n}'. Available: all, {}",
+                    "unknown scope '{n}'. Available: {}{none_defined}",
                     avail.join(", ")
                 )));
             }
@@ -302,6 +347,31 @@ pub fn resolve(
     }
 
     add_present_schemas(&mut base, all_entities);
+    let extensions: Option<HashSet<String>> = spec.extensions.as_ref().map(|v| v.iter().cloned().collect());
+
+    // A kept extension whose schema the scope excludes cannot be installed:
+    // the scope contradicts itself, and apply would fail on the missing
+    // schema. Say so here, where every command resolves the scope.
+    let contradictions: Vec<String> = all_entities
+        .iter()
+        .filter(|e| e.entity_type == EntityType::Extension)
+        .filter(|e| extensions.as_ref().is_none_or(|allow| allow.contains(&e.name)))
+        .filter_map(|e| {
+            let schema = e.schema.as_ref()?;
+            excluded
+                .contains(schema)
+                .then(|| format!("'{}' installs into '{schema}'", e.name))
+        })
+        .collect();
+    if !contradictions.is_empty() {
+        return Err(DbdError::Config(format!(
+            "scope '{scope_name}' keeps an extension whose schema it excludes ({}) — stop \
+             excluding that schema, or leave the extension out of the scope's `extensions:` \
+             allowlist",
+            contradictions.join(", ")
+        )));
+    }
+    add_extension_schemas(&mut base, all_entities, extensions.as_ref(), &excluded);
 
     Ok(ResolvedScope {
         name: scope_name,
@@ -309,7 +379,7 @@ pub fn resolve(
         excluded,
         deps: deps_override.unwrap_or(spec.deps),
         is_all: false,
-        extensions: spec.extensions.as_ref().map(|v| v.iter().cloned().collect()),
+        extensions,
     })
 }
 
@@ -379,6 +449,12 @@ pub fn closure(resolved: &ResolvedScope, all_entities: &[Entity], externals: &[S
     }
 
     add_present_schemas(&mut visited, all_entities);
+    add_extension_schemas(
+        &mut visited,
+        all_entities,
+        resolved.extensions.as_ref(),
+        &resolved.excluded,
+    );
     Ok(visited)
 }
 
@@ -568,6 +644,28 @@ mod tests {
         let scopes = scopes_yaml("hub:\n  includes: [config]\n");
         let err = resolve(&scopes, Some("nope"), None, &world(), &[]).unwrap_err();
         assert!(err.to_string().contains("unknown scope 'nope'"));
+    }
+
+    /// With no `scopes:` in design.yaml the list of choices is just `all`. It
+    /// read "Available: all, " — a dangling comma promising a list that never
+    /// came, which reads like a bug in the message rather than the answer.
+    #[test]
+    fn an_unknown_scope_with_none_defined_lists_only_all() {
+        let err = resolve(&IndexMap::new(), Some("nope"), None, &world(), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("all, "), "no dangling separator: {err}");
+        assert!(err.contains("Available: all"), "`all` is still offered: {err}");
+        assert!(err.contains("no `scopes:`"), "and says why it is the only one: {err}");
+
+        let scopes = scopes_yaml("hub:\n  includes: [config]\n");
+        let err = resolve(&scopes, Some("nope"), None, &world(), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Available: all, hub"),
+            "defined scopes follow `all`: {err}"
+        );
     }
 
     #[test]

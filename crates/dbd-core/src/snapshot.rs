@@ -133,8 +133,10 @@ fn todos_in_migration_dir(version: u32, dir: &Path) -> Result<Vec<DataSqlTodo>> 
         if !entry.path().to_string_lossy().ends_with(".data.sql") {
             continue;
         }
-        let content = std::fs::read_to_string(entry.path()) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-            .map_err(|e| DbdError::Config(format!("read {}: {e}", entry.path().display())))?;
+        // Decoded as `apply` decodes the file it then runs, so a `.data.sql`
+        // re-saved by SSMS is checked rather than failing the gate on its
+        // encoding. Still fails closed on a file `source_text` cannot read.
+        let content = crate::source_text::read_to_string(entry.path())?;
         let todo_lines: Vec<String> = content
             .lines()
             .filter(|line| {
@@ -697,18 +699,19 @@ pub fn prepare_multi_snapshot(
         };
     }
 
-    // Determine number of stages
-    let has_enum_removal = complex_changes
-        .iter()
-        .any(|c| matches!(c, ComplexChange::EnumValueRemoval { .. }));
-    let num_stages = if has_enum_removal { 3 } else { 2 };
-
+    // Two stages: first what is safe to run before anything is lost — the
+    // additions, and the `data.sql` that moves rows off a column or a value
+    // about to go — then what drops or replaces. An enum value removal used to
+    // take a third stage that re-pointed its columns at a type the second had
+    // dropped; apply runs each entity's migrations at its place in dependency
+    // order, not stage by stage, so that never ran in the order it was written.
     let ctx = MultiStageCtx {
         prev,
         final_snapshot: &final_snapshot,
         complex_changes: &complex_changes,
+        entities,
         next_version,
-        num_stages,
+        num_stages: 2,
         description,
     };
 
@@ -724,11 +727,6 @@ pub fn prepare_multi_snapshot(
     // Stage 2: destructive changes on top of stage 1.
     snapshots.push(build_stage2(&ctx, stage1_snap));
 
-    // Stage 3: only needed to rebuild a shrunken enum.
-    if has_enum_removal {
-        snapshots.push(build_stage3(&ctx));
-    }
-
     MultiSnapshotResult { snapshots, todos }
 }
 
@@ -737,6 +735,9 @@ struct MultiStageCtx<'a> {
     prev: &'a Snapshot,
     final_snapshot: &'a Snapshot,
     complex_changes: &'a [ComplexChange],
+    /// The design's entities: what an enum swap finds the views over its
+    /// tables in, to drop them around it.
+    entities: &'a [Entity],
     next_version: u32,
     num_stages: u32,
     description: &'a str,
@@ -926,34 +927,38 @@ impl StageBuilder {
             }
             ComplexChange::EnumValueRemoval {
                 enum_name,
+                removed_values,
+                remaining_values,
                 affected_columns,
-                ..
             } => {
-                // No schema change in stage 1 for enum removal
-                // Generate data.sql for affected tables
-                let data_sql = diff::generate_data_sql(change);
-                // Use the first affected table for the data path, or the enum name
-                let data_entity = if let Some((table, _)) = affected_columns.first() {
-                    table.as_str()
-                } else {
-                    enum_name.as_str()
-                };
-                let data_path = entity_data_migration_path(data_entity);
-                self.files.push(MigrationFile {
-                    relative_path: data_path.clone(),
-                    content: data_sql,
-                });
-
-                todos.push(TodoItem {
-                    file: data_path,
-                    message: format!("Review data migration SQL for enum value removal in {}", enum_name),
-                });
+                // No schema change in stage 1: each table gets the `data.sql`
+                // that maps its rows off the removed values, under its own name.
+                // Apply runs a migration's `data.sql` when it migrates that
+                // entity, so the table is marked altered — it was not, and the
+                // mapping never ran — and a scope that does not build the table
+                // never runs an UPDATE against it. An enum no column uses has no
+                // rows to map.
+                for table in tables_of(affected_columns) {
+                    let one = ComplexChange::EnumValueRemoval {
+                        enum_name: enum_name.clone(),
+                        removed_values: removed_values.clone(),
+                        remaining_values: remaining_values.clone(),
+                        affected_columns: affected_columns.iter().filter(|(t, _)| t == table).cloned().collect(),
+                    };
+                    let data_path = entity_data_migration_path(table);
+                    push_or_append_sql(&mut self.files, data_path.clone(), diff::generate_data_sql(&one));
+                    self.mark_altered(table);
+                    todos.push(TodoItem {
+                        file: data_path,
+                        message: format!("Review data migration SQL for enum value removal in {}", enum_name),
+                    });
+                }
             }
         }
     }
 
     /// Stage 2: apply the destructive/finalizing step of one complex change.
-    fn apply_complex_stage2(&mut self, change: &ComplexChange) {
+    fn apply_complex_stage2(&mut self, change: &ComplexChange, ctx: &MultiStageCtx) {
         match change {
             ComplexChange::ColumnRename {
                 table_name, old_name, ..
@@ -1005,77 +1010,192 @@ impl StageBuilder {
             }
             ComplexChange::EnumValueRemoval {
                 enum_name,
+                removed_values,
+                remaining_values,
                 affected_columns,
-                ..
-            } => {
-                // Change affected columns' data_type to TEXT
-                for (table_name, col_name) in affected_columns {
-                    if let Some(snap_t) = self
-                        .snap
-                        .tables
-                        .iter_mut()
-                        .find(|t| format!("{}.{}", t.schema, t.name) == *table_name)
-                        && let Some(col) = snap_t.columns.iter_mut().find(|c| c.name == *col_name)
-                    {
-                        col.data_type = "TEXT".to_string();
-                    }
-
-                    let sql = format!("ALTER TABLE {} ALTER COLUMN {} TYPE TEXT;", table_name, col_name);
-                    push_or_append_sql(&mut self.files, entity_migration_path(table_name), sql);
-
-                    self.mark_altered(table_name);
-                }
-
-                // Remove enum from snapshot
-                self.snap
-                    .enums
-                    .retain(|e| format!("{}.{}", e.schema, e.name) != *enum_name);
-
-                // Generate DROP TYPE SQL
-                let drop_sql = format!("DROP TYPE {};", enum_name);
-                push_or_append_sql(&mut self.files, entity_migration_path(enum_name), drop_sql);
-
-                if !self.dropped.iter().any(|n| n == enum_name) {
-                    self.dropped.push(enum_name.clone());
-                }
-            }
+            } => self.swap_enum_type(enum_name, removed_values, remaining_values, affected_columns, ctx),
         }
     }
 
-    /// Stage 3 (enum-removal only): recreate the shrunken enum with its
-    /// remaining values and re-point affected columns back to it.
-    fn apply_complex_stage3(&mut self, change: &ComplexChange) {
-        let ComplexChange::EnumValueRemoval {
-            enum_name,
-            remaining_values,
-            affected_columns,
-            ..
-        } = change
-        else {
-            return;
+    /// Stage 2 of an enum value removal: swap the column types onto a new
+    /// type holding exactly the design's values — the swap reconcile runs (see
+    /// [`crate::reconcile::plan_enum_recreation`]), split by entity because apply
+    /// runs each entity's migration at its place in dependency order.
+    ///
+    /// - The enum's own file renames the old type aside and creates the new one.
+    ///   The enum comes before every table using it, so this runs first.
+    /// - Each table's file drops what stands in the way of `ALTER COLUMN … TYPE`
+    ///   — the views and materialized views over it (deepest first), the
+    ///   indexes whose predicate or expression reads the column, the default
+    ///   typed against the old type — moves the column across by text, and
+    ///   puts the default and indexes back. Apply then re-creates the views and
+    ///   matviews from their own DDL at their place in the same run, as it
+    ///   re-applies every entity.
+    /// - The old type goes when the last table using it has left it: each
+    ///   table's file drops it once none of the columns this swap moves still
+    ///   has it. A table the database does not have — another scope's — has no
+    ///   column to wait for, and a column the design does not know of still
+    ///   holds the type and fails the drop by name.
+    fn swap_enum_type(
+        &mut self,
+        enum_name: &str,
+        removed_values: &[String],
+        remaining_values: &[String],
+        affected_columns: &[(String, String)],
+        ctx: &MultiStageCtx,
+    ) {
+        use crate::reconcile::ENUM_RECREATE_SUFFIX;
+        use crate::sql_quote::{literal, qualified};
+
+        let qname = |s: &str, n: &str| format!("{s}.{n}");
+        // The design's values, in its order — not the old ones less the removed:
+        // a value added in the same change belongs in the new type too.
+        let values: Vec<String> = ctx
+            .final_snapshot
+            .enums
+            .iter()
+            .find(|e| qname(&e.schema, &e.name) == enum_name)
+            .map(|e| e.values.clone())
+            .unwrap_or_else(|| remaining_values.to_vec());
+        if let Some(e) = self
+            .snap
+            .enums
+            .iter_mut()
+            .find(|e| qname(&e.schema, &e.name) == enum_name)
+        {
+            e.values = values.clone();
+        }
+
+        let (schema, bare) = crate::entity::split_qualified_name(enum_name);
+        let old_bare = format!("{bare}{ENUM_RECREATE_SUFFIX}");
+        let old_type = match &schema {
+            Some(s) => format!("{s}.{old_bare}"),
+            None => old_bare.clone(),
         };
 
-        // Generate CREATE TYPE SQL with remaining values
-        let values_sql: Vec<String> = remaining_values.iter().map(|v| format!("'{v}'")).collect();
-        let create_sql = format!("CREATE TYPE {} AS ENUM ({});", enum_name, values_sql.join(", "));
-        self.files.push(MigrationFile {
-            relative_path: entity_migration_path(enum_name),
-            content: create_sql,
-        });
+        let mut enum_sql = vec![
+            format!(
+                "-- {enum_name}: Postgres has no ALTER TYPE … DROP VALUE, so the type is recreated \
+                 (dropping {}). The old type is renamed aside; each table migrated in this version \
+                 moves its columns onto the new one, and the last to do so drops it.",
+                removed_values.join(", ")
+            ),
+            format!("ALTER TYPE {enum_name} RENAME TO {old_bare};"),
+            format!(
+                "CREATE TYPE {enum_name} AS ENUM ({});",
+                values.iter().map(|v| literal(v)).collect::<Vec<_>>().join(", ")
+            ),
+            // The comment stays with the type renamed aside, and went with it.
+            crate::reconcile::enum_comment_carry(enum_name, &old_type),
+        ];
+        if affected_columns.is_empty() {
+            enum_sql.push(format!("DROP TYPE {old_type};"));
+        }
+        push_or_append_sql(&mut self.files, entity_migration_path(enum_name), enum_sql.join("\n"));
+        self.mark_altered(enum_name);
 
-        self.added.push(enum_name.clone());
+        // `(regclass, attname)` for every column this swap moves, the guard
+        // each table's file checks before dropping the old type.
+        let moved: Vec<String> = affected_columns
+            .iter()
+            .map(|(t, c)| format!("(to_regclass({}), {})", literal(&qualified(t)), literal(c)))
+            .collect();
+        let drop_old = format!(
+            "DO $$ BEGIN\n  \
+             IF to_regtype({old}) IS NOT NULL AND NOT EXISTS (\n    \
+             SELECT FROM pg_catalog.pg_attribute a\n    \
+             WHERE a.atttypid = to_regtype({old}) AND NOT a.attisdropped\n      \
+             AND (a.attrelid, a.attname) IN ({})\n  \
+             ) THEN\n    \
+             DROP TYPE {old_type};\n  \
+             END IF;\n\
+             END $$;",
+            moved.join(", "),
+            old = literal(&old_type),
+        );
 
-        // Generate ALTER COLUMN TYPE enum_name USING for affected columns
-        for (table_name, col_name) in affected_columns {
-            let alter_sql = format!(
-                "ALTER TABLE {} ALTER COLUMN {} TYPE {} USING {}::{};",
-                table_name, col_name, enum_name, col_name, enum_name
+        for table in tables_of(affected_columns) {
+            let columns: Vec<&str> = affected_columns
+                .iter()
+                .filter(|(t, _)| t == table)
+                .map(|(_, c)| c.as_str())
+                .collect();
+            let Some(snap_t) = self.snap.tables.iter().find(|t| qname(&t.schema, &t.name) == table) else {
+                continue;
+            };
+            let mut lines = Vec::new();
+
+            let roots: std::collections::HashSet<String> = [table.to_string()].into();
+            for (_, view) in crate::reconcile::dependent_views(ctx.entities, &roots) {
+                let kind = if view.entity_type == EntityType::MaterializedView {
+                    "MATERIALIZED VIEW"
+                } else {
+                    "VIEW"
+                };
+                lines.push(format!(
+                    "DROP {kind} IF EXISTS {};",
+                    crate::reconcile::qualified_entity_name(view)
+                ));
+            }
+
+            let indexes = crate::reconcile::indexes_reading_columns(snap_t, &columns);
+            for ix in &indexes {
+                if let Some(name) = &ix.name {
+                    lines.push(format!(
+                        "DROP INDEX IF EXISTS {}.{};",
+                        crate::sql_quote::ident(&snap_t.schema),
+                        crate::sql_quote::ident(name)
+                    ));
+                }
+            }
+
+            let mut restore = Vec::new();
+            for col in snap_t.columns.iter().filter(|c| columns.contains(&c.name.as_str())) {
+                let default = col
+                    .default_value
+                    .as_deref()
+                    .map(|d| crate::reconcile::canonical_default(d, &col.data_type));
+                if default.is_some() {
+                    lines.push(format!("ALTER TABLE {table} ALTER COLUMN {} DROP DEFAULT;", col.name));
+                }
+                lines.push(format!(
+                    "ALTER TABLE {table} ALTER COLUMN {c} TYPE {enum_name} USING {c}::text::{enum_name};",
+                    c = col.name
+                ));
+                if let Some(d) = default {
+                    restore.push(format!(
+                        "ALTER TABLE {table} ALTER COLUMN {} SET DEFAULT {d};",
+                        col.name
+                    ));
+                }
+            }
+            lines.extend(restore);
+
+            let qtable = format!(
+                "{}.{}",
+                crate::sql_quote::ident(&snap_t.schema),
+                crate::sql_quote::ident(&snap_t.name)
             );
-            push_or_append_sql(&mut self.files, entity_migration_path(table_name), alter_sql);
+            for ix in &indexes {
+                lines.push(crate::emit::emit_index_sql(ix, &qtable, &snap_t.name, false));
+            }
+            lines.push(drop_old.clone());
 
-            self.mark_altered(table_name);
+            push_or_append_sql(&mut self.files, entity_migration_path(table), lines.join("\n"));
+            self.mark_altered(table);
         }
     }
+}
+
+/// The distinct tables of `columns`, in first-seen order.
+fn tables_of(columns: &[(String, String)]) -> Vec<&str> {
+    let mut tables: Vec<&str> = Vec::new();
+    for (t, _) in columns {
+        if !tables.contains(&t.as_str()) {
+            tables.push(t);
+        }
+    }
+    tables
 }
 
 /// Build stage 1: apply every simple diff plus the additive first step of each
@@ -1132,7 +1252,7 @@ fn build_stage2(ctx: &MultiStageCtx, stage1_snap: Snapshot) -> SnapshotResult {
 
     let mut builder = StageBuilder::new(base);
     for change in ctx.complex_changes {
-        builder.apply_complex_stage2(change);
+        builder.apply_complex_stage2(change, ctx);
     }
 
     let graph = MigrationGraph {
@@ -1143,42 +1263,6 @@ fn build_stage2(ctx: &MultiStageCtx, stage1_snap: Snapshot) -> SnapshotResult {
         dropped: builder.dropped,
         stage: Some(MigrationStage {
             index: 2,
-            of: ctx.num_stages,
-        }),
-    };
-
-    SnapshotResult {
-        snapshot: builder.snap,
-        diffs: vec![],
-        migration_files: builder.files,
-        graph: Some(graph),
-        warnings: vec![],
-        is_baseline: false,
-        no_changes: false,
-    }
-}
-
-/// Build stage 3 (only when an enum value was removed): rebuild each shrunken
-/// enum and re-point its columns back to it.
-fn build_stage3(ctx: &MultiStageCtx) -> SnapshotResult {
-    let mut base = ctx.final_snapshot.clone();
-    base.version = ctx.next_version + 2;
-    base.description = format!("{} (stage 3/{})", ctx.description, ctx.num_stages);
-    base.timestamp = chrono::Utc::now().to_rfc3339();
-
-    let mut builder = StageBuilder::new(base);
-    for change in ctx.complex_changes {
-        builder.apply_complex_stage3(change);
-    }
-
-    let graph = MigrationGraph {
-        from_version: ctx.next_version + 1,
-        to_version: ctx.next_version + 2,
-        added: builder.added,
-        altered: builder.altered,
-        dropped: vec![],
-        stage: Some(MigrationStage {
-            index: 3,
             of: ctx.num_stages,
         }),
     };
@@ -1463,6 +1547,7 @@ mod tests {
             generated: None,
             comment: None,
             inline_fk: None,
+            collation: None,
         }
     }
 
@@ -2231,7 +2316,7 @@ mod tests {
     }
 
     #[test]
-    fn b3_enum_removal_three_snapshots() {
+    fn b3_enum_removal_is_a_data_stage_then_a_swap_stage() {
         let prev = Snapshot {
             version: 1,
             description: "v1".to_string(),
@@ -2270,8 +2355,34 @@ mod tests {
             make_enum_entity("public.status_type", vec!["active", "inactive"]),
         ];
         let result = prepare_multi_snapshot(&entities, Some(&prev), 2, "remove deleted");
-        assert_eq!(result.snapshots.len(), 3, "enum removal should produce 3 snapshots");
+        // Two stages: the rows are mapped off the removed value, then the type
+        // is swapped. A third stage re-pointed the column at a type the second
+        // had dropped, which apply — running each entity's migrations at its
+        // place in dependency order — never ran in that order.
+        assert_eq!(
+            result.snapshots.len(),
+            2,
+            "enum removal is a data stage and a swap stage"
+        );
         assert!(!result.todos.is_empty(), "should have TODO items for enum mapping");
+
+        // The data stage's mapping only runs if its table is in that stage's
+        // `altered` list: apply runs a `data.sql` as part of migrating the entity.
+        let stage1 = result.snapshots[0].graph.as_ref().unwrap();
+        assert!(
+            stage1.altered.iter().any(|t| t == "config.events"),
+            "the mapping of config.events runs: {:?}",
+            stage1.altered
+        );
+        // And the last stage is the design, so the next snapshot is empty.
+        let last = &result.snapshots[1].snapshot;
+        let design = prepare_snapshot(&entities, None, 99, "design").snapshot;
+        assert!(
+            diff::diff(&canonical_types(last), &canonical_types(&design)).is_empty(),
+            "the last stage ends at the design: {:?} vs {:?}",
+            last.enums,
+            design.enums
+        );
     }
 
     #[test]
@@ -2409,6 +2520,24 @@ mod tests {
         assert_eq!(todos[0].version, 2);
         assert_eq!(todos[0].lines.len(), 1);
         assert!(todos[0].lines[0].contains("TODO:"));
+    }
+
+    /// `apply` runs a `.data.sql` decoded (it may have been hand-edited in
+    /// SSMS), but the TODO gate in front of it read the file with
+    /// `read_to_string` — so a UTF-16 one blocked the apply with an encoding
+    /// error instead of being checked for TODOs.
+    #[test]
+    fn a_utf16_data_sql_is_checked_for_todos() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = make_data_sql(&tmp, 2, "");
+        fs::write(
+            &file,
+            crate::source_text::utf16le("-- TODO: Data correction required for config.users.score.\n"),
+        )
+        .unwrap();
+        let todos = scan_data_sql_todos(tmp.path()).expect("a UTF-16 data.sql must be readable");
+        assert_eq!(todos.len(), 1);
+        assert!(todos[0].lines[0].contains("TODO:"), "{:?}", todos[0].lines);
     }
 
     #[test]

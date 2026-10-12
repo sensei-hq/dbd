@@ -45,6 +45,22 @@ pub fn warn(msg: &str) {
     eprintln!("{}", style(format!("⚠ {msg}")).yellow());
 }
 
+/// Warn, per file, that a generated document leaves out what dbd could not
+/// parse — see `Design::unparsed`.
+pub fn left_out_unparsed(entities: &[&dbd_core::Entity]) {
+    for e in entities {
+        let file = e
+            .file
+            .as_ref()
+            .map_or_else(|| e.name.clone(), |f| f.display().to_string());
+        warn(&format!(
+            "{file} could not be parsed, so {} is left out: {}",
+            e.name,
+            e.errors.join("; ")
+        ));
+    }
+}
+
 /// Announce that output was narrowed to a scope, and by how much.
 ///
 /// Every command that filters by scope calls this, so a narrowed run always
@@ -54,10 +70,37 @@ pub fn warn(msg: &str) {
 ///
 /// No-op for the all-scope, which filters nothing.
 pub fn scope_filtered(scope: &dbd_core::ResolvedScope, kept: usize, total: usize) {
-    if scope.is_all {
-        return;
+    if let Some(line) = scope_line(scope, kept, total) {
+        println!("{line}");
     }
-    println!("scope '{}': {kept} of {total} entities", scope.name);
+}
+
+/// The line [`scope_filtered`] prints, for a command whose stdout is a
+/// document (`diff --json`) and so has to say it on stderr instead.
+pub fn scope_line(scope: &dbd_core::ResolvedScope, kept: usize, total: usize) -> Option<String> {
+    (!scope.is_all).then(|| format!("scope '{}': {kept} of {total} entities", scope.name))
+}
+
+/// Print a scope's dependency gaps the way its `deps` policy treats them.
+///
+/// Under `report` a gap fails the run, so it carries the ✗ of an error. Under
+/// `include` the closure pulls it in — an expected step, not a failure — and
+/// marking it ✗ made a preview of a run that will succeed read as a list of
+/// failures.
+pub fn scope_gaps(scope: &dbd_core::ResolvedScope, gaps: &[dbd_core::ScopeGap]) {
+    for gap in gaps {
+        let chain = gap.chain.join(" → ");
+        match scope.deps {
+            dbd_core::config::DepsPolicy::Report => println!(
+                "✗ dependency gap: {} requires {} (out of scope)\n    chain: {chain}",
+                gap.required_by, gap.missing
+            ),
+            dbd_core::config::DepsPolicy::Include => println!(
+                "+ auto-included: {} (required by {})\n    chain: {chain}",
+                gap.missing, gap.required_by
+            ),
+        }
+    }
 }
 
 /// Print a summary line with counts.

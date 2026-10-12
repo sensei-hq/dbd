@@ -10,9 +10,18 @@ description: >-
   reset emit DROP VIEW), string-set CHECK constraints that should be Postgres
   enums, materialized-view drift misuse, seed data that can never load (an
   `import/<env>/` tree no deploy env ever matches, files outside the `import/`
-  convention, or a `--scope` that drops them), RLS expected from `dbd apply`
-  without `--with-policies`, and post-DDL SQL parked in `import.after` (which
-  never runs on `dbd apply`) instead of `apply.after`. Reviews from the files
+  convention, a `--scope` that drops them, a data file outside `import.staging`,
+  a CSV header that does not name its table's columns, a JSON key that names no
+  column, a file setting a generated column, two procedures with an equal claim
+  to one staging table, a data file in a folder deeper than an import reads, or a
+  dev database built without `-e dev`), a renamed `project.name` on a deployed
+  project, `ddl/extension/`/`ddl/schema/` files dbd never reads, RLS expected
+  from `dbd apply`
+  without `--with-policies`, post-DDL SQL parked in `import.after` (which
+  never runs on `dbd apply`) instead of `apply.after`, a scoped
+  `reconcile --prune` on a dbd older than 0.24.1, and any `reconcile --prune`
+  on a dbd older than 0.25 in a design whose roles or schema-less extensions
+  made `public` managed. Reviews from the files
   (no DB needed); corroborates with `dbd doctor`/`dbd inspect`/`dbd diff` only
   if the binary is present.
 
@@ -47,22 +56,54 @@ You work **from the files** — no database and no network are required. If a `d
 
 ## First, determine the release state (it drives the #1 check)
 
-The project is **released** iff `design.yaml` has `project.released: true` **OR** a baseline
-snapshot exists under `snapshots/`. Otherwise it is **pre-release**. Establish this before
-judging the workflow, and state which one you concluded and why (the file evidence).
+Read `project.released` in `design.yaml` and look for `snapshots/`:
+
+- `project.released: true` → **released** (dbd refuses `reconcile`).
+- neither → **pre-release**.
+- snapshots but no `released` flag → **snapshots but not released** — what `dbd init --from-db`
+  and `dbd merge` leave. Judge it as released (changes go snapshot → apply), but note that dbd
+  checks only the flag, so `reconcile` still runs there. Recommend `dbd release`: on a project
+  with snapshots it releases at the latest snapshot's version (no second baseline), after
+  `dbd snapshot` has captured any change no snapshot records and with `project.version` matching
+  the latest snapshot — it refuses otherwise.
+
+Establish this before judging the workflow, and state which one you concluded and why (the
+file evidence).
 
 ## What you check (report most-severe first)
 
 1. **Wrong workflow for the release state** — the highest-value catch.
-   - **Released** project using or being advised to use **`dbd reconcile`** → violation (release
-     disables reconcile; changes must go through `dbd snapshot` → `dbd apply`).
+   - **Released** (or snapshots-but-not-released) project using or being advised to use
+     **`dbd reconcile`** → violation (changes must go through `dbd snapshot` → `dbd apply`).
+   - A **scoped prune** (`reconcile --prune --scope …`) in a script, CI job or advice where the
+     dbd in use is older than 0.24.1 → violation: those versions dropped the design's own tables
+     outside the scope (#40). Fix: upgrade first.
+   - Any **`reconcile --prune`** where the dbd in use is older than 0.25 and the design declares a
+     role (`ddl/role/` or `target.roles`) or an extension with no `schema:` → violation: those
+     versions treated `public` as managed and dropped every table there the design does not
+     declare. Fix: upgrade first.
    - **Pre-release** project with hand-written migration files / snapshots being authored by hand,
      or someone hand-editing the live DB instead of `reconcile` → violation.
+   - A **renamed `project.name`** on a project that already has databases (check `git log -p
+     design.yaml`) → violation. dbd keys its record of a database on the name. From 0.25 the
+     guards hold the renamed project to the old record while the database holds its objects, and
+     refuse naming it; but a run that trips no guard records a second row, and a design ahead of
+     the old record's version is planned as a fresh install, so its pending migrations never run.
+     Fix: set `project.name` back.
+   - A **`migrations/NNN/…/<table>.data.sql` for a table that version's `graph.json` neither adds
+     nor alters** (`added`/`altered`) → violation: it never runs, and no preview lists it. A
+     version runs the data scripts of the tables it alters or adds (before 0.25, of those it
+     alters only — so a script seeding a table the version adds never ran either). Fix: put the
+     script in the version that adds or alters the table.
    - Evidence: `project.released`, `snapshots/` contents, and any command/README/script that
      names `reconcile`, `snapshot`, or raw SQL against the DB.
 2. **Non-idempotent DDL** (re-`apply` would error). Flag a `CREATE TABLE`/`CREATE MATERIALIZED
    VIEW`/`CREATE INDEX` missing `IF NOT EXISTS`, or a `CREATE VIEW` missing `OR REPLACE`. (Postgres
-   has no `CREATE OR REPLACE MATERIALIZED VIEW`, so matviews use `IF NOT EXISTS`.)
+   has no `CREATE OR REPLACE MATERIALIZED VIEW`, so matviews use `IF NOT EXISTS`.) A trigger in a
+   table's or view's file is idempotent as `CREATE OR REPLACE TRIGGER`, or — for a constraint
+   trigger, which Postgres cannot replace — as `DROP TRIGGER IF EXISTS` before `CREATE CONSTRAINT
+   TRIGGER`; a `CREATE TYPE … AS ENUM` inside `DO … EXCEPTION WHEN duplicate_object` is too. That is
+   how `dbd init --from-db` writes them — do not flag those shapes.
 3. **Hardcoded secrets** — a `design.yaml` target `url:` with a literal connection string /
    password instead of `$ENV_VAR`.
 4. **Wrong layout** — plural type folders (`ddl/tables/`, `ddl/views/`, …) instead of singular;
@@ -71,6 +112,11 @@ judging the workflow, and state which one you concluded and why (the file eviden
    VIEW` filed under `ddl/view/` (or a plain `CREATE VIEW` under `ddl/materialized_view/`). dbd
    types by folder, so a misfiled matview makes `dbd reset` emit `DROP VIEW` on it (`"… is not a
    view"`). `dbd doctor` detects this; the fix is to move the file (not auto-fixed).
+   Also flag any file under `ddl/extension/` or `ddl/schema/`: dbd reads neither — extensions
+   are declared in the target's `extensions:` (with `schema:`) and schemas under `schemas:` —
+   so `dbd inspect` refuses such a file (one for a schema already listed is silently ignored).
+   `dbd doctor` names the design.yaml entry each one becomes; the fix is to declare it there and
+   delete the file.
 5. **String-set `CHECK` → enum** — a `CHECK (col IN ('a','b',…))` (or `= ANY(ARRAY[…])`, or an
    `OR`-chain of `col = '…'`) on a fixed set of string literals is better modeled as a Postgres
    `enum` (`ddl/enum/<schema>/<name>.ddl`). Advisory (same rule `dbd inspect` suggests).
@@ -83,12 +129,57 @@ judging the workflow, and state which one you concluded and why (the file eviden
    - An `import/<env>/…` directory whose `<env>` matches no environment the project actually
      deploys with (check `-e`/`--environment` in install scripts, CI, Makefiles, READMEs).
      `import/dev/staging/x.csv` is invisible to a `-e prod` deploy — by design, and dbd now warns,
-     but the *layout* is still the bug when no run ever uses that env.
+     but the *layout* is still the bug when no run ever uses that env. From 0.25 a file directly
+     in `import/dev/` or `import/prod/` is env-gated too (SQLite's env-only data lives there), so
+     a schema named `dev` or `prod` cannot keep files directly in that folder.
+   - A **dev database built without `-e dev`**: `-e` defaults to prod, so the first `apply`/
+     `deploy` without it marks the database prod, and from 0.25 every later `-e dev` run against
+     it — `apply`, `deploy`, `reconcile`, `import`, an ad-hoc `import -n -f`, and their dry runs —
+     is refused (the environment guard; no override). A run that promotes a dev database prints
+     `This database was marked dev and is now marked prod`. Flag a dev setup script whose first
+     build omits `-e dev` while later steps pass it. Fix: pass `-e dev` from the first run; for a
+     database already marked, `dbd reset --force` under the all-scope or the scope the database is
+     pinned to (a bare reset in a design whose `default:` scope built it) — it forgets the mark; a
+     narrower scope does not — then `-e dev`.
+   - A **data file in a folder deeper than an import reads** — anything below
+     `import/<schema>/` or `import/<env>/<schema>/` (`import/staging/core/accounts.csv`). It never
+     loads (from 0.25 dbd names it; before, `import/dev/staging/sub/y.csv` loaded into
+     `staging.y`). An `export -o` into such a folder lands there too; `-o import/<schema>` (or
+     `import/<env>/<schema>`) writes `<table>.<fmt>` straight into that schema folder, and
+     `-o import` keeps each table under its own schema.
    - Data files outside the convention: anything under `data/` or `seeds/` rather than
      `import/<schema>/<table>.<csv|tsv|json|jsonl>` is never scanned.
    - A `--scope` in the deploy command whose working set excludes the staging tables (or the
      tables the import procedures write to) — those entries are dropped from the import plan.
-   - Evidence: the `import/` tree next to the actual deploy/install invocation.
+   - A Convex target with a `.json` data file holding JSON Lines — Convex's importer reads a
+     `.json` file as a JSON array only; rename it `.jsonl` or rewrite it as an array.
+   - An import loader written as a **function** — dbd runs only procedures, so the function is
+     never called and its target stays empty (dbd warns: `… has no loader procedure`); it must
+     be a procedure.
+   - From dbd 0.25 these are **refused**, so the whole import (and a `deploy`, before it applies
+     anything) fails rather than loading less:
+     - a data file under `import/<schema>/` whose schema a non-empty `import.staging` does not
+       list — `import.staging` used to be ignored and is now enforced;
+     - a CSV/TSV whose **header does not name the target table's columns** — a header column
+       the table lacks, a column named twice, or a space after a comma (`id, name`; nothing is
+       trimmed). The header is matched exactly or folded to lower case; on PostgreSQL it used to
+       be skipped and the file loaded by position, so labels in the header worked until 0.25;
+     - two procedures that read the same staging table with an **equal claim** to load it —
+       neither named `import_<table>`, both reading only that staging table. dbd calls one loader
+       per staging table; name the loader `import_<table>` (and call the other from it or from
+       `import.after`);
+     - a JSON/JSONL record with a **key that names no column** of its table (it used to be
+       dropped silently), and any data file — CSV header or JSON key — that **sets a generated
+       column**;
+     - under a deploy's `--scope`, a staging table the scope keeps whose **loader procedure the
+       scope leaves out**;
+     - a data file whose target the design declares as a **view, materialized view or
+       sequence**;
+     - a staging table that a table **outside the import holds a foreign key to** — the
+       truncate fails, naming the holder, before anything is emptied.
+   - Evidence: the `import/` tree next to the actual deploy/install invocation; `import.staging`
+     in `design.yaml`; the first line of each CSV/TSV against its table's DDL; the procedures
+     under `ddl/procedure/` that read each staging table.
 8. **RLS expected but never applied** — an install path that runs `dbd apply` (RLS is opt-in,
    needs `--with-policies`) while the project has a `policies/` directory, or docs claiming
    `apply` covers policies. `dbd deploy` applies them unconditionally; `dbd apply` does not.
@@ -105,14 +196,19 @@ judging the workflow, and state which one you concluded and why (the file eviden
 9. **Post-DDL SQL in the wrong hook** — an `import.after` entry whose job is schema-adjacent
    setup rather than data loading: attaching tables to a publication (Supabase realtime),
    `grant`s, or anything whose own comment says it must "run once every entity exists".
-   `import.after` runs **only on `dbd deploy`** — the import phase is the only thing that
-   executes it — so on `dbd apply` it silently does nothing. The fix is `apply.after`, which
-   runs on both and lands after every entity is applied and before `policies/`.
+   `import.after` runs **only with the import phase** — `dbd import` and `dbd deploy` — so on
+   `dbd apply` it silently does nothing. The fix is `apply.after`, which runs on `apply`,
+   `deploy` and `reconcile` and lands after every entity is applied, before the configured
+   grants and `policies/`.
    - When moving such a hook, check whether it needs an explicit `writes:`. dbd derives a
      script's tables by parsing it; a realtime hook typically names its tables as *data* inside
      `array['a','b']` and `format('… %I', t)`, where derivation returns empty. A script with no
      derivable deps and no `writes:` **always runs** (the safe direction) — so it is not broken,
      but it is also not scope-filtered until `writes:` is declared.
+   - Under `--scope` a hook is skipped only when it touches a table the design manages *outside*
+     the scope; a table under `external:`, or one the hook creates, never causes a skip (from
+     0.25 — before, such a hook was skipped under every named scope). Do not flag a hook for
+     naming an `external:` table.
    - Evidence: the `import.after` list in `design.yaml` plus the script's own content/comments.
 
 ## How to work

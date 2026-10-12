@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use dbd_core::design::{ApplyComplete, Progress};
 use dbd_core::{Design, Entity, EntityType};
 
-use super::{format_apply_summary, get_adapter, safe_read, safe_write};
+use super::{format_apply_summary, format_in_place, get_adapter, safe_canonicalize_within};
 use crate::output::{self, Verbosity};
 
 /// Warn when the config loaded but no authored DDL was scanned under the
@@ -41,17 +41,43 @@ pub async fn cmd_inspect(
     resolve_inspect_refs(&mut design, config, database_url, use_database, verbosity).await?;
 
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
+    // Resolve the working set the way every run does, before reporting on it.
+    // Under `deps: include` that is the closure, and a closure that needs what
+    // the scope excludes is refused by apply, dbml and diagram — so inspect,
+    // which exists to vet a scope before a run, must refuse it too rather than
+    // promise to auto-include an entity the scope forbids.
+    let scoped = design.scoped_entities(&resolved)?;
+    // A `-n` that names nothing reported "Everything looks ok" on an empty
+    // selection; under a scope, a name the scope does not build did the same.
+    if let Some(n) = name {
+        // An `external:` name is known to the design but has no DDL — dbd reads
+        // nothing of it, so there is nothing here to check. `apply -n` refuses
+        // it for the same reason, and "Everything looks ok" over it was the
+        // false all-clear a `-n` selecting nothing used to give.
+        if design.resolve_name(n, Some(&resolved))?.entity_type == EntityType::External {
+            anyhow::bail!(
+                "{n} is declared `external:` — dbd has no DDL for it, so there is nothing to inspect; \
+                 it only resolves references to it"
+            );
+        }
+    }
     let report = design.report(name, Some(&resolved));
 
+    // Count what this run is actually about, the way every other command
+    // counts it: under a scope, the entities it builds (closure included) —
+    // and with `-n`, the one entity named.
+    let (scope_entities, design_entities) = design.scope_counts(&resolved)?;
+    output::scope_filtered(&resolved, scope_entities, design_entities);
+    let run_entities = if name.is_some() { 1 } else { scope_entities };
+    // What the advisory checks below run over: the scope's entities, narrowed
+    // to the named one. `-n` used to count and advise on the whole design.
+    let inspected: Vec<Entity> = scoped
+        .iter()
+        .filter(|e| name.is_none_or(|n| e.name == n))
+        .cloned()
+        .collect();
     report_scope_gaps(&resolved, &report, verbosity)?;
-
-    // Count what this run is actually about. Under a scope the whole-project
-    // total contradicts the "scope 'X': N entities" line printed just above.
     let scope_name = (!resolved.is_all).then_some(resolved.name.as_str());
-    let total_entities = match scope_name {
-        Some(_) => resolved.entities.len(),
-        None => design.entities().len(),
-    };
 
     if verbosity.is_verbose()
         && let Some(entity) = &report.entity
@@ -61,25 +87,34 @@ pub async fn cmd_inspect(
 
     print_report_findings(&report, scope_name, verbosity);
 
-    // Auto-format DDL files when --fix is passed
+    // Auto-format DDL files when --fix is passed. Under a scope, only the files
+    // the scope builds: a scoped inspect that rewrites the rest of the project
+    // has quietly stopped being scoped.
     if fix {
-        fix_format_ddl(config, project_dir, verbosity)?;
+        let only: Option<std::collections::HashSet<std::path::PathBuf>> =
+            (!resolved.is_all).then(|| scoped.iter().filter_map(|e| e.file.clone()).collect());
+        fix_format_ddl(config, project_dir, only.as_ref(), verbosity)?;
     }
 
     // Report unresolved data.sql TODOs across all migration directories
     let todos = design.data_sql_todos()?;
     print_data_sql_todos(&todos);
 
+    // The checks below run over what this run is about — the scope's entities,
+    // not the design's. Run over the whole design, `inspect --scope hub` advised
+    // on tables `hub` never builds, and failed on a matview it never creates.
+
     // Validate materialized-view refresh config (concurrently/unique-index,
-    // pg_cron presence, cron expression syntax) — offline, no DB required.
-    let declared_extensions: Vec<String> = design
-        .entities()
+    // pg_cron presence, cron expression syntax) — offline, no DB required. The
+    // extensions are the scope's too: an `extensions:` allowlist that leaves
+    // out pg_cron leaves a scheduled matview in the scope unschedulable.
+    let declared_extensions: Vec<String> = scoped
         .iter()
         .filter(|e| e.entity_type == dbd_core::EntityType::Extension)
         .map(|e| e.name.clone())
         .collect();
     let matview_errors = dbd_core::design::validate_materialized_views(
-        design.entities(),
+        &inspected,
         &design.config().materialized_views,
         &declared_extensions,
     );
@@ -87,26 +122,43 @@ pub async fn cmd_inspect(
 
     // Advisory only — string-set CHECK constraints that could be a Postgres enum.
     // Report-only: NOT added to the summary error count, never affects the exit code.
-    let enum_hints = dbd_core::design::suggest_enum_candidates(design.entities(), &design.config().source.dialect);
+    let enum_hints = dbd_core::design::suggest_enum_candidates(&inspected, &design.config().source.dialect);
     print_enum_hints(&enum_hints);
 
     // Advisory only, and the one with teeth: a table in a schema something
     // outside the database serves, with no RLS policy declared. On Supabase
     // that is readable by `anon` over HTTP. Report-only like the enum hints —
     // dbd cannot know the author did not mean it.
-    let exposed = design.unprotected_exposed_tables();
-    print_exposed_tables(&exposed, &design.exposed_schemas());
+    let in_scope: std::collections::HashSet<&str> = inspected.iter().map(|e| e.name.as_str()).collect();
+    let exposed: Vec<String> = design
+        .unprotected_exposed_tables()
+        .into_iter()
+        .filter(|t| in_scope.contains(t.as_str()))
+        .collect();
+    let exposed_schemas: Vec<String> = design
+        .exposed_schemas()
+        .into_iter()
+        .filter(|s| inspected.iter().any(|e| e.schema.as_deref() == Some(s.as_str())))
+        .collect();
+    print_exposed_tables(&exposed, &exposed_schemas);
 
     // Summary last, so the counts are the final thing on screen. Printed before
     // the advisory section it would scroll away behind it, which is backwards:
     // the tally is what a reader is looking for.
     let blocking = report.issues.len() + todos.len() + matview_errors.len();
     output::always("");
-    output::summary(blocking, report.warnings.len(), total_entities);
+    output::summary(blocking, report.warnings.len(), run_entities);
     if !report.out_of_scope_issues.is_empty() {
         output::always(&format!(
             "({} error(s) outside scope '{}')",
             report.out_of_scope_issues.len(),
+            scope_name.unwrap_or("all"),
+        ));
+    }
+    if !report.out_of_scope_warnings.is_empty() {
+        output::always(&format!(
+            "({} warning(s) outside scope '{}')",
+            report.out_of_scope_warnings.len(),
             scope_name.unwrap_or("all"),
         ));
     }
@@ -187,18 +239,7 @@ fn report_scope_gaps(
         return Ok(());
     }
 
-    output::info(
-        verbosity,
-        &format!("scope '{}': {} entities", resolved.name, resolved.entities.len()),
-    );
-    for gap in &report.gaps {
-        output::always(&format!(
-            "✗ dependency gap: {} requires {} (out of scope)\n    chain: {}",
-            gap.required_by,
-            gap.missing,
-            gap.chain.join(" → ")
-        ));
-    }
+    output::scope_gaps(resolved, &report.gaps);
     if report.gaps.is_empty() {
         return Ok(());
     }
@@ -294,8 +335,14 @@ pub(crate) fn inspect_exit_code(blocking_errors: usize) -> i32 {
     if blocking_errors > 0 { 1 } else { 0 }
 }
 
-/// Auto-format every DDL file under `project_dir` in place (the `--fix` path).
-fn fix_format_ddl(config: &Path, project_dir: &Path, verbosity: Verbosity) -> Result<()> {
+/// Auto-format DDL files under `project_dir` in place (the `--fix` path):
+/// every file, or only those in `only` when given.
+fn fix_format_ddl(
+    config: &Path,
+    project_dir: &Path,
+    only: Option<&std::collections::HashSet<std::path::PathBuf>>,
+    verbosity: Verbosity,
+) -> Result<()> {
     let format_config = if config.exists() {
         dbd_core::config::read(config)?.format
     } else {
@@ -304,12 +351,9 @@ fn fix_format_ddl(config: &Path, project_dir: &Path, verbosity: Verbosity) -> Re
 
     let files = dbd_core::scanner::scan_ddl(project_dir)?;
     let mut changed = 0;
-    for file in &files {
-        let content = safe_read(project_dir, file)?;
-        let formatted = dbd_core::formatter::format_ddl(&content, &format_config);
-        if content != formatted {
+    for file in files.iter().filter(|f| only.is_none_or(|set| set.contains(*f))) {
+        if format_in_place(project_dir, file, &format_config, true)? {
             changed += 1;
-            safe_write(project_dir, file, &formatted)?;
             output::info(verbosity, &format!("  formatted: {}", file.display()));
         }
     }
@@ -466,7 +510,7 @@ fn policy_phase_exit_code(report: &dbd_core::design::PolicyReport) -> i32 {
 /// under `policies/` against the live database. Discarding a closure conflict
 /// would therefore widen the run instead of narrowing it — the opposite of what
 /// `--scope` was asked for, and visible only as a count with no baseline.
-fn policy_working_set(
+pub(super) fn policy_working_set(
     design: &Design,
     resolved: &dbd_core::ResolvedScope,
 ) -> Result<Option<(String, std::collections::HashSet<String>)>> {
@@ -707,11 +751,17 @@ pub fn cmd_emit(
 ) -> Result<()> {
     let target = dbd_core::parser::Dialect::from_label(dialect)
         .ok_or_else(|| anyhow::anyhow!("unknown dialect {dialect:?} — expected mysql, tsql or sqlite"))?;
+    // Both destinations checked before either is written, so a refused report
+    // path does not leave the script behind. See `cmd_combine` for the rule.
+    let dest = safe_canonicalize_within(project_dir, file)?;
+    let report_dest = report.map(|r| safe_canonicalize_within(project_dir, r)).transpose()?;
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
     let resolved = design.resolve_scope(scope, deps)?;
+    let (kept, total) = design.scope_counts(&resolved)?;
+    output::scope_filtered(&resolved, kept, total);
 
     let (sql, downgrades) = dbd_core::emit_dialect::emit_schema(&design, target, Some(&resolved))?;
-    std::fs::write(file, sql).with_context(|| format!("Failed to write {}", file.display()))?;
+    std::fs::write(&dest, sql).with_context(|| format!("Failed to write {}", file.display()))?;
     output::info(verbosity, &format!("Generated {}", file.display()));
 
     // Counted, not just listed: a summary someone can act on without reading
@@ -732,9 +782,9 @@ pub fn cmd_emit(
         }
     }
 
-    if let Some(path) = report {
+    if let (Some(path), Some(dest)) = (report, &report_dest) {
         let json = serde_json::to_string_pretty(&downgrades).context("Failed to serialize the report")?;
-        std::fs::write(path, json).with_context(|| format!("Failed to write {}", path.display()))?;
+        std::fs::write(dest, json).with_context(|| format!("Failed to write {}", path.display()))?;
         output::info(verbosity, &format!("Wrote {}", path.display()));
     }
     Ok(())
@@ -749,14 +799,18 @@ pub fn cmd_combine(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
+    // One rule for every file a command writes: inside the project, or
+    // refused. `dbml` and `diagram` always held it and `combine` and `emit` did
+    // not; the stricter one is kept, because a `-f` that resolves elsewhere — a
+    // relative path run from the wrong directory, a `../` meant for another
+    // tree — overwrote a file dbd does not own without a word. Output wanted
+    // outside the project is written inside it and moved.
+    let dest = safe_canonicalize_within(project_dir, file)?;
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
     let resolved = design.resolve_scope(scope, deps)?;
-    output::scope_filtered(
-        &resolved,
-        design.scoped_entities(&resolved)?.len(),
-        design.entities().len(),
-    );
-    design.combine(file, Some(&resolved))?;
+    let (kept, total) = design.scope_counts(&resolved)?;
+    output::scope_filtered(&resolved, kept, total);
+    design.combine(&dest, Some(&resolved))?;
     output::info(verbosity, &format!("Generated {}", file.display()));
     Ok(())
 }
@@ -779,26 +833,43 @@ pub async fn cmd_apply(
     warn_if_no_authored_ddl(&design, project_dir);
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
 
+    // Named for the run as for its preview: the preview said what it narrowed
+    // to, and the run it previewed did not.
+    let (kept, total) = design.scope_counts(&resolved)?;
+    output::scope_filtered(&resolved, kept, total);
+    // Each file the run executes on a path it does not state, said before the
+    // run and its preview alike — a forgotten search_path is never silent.
+    for warning in design.search_path_warnings(name, Some(&resolved))? {
+        output::warn(&warning);
+    }
+
     if dry_run {
-        // Surface the same gap/closure errors a real apply would (dry-run must
-        // not hide a misconfigured scope).
-        design.check_scope_gaps(&resolved).context("scope check failed")?;
-        let ws = design.working_set(&resolved)?;
-        let entities: Vec<_> = design
-            .entities()
-            .iter()
-            .filter(|e| e.errors.is_empty())
-            .filter(|e| e.entity_type != dbd_core::EntityType::External)
-            .filter(|e| name.is_none() || e.name == name.unwrap_or(""))
-            .filter(|e| {
-                resolved.is_all
-                    || ws.contains(&e.name)
-                    || matches!(
-                        e.entity_type,
-                        dbd_core::EntityType::Extension | dbd_core::EntityType::Role
-                    )
-            })
-            .collect();
+        // The real apply's own gate, not a copy of it: the scope's gaps and
+        // closure, its `extensions:` allowlist, and the refusal of a file that
+        // did not parse. A preview that filters for itself lists what the run
+        // will not do and passes what the run refuses.
+        let entities = design.entities_to_apply(name, Some(&resolved))?;
+
+        // With a database to ask, refuse where the run refuses: the scope pin,
+        // then the run's own environment and version guards.
+        let adapter = super::dry_run_adapter(config, database_url).await?;
+        if let Some(adapter) = &adapter {
+            let marks = design.database_marks(&**adapter).await?;
+            Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
+            design.check_apply_guards(&marks)?;
+        }
+
+        // Built before anything is printed: it refuses where the run does — a
+        // named apply while migrations are pending — and a refused preview
+        // should not list a plan first.
+        let preview = match &adapter {
+            Some(adapter) => Some(
+                design
+                    .pending_migration_preview(&**adapter, name, Some(&resolved))
+                    .await?,
+            ),
+            None => None,
+        };
 
         for entity in &entities {
             let detail = match &entity.file {
@@ -806,6 +877,15 @@ pub async fn cmd_apply(
                 None => format!("{:?} => {}", entity.entity_type, entity.name),
             };
             output::info(verbosity, &detail);
+        }
+        // The hooks the run would skip, decided as the run decides them.
+        for skip in design.hook_skips(Some(&resolved))? {
+            output::warn(&skip);
+        }
+        // The migrations the run executes before the entities, a drop marked.
+        match &preview {
+            Some(preview) => super::print_migration_preview(verbosity, preview),
+            None => super::note_unlisted_migrations(verbosity, project_dir),
         }
         output::summary(0, 0, entities.len());
         return Ok(());
@@ -815,8 +895,16 @@ pub async fn cmd_apply(
 
     // Scope guard: refuse an apply under a different scope than this DB was
     // pinned to (unless the operator opted in to re-point it).
-    let meta = adapter.get_project_meta().await?;
-    Design::check_scope_guard(meta.as_ref(), &resolved.name, allow_scope_change)?;
+    let marks = design.database_marks(&*adapter).await?;
+    Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
+
+    // Said before the run, not in its summary: a run that fails never prints
+    // one, and a skipped hook is often why it failed. Always shown, whatever
+    // the verbosity — a hook a scope filtered out is the reason something the
+    // user expected to happen did not.
+    for skip in design.hook_skips(Some(&resolved))? {
+        output::warn(&skip);
+    }
 
     let spinner = output::StepSpinner::new(verbosity);
     let mut apply_summary: Option<ApplyComplete> = None;
@@ -837,58 +925,17 @@ pub async fn cmd_apply(
     result?;
 
     if let Some(s) = apply_summary {
-        // Always reported, whatever the verbosity: a hook a scope filtered out
-        // is the reason something the user expected to happen did not.
-        for warning in &s.warnings {
-            output::warn(warning);
-        }
+        // `s.warnings` are the hook skips, already said before the run.
         output::info(verbosity, &format_apply_summary(&s));
     }
+    super::note_promotion(&marks, design.env());
 
     // pg_cron refresh-job sync + matview hash-stamping now live in core
     // `Design::apply`, so `dbd apply` and `dbd deploy` both schedule refresh
     // jobs through the shared path (no CLI-side sync call needed here).
 
-    // Grants: universal `schemas:` `WithGrants` entries apply regardless of
-    // target; the chosen target's `grants:` config merges on top of them —
-    // per schema, target role entries add to / override the universal ones
-    // for that role.
-    let mut schema_grants = design.config().schema_grants();
-    let mut supabase_schemas: Vec<String> = vec![];
-    if let Some((target_name, target_config)) = design.config().target.iter().next() {
-        if let Some(ref grants) = target_config.grants {
-            for (schema, gc) in grants {
-                schema_grants
-                    .entry(schema.clone())
-                    .or_default()
-                    .extend(gc.roles.clone());
-            }
-        }
-        // PostgREST USAGE grants ride along only when the user configured some
-        // grants, so a no-grants Supabase apply stays a no-op (as it was before
-        // universal `schemas:` grants existed).
-        if target_name == "supabase" && !schema_grants.is_empty() {
-            supabase_schemas = design.config().schema_names();
-        }
-    }
-
-    // Grants are Postgres/Supabase DDL. Skip cleanly on targets without a grant
-    // model (SQLite, Convex) rather than feeding them SQL they can't run — a
-    // cross-target design may declare schema grants yet apply to any target.
-    if !schema_grants.is_empty() {
-        if adapter.supports_schema_grants() {
-            if let Some(grants_sql) = dbd_core::script::build_grants_script(&schema_grants, &supabase_schemas) {
-                output::info(verbosity, "Applying grants...");
-                adapter
-                    .execute_script(&grants_sql)
-                    .await
-                    .context("Failed to apply grants")?;
-                output::detail(verbosity, "  NOTIFY pgrst, 'reload config'");
-            }
-        } else {
-            output::info(verbosity, "Skipping schema grants (target has no grant model).");
-        }
-    }
+    // Grants: shared with `Design::deploy`, so both commands grant alike.
+    super::apply_and_report_grants(&design, &*adapter, &resolved, verbosity).await?;
 
     // Apply RLS policies if requested
     if with_policies {
@@ -941,6 +988,38 @@ fn select_matviews<'a>(entities: &'a [Entity], name: Option<&str>) -> Vec<&'a En
         .collect()
 }
 
+/// Refuse a `refresh -n` selection that names no materialized view this run
+/// can refresh, before connecting.
+///
+/// It used to print "No materialized views to refresh." and exit 0 — for a
+/// typo, for a table, and for a matview the scope does not build alike. An
+/// exact name is checked like every other `-n`; a `schema.*` wildcard must
+/// match a matview in the design, and one the scope keeps.
+fn check_refresh_selection(
+    design: &Design,
+    scope: &dbd_core::ResolvedScope,
+    scoped: &[Entity],
+    sel: &str,
+) -> Result<()> {
+    if sel.ends_with(".*") {
+        if select_matviews(design.entities(), Some(sel)).is_empty() {
+            anyhow::bail!("no materialized view matches '{sel}'");
+        }
+        if select_matviews(scoped, Some(sel)).is_empty() {
+            anyhow::bail!(
+                "every materialized view matching '{sel}' is outside scope '{}'",
+                scope.name
+            );
+        }
+        return Ok(());
+    }
+    let entity = design.resolve_name(sel, Some(scope))?;
+    if entity.entity_type != EntityType::MaterializedView {
+        anyhow::bail!("{sel} is not a materialized view — only materialized views can be refreshed");
+    }
+    Ok(())
+}
+
 /// Refresh materialized views: `REFRESH MATERIALIZED VIEW [CONCURRENTLY] …`,
 /// honoring each view's resolved `concurrently` setting, in dependency order.
 #[allow(clippy::too_many_arguments)]
@@ -961,8 +1040,12 @@ pub async fn cmd_refresh(
     // as an error, the same failure the policy phase used to produce.
     let resolved_scope = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
     let scoped = design.scoped_entities(&resolved_scope)?;
-    output::scope_filtered(&resolved_scope, scoped.len(), design.entities().len());
+    let (kept, total) = design.scope_counts(&resolved_scope)?;
+    output::scope_filtered(&resolved_scope, kept, total);
 
+    if let Some(sel) = name {
+        check_refresh_selection(&design, &resolved_scope, &scoped, sel)?;
+    }
     let selected = select_matviews(&scoped, name);
     if selected.is_empty() {
         output::info(verbosity, "No materialized views to refresh.");
@@ -970,6 +1053,17 @@ pub async fn cmd_refresh(
     }
 
     let adapter = get_adapter(config, database_url).await?;
+    // Every other command that reaches the database checks its pin; `refresh`
+    // did not, and on another scope's database refreshed views over tables it
+    // was not built with — failing partway, after the ones that happened to
+    // exist. It never re-pins, so there is no `--allow-scope-change` here.
+    super::check_pinned_scope(
+        &*adapter,
+        &design,
+        &resolved_scope,
+        "Refreshing another scope's materialized views would read tables this database was not built with.",
+    )
+    .await?;
 
     for entity in selected {
         let resolved = design.config().materialized_views.resolve(&entity.name);
@@ -994,26 +1088,55 @@ pub async fn cmd_policies(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    if dry_run {
-        let files = dbd_core::scanner::scan_policies(project_dir)?;
-        if files.is_empty() {
-            output::info(verbosity, "No policy files found in policies/");
-            return Ok(());
-        }
-        output::info(verbosity, "[dry-run] Would apply policies:");
-        for file in &files {
-            output::info(verbosity, &format!("  {}", file.display()));
-        }
-        return Ok(());
-    }
-
-    let adapter = get_adapter(config, database_url).await?;
     // `dbd policies` takes the global --scope like every other command; before
     // this it silently applied every file, so a policy for a schema this plane
     // does not have reported `schema "…" does not exist` on every run.
     let design = Design::from_config_with_dir(config, env, Some(project_dir))?;
     let resolved = design.resolve_scope(scope, deps)?;
+    let (kept, total) = design.scope_counts(&resolved)?;
+    output::scope_filtered(&resolved, kept, total);
     let policy_ws = policy_working_set(&design, &resolved)?;
+
+    // What a policy for another scope would do to this database.
+    const POLICY_CONSEQUENCE: &str =
+        "Applying another scope's policies would secure tables this database was not built with.";
+
+    if dry_run {
+        // The real run's guard, whenever there is a database to ask: a preview
+        // of policies the run refuses to apply promised something it won't do.
+        if let Some(adapter) = super::dry_run_adapter(config, database_url).await? {
+            super::check_pinned_scope(&*adapter, &design, &resolved, POLICY_CONSEQUENCE).await?;
+        }
+        // The real run's filter, so the preview never lists a policy the scope
+        // skips — and says which ones it skips, as the real run does.
+        let plan = dbd_core::design::plan_policies(project_dir, policy_ws.as_ref().map(|(n, ws)| (n.as_str(), ws)))?;
+        if plan.applied.is_empty() && plan.skipped.is_empty() {
+            output::info(verbosity, "No policy files found in policies/");
+            return Ok(());
+        }
+        // Each list under its own heading: "Would apply" over a list of skips
+        // announced work the run will not do.
+        if plan.applied.is_empty() {
+            output::info(verbosity, "[dry-run] No policy file would be applied.");
+        } else {
+            output::info(verbosity, "[dry-run] Would apply policies:");
+            for file in &plan.applied {
+                output::info(verbosity, &format!("  {}", file.display()));
+            }
+        }
+        if !plan.skipped.is_empty() {
+            output::info(verbosity, "[dry-run] Would skip policies:");
+            for (file, why) in &plan.skipped {
+                output::info(verbosity, &format!("  skipped {} — {why}", file.display()));
+            }
+        }
+        return Ok(());
+    }
+
+    let adapter = get_adapter(config, database_url).await?;
+    // The scope guard every other writing command runs. Policies do not re-pin
+    // the database, so there is no `--allow-scope-change` to offer.
+    super::check_pinned_scope(&*adapter, &design, &resolved, POLICY_CONSEQUENCE).await?;
     let report = dbd_core::design::apply_policies(
         &*adapter,
         project_dir,
@@ -1067,17 +1190,10 @@ pub fn cmd_format(config: &Path, project_dir: &Path, check: bool, verbosity: Ver
     let mut changed = 0;
 
     for file in &files {
-        let content = safe_read(project_dir, file)?;
-        let formatted = dbd_core::formatter::format_ddl(&content, &format_config);
-
-        if content != formatted {
+        if format_in_place(project_dir, file, &format_config, !check)? {
             changed += 1;
-            if check {
-                output::info(verbosity, &format!("  would reformat: {}", file.display()));
-            } else {
-                safe_write(project_dir, file, &formatted)?;
-                output::info(verbosity, &format!("  formatted: {}", file.display()));
-            }
+            let verb = if check { "would reformat" } else { "formatted" };
+            output::info(verbosity, &format!("  {verb}: {}", file.display()));
         }
     }
 
@@ -1567,16 +1683,17 @@ mod tests {
         .unwrap();
     }
 
-    /// `combine` writes a single concatenated SQL file (target may live outside
-    /// the project, per the core API).
+    /// `combine` writes a single concatenated SQL file — inside the project, as
+    /// every command's output is; the core API takes any path, the command does
+    /// not (see `every_command_that_writes_a_file_keeps_it_inside_the_project`).
     #[test]
     fn combine_writes_sql_file() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = testutil::copy_fixture_project();
         let out = tmp.path().join("combined.sql");
         cmd_combine(
-            &testutil::fixture_config(),
+            &tmp.path().join("design.yaml"),
             "dev",
-            &testutil::fixtures(),
+            tmp.path(),
             &out,
             None,
             None,
@@ -1590,10 +1707,11 @@ mod tests {
     /// constructing an adapter.
     #[tokio::test]
     async fn apply_dry_run_lists_entities() {
+        let proj = testutil::offline_fixture_project();
         cmd_apply(
-            &testutil::fixture_config(),
+            &proj.path().join("design.yaml"),
             "dev",
-            &testutil::fixtures(),
+            proj.path(),
             None,
             /*name*/ None,
             /*dry_run*/ true,
@@ -1611,10 +1729,11 @@ mod tests {
     /// "no policy files" path without touching a DB.
     #[tokio::test]
     async fn policies_dry_run_without_policy_dir() {
+        let proj = testutil::offline_fixture_project();
         cmd_policies(
-            &testutil::fixture_config(),
+            &proj.path().join("design.yaml"),
             "dev",
-            &testutil::fixtures(),
+            proj.path(),
             None,
             /*dry_run*/ true,
             None,
@@ -1717,10 +1836,11 @@ mod tests {
     /// short-circuit the all-scope tests take).
     #[tokio::test]
     async fn apply_dry_run_lists_entities_for_named_scope() {
+        let proj = testutil::offline_fixture_project();
         cmd_apply(
-            &testutil::fixture_config(),
+            &proj.path().join("design.yaml"),
             "dev",
-            &testutil::fixtures(),
+            proj.path(),
             None,
             /*name*/ None,
             /*dry_run*/ true,
@@ -1738,7 +1858,7 @@ mod tests {
     /// it would apply, still without touching a DB.
     #[tokio::test]
     async fn policies_dry_run_lists_existing_policy_files() {
-        let proj = testutil::copy_fixture_project();
+        let proj = testutil::offline_fixture_project();
         std::fs::create_dir_all(proj.path().join("policies")).unwrap();
         std::fs::write(proj.path().join("policies").join("secrets.sql"), "-- rls policy\n").unwrap();
         let cfg = proj.path().join("design.yaml");
@@ -1846,6 +1966,7 @@ mod tests {
             issues: vec![broken],
             out_of_scope_issues: vec![],
             warnings: vec![],
+            out_of_scope_warnings: vec![],
             gaps: vec![],
         };
         // Exercises the issues-loop formatting (label fallback + per-error line).
@@ -1864,6 +1985,7 @@ mod tests {
             issues: vec![],
             out_of_scope_issues: vec![broken],
             warnings: vec![],
+            out_of_scope_warnings: vec![],
             gaps: vec![],
         };
         print_report_findings(&report, Some("daemon"), Verbosity::Normal);
@@ -1931,6 +2053,59 @@ mod tests {
 
         let formatted = std::fs::read_to_string(tmp.path().join("ddl/table/public/thing.ddl")).unwrap();
         assert_ne!(formatted, "create table public.thing(id int,name text);");
+    }
+
+    /// `text` as SSMS saves it: UTF-16LE behind a byte-order mark.
+    fn utf16le(text: &str) -> Vec<u8> {
+        let mut bytes = vec![0xFF, 0xFE];
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes
+    }
+
+    /// `format` read each DDL file with `read_to_string`, so one file saved by
+    /// SSMS (UTF-16) failed the whole run — though the project load decodes it.
+    /// And a file it rewrites keeps the encoding it had: it was written back as
+    /// UTF-8, so formatting changed every byte of an SSMS project's files
+    /// without saying so.
+    #[test]
+    fn format_rewrites_a_utf16_ddl_file_in_utf16() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ddl/table/public/thing.ddl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, utf16le("create table public.thing(id int,name text);")).unwrap();
+
+        cmd_format(
+            &tmp.path().join("design.yaml"),
+            tmp.path(),
+            /*check*/ false,
+            Verbosity::Normal,
+        )
+        .expect("a UTF-16 DDL file must be formatted, not fail the run");
+
+        let bytes = std::fs::read(&path).unwrap();
+        let text = dbd_core::source_text::read_to_string(&path).unwrap();
+        assert_eq!(bytes, utf16le(&text), "rewritten in UTF-16LE behind its BOM");
+        assert!(text.contains("thing"), "{text:?}");
+        assert_ne!(text, "create table public.thing(id int,name text);");
+    }
+
+    /// `inspect --fix` formats through the same rewrite, so it keeps a file's
+    /// encoding too.
+    #[test]
+    fn inspect_fix_rewrites_a_utf16_ddl_file_in_utf16() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ddl/table/public/thing.ddl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, utf16le("create table public.thing(id int,name text);")).unwrap();
+
+        fix_format_ddl(&tmp.path().join("design.yaml"), tmp.path(), None, Verbosity::Normal).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let text = dbd_core::source_text::read_to_string(&path).unwrap();
+        assert_ne!(text, "create table public.thing(id int,name text);");
+        assert_eq!(bytes, utf16le(&text), "rewritten in UTF-16LE behind its BOM");
     }
 
     /// Mixed fixture for `select_matviews`: two matviews in `analytics`, one

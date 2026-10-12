@@ -336,13 +336,21 @@ pub enum RefKind {
     /// Hard, like a read, but deliberately not one: a caller walking data flow
     /// through `reads()` must not find role memberships in it.
     Member,
+    /// The type a column is declared with, or the sequence its default draws
+    /// from (`nextval('s')`).
+    ///
+    /// Hard once it resolves — the enum or sequence must exist before the
+    /// table. But most column types are built-ins (`text`, `uuid`) that name
+    /// nothing in the project, so an unresolved one is **dropped**, not kept:
+    /// one dangling edge per built-in column would bury the dependency graph.
+    Uses,
 }
 
 impl RefKind {
     /// Whether an unresolved reference of this kind is dropped rather than
-    /// warned about. See [`Self::Calls`].
+    /// warned about. See [`Self::Calls`] and [`Self::Uses`].
     pub fn is_soft(self) -> bool {
-        self == Self::Calls
+        matches!(self, Self::Calls | Self::Uses)
     }
 }
 
@@ -413,6 +421,25 @@ pub struct ForeignKey {
     pub ref_columns: Vec<String>,
     pub on_delete: Option<FkAction>,
     pub on_update: Option<FkAction>,
+    /// `MATCH FULL`: a key with some columns NULL and others not is refused,
+    /// where the default `MATCH SIMPLE` lets it through unchecked. Postgres
+    /// implements no other (`MATCH PARTIAL` is refused).
+    ///
+    /// Each of these three is part of what the key enforces, so each is part
+    /// of its identity: a reversed file that dropped them wrote a key that
+    /// accepts rows this one refuses, and `diff` could not see the difference.
+    /// Skipped when false, so snapshots of ordinary keys are unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub match_full: bool,
+    /// `DEFERRABLE`: the check can be put off to the end of the transaction
+    /// (`SET CONSTRAINTS … DEFERRED`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deferrable: bool,
+    /// `INITIALLY DEFERRED`: the check is put off to commit unless a
+    /// transaction says otherwise — so a child row may be inserted before its
+    /// parent. Implies [`Self::deferrable`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub initially_deferred: bool,
     /// Where [`Self::ref_schema`] came from. See [`SchemaSource`], and the note
     /// on this struct for why it is outside `PartialEq`.
     ///
@@ -446,6 +473,9 @@ impl PartialEq for ForeignKey {
             ref_columns,
             on_delete,
             on_update,
+            match_full,
+            deferrable,
+            initially_deferred,
             ref_schema_source: _,
         } = self;
         *name == other.name
@@ -455,6 +485,9 @@ impl PartialEq for ForeignKey {
             && *ref_columns == other.ref_columns
             && *on_delete == other.on_delete
             && *on_update == other.on_update
+            && *match_full == other.match_full
+            && *deferrable == other.deferrable
+            && *initially_deferred == other.initially_deferred
     }
 }
 
@@ -521,6 +554,25 @@ pub enum TableConstraint {
         name: Option<String>,
         expression: String,
     },
+    /// `EXCLUDE …` — no two rows may match on every element under its
+    /// operator: `EXCLUDE USING gist (room WITH =, during WITH &&)` stops two
+    /// bookings of one room overlapping.
+    ///
+    /// `definition` is everything after `EXCLUDE`, as valid SQL in Postgres's
+    /// own order: the access method, the elements with their operators, then
+    /// `INCLUDE`, `WITH`, `WHERE` and `DEFERRABLE` — what
+    /// `pg_get_constraintdef` prints, and what the parser renders from the
+    /// statement. Two spellings of one constraint differ in text (quoting, a
+    /// default operator class written out), so they are compared through
+    /// [`crate::sql_expr::canonical_exclusion`], never as written.
+    ///
+    /// Without it, introspection read only the constraint's backing index:
+    /// a reversed table got a plain gist index — the speed kept, the rule gone
+    /// — and the table parser refused a project that declared one.
+    Exclude {
+        name: Option<String>,
+        definition: String,
+    },
 }
 
 /// How an identity column generates its value (`GENERATED … AS IDENTITY`).
@@ -566,6 +618,30 @@ pub struct ColumnDef {
     pub generated: Option<String>,
     pub comment: Option<String>,
     pub inline_fk: Option<ForeignKey>,
+    /// `COLLATE "C"` — the collation the column's values sort and compare
+    /// under, when it is not its type's default; `None` for the default.
+    /// Held as SQL, built by [`collation_sql`]: each part double-quoted, and
+    /// `pg_catalog` — where the built-in collations live — left off. A name
+    /// may itself hold a dot (`en_US.utf8`), so it is never split apart again.
+    ///
+    /// Part of the column's identity: byte order and a language's order put
+    /// rows in different places, and decide what a `LIKE 'abc%'` index can
+    /// serve. `#[serde(default)]`, and skipped when `None`, so snapshots of
+    /// ordinary columns are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collation: Option<String>,
+}
+
+/// A collation as SQL, for [`ColumnDef::collation`]: `"C"`, or
+/// `"schema"."name"` outside `pg_catalog`. Quoted unconditionally, so `C` —
+/// which Postgres would fold to `c` bare — keeps its case, and so the parser
+/// and the introspector spell one collation the same way.
+pub fn collation_sql(schema: Option<&str>, name: &str) -> String {
+    let quote = |part: &str| format!("\"{}\"", part.replace('"', "\"\""));
+    match schema {
+        Some(schema) if schema != "pg_catalog" => format!("{}.{}", quote(schema), quote(name)),
+        _ => quote(name),
+    }
 }
 
 /// Index definition.
@@ -791,6 +867,19 @@ pub struct Entity {
     /// `None` for the Postgres/DBML paths, which reconstruct DDL from the structured model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_ddl: Option<String>,
+    /// The triggers on this table or view, as the statements that create them — each
+    /// one runnable twice (`CREATE OR REPLACE TRIGGER`, or a `DROP TRIGGER IF
+    /// EXISTS` before a constraint trigger, which Postgres will not replace).
+    ///
+    /// Filled by the Postgres introspector alone, and written by
+    /// [`crate::emit::emit_table`] and [`crate::emit::emit_view`] after the
+    /// table or view, where an authored file keeps its triggers. The parsers read a trigger there only as
+    /// the edge to the function it fires — apply needs the order and nothing
+    /// compares triggers — so a parsed entity leaves this empty. Without it,
+    /// `init --from-db` wrote every table without its triggers, and `merge`
+    /// deleted the triggers from the authored table files it overwrote.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub triggers: Vec<String>,
 }
 
 impl Entity {
@@ -876,6 +965,7 @@ impl Entity {
             table_def: None,
             enum_values: Vec::new(),
             raw_ddl: None,
+            triggers: Vec::new(),
         }
     }
 
@@ -918,9 +1008,7 @@ impl Entity {
         entity.file = Some(path.to_path_buf());
         entity.format = Some(ext.to_string());
         if recognized_type.is_none() {
-            entity.errors.push(format!(
-                "unrecognized DDL folder '{folder}' (expected table/view/materialized_view/function/procedure/enum/role/sequence)"
-            ));
+            entity.errors.push(unread_folder_error(folder));
         }
         entity
     }
@@ -949,14 +1037,14 @@ impl Entity {
             None => &parts,
         };
 
-        // Detect env prefix: import/dev/staging/file.csv → env=dev, schema=staging
-        // vs import/staging/file.csv → env=None, schema=staging
-        let (_env, schema_and_rest) =
-            if after_import.len() >= 3 && (after_import[0] == "dev" || after_import[0] == "prod") {
-                (Some(after_import[0].to_string()), &after_import[1..])
-            } else {
-                (None, after_import)
-            };
+        // Detect env prefix: import/dev/staging/file.csv → env=dev, schema=staging,
+        // and import/dev/file.csv → env=dev, no schema (a schemaless project's
+        // layout); vs import/staging/file.csv → env=None, schema=staging.
+        let (_env, schema_and_rest) = if after_import.len() >= 2 && crate::scanner::is_env_folder(after_import[0]) {
+            (Some(after_import[0].to_string()), &after_import[1..])
+        } else {
+            (None, after_import)
+        };
 
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
 
@@ -995,6 +1083,28 @@ impl Entity {
     }
 }
 
+/// Why a file under `ddl/<folder>/` is not read, for a folder that names no
+/// entity type.
+///
+/// Schemas and extensions are real kinds, but design.yaml declares them —
+/// `schemas:` and the target's `extensions:` — so a file for one says where
+/// it belongs rather than only that its folder is unknown (`dbd doctor` names
+/// the entry to write).
+fn unread_folder_error(folder: &str) -> String {
+    match folder {
+        "extension" | "extensions" => format!(
+            "ddl/{folder}/ is not read: extensions are declared in design.yaml, in the target's \
+             `extensions:` list (`dbd doctor` names the entry)"
+        ),
+        "schema" | "schemas" => {
+            format!("ddl/{folder}/ is not read: schemas are declared in design.yaml, under `schemas:`")
+        }
+        _ => format!(
+            "unrecognized DDL folder '{folder}' (expected table/view/materialized_view/function/procedure/enum/role/sequence)"
+        ),
+    }
+}
+
 /// Split "schema.name" into (Some("schema"), "name"), or (None, "name").
 pub fn split_qualified_name(name: &str) -> (Option<String>, String) {
     match name.split_once('.') {
@@ -1007,6 +1117,20 @@ pub fn split_qualified_name(name: &str) -> (Option<String>, String) {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// `ddl/extension/` and `ddl/schema/` are not DDL folders: both kinds are
+    /// declared in design.yaml. The scanner said only "unrecognized DDL folder",
+    /// which left the reader to guess where an extension goes instead.
+    #[test]
+    fn a_file_under_ddl_extension_or_ddl_schema_is_pointed_at_design_yaml() {
+        let ext = Entity::from_file(Path::new("ddl/extension/citext.ddl"));
+        let said = ext.errors.join("\n");
+        assert!(said.contains("design.yaml") && said.contains("extensions:"), "{said}");
+
+        let schema = Entity::from_file(Path::new("ddl/schema/app.ddl"));
+        let said = schema.errors.join("\n");
+        assert!(said.contains("design.yaml") && said.contains("schemas:"), "{said}");
+    }
 
     #[test]
     fn entity_type_from_folder_name() {
@@ -1149,6 +1273,21 @@ mod tests {
         assert_eq!(entity.name, "staging.lookups");
         assert_eq!(entity.schema, Some("staging".to_string()));
         assert_eq!(entity.format, Some("csv".to_string()));
+    }
+
+    /// A file directly in an env folder is that env's data for a table of no
+    /// schema — SQLite's layout — not a table in a schema named after the env.
+    #[test]
+    fn a_file_directly_in_an_env_folder_names_a_table_of_no_schema() {
+        let entity = Entity::from_import_file(Path::new("import/dev/items.csv"));
+        assert_eq!(entity.name, "items");
+        assert_eq!(entity.schema, None);
+
+        let staged = Entity::from_import_file(Path::new("import/prod/staging/items.csv"));
+        assert_eq!(
+            staged.name, "staging.items",
+            "the schema folder under an env still counts"
+        );
     }
 
     // ── IF2: Import entity from TSV file ─────────────────

@@ -7,33 +7,100 @@ use dbd_core::{Design, Entity, EntityType};
 use super::{format_import_summary, get_adapter};
 use crate::output::{self, Verbosity};
 
-/// Infer the import/export data format from a file extension.
-/// `.jsonl` → "jsonl", `.tsv` → "tsv", everything else → "csv".
+/// Infer the import data format from a file extension.
+/// `.jsonl` → "jsonl", `.json` → "json" (a JSON array of records, or JSON
+/// lines), `.tsv` → "tsv", everything else → "csv".
 fn format_from_ext(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()) {
         Some(ext) if ext.eq_ignore_ascii_case("jsonl") => "jsonl",
+        Some(ext) if ext.eq_ignore_ascii_case("json") => "json",
         Some(ext) if ext.eq_ignore_ascii_case("tsv") => "tsv",
         _ => "csv",
     }
 }
 
-/// Resolve the schema-qualified name of a `Table` entity matching `name`.
-/// Falls back to `name` verbatim when no matching table is found (so an
-/// ad-hoc COPY target can still be addressed by its bare name).
+/// Resolve the schema-qualified name of the table `name` means.
+///
+/// When the project lists schemas under `import.staging`, a name matching a
+/// table in one of them means that one — it is the only kind an import may
+/// load. Taking whichever table matched first resolved `-n lookups` to the
+/// live `config.lookups` beside `staging.lookups`. The staging table may be
+/// one the project only has a data file for. Otherwise the first declared
+/// table matching wins, and failing that `name` verbatim (so an ad-hoc COPY
+/// target can still be addressed by its bare name).
 fn resolve_table_name(design: &Design, name: &str) -> String {
-    design
+    let matches = |e: &&Entity| e.name == name || e.name.ends_with(&format!(".{name}"));
+    let staging = &design.config().import.staging;
+    let in_staging = |e: &&Entity| {
+        e.name
+            .split_once('.')
+            .is_some_and(|(schema, _)| staging.iter().any(|s| s == schema))
+    };
+    let declared = design
         .entities()
         .iter()
-        .find(|e| e.entity_type == EntityType::Table && (e.name == name || e.name.ends_with(&format!(".{name}"))))
+        .filter(|e| e.entity_type == EntityType::Table)
+        .filter(matches);
+    declared
+        .clone()
+        .chain(design.import_tables().iter().filter(matches))
+        .find(in_staging)
+        .or_else(|| declared.clone().next())
         .map(|e| e.name.clone())
         .unwrap_or_else(|| name.to_string())
 }
 
+/// Hold an ad-hoc `-f` import to the scope and to `import.staging`, as every
+/// other import is held.
+///
+/// It ignored `--scope` entirely, loading into a table the scope does not
+/// build. A table the design declares must be one the scope builds. One it
+/// does not declare is a deliberate ad-hoc COPY target (see
+/// [`resolve_table_name`]) that no scope can contain — so the scope is not
+/// applied to it, and that is said rather than left silent. Neither may load
+/// outside the schemas `import.staging` lists.
+fn check_adhoc_import_target(design: &Design, resolved: &dbd_core::ResolvedScope, qualified: &str) -> Result<()> {
+    if !resolved.is_all {
+        if design.entities().iter().any(|e| e.name == qualified) {
+            design.resolve_name(qualified, Some(resolved))?;
+        } else {
+            output::warn(&format!(
+                "--scope {} not applied to {qualified}: the design does not declare it, so no scope contains it",
+                resolved.name
+            ));
+        }
+    }
+    design.check_import_target(qualified)?;
+    Ok(())
+}
+
+/// What importing under a scope the database is not pinned to would do.
+const PINNED: &str = "Importing under another scope would load tables this database was not built with.";
+
+/// Every guard an import checks before it loads anything: the scope pin, then
+/// the environment — a dev import into a database marked prod would load
+/// `import/dev/` data into production. [`Design::import_data`] checks the
+/// second itself; the ad-hoc `-f` load, which goes to the adapter directly,
+/// and both previews check them here.
+async fn check_import_guards(
+    adapter: &dyn dbd_core::DatabaseAdapter,
+    design: &Design,
+    resolved: &dbd_core::ResolvedScope,
+) -> Result<()> {
+    super::check_pinned_scope(adapter, design, resolved, PINNED).await?;
+    design.guard_env(adapter).await?;
+    Ok(())
+}
+
+/// `dbd import --dry-run`. Offline when no database is configured; with one to
+/// ask, it refuses where the import would — a preview of a load the run
+/// refuses is a false promise.
 #[allow(clippy::too_many_arguments)]
-pub fn cmd_import_dry_run(
+pub async fn cmd_import_dry_run(
     config: &Path,
     env: &str,
     project_dir: &Path,
+    database_url: Option<&str>,
     name: Option<&str>,
     file: Option<&Path>,
     scope: Option<&str>,
@@ -41,6 +108,15 @@ pub fn cmd_import_dry_run(
     verbosity: Verbosity,
 ) -> Result<()> {
     let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
+    // The guards, whenever a database is configured to ask — and the database
+    // asked, which the plan below is ordered by as the import's is.
+    let guard = async |resolved: &dbd_core::ResolvedScope| -> Result<Option<Box<dyn dbd_core::DatabaseAdapter>>> {
+        let adapter = super::dry_run_adapter(config, database_url).await?;
+        if let Some(adapter) = &adapter {
+            check_import_guards(&**adapter, &design, resolved).await?;
+        }
+        Ok(adapter)
+    };
 
     // Ad-hoc single-file import plan: print the one line and write nothing.
     if let Some(path) = file {
@@ -49,6 +125,11 @@ pub fn cmd_import_dry_run(
             None => bail!("--file requires --name <entity>"),
         };
         let qualified = resolve_table_name(&design, name);
+        let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
+        let (kept, total) = design.scope_counts(&resolved)?;
+        output::scope_filtered(&resolved, kept, total);
+        check_adhoc_import_target(&design, &resolved, &qualified)?;
+        guard(&resolved).await?;
         output::info(verbosity, &format!("import {qualified} ← {}", path.display()));
         output::summary(0, 0, 1);
         return Ok(());
@@ -59,16 +140,20 @@ pub fn cmd_import_dry_run(
     // Surface the same gap/closure errors a real import would (dry-run must
     // not hide a misconfigured scope).
     design.check_scope_gaps(&resolved).context("scope check failed")?;
-    let plan = design.import_plan(name);
-    let ws = design.working_set(&resolved)?;
-    let plan: Vec<_> = plan
-        .into_iter()
-        .filter(|e| dbd_core::design::import_entry_in_scope(e, &ws, resolved.is_all))
-        .collect();
+    let (kept, total) = design.scope_counts(&resolved)?;
+    output::scope_filtered(&resolved, kept, total);
+    let adapter = guard(&resolved).await?;
+    // In the order the import loads them: by the database's own foreign keys
+    // too, when there is one to ask (see `Design::live_import_plan`).
+    let (plan, skips) = match &adapter {
+        Some(adapter) => design.live_import_plan(&**adapter, name, Some(&resolved)).await?,
+        None => design.scoped_import_plan(name, Some(&resolved))?,
+    };
 
-    // Anything the scan or plan left out, before listing what remains — so a
-    // preview that shows no steps still explains itself.
-    for warning in design.import_warnings(name) {
+    // Anything the scan, plan or scope left out, before listing what remains —
+    // so a preview that shows no steps still explains itself, exactly as the
+    // real import would.
+    for warning in design.import_warnings(name).into_iter().chain(skips) {
         output::warn(&warning);
     }
 
@@ -111,7 +196,10 @@ pub fn cmd_import_dry_run(
         output::warn(warning);
     }
 
-    output::summary(0, 0, plan.len());
+    // Tables, as the run's summary counts them: a table with a shared data
+    // file and an env's own is two plan entries and one table.
+    let tables: std::collections::HashSet<&str> = plan.iter().map(|e| e.table.name.as_str()).collect();
+    output::summary(0, 0, tables.len());
     Ok(())
 }
 
@@ -133,6 +221,12 @@ pub async fn cmd_import(
     // the error is about the flags rather than the database.
     if file.is_some() && name.is_none() {
         bail!("--file requires --name <entity>");
+    }
+    // Likewise a `-n` that selects no data file: refused here, before the
+    // connection, so the error names the typo rather than the database. (An
+    // ad-hoc `-f` load names its target table, not a data file under import/.)
+    if file.is_none() {
+        design.check_import_plan(name)?;
     }
 
     let adapter = get_adapter(config, database_url).await?;
@@ -160,6 +254,16 @@ pub(crate) async fn import_with_adapter(
             None => bail!("--file requires --name <entity>"),
         };
         let qualified = resolve_table_name(design, name);
+        let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
+        // Said as every scoped run says it — the ad-hoc load is checked
+        // against the scope too, and was the one import path silent about it.
+        let (kept, total) = design.scope_counts(&resolved)?;
+        output::scope_filtered(&resolved, kept, total);
+        check_adhoc_import_target(design, &resolved, &qualified)?;
+        // It loads data into the database as any import does, so it is held
+        // to the same guards — the environment guard included, which it
+        // skipped: `-e dev import -n -f` loaded a dev file into production.
+        check_import_guards(adapter, design, &resolved).await?;
         let format = format_from_ext(path);
 
         let mut entity = Entity::new(EntityType::Table, &qualified);
@@ -175,6 +279,9 @@ pub(crate) async fn import_with_adapter(
     }
 
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
+    let (kept, total) = design.scope_counts(&resolved)?;
+    output::scope_filtered(&resolved, kept, total);
+    super::check_pinned_scope(adapter, design, &resolved, PINNED).await?;
 
     let spinner = output::StepSpinner::new(verbosity);
     let mut import_summary: Option<ImportComplete> = None;
@@ -217,20 +324,87 @@ pub async fn cmd_export(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
+    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
+    let resolved = design.resolve_scope(scope, deps)?;
+    // A `-n` that selects nothing is refused before connecting: the mistake is
+    // in the command line, and an error about the database would hide it.
+    export_selection(&design, &resolved, name)?;
     let adapter = get_adapter(config, database_url).await?;
-    export_with_adapter(
-        &*adapter,
-        config,
-        env,
-        project_dir,
-        name,
-        format,
-        output,
-        scope,
-        deps,
-        verbosity,
+    export_with_adapter(&*adapter, &design, &resolved, name, format, output, verbosity).await
+}
+
+/// The tables and views `dbd export` writes, in design order.
+///
+/// Either the `export:` list or, without one, every table — filtered to the
+/// scope's working set, and to `name` when given. A listed entry may be a view
+/// (or materialized view) as well as a table: views that dereference foreign
+/// keys are how the export comes to match the import staging tables, which is
+/// what moves a long-running system's data to a new database. Only listed
+/// views are exported — unlisted, the default is every table.
+///
+/// A `name` that selects nothing is an error rather than an empty export: it
+/// printed "No tables to export." and exited 0 for a typo, for a table the
+/// scope does not build, and for one the `export:` list leaves out.
+fn export_selection<'a>(
+    design: &'a Design,
+    resolved: &dbd_core::ResolvedScope,
+    name: Option<&str>,
+) -> Result<Vec<&'a dbd_core::Entity>> {
+    if let Some(n) = name {
+        design.resolve_name(n, Some(resolved))?;
+    }
+    let in_scope: std::collections::HashSet<String> =
+        design.scoped_entities(resolved)?.into_iter().map(|e| e.name).collect();
+    let listed: Option<Vec<String>> =
+        (!design.config().export.is_empty()).then(|| design.config().export.iter().map(|e| e.name()).collect());
+    let selected: Vec<&dbd_core::Entity> = design
+        .entities()
+        .iter()
+        .filter(|e| match &listed {
+            Some(names) => is_exportable(e) && names.contains(&e.name),
+            None => e.entity_type == dbd_core::EntityType::Table,
+        })
+        .filter(|e| in_scope.contains(&e.name))
+        .filter(|e| name.is_none_or(|n| e.name == n))
+        .collect();
+    if let Some(n) = name
+        && selected.is_empty()
+    {
+        match listed {
+            Some(_) => bail!("{n} is not listed under export: in design.yaml, so it is not exported"),
+            None => bail!("{n} is not a table — without an export: list, only tables are exported"),
+        }
+    }
+    Ok(selected)
+}
+
+/// "1 table(s) and 1 view(s)": what an export writes, by kind. A view counted
+/// as a table promised a table that does not exist.
+fn export_tally(selected: &[&dbd_core::Entity]) -> String {
+    use dbd_core::EntityType;
+    let count = |t: EntityType| selected.iter().filter(|e| e.entity_type == t).count();
+    let parts: Vec<String> = [
+        (count(EntityType::Table), "table(s)"),
+        (count(EntityType::View), "view(s)"),
+        (count(EntityType::MaterializedView), "materialized view(s)"),
+    ]
+    .into_iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, what)| format!("{n} {what}"))
+    .collect();
+    match parts.as_slice() {
+        [] => "nothing".to_string(),
+        [only] => only.clone(),
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+    }
+}
+
+/// What an `export:` entry may name: a table, or a view that reshapes one.
+fn is_exportable(e: &dbd_core::Entity) -> bool {
+    matches!(
+        e.entity_type,
+        dbd_core::EntityType::Table | dbd_core::EntityType::View | dbd_core::EntityType::MaterializedView
     )
-    .await
 }
 
 /// The body of `dbd export`, with the adapter supplied rather than connected.
@@ -238,26 +412,15 @@ pub async fn cmd_export(
 /// Split out so the decisions here — which tables are in scope, and which format
 /// each one exports as — are testable against a recording adapter without a
 /// live database.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn export_with_adapter(
     adapter: &dyn dbd_core::DatabaseAdapter,
-    config: &Path,
-    env: &str,
-    project_dir: &Path,
+    design: &Design,
+    resolved: &dbd_core::ResolvedScope,
     name: Option<&str>,
     format: &str,
     output: Option<&Path>,
-    scope: Option<&str>,
-    deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
-
-    // Restrict to the scope's working set (all entities for the all-scope).
-    let resolved = design.resolve_scope(scope, deps)?;
-    let in_scope: std::collections::HashSet<String> =
-        design.scoped_entities(&resolved)?.into_iter().map(|e| e.name).collect();
-
     // Build a name→format map from config export entries (per-table overrides).
     let config_format_map: std::collections::HashMap<String, String> = design
         .config()
@@ -266,57 +429,181 @@ pub(crate) async fn export_with_adapter(
         .filter_map(|e| e.format().map(|f| (e.name(), f.to_string())))
         .collect();
 
-    // Build export list: either from config export entries, or all tables.
-    // The scope's working set filters either branch.
-    let tables: Vec<&dbd_core::Entity> = if !design.config().export.is_empty() {
-        let export_names: Vec<String> = design.config().export.iter().map(|e| e.name()).collect();
-        design
-            .entities()
-            .iter()
-            .filter(|e| e.entity_type == dbd_core::EntityType::Table)
-            .filter(|e| export_names.contains(&e.name))
-            .filter(|e| in_scope.contains(&e.name))
-            .filter(|e| name.is_none() || e.name == name.unwrap_or(""))
-            .collect()
-    } else {
-        design
-            .entities()
-            .iter()
-            .filter(|e| e.entity_type == dbd_core::EntityType::Table)
-            .filter(|e| in_scope.contains(&e.name))
-            .filter(|e| name.is_none() || e.name == name.unwrap_or(""))
-            .collect()
-    };
+    for listed in design.config().export.iter().map(|e| e.name()) {
+        if !design.entities().iter().any(|e| e.name == listed && is_exportable(e)) {
+            output::warn(&format!(
+                "export: {listed} is not a table or view in this design — nothing exported for it"
+            ));
+        }
+    }
+    let tables = export_selection(design, resolved, name)?;
 
     // Say the export was narrowed before reporting what it found: "No tables to
     // export" on a scoped run otherwise reads as an empty database.
-    output::scope_filtered(&resolved, in_scope.len(), design.entities().len());
+    let (kept, total) = design.scope_counts(resolved)?;
+    output::scope_filtered(resolved, kept, total);
+    // And name each `export:` entry the scope left out. The list is what the
+    // reader expects to find files for; one missing without a word looks like
+    // a failed export.
+    if !resolved.is_all && name.is_none() {
+        let in_scope: std::collections::HashSet<String> =
+            design.scoped_entities(resolved)?.into_iter().map(|e| e.name).collect();
+        for listed in design.config().export.iter().map(|e| e.name()) {
+            let exists = design.entities().iter().any(|e| e.name == listed && is_exportable(e));
+            if exists && !in_scope.contains(&listed) {
+                output::warn(&format!(
+                    "export: {listed} is outside scope '{}' — not exported",
+                    resolved.name
+                ));
+            }
+        }
+    }
 
     if tables.is_empty() {
         output::info(verbosity, "No tables to export.");
         return Ok(());
     }
+    super::check_pinned_scope(
+        adapter,
+        design,
+        resolved,
+        "Exporting under another scope would read tables this database was not built with.",
+    )
+    .await?;
 
-    output::info(verbosity, &format!("Exporting {} table(s)...", tables.len()));
+    output::info(verbosity, &format!("Exporting {}...", export_tally(&tables)));
 
+    // `-o` replaces the project's `export/`; the layout under it is the same —
+    // unless it names a schema folder of the project's `import/` tree, where
+    // each file is written as that import reads it (see `is_import_schema_folder`).
+    let root = output.map_or_else(|| design.project_dir().join("export"), Path::to_path_buf);
+    let into_schema_folder = output.is_some_and(|out| is_import_schema_folder(design.project_dir(), out));
+    if into_schema_folder {
+        refuse_shared_files(&tables, &root)?;
+    }
     for table in &tables {
         // Precedence: per-table config override → CLI --format flag → "csv".
         let effective_format = config_format_map.get(&table.name).map(|s| s.as_str()).unwrap_or(format);
 
         let mut export_entity = (*table).clone();
         export_entity.format = Some(effective_format.to_string());
+        let dir = if into_schema_folder {
+            root.clone()
+        } else {
+            export_dir(&root, &table.name)?
+        };
         adapter
-            .export_data(&export_entity, output)
+            .export_data(&export_entity, Some(&dir))
             .await
             .context(format!("Failed to export {}", table.name))?;
         output::detail(verbosity, &format!("  exported {} ({})", table.name, effective_format));
     }
 
-    let dest = output
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "export/".to_string());
-    output::info(verbosity, &format!("Export complete. Files written to {dest}"));
+    output::info(
+        verbosity,
+        &format!("Export complete. Files written to {}", root.display()),
+    );
     Ok(())
+}
+
+/// Whether `out` is a schema folder of the project's `import/` tree —
+/// `import/<schema>`, or `import/<env>/<schema>` under an env folder.
+///
+/// Exporting there is how a long-running system's data moves to a new
+/// database: `export -n core.accounts -o import/staging` writes
+/// `import/staging/accounts.csv`, which the new database's import loads into
+/// `staging.accounts`. Written under a schema folder of its own instead —
+/// `import/staging/core/accounts.csv`, `-o`'s layout everywhere else — the
+/// file sat where no import reads, and the round trip loaded nothing.
+///
+/// Compared as resolved paths: `-o` is read against the directory dbd runs
+/// in and the project against `-s`, and either may pass through a symlink
+/// (macOS's `/var` is `/private/var`). The folder need not exist yet.
+fn is_import_schema_folder(project_dir: &Path, out: &Path) -> bool {
+    let (Some(out), Some(import)) = (resolved(out), resolved(&project_dir.join("import"))) else {
+        return false;
+    };
+    let Ok(rel) = out.strip_prefix(&import) else {
+        return false;
+    };
+    let folders: Vec<&str> = rel.iter().filter_map(|c| c.to_str()).collect();
+    match folders.as_slice() {
+        [env, _schema] => dbd_core::scanner::is_env_folder(env),
+        [schema] => !dbd_core::scanner::is_env_folder(schema),
+        _ => false,
+    }
+}
+
+/// `path` made absolute, with its deepest existing ancestor canonicalized —
+/// symlinks resolved — and the rest, which does not exist yet, appended.
+fn resolved(path: &Path) -> Option<std::path::PathBuf> {
+    let absolute = std::path::absolute(path).ok()?;
+    let mut existing = absolute.as_path();
+    let mut rest = Vec::new();
+    loop {
+        if let Ok(real) = existing.canonicalize() {
+            return Some(rest.iter().rev().fold(real, |p, part| p.join(part)));
+        }
+        rest.push(existing.file_name()?);
+        existing = existing.parent()?;
+    }
+}
+
+/// Refuse an export into an import schema folder where two of `tables` would
+/// be one file — `core.accounts` and `staging.accounts` are both
+/// `accounts.csv` there — naming each pair, before anything is written.
+fn refuse_shared_files(tables: &[&dbd_core::Entity], root: &Path) -> Result<()> {
+    let mut by_file: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
+    for table in tables {
+        let (_, bare) = table.name.rsplit_once('.').unwrap_or(("", &table.name));
+        by_file.entry(bare).or_default().push(&table.name);
+    }
+    let shared: Vec<String> = by_file
+        .iter()
+        .filter(|(_, names)| names.len() > 1)
+        .map(|(bare, names)| format!("  {bare}: {}", names.join(", ")))
+        .collect();
+    if shared.is_empty() {
+        return Ok(());
+    }
+    // The folder above is no way out: exporting there gives each table a
+    // folder of its own schema, `import/core/…`, which an import refuses unless
+    // that schema is a staging one — and the next import failed on it.
+    let schema = root
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    bail!(
+        "nothing exported: {} is a schema folder of the import tree, where a table is written as \
+         <table>.<format> — and these tables would be one file there:\n{}\n\
+         An import loads each file here into {schema}.<table>: export into this folder, with -n, \
+         the one table whose rows that should be (a second export here overwrites the first). \
+         Outside import/ — the default export/ — each table keeps its own schema folder.",
+        root.display(),
+        shared.join("\n"),
+    )
+}
+
+/// The directory `table`'s file is written to: `<root>/<schema>/`, or `<root>/`
+/// for a table with no schema (SQLite's).
+///
+/// One layout for the default `export/` and for `-o`, and the
+/// `import/<schema>/<table>` layout an import reads — so `-o import` exports
+/// straight into the import tree. `-o` wrote every table flat into `<root>`,
+/// and the second of two same-named tables in different schemas overwrote the
+/// first while the summary counted both. The default `export/` was resolved
+/// against the directory dbd ran in rather than the project `-s` names.
+fn export_dir(root: &Path, table: &str) -> Result<std::path::PathBuf> {
+    match dbd_core::entity::split_qualified_name(table) {
+        (Some(schema), _) if dbd_core::path_safe::is_safe_segment(&schema) => Ok(root.join(schema)),
+        // A schema name is a directory name here, and a quoted identifier may
+        // hold a path separator — refused rather than joined.
+        (Some(_), _) => bail!(
+            "cannot export {table}: its schema name is not usable as a directory name (it contains a path \
+             separator, or is '.' or '..'). Rename the schema, or export the table by hand"
+        ),
+        (None, _) => Ok(root.to_path_buf()),
+    }
 }
 
 #[cfg(test)]
@@ -324,11 +611,44 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// Two tables that would share a file in an import schema folder were
+    /// refused with the advice to export to the folder above it, `-o import`,
+    /// "to keep each under its schema" — which writes `import/core/…`, a
+    /// folder the next import refuses unless `core` is a staging schema. The
+    /// refusal advises what an import can load.
+    #[test]
+    fn the_shared_file_refusal_advises_only_what_an_import_can_load() {
+        let core = Entity::new(EntityType::Table, "core.accounts");
+        let staging = Entity::new(EntityType::Table, "staging.accounts");
+        let root = PathBuf::from("/p/import/staging");
+        let err = refuse_shared_files(&[&core, &staging], &root).unwrap_err().to_string();
+        assert!(
+            err.contains("core.accounts") && err.contains("staging.accounts"),
+            "naming both: {err}"
+        );
+        assert!(
+            !err.contains("-o /p/import"),
+            "never into the import tree above the folder, whose other schema folders an import refuses: {err}"
+        );
+        assert!(
+            err.contains("-n"),
+            "and names the way that works — one table, by -n: {err}"
+        );
+    }
+
     #[test]
     fn format_from_ext_maps_known_extensions() {
         assert_eq!(format_from_ext(&PathBuf::from("data/users.jsonl")), "jsonl");
         assert_eq!(format_from_ext(&PathBuf::from("data/users.tsv")), "tsv");
         assert_eq!(format_from_ext(&PathBuf::from("data/users.csv")), "csv");
+    }
+
+    /// A `.json` file is JSON. It fell through to the CSV default, so
+    /// `dbd import -n <table> -f rows.json` fed JSON to the CSV loader.
+    #[test]
+    fn a_json_file_is_read_as_json() {
+        assert_eq!(format_from_ext(&PathBuf::from("data/users.json")), "json");
+        assert_eq!(format_from_ext(&PathBuf::from("USERS.JSON")), "json");
     }
 
     #[test]
@@ -360,50 +680,59 @@ mod tests {
 
     /// Full-plan dry-run against the fixture: resolves scope, builds the import
     /// plan, prints it, writes nothing.
-    #[test]
-    fn import_dry_run_full_plan_on_fixture() {
+    #[tokio::test]
+    async fn import_dry_run_full_plan_on_fixture() {
+        let tmp = testutil::offline_fixture_project();
         cmd_import_dry_run(
-            &testutil::fixture_config(),
+            &tmp.path().join("design.yaml"),
             "dev",
-            &testutil::fixtures(),
+            tmp.path(),
+            None,
             None,
             None,
             None,
             None,
             Verbosity::Verbose,
         )
+        .await
         .unwrap();
     }
 
     /// Ad-hoc single-file dry-run prints one line for the resolved target.
-    #[test]
-    fn import_dry_run_adhoc_file() {
+    #[tokio::test]
+    async fn import_dry_run_adhoc_file() {
+        let tmp = testutil::offline_fixture_project();
         cmd_import_dry_run(
-            &testutil::fixture_config(),
+            &tmp.path().join("design.yaml"),
             "dev",
-            &testutil::fixtures(),
+            tmp.path(),
+            None,
             Some("lookups"),
             Some(Path::new("data/x.csv")),
             None,
             None,
             Verbosity::Normal,
         )
+        .await
         .unwrap();
     }
 
     /// `--file` without `--name` is an actionable error (both dry-run and real).
-    #[test]
-    fn import_dry_run_file_without_name_bails() {
+    #[tokio::test]
+    async fn import_dry_run_file_without_name_bails() {
+        let tmp = testutil::offline_fixture_project();
         let err = cmd_import_dry_run(
-            &testutil::fixture_config(),
+            &tmp.path().join("design.yaml"),
             "dev",
-            &testutil::fixtures(),
+            tmp.path(),
+            None,
             None,
             Some(Path::new("data/x.csv")),
             None,
             None,
             Verbosity::Normal,
         )
+        .await
         .unwrap_err();
         assert!(err.to_string().contains("--file requires --name"), "got: {err}");
     }
@@ -434,6 +763,19 @@ mod tests {
     // selection logic entirely broken.
 
     use dbd_core::adapter::mock::MockAdapter;
+
+    /// Run `export_with_adapter` against the project at `cfg`, unscoped.
+    async fn export_project(
+        mock: &MockAdapter,
+        cfg: &Path,
+        dir: &Path,
+        name: Option<&str>,
+        format: &str,
+    ) -> Result<()> {
+        let design = Design::from_config_with_dir(cfg, "dev", Some(dir)).unwrap();
+        let resolved = design.resolve_scope(None, None).unwrap();
+        export_with_adapter(mock, &design, &resolved, name, format, None, Verbosity::Normal).await
+    }
 
     fn fixture_design() -> Design {
         Design::from_config_with_dir(&testutil::fixture_config(), "dev", Some(&testutil::fixtures())).unwrap()
@@ -466,13 +808,117 @@ mod tests {
         );
     }
 
-    /// An unknown name is passed through verbatim rather than silently dropped,
-    /// so an ad-hoc COPY target can still be addressed by a bare name.
+    /// The real ad-hoc import honours `--scope` as its dry run does: a table the
+    /// scope does not build is refused, and nothing reaches the adapter.
+    #[tokio::test]
+    async fn import_adhoc_into_a_table_outside_the_scope_is_refused() {
+        let mock = MockAdapter::new();
+        let design = fixture_design();
+        // `incomplete` builds config.lookup_values, not config.lookups.
+        let err = import_with_adapter(
+            &mock,
+            &design,
+            Some("config.lookups"),
+            Some(Path::new("data/lookups.csv")),
+            Some("incomplete"),
+            None,
+            Verbosity::Normal,
+        )
+        .await
+        .expect_err("a table outside the scope must not be loaded");
+
+        assert!(
+            err.to_string().contains("config.lookups is outside scope 'incomplete'"),
+            "{err}"
+        );
+        assert!(mock.imported.lock().unwrap().is_empty(), "nothing is imported");
+    }
+
+    /// A name the design does not declare is passed through verbatim rather
+    /// than silently dropped, so an ad-hoc COPY target need not be in the DDL.
+    /// (The fixture lists `staging` under `import.staging`, so the target is
+    /// qualified with it — see the next test for an unqualified one.)
     #[tokio::test]
     async fn import_adhoc_unknown_name_passes_through() {
         let mock = MockAdapter::new();
         let design = fixture_design();
         import_with_adapter(
+            &mock,
+            &design,
+            Some("staging.not_a_fixture_table"),
+            Some(Path::new("data/x.jsonl")),
+            None,
+            None,
+            Verbosity::Normal,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *mock.imported.lock().unwrap(),
+            vec!["staging.not_a_fixture_table".to_string()]
+        );
+    }
+
+    /// `import.staging` lists the schemas an import may load, and an ad-hoc
+    /// `-f` load is an import: `-n config.lookups -f …` loaded straight into a
+    /// live table the list leaves out. Refused, and nothing reaches the
+    /// adapter.
+    #[tokio::test]
+    async fn an_adhoc_import_into_a_table_outside_the_staging_schemas_is_refused() {
+        let mock = MockAdapter::new();
+        let design = fixture_design();
+        assert_eq!(
+            design.config().import.staging,
+            vec!["staging".to_string()],
+            "precondition"
+        );
+        let err = import_with_adapter(
+            &mock,
+            &design,
+            Some("config.lookups"),
+            Some(Path::new("data/lookups.csv")),
+            None,
+            None,
+            Verbosity::Normal,
+        )
+        .await
+        .expect_err("config is not a staging schema");
+        assert!(
+            err.to_string().contains("config.lookups") && err.to_string().contains("import.staging"),
+            "{err}"
+        );
+        assert!(mock.imported.lock().unwrap().is_empty(), "nothing is imported");
+    }
+
+    /// The dry run refuses it too, rather than printing a load the run refuses.
+    #[tokio::test]
+    async fn an_adhoc_dry_run_into_a_table_outside_the_staging_schemas_is_refused() {
+        let tmp = testutil::offline_fixture_project();
+        let err = cmd_import_dry_run(
+            &tmp.path().join("design.yaml"),
+            "dev",
+            tmp.path(),
+            None,
+            Some("config.lookups"),
+            Some(Path::new("data/lookups.csv")),
+            None,
+            None,
+            Verbosity::Normal,
+        )
+        .await
+        .expect_err("config is not a staging schema");
+        assert!(err.to_string().contains("import.staging"), "{err}");
+    }
+
+    /// An unqualified name the design does not declare resolves through the
+    /// database's search_path — to a schema `import.staging` cannot vouch for
+    /// — so it has to be qualified.
+    #[tokio::test]
+    async fn an_unqualified_adhoc_target_is_refused_under_import_staging() {
+        let mock = MockAdapter::new();
+        let design = fixture_design();
+        let err = import_with_adapter(
             &mock,
             &design,
             Some("not_a_fixture_table"),
@@ -482,9 +928,70 @@ mod tests {
             Verbosity::Normal,
         )
         .await
-        .unwrap();
+        .expect_err("a bare unknown name cannot be checked against import.staging");
+        assert!(err.to_string().contains("not_a_fixture_table"), "{err}");
+        assert!(mock.imported.lock().unwrap().is_empty(), "nothing is imported");
+    }
 
-        assert_eq!(*mock.imported.lock().unwrap(), vec!["not_a_fixture_table".to_string()]);
+    /// A bare name matching tables in several schemas means the staging one
+    /// when the project lists staging schemas: that is the only table an import
+    /// may load. It resolved to whichever came first — `config.lookups` here.
+    #[tokio::test]
+    async fn a_bare_adhoc_name_resolves_to_the_staging_table() {
+        let mock = MockAdapter::new();
+        let design = fixture_design();
+        assert!(
+            design.entities().iter().any(|e| e.name == "config.lookups")
+                && design.import_tables().iter().any(|e| e.name == "staging.lookups"),
+            "precondition: `lookups` names a live table and a staging one"
+        );
+        import_with_adapter(
+            &mock,
+            &design,
+            Some("lookups"),
+            Some(Path::new("data/lookups.csv")),
+            None,
+            None,
+            Verbosity::Normal,
+        )
+        .await
+        .expect("the staging table is a valid target");
+        assert_eq!(*mock.imported.lock().unwrap(), vec!["staging.lookups".to_string()]);
+    }
+
+    /// `export:` is how a long-running system moves to a new database: it lists
+    /// views that dereference foreign keys, so the files match the import
+    /// staging tables. A listed view was filtered out as "not a table" — the
+    /// export wrote nothing for it and said nothing.
+    #[tokio::test]
+    async fn export_writes_a_view_listed_under_export() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for d in ["ddl/table/config", "ddl/view/config"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: t\nschemas:\n  - config\nexport:\n  - config.lookups_export\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/config/lookups.ddl"),
+            "set search_path to config;\ncreate table if not exists lookups (id int primary key, name text);\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/view/config/lookups_export.ddl"),
+            "set search_path to config;\ncreate or replace view lookups_export as select name from config.lookups;\n",
+        )
+        .unwrap();
+        let mock = MockAdapter::new();
+        export_project(&mock, &dir.join("design.yaml"), dir, None, "csv")
+            .await
+            .unwrap();
+
+        let exported = mock.exported.lock().unwrap().clone();
+        assert_eq!(exported, vec!["config.lookups_export (csv)".to_string()]);
     }
 
     /// Format precedence: a per-table `format:` in `design.yaml`'s `export:`
@@ -496,20 +1003,9 @@ mod tests {
     #[tokio::test]
     async fn export_format_precedence_config_override_beats_cli_flag() {
         let mock = MockAdapter::new();
-        export_with_adapter(
-            &mock,
-            &testutil::fixture_config(),
-            "dev",
-            &testutil::fixtures(),
-            None,
-            "tsv",
-            None,
-            None,
-            None,
-            Verbosity::Normal,
-        )
-        .await
-        .unwrap();
+        export_project(&mock, &testutil::fixture_config(), &testutil::fixtures(), None, "tsv")
+            .await
+            .unwrap();
 
         let exported = mock.exported.lock().unwrap().clone();
         assert!(
@@ -546,20 +1042,7 @@ mod tests {
         );
 
         let mock = MockAdapter::new();
-        export_with_adapter(
-            &mock,
-            &cfg,
-            "dev",
-            proj.path(),
-            None,
-            "csv",
-            None,
-            None,
-            None,
-            Verbosity::Normal,
-        )
-        .await
-        .unwrap();
+        export_project(&mock, &cfg, proj.path(), None, "csv").await.unwrap();
 
         let exported = mock.exported.lock().unwrap().clone();
         assert!(
@@ -584,17 +1067,12 @@ mod tests {
             .map(|e| e.name.clone())
             .expect("fixture has at least one table");
 
-        export_with_adapter(
+        export_project(
             &mock,
             &testutil::fixture_config(),
-            "dev",
             &testutil::fixtures(),
             Some(&target),
             "csv",
-            None,
-            None,
-            None,
-            Verbosity::Normal,
         )
         .await
         .unwrap();
@@ -607,30 +1085,134 @@ mod tests {
         );
     }
 
-    /// A name matching no table exports nothing and takes the early return —
-    /// it must not silently export everything.
+    /// A name matching no table is refused, and exports nothing — neither
+    /// everything, nor the silent empty export it used to report as success.
     #[tokio::test]
-    async fn export_unknown_name_exports_nothing() {
+    async fn export_unknown_name_is_refused_and_exports_nothing() {
         let mock = MockAdapter::new();
-        export_with_adapter(
+        let err = export_project(
             &mock,
             &testutil::fixture_config(),
-            "dev",
             &testutil::fixtures(),
             Some("no_such_table"),
             "csv",
-            None,
+        )
+        .await
+        .expect_err("an unmatched --name must be refused");
+
+        assert!(err.to_string().contains("no entity named 'no_such_table'"), "{err}");
+        assert!(
+            mock.exported.lock().unwrap().is_empty(),
+            "an unmatched --name must export nothing, not everything"
+        );
+    }
+
+    /// A real table the `export:` list leaves out is refused by name too: it
+    /// would otherwise export nothing and say "No tables to export.".
+    #[tokio::test]
+    async fn export_name_absent_from_the_export_list_is_refused() {
+        let proj = testutil::copy_fixture_project();
+        std::fs::write(
+            proj.path().join("ddl/table/config/unlisted.ddl"),
+            "set search_path to config;\ncreate table if not exists unlisted (id int primary key);\n",
+        )
+        .unwrap();
+        let mock = MockAdapter::new();
+        let err = export_project(
+            &mock,
+            &proj.path().join("design.yaml"),
+            proj.path(),
+            Some("config.unlisted"),
+            "csv",
+        )
+        .await
+        .expect_err("a table the export: list leaves out is not exported");
+        assert!(err.to_string().contains("not listed under export:"), "{err}");
+    }
+
+    // ── The scope guard ────────────────────────────────────────────────────────
+
+    /// `apply` and `deploy` refuse a database pinned to another scope; `import`
+    /// ran on one and failed partway — staging truncated, some loaders called
+    /// — because the tables it loads are another scope's to build. Refused
+    /// before anything is truncated or loaded.
+    #[tokio::test]
+    async fn an_import_on_a_database_pinned_to_another_scope_is_refused() {
+        let mock = MockAdapter::new().with_scope("config_only");
+        let design = fixture_design();
+        let err = import_with_adapter(&mock, &design, None, None, None, None, Verbosity::Normal)
+            .await
+            .expect_err("the database is pinned to config_only, and this run asks for all");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("scope guard") && msg.contains("pinned to scope 'config_only'") && msg.contains("'all'"),
+            "{msg}"
+        );
+        assert!(
+            mock.scripts.lock().unwrap().is_empty() && mock.imported.lock().unwrap().is_empty(),
+            "nothing truncated, loaded or run: {:?}",
+            mock.scripts.lock().unwrap()
+        );
+    }
+
+    /// An ad-hoc `-f` load is an import too.
+    #[tokio::test]
+    async fn an_adhoc_import_on_a_database_pinned_to_another_scope_is_refused() {
+        let mock = MockAdapter::new().with_scope("config_only");
+        let design = fixture_design();
+        let err = import_with_adapter(
+            &mock,
+            &design,
+            Some("lookups"),
+            Some(Path::new("data/lookups.csv")),
             None,
             None,
             Verbosity::Normal,
         )
         .await
-        .unwrap();
+        .expect_err("refused like the full import");
+        assert!(err.to_string().contains("pinned to scope 'config_only'"), "{err}");
+        assert!(mock.imported.lock().unwrap().is_empty(), "nothing is imported");
+    }
 
+    /// `import` never re-pins the database, so there is no flag to override
+    /// the guard with; the refusal says how to get through instead.
+    #[tokio::test]
+    async fn the_import_scope_guard_names_the_way_through() {
+        let mock = MockAdapter::new().with_scope("config_only");
+        let design = fixture_design();
+        let err = import_with_adapter(&mock, &design, None, None, None, None, Verbosity::Normal)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
         assert!(
-            mock.exported.lock().unwrap().is_empty(),
-            "an unmatched --name must export nothing, not everything"
+            msg.contains("--scope config_only") && msg.contains("dbd apply --scope all --allow-scope-change"),
+            "the pinned scope to re-run with, or the re-pin: {msg}"
         );
+    }
+
+    /// The pinned scope itself is let through.
+    #[tokio::test]
+    async fn an_import_under_the_pinned_scope_runs() {
+        let mock = MockAdapter::new().with_scope("all");
+        let design = fixture_design();
+        import_with_adapter(&mock, &design, None, None, None, None, Verbosity::Normal)
+            .await
+            .expect("the requested scope is the pinned one");
+        assert!(!mock.imported.lock().unwrap().is_empty());
+    }
+
+    /// `export` read tables the pinned scope never built, and failed on the
+    /// first missing one with some files already written. Refused before
+    /// anything is written.
+    #[tokio::test]
+    async fn an_export_from_a_database_pinned_to_another_scope_is_refused() {
+        let mock = MockAdapter::new().with_scope("config_only");
+        let err = export_project(&mock, &testutil::fixture_config(), &testutil::fixtures(), None, "csv")
+            .await
+            .expect_err("pinned to config_only, and this run asks for all");
+        assert!(err.to_string().contains("pinned to scope 'config_only'"), "{err}");
+        assert!(mock.exported.lock().unwrap().is_empty(), "nothing exported");
     }
 
     /// A full (non-ad-hoc) import runs the design's import plan through the
