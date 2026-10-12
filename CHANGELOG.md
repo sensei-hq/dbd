@@ -22,10 +22,16 @@ project too.
   moves the project's own rows; another project's stay, and so does a legacy
   table while it holds any, unaltered. A project not yet healed reads its own
   record there, so its guards still see a database it marked prod. The heal
-  locks a legacy table before reading it, so a row an older dbd commits
-  meanwhile is seen, not dropped with the table; an emptied table is dropped,
-  or kept if Postgres refuses (a view over it); and a table the project's
-  role cannot read — another project's — is passed over, by reads too.
+  locks a legacy table before reading it, reading committed whatever the
+  database's isolation default, so a row an older dbd commits meanwhile is
+  seen, not dropped with the table; it locks them in the order an older
+  dbd's batch writes them, so the two never deadlock; it waits at most 5
+  seconds for another session's write, then fails naming the table; and one
+  heal runs at a time, so two projects' first runs no longer collide creating
+  the `dbd` schema. An emptied table is dropped, or kept if Postgres refuses
+  (a view over it). A table the project's role cannot read — another
+  project's — is passed over, by reads too; one it can read but not take that
+  holds its own row is refused, naming the table.
 - **A pg_cron refresh job is named for its project** —
   `dbd-refresh:<project>:<schema>.<name>` — and a sync unschedules only its own
   project's. It unscheduled every `dbd:refresh:` job it was not given, so each
@@ -36,7 +42,8 @@ project too.
   one project's name cannot reach another's jobs. A job an older dbd named
   `dbd:refresh:<schema>.<name>` is replaced for a matview the project
   declares, and unscheduled, by any project, once the view it refreshes no
-  longer exists.
+  longer exists — read from the catalog, so a schema the role cannot use
+  fails nothing; concurrent syncs take turns.
 - **Each project stages its JSON imports in its own table**,
   `dbd."import_tmp:<project>"`. Every load dropped and recreated one
   `dbd.import_tmp`, so two projects importing at once emptied each other's
