@@ -17,13 +17,13 @@ unreleased.
   in its batch, reconcile after its writes, reset only checks. A failed, killed
   or concurrent run takes nothing, so there is no give-back. Registry waits are
   capped at 5s (55P03/40001 name the table).
-- CHANGELOG and spec describe claim-when-built (`7548ff03`).
+- CHANGELOG and spec describe claim-when-built (`7548ff03`, `59aaf4ca`).
 - Embedded 171/171, `cli_live` 44/44, workspace 1997/0, clippy and fmt clean.
 
 ## Next
 
-    git push origin feat/ownership-uses:feat/ownership-registry   # PR #50
-    # update the PR #50 body; focused review; merge #50 locally into feat/ownership;
+    # PR #50 pushed (4f31184f), body updated; focused review running (3 agents);
+    # fix findings test-first, push, CI green; merge #50 locally into feat/ownership;
     # then slice 3: prune rules (a)/(b), --prune-unowned, release.
 
 ## Open
