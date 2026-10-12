@@ -101,8 +101,8 @@ pub enum MigrationAction {
     EnumValues,
     /// A migration altered it; its `.sql` runs.
     Migrate,
-    /// A migration altered it; its `.data.sql` runs, after every schema change
-    /// of the same version.
+    /// A migration altered or added it; its `.data.sql` runs, after every
+    /// schema change of the same version.
     Data,
     /// A migration dropped it; its drop script runs where it still exists.
     Drop,
