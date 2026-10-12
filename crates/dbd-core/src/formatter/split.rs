@@ -90,6 +90,40 @@ pub(in crate::formatter) fn opaque_text(sql: &str) -> Option<Vec<&str>> {
     )
 }
 
+/// `formatted` with each string literal and quoted name written as
+/// `original` writes it, when the two hold the same kinds of them in the same
+/// order — and `formatted` as it is otherwise.
+///
+/// A layout writes them from sqlparser's tree, which keeps a literal's value,
+/// not its spelling: `U&'d\0061t'` came back `U&'dat'`, the same string the
+/// guard rightly refused as a changed literal, and the table was kept as
+/// written. Its spelling is the file's; the guard then checks that what it is
+/// put back into means what the original did.
+pub(in crate::formatter) fn spelled_as_written(original: &str, formatted: &str) -> String {
+    let (Some(from), Some(into)) = (lex(original), lex(formatted)) else {
+        return formatted.to_string();
+    };
+    let texts = |tokens: Vec<Lexeme>, sql: &str| -> Vec<Lexeme> {
+        tokens
+            .into_iter()
+            .filter(|t| t.is_opaque(sql) && !t.is_comment())
+            .collect()
+    };
+    let (from, into) = (texts(from, original), texts(into, formatted));
+    if from.len() != into.len() || from.iter().zip(&into).any(|(a, b)| a.kind != b.kind) {
+        return formatted.to_string();
+    }
+    let mut out = String::with_capacity(formatted.len());
+    let mut copied = 0;
+    for (written, laid) in from.iter().zip(&into) {
+        out.push_str(&formatted[copied..laid.start]);
+        out.push_str(written.text(original));
+        copied = laid.end;
+    }
+    out.push_str(&formatted[copied..]);
+    out
+}
+
 /// Whether `sql` holds a dollar-quoted body (`$$ … $$`, `$tag$ … $tag$`).
 pub(in crate::formatter) fn has_dollar_body(sql: &str) -> bool {
     lex(sql).is_some_and(|tokens| {

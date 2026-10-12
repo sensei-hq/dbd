@@ -101,6 +101,7 @@ fn format_block(original: &str, config: &FormatConfig) -> String {
         // parse, so the grammar cannot say which of its words are keywords.
         ref case => apply_keyword_case(&format_statement_block(original, config), case),
     };
+    let laid_out = spelled_as_written(original, &laid_out);
     if block_is_faithful(original, &laid_out) {
         return laid_out;
     }
@@ -164,16 +165,17 @@ fn format_statement_block(block: &str, config: &FormatConfig) -> String {
         return String::new();
     }
 
-    // A statement with a dollar-quoted body (a function's, a `DO` block's) is
-    // only recased: the body is one token of text, left as written.
-    if has_dollar_body(trimmed) {
-        return ensure_semicolon(&apply_keyword_case(trimmed, &config.keyword_case));
-    }
-
     // Try parsing with sqlparser
     let dialect = PostgreSqlDialect {};
     let sql_to_parse = ensure_semicolon(trimmed);
     match Parser::parse_sql(&dialect, &sql_to_parse) {
+        // A statement with a dollar-quoted body (a function's, a `DO`
+        // block's) is only recased: the body is one token of text, left as
+        // written. A table's `$$` string is a literal like any other — and
+        // skipping it kept every table with a `$$` default as written.
+        Ok(statements) if has_dollar_body(trimmed) && !matches!(statements.as_slice(), [Statement::CreateTable(_)]) => {
+            ensure_semicolon(&apply_keyword_case(trimmed, &config.keyword_case))
+        }
         Ok(statements) if !statements.is_empty() => format_parsed_statements(&statements, trimmed, config),
         _ => {
             // Unparseable: apply keyword case only
