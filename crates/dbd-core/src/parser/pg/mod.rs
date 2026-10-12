@@ -63,6 +63,28 @@ impl PgQueryDdl {
     }
 }
 
+/// The schema and name the first `CREATE` of `entity_type` in `sql` makes, as
+/// Postgres reads them: an unquoted name folded to lower case. The schema is
+/// `None` when the statement leaves it to the search path. `None` when no such
+/// statement can be read — a file that does not parse, or one that declares
+/// its entity inside a `DO` block.
+pub(crate) fn created_identity(entity_type: EntityType, sql: &str) -> Option<(Option<String>, String)> {
+    // Passed as the default schema, so an unqualified name comes back with it.
+    const UNSTATED: &str = "\u{1}";
+    let parsed = pg_query::parse(sql).ok()?;
+    let (decls, _) = declarations::declarations(&parsed, sql, UNSTATED);
+    let decl = decls.into_iter().find(|d| d.entity_type == entity_type)?;
+    let name = match &decl.schema {
+        Some(schema) => decl
+            .name
+            .strip_prefix(&format!("{schema}."))
+            .unwrap_or(&decl.name)
+            .to_string(),
+        None => decl.name.clone(),
+    };
+    Some((decl.schema.filter(|s| s != UNSTATED), name))
+}
+
 /// [`PgQueryDdl::parse`] with the project's fallback schema path.
 ///
 /// Seeded onto the entity before dispatch; `common::resolve_schema_path` keeps

@@ -857,6 +857,9 @@ pub async fn cmd_apply(
             let marks = design.database_marks(&**adapter).await?;
             Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
             design.check_apply_guards(&marks)?;
+            // The real run claims the design's entities; its preview refuses
+            // what that claim would (#7).
+            design.check_ownership(&**adapter).await?;
         }
 
         // Built before anything is printed: it refuses where the run does — a
@@ -1107,6 +1110,7 @@ pub async fn cmd_policies(
         // of policies the run refuses to apply promised something it won't do.
         if let Some(adapter) = super::dry_run_adapter(config, database_url).await? {
             super::check_pinned_scope(&*adapter, &design, &resolved, POLICY_CONSEQUENCE).await?;
+            design.check_ownership(&*adapter).await?;
         }
         // The real run's filter, so the preview never lists a policy the scope
         // skips — and says which ones it skips, as the real run does.

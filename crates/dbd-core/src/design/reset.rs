@@ -55,50 +55,57 @@ impl Design {
         if !force {
             self.check_reset_guard(&marks)?;
         }
-        self.preflight(adapter, ownership::Preflight::Claim).await?;
+        // What the claim newly took, a reset that then fails gives back.
+        let claimed = self.preflight(adapter, ownership::Preflight::Claim).await?;
+        let result: Result<ResetComplete> = async {
+            let roles_kept = self.roles_kept_by_reset(adapter, target, scope).await?;
+            let keep: Vec<String> = roles_kept.iter().map(|k| k.role.clone()).collect();
+            let plan = self.reset_plan(target, drop_schemas, drop_extensions, scope, &keep)?;
+            let mut summary = ResetComplete {
+                roles_kept,
+                ..Default::default()
+            };
+            if let Some(sql) = &plan.sql {
+                let existed = adapter.existing_objects(&plan.objects).await?;
+                // The matviews that exist now and not after the drop are the ones
+                // this reset dropped — by name, with their schema, or by CASCADE
+                // from what they read. Their drift stamps go with them.
+                let before = adapter.matview_states().await?;
+                adapter.execute_script(sql).await?;
+                let after = adapter.matview_states().await?;
+                let mut dropped: Vec<String> = before.into_keys().filter(|mv| !after.contains_key(mv)).collect();
+                dropped.sort();
+                adapter.forget_matview_stamps(&dropped).await?;
 
-        let roles_kept = self.roles_kept_by_reset(adapter, target, scope).await?;
-        let keep: Vec<String> = roles_kept.iter().map(|k| k.role.clone()).collect();
-        let plan = self.reset_plan(target, drop_schemas, drop_extensions, scope, &keep)?;
-        let mut summary = ResetComplete {
-            roles_kept,
-            ..Default::default()
-        };
-        if let Some(sql) = &plan.sql {
-            let existed = adapter.existing_objects(&plan.objects).await?;
-            // The matviews that exist now and not after the drop are the ones
-            // this reset dropped — by name, with their schema, or by CASCADE
-            // from what they read. Their drift stamps go with them.
-            let before = adapter.matview_states().await?;
-            adapter.execute_script(sql).await?;
-            let after = adapter.matview_states().await?;
-            let mut dropped: Vec<String> = before.into_keys().filter(|mv| !after.contains_key(mv)).collect();
-            dropped.sort();
-            adapter.forget_matview_stamps(&dropped).await?;
+                let remaining = adapter.existing_objects(&plan.objects).await?;
+                summary.dropped = plan
+                    .objects
+                    .into_iter()
+                    .filter(|o| existed.contains(o) && !remaining.contains(o))
+                    .collect();
+            }
+            adapter.clear_project_migrations().await?;
+            // A reset of everything the database was built with leaves nothing of
+            // the project, so its record of the database goes too, and the next
+            // apply records it afresh. That is the way to rebuild, with `-e dev`, a
+            // database a run without `-e` marked prod: the env guard refuses a dev
+            // run against the mark, and the mark survived the reset. "Everything"
+            // is the all-scope, or the scope the database is pinned to — a design
+            // with a `default:` scope builds and resets under it, and a bare
+            // `reset --force` there kept the mark. A narrower scope leaves the rest
+            // of the project — and its version and pin — in place.
+            let pinned = marks.own.as_ref().and_then(|m| m.scope.as_deref());
+            if scope.is_none_or(|s| s.is_all || pinned == Some(s.name.as_str())) {
+                adapter.forget_project_meta().await?;
+            }
 
-            let remaining = adapter.existing_objects(&plan.objects).await?;
-            summary.dropped = plan
-                .objects
-                .into_iter()
-                .filter(|o| existed.contains(o) && !remaining.contains(o))
-                .collect();
+            Ok(summary)
         }
-        adapter.clear_project_migrations().await?;
-        // A reset of everything the database was built with leaves nothing of
-        // the project, so its record of the database goes too, and the next
-        // apply records it afresh. That is the way to rebuild, with `-e dev`, a
-        // database a run without `-e` marked prod: the env guard refuses a dev
-        // run against the mark, and the mark survived the reset. "Everything"
-        // is the all-scope, or the scope the database is pinned to — a design
-        // with a `default:` scope builds and resets under it, and a bare
-        // `reset --force` there kept the mark. A narrower scope leaves the rest
-        // of the project — and its version and pin — in place.
-        let pinned = marks.own.as_ref().and_then(|m| m.scope.as_deref());
-        if scope.is_none_or(|s| s.is_all || pinned == Some(s.name.as_str())) {
-            adapter.forget_project_meta().await?;
+        .await;
+        match result {
+            Ok(done) => Ok(done),
+            Err(e) => Err(self.give_back(adapter, &claimed, e).await),
         }
-
-        Ok(summary)
     }
 
     /// The guard [`Design::reset`] checks unless forced: a database marked prod,

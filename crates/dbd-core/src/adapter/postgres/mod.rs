@@ -2555,13 +2555,12 @@ ORDER BY 1, 2, 4, 5"#;
         self.bookkeeping.heal().await
     }
 
-    async fn claim_objects(
-        &self,
-        owner: &str,
-        objects: &[super::OwnedObject],
-        write: bool,
-    ) -> Result<Vec<super::HeldObject>> {
+    async fn claim_objects(&self, owner: &str, objects: &[super::OwnedObject], write: bool) -> Result<super::Claim> {
         self.bookkeeping.claim_objects(owner, objects, write).await
+    }
+
+    async fn release_objects(&self, owner: &str, objects: &[super::OwnedObject]) -> Result<()> {
+        self.bookkeeping.release_objects(owner, objects).await
     }
 
     async fn record_uses(&self, owner: &str, uses: &[super::Use]) -> Result<()> {

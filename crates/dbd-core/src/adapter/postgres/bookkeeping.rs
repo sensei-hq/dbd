@@ -428,7 +428,7 @@ impl Bookkeeping {
         owner: &str,
         objects: &[crate::adapter::OwnedObject],
         write: bool,
-    ) -> Result<Vec<crate::adapter::HeldObject>> {
+    ) -> Result<crate::adapter::Claim> {
         use sqlx::Executor as _;
         let column = |f: fn(&crate::adapter::OwnedObject) -> &str| -> Vec<String> {
             objects.iter().map(|o| f(o).to_string()).collect()
@@ -462,7 +462,7 @@ impl Bookkeeping {
                 .await
                 .map_err(|e| DbdError::Config(format!("ownership lookup failed: {e}")))?;
             if exists.is_none() {
-                return Ok(Vec::new());
+                return Ok(Default::default());
             }
             let rows = sqlx::query(HELD)
                 .bind(&namespaces)
@@ -472,7 +472,10 @@ impl Bookkeeping {
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| DbdError::Config(format!("ownership read failed: {e}")))?;
-            return Ok(held(rows));
+            return Ok(crate::adapter::Claim {
+                held: held(rows),
+                claimed: Vec::new(),
+            });
         }
         let mut tx = self
             .pool
@@ -480,24 +483,52 @@ impl Bookkeeping {
             .await
             .map_err(|e| DbdError::Config(format!("claim: begin failed: {e}")))?;
         (&mut *tx)
-            .execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            .execute(
+                format!(
+                    "SET TRANSACTION ISOLATION LEVEL READ COMMITTED; \
+                     SET LOCAL lock_timeout = '{HEAL_LOCK_TIMEOUT}'"
+                )
+                .as_str(),
+            )
             .await
             .map_err(|e| DbdError::Config(format!("claim: begin failed: {e}")))?;
-        sqlx::query(
+        // `xmax = 0` marks a row this statement inserted rather than updated:
+        // the claims this run newly took, which it gives back if it fails.
+        let inserted = sqlx::query(
             "INSERT INTO dbd.objects (namespace, schema, name, kind, owner) \
                SELECT d.namespace, d.schema, d.name, d.kind, $5 \
                FROM unnest($1::text[], $2::text[], $3::text[], $4::text[]) AS d(namespace, schema, name, kind) \
              ON CONFLICT (namespace, schema, name) DO UPDATE SET kind = EXCLUDED.kind \
-               WHERE dbd.objects.owner = EXCLUDED.owner",
+               WHERE dbd.objects.owner = EXCLUDED.owner \
+             RETURNING namespace, schema, name, kind, (xmax = 0) AS inserted",
         )
         .bind(&namespaces)
         .bind(&schemas)
         .bind(&names)
         .bind(&kinds)
         .bind(owner)
-        .execute(&mut *tx)
+        .fetch_all(&mut *tx)
         .await
-        .map_err(|e| DbdError::Config(format!("claim failed: {e}")))?;
+        .map_err(|e| {
+            DbdError::Config(if sqlstate(&e).as_deref() == Some("55P03") {
+                format!(
+                    "claim: dbd.objects is held by another session's open write, which did not finish \
+                     within {HEAL_LOCK_TIMEOUT} — let it finish, or end it, and run again"
+                )
+            } else {
+                format!("claim failed: {e}")
+            })
+        })?;
+        let claimed: Vec<crate::adapter::OwnedObject> = inserted
+            .iter()
+            .filter(|r| r.get::<bool, _>("inserted"))
+            .map(|r| crate::adapter::OwnedObject {
+                namespace: r.get("namespace"),
+                schema: r.get("schema"),
+                name: r.get("name"),
+                kind: r.get("kind"),
+            })
+            .collect();
         let rows = sqlx::query(HELD)
             .bind(&namespaces)
             .bind(&schemas)
@@ -511,12 +542,36 @@ impl Bookkeeping {
             tx.commit()
                 .await
                 .map_err(|e| DbdError::Config(format!("claim: commit failed: {e}")))?;
+            Ok(crate::adapter::Claim { held, claimed })
         } else {
             tx.rollback()
                 .await
                 .map_err(|e| DbdError::Config(format!("claim: rollback failed: {e}")))?;
+            Ok(crate::adapter::Claim {
+                held,
+                claimed: Vec::new(),
+            })
         }
-        Ok(held)
+    }
+
+    /// Delete `owner`'s rows in `dbd.objects` for `objects`.
+    pub(super) async fn release_objects(&self, owner: &str, objects: &[crate::adapter::OwnedObject]) -> Result<()> {
+        let column = |f: fn(&crate::adapter::OwnedObject) -> &str| -> Vec<String> {
+            objects.iter().map(|o| f(o).to_string()).collect()
+        };
+        sqlx::query(
+            "DELETE FROM dbd.objects o \
+             USING unnest($2::text[], $3::text[], $4::text[]) AS d(namespace, schema, name) \
+             WHERE o.owner = $1 AND o.namespace = d.namespace AND o.schema = d.schema AND o.name = d.name",
+        )
+        .bind(owner)
+        .bind(column(|o| &o.namespace))
+        .bind(column(|o| &o.schema))
+        .bind(column(|o| &o.name))
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DbdError::Config(format!("releasing unbuilt claims failed: {e}")))?;
+        Ok(())
     }
 
     /// Replace `owner`'s rows in `dbd.uses` with `uses`, in one transaction. A

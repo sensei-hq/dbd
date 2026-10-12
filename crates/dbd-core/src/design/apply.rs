@@ -292,68 +292,249 @@ impl Design {
         // The last gate, before the first hook: claim the design's entities —
         // or, for a dry run, check them — refusing when another owner holds
         // any (#7). A claim heals the bookkeeping first.
-        self.preflight(
-            adapter,
-            if dry_run {
-                ownership::Preflight::Check
-            } else {
-                ownership::Preflight::Claim
-            },
-        )
-        .await?;
+        // What the claim newly took, a run that then fails gives back.
+        let claimed = self
+            .preflight(
+                adapter,
+                if dry_run {
+                    ownership::Preflight::Check
+                } else {
+                    ownership::Preflight::Claim
+                },
+            )
+            .await?;
+        let result: Result<()> = async {
+            // A hook is filtered against the same working set the entities were.
+            // `None` — unscoped or the all-scope — runs every hook, and skips the
+            // derivation cost entirely on that common path.
+            let hook_scope = self.hook_scope(scope, working_set.as_ref());
+            let hook_scope = hook_scope.as_ref().map(|(name, outside)| (*name, outside));
 
-        // A hook is filtered against the same working set the entities were.
-        // `None` — unscoped or the all-scope — runs every hook, and skips the
-        // derivation cost entirely on that common path.
-        let hook_scope = self.hook_scope(scope, working_set.as_ref());
-        let hook_scope = hook_scope.as_ref().map(|(name, outside)| (*name, outside));
-
-        // `apply.before` runs here: after the scope and parse gates, so a bad
-        // design still refuses before any hook fires, and before the first
-        // entity, so a hook can prepare the ground the DDL lands on.
-        let before = hooks::run_hooks(
-            adapter,
-            self.hook_source(),
-            &self.config.apply.before,
-            hooks::HookKind::Before,
-            hook_scope,
-            dry_run,
-            &mut progress,
-        )
-        .await?;
-
-        if dry_run {
-            // A dry run executes nothing but must still name every script the
-            // real run would — including the after-hooks, which the early
-            // return below would otherwise hide, and including a missing file,
-            // which is a misconfiguration whether or not we are about to write.
-            hooks::run_hooks(
+            // `apply.before` runs here: after the scope and parse gates, so a bad
+            // design still refuses before any hook fires, and before the first
+            // entity, so a hook can prepare the ground the DDL lands on.
+            let before = hooks::run_hooks(
                 adapter,
                 self.hook_source(),
-                &self.config.apply.after,
-                hooks::HookKind::After,
+                &self.config.apply.before,
+                hooks::HookKind::Before,
                 hook_scope,
                 dry_run,
                 &mut progress,
             )
             .await?;
-            return Ok(());
-        }
 
-        // Batch adapters (e.g. Convex) short-circuit — no execution plan needed
-        if adapter.prefers_batch_apply() {
-            let count = valid_entities.len() as u32;
-            let owned: Vec<Entity> = valid_entities.into_iter().cloned().collect();
-            adapter.apply_entities(&owned).await?;
-            // Batch adapters skip the execution plan (and its SetVersion step), so
-            // pin the applied scope here. Preserve the recorded version.
-            let db_version = adapter.get_db_version().await?;
-            adapter
-                .set_project_meta(&self.env, db_version, scope.map(|s| s.name.as_str()))
+            if dry_run {
+                // A dry run executes nothing but must still name every script the
+                // real run would — including the after-hooks, which the early
+                // return below would otherwise hide, and including a missing file,
+                // which is a misconfiguration whether or not we are about to write.
+                hooks::run_hooks(
+                    adapter,
+                    self.hook_source(),
+                    &self.config.apply.after,
+                    hooks::HookKind::After,
+                    hook_scope,
+                    dry_run,
+                    &mut progress,
+                )
                 .await?;
-            // Batch adapters take this shortcut past the execution plan, but a
-            // hook is a hook: leaving `apply.after` out here would recreate, for
-            // one backend, exactly the silent no-op this feature removes.
+                return Ok(());
+            }
+
+            // Batch adapters (e.g. Convex) short-circuit — no execution plan needed
+            if adapter.prefers_batch_apply() {
+                let count = valid_entities.len() as u32;
+                let owned: Vec<Entity> = valid_entities.into_iter().cloned().collect();
+                adapter.apply_entities(&owned).await?;
+                // Batch adapters skip the execution plan (and its SetVersion step), so
+                // pin the applied scope here. Preserve the recorded version.
+                let db_version = adapter.get_db_version().await?;
+                adapter
+                    .set_project_meta(&self.env, db_version, scope.map(|s| s.name.as_str()))
+                    .await?;
+                // Batch adapters take this shortcut past the execution plan, but a
+                // hook is a hook: leaving `apply.after` out here would recreate, for
+                // one backend, exactly the silent no-op this feature removes.
+                let after = hooks::run_hooks(
+                    adapter,
+                    self.hook_source(),
+                    &self.config.apply.after,
+                    hooks::HookKind::After,
+                    hook_scope,
+                    dry_run,
+                    &mut progress,
+                )
+                .await?;
+                (progress.on_complete)(ApplyComplete {
+                    strategy: ApplyStrategy::Current,
+                    from_version: 0,
+                    to_version: 0,
+                    applied: count,
+                    migrated: 0,
+                    created: 0,
+                    dropped: 0,
+                    before_scripts: before.ran,
+                    after_scripts: after.ran,
+                    warnings: [before.warnings, after.warnings].concat(),
+                    previously_built: false,
+                });
+                return Ok(());
+            }
+
+            // Build execution plan
+            let db_version = adapter.get_db_version().await?;
+            let latest_version = self.config.project.version.unwrap_or(0);
+            let pending = snapshot::pending_migrations(db_version, &self.project_dir);
+
+            // Filter entities by name if scoped
+            let scoped_entities: Vec<Entity> = valid_entities.iter().map(|e| (*e).clone()).collect();
+            let plan = build_execution_plan(
+                &scoped_entities,
+                db_version,
+                latest_version,
+                &pending,
+                working_set.as_ref(),
+            );
+
+            // No recorded version does not mean an empty database: one built
+            // before the project had a version records none, and neither does one
+            // built by hand. Asked before the plan runs, since its SetVersion step
+            // writes the very record this looks for.
+            let previously_built = plan.strategy == ApplyStrategy::Fresh && {
+                let live: std::collections::HashSet<String> = adapter.list_entities().await?.into_iter().collect();
+                adapter.get_project_meta().await?.is_some() || valid_entities.iter().any(|e| live.contains(&e.name))
+            };
+
+            // Running tallies for the on_complete summary.
+            let mut counts = ApplyCounts::default();
+
+            // Build entity lookup for ApplyEntity / CreateEntity steps
+            let entity_map: std::collections::HashMap<&str, &Entity> =
+                self.entities.iter().map(|e| (e.name.as_str(), e)).collect();
+
+            // Materialized views this run applies (respecting the scope + name
+            // filter). Capture which of them ALREADY exist before applying, so that
+            // afterwards we stamp the `dbd:hash` sentinel only on the ones this run
+            // newly creates. Skip the state query entirely when there are none.
+            let applied_matviews: Vec<&Entity> = valid_entities
+                .iter()
+                .copied()
+                .filter(|e| e.entity_type == EntityType::MaterializedView)
+                .collect();
+            let pre_existing_states = if applied_matviews.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                adapter.matview_states().await?
+            };
+            let pre_existing_matviews: std::collections::HashSet<String> =
+                pre_existing_states.keys().cloned().collect();
+
+            // Wrap the whole plan in one transaction when the backend supports it,
+            // so an interrupted upgrade rolls back to the prior schema instead of
+            // leaving objects half-applied. `DBD_NO_TX` opts out for plans that
+            // contain non-transactional DDL (e.g. CREATE INDEX CONCURRENTLY).
+            //
+            // The one exception is a version that adds enum values: the run
+            // commits after running them, and carries on in a new transaction —
+            // see `ExecutionStep::AddEnumValues`.
+            let use_txn = adapter.supports_transactional_apply()
+                && std::env::var_os("DBD_NO_TX").is_none()
+                && !plan.steps.is_empty();
+
+            if use_txn {
+                adapter.begin_batch().await?;
+            }
+
+            // Execute plan steps inside an async block so a mid-plan error routes
+            // through rollback below rather than returning early. Each step's logic
+            // lives in `execute_plan_step`, keeping this a thin driver loop.
+            let exec: Result<()> = async {
+                for step in &plan.steps {
+                    self.execute_plan_step(
+                        adapter,
+                        step,
+                        &entity_map,
+                        scope,
+                        &mut counts,
+                        &mut progress.on_start,
+                        &mut progress.on_done,
+                    )
+                    .await?;
+                    // A version's new enum values commit before the rest of it
+                    // uses them (see `ExecutionStep::AddEnumValues`).
+                    if use_txn && matches!(step, ExecutionStep::AddEnumValues { .. }) {
+                        adapter.commit_batch().await?;
+                        adapter.begin_batch().await?;
+                    }
+                }
+                Ok(())
+            }
+            .await;
+
+            match exec {
+                Ok(()) => {
+                    if use_txn {
+                        adapter.commit_batch().await?;
+                    }
+                }
+                Err(e) => {
+                    if use_txn {
+                        // Best-effort rollback; surface the original failure.
+                        let _ = adapter.rollback_batch().await;
+                    }
+                    return Err(e);
+                }
+            }
+
+            // The Current strategy (DB already at latest) emits no SetVersion step, so
+            // the scope would never be pinned/re-pinned on an up-to-date apply. Stamp it
+            // here — post-commit, alongside the matview sentinels — so every successful
+            // `apply`/`deploy` pins the applied scope (needed for `--allow-scope-change`
+            // re-pinning and for pinning pre-existing/legacy databases). Preserve the
+            // recorded version (`db_version`) to avoid downgrading it. Fresh/Migrate
+            // already pinned via their SetVersion step, so skip to avoid a double write.
+            if !plan.steps.iter().any(|s| matches!(s, ExecutionStep::SetVersion(_))) {
+                adapter
+                    .set_project_meta(&self.env, db_version, scope.map(|s| s.name.as_str()))
+                    .await?;
+            }
+
+            // Stamp the `dbd:hash` sentinel on the materialized views THIS run newly
+            // created (absent from `pre_existing_matviews`), so a later `dbd
+            // reconcile` recognizes them as dbd-managed instead of warning "exists
+            // but is not stamped by dbd". An already-existing matview is left
+            // untouched on purpose (see `matviews_to_stamp`): stamping a "current"
+            // hash onto one whose deployed definition may have drifted would mask
+            // that drift. Runs after commit, so the object exists for the COMMENT.
+            let adopted = self
+                .verified_unstamped_matviews(adapter, &applied_matviews, &pre_existing_states)
+                .await?;
+            for e in matviews_to_stamp(&applied_matviews, &pre_existing_matviews)
+                .into_iter()
+                .chain(adopted)
+            {
+                adapter
+                    .stamp_matview(
+                        &crate::reconcile::qualified_entity_name(e),
+                        &crate::reconcile::matview_stamp(&crate::reconcile::matview_hash(e)),
+                    )
+                    .await?;
+            }
+
+            // Sync pg_cron refresh jobs across the WHOLE design (not the scoped
+            // subset): `sync_refresh_jobs` unschedules every `dbd:refresh:%` job
+            // absent from the set it is given, so a scoped run fed only its subset
+            // would unschedule out-of-scope matviews' jobs. Centralized here (rather
+            // than in the CLI) so BOTH `dbd apply` and `dbd deploy` schedule refresh
+            // jobs. The adapter guards on pg_cron presence, so it is a safe no-op on
+            // databases (and non-Postgres targets) without the extension.
+            adapter.sync_refresh_jobs(&self.all_matview_jobs()).await?;
+
+            // `apply.after` closes with the phase: every entity is applied, every
+            // matview stamped, and — critically — `policies/` has not run yet.
+            // Publications and grants attach to objects that must already exist;
+            // RLS is independent of them, so it stays last (see `deploy_with_progress`).
             let after = hooks::run_hooks(
                 adapter,
                 self.hook_source(),
@@ -364,198 +545,27 @@ impl Design {
                 &mut progress,
             )
             .await?;
+
             (progress.on_complete)(ApplyComplete {
-                strategy: ApplyStrategy::Current,
-                from_version: 0,
-                to_version: 0,
-                applied: count,
-                migrated: 0,
-                created: 0,
-                dropped: 0,
+                strategy: plan.strategy,
+                from_version: db_version,
+                to_version: latest_version,
+                applied: counts.applied,
+                migrated: counts.migrated,
+                created: counts.created,
+                dropped: counts.dropped,
                 before_scripts: before.ran,
                 after_scripts: after.ran,
                 warnings: [before.warnings, after.warnings].concat(),
-                previously_built: false,
+                previously_built,
             });
-            return Ok(());
-        }
-
-        // Build execution plan
-        let db_version = adapter.get_db_version().await?;
-        let latest_version = self.config.project.version.unwrap_or(0);
-        let pending = snapshot::pending_migrations(db_version, &self.project_dir);
-
-        // Filter entities by name if scoped
-        let scoped_entities: Vec<Entity> = valid_entities.iter().map(|e| (*e).clone()).collect();
-        let plan = build_execution_plan(
-            &scoped_entities,
-            db_version,
-            latest_version,
-            &pending,
-            working_set.as_ref(),
-        );
-
-        // No recorded version does not mean an empty database: one built
-        // before the project had a version records none, and neither does one
-        // built by hand. Asked before the plan runs, since its SetVersion step
-        // writes the very record this looks for.
-        let previously_built = plan.strategy == ApplyStrategy::Fresh && {
-            let live: std::collections::HashSet<String> = adapter.list_entities().await?.into_iter().collect();
-            adapter.get_project_meta().await?.is_some() || valid_entities.iter().any(|e| live.contains(&e.name))
-        };
-
-        // Running tallies for the on_complete summary.
-        let mut counts = ApplyCounts::default();
-
-        // Build entity lookup for ApplyEntity / CreateEntity steps
-        let entity_map: std::collections::HashMap<&str, &Entity> =
-            self.entities.iter().map(|e| (e.name.as_str(), e)).collect();
-
-        // Materialized views this run applies (respecting the scope + name
-        // filter). Capture which of them ALREADY exist before applying, so that
-        // afterwards we stamp the `dbd:hash` sentinel only on the ones this run
-        // newly creates. Skip the state query entirely when there are none.
-        let applied_matviews: Vec<&Entity> = valid_entities
-            .iter()
-            .copied()
-            .filter(|e| e.entity_type == EntityType::MaterializedView)
-            .collect();
-        let pre_existing_states = if applied_matviews.is_empty() {
-            std::collections::HashMap::new()
-        } else {
-            adapter.matview_states().await?
-        };
-        let pre_existing_matviews: std::collections::HashSet<String> = pre_existing_states.keys().cloned().collect();
-
-        // Wrap the whole plan in one transaction when the backend supports it,
-        // so an interrupted upgrade rolls back to the prior schema instead of
-        // leaving objects half-applied. `DBD_NO_TX` opts out for plans that
-        // contain non-transactional DDL (e.g. CREATE INDEX CONCURRENTLY).
-        //
-        // The one exception is a version that adds enum values: the run
-        // commits after running them, and carries on in a new transaction —
-        // see `ExecutionStep::AddEnumValues`.
-        let use_txn =
-            adapter.supports_transactional_apply() && std::env::var_os("DBD_NO_TX").is_none() && !plan.steps.is_empty();
-
-        if use_txn {
-            adapter.begin_batch().await?;
-        }
-
-        // Execute plan steps inside an async block so a mid-plan error routes
-        // through rollback below rather than returning early. Each step's logic
-        // lives in `execute_plan_step`, keeping this a thin driver loop.
-        let exec: Result<()> = async {
-            for step in &plan.steps {
-                self.execute_plan_step(
-                    adapter,
-                    step,
-                    &entity_map,
-                    scope,
-                    &mut counts,
-                    &mut progress.on_start,
-                    &mut progress.on_done,
-                )
-                .await?;
-                // A version's new enum values commit before the rest of it
-                // uses them (see `ExecutionStep::AddEnumValues`).
-                if use_txn && matches!(step, ExecutionStep::AddEnumValues { .. }) {
-                    adapter.commit_batch().await?;
-                    adapter.begin_batch().await?;
-                }
-            }
             Ok(())
         }
         .await;
-
-        match exec {
-            Ok(()) => {
-                if use_txn {
-                    adapter.commit_batch().await?;
-                }
-            }
-            Err(e) => {
-                if use_txn {
-                    // Best-effort rollback; surface the original failure.
-                    let _ = adapter.rollback_batch().await;
-                }
-                return Err(e);
-            }
+        match result {
+            Ok(done) => Ok(done),
+            Err(e) => Err(self.give_back(adapter, &claimed, e).await),
         }
-
-        // The Current strategy (DB already at latest) emits no SetVersion step, so
-        // the scope would never be pinned/re-pinned on an up-to-date apply. Stamp it
-        // here — post-commit, alongside the matview sentinels — so every successful
-        // `apply`/`deploy` pins the applied scope (needed for `--allow-scope-change`
-        // re-pinning and for pinning pre-existing/legacy databases). Preserve the
-        // recorded version (`db_version`) to avoid downgrading it. Fresh/Migrate
-        // already pinned via their SetVersion step, so skip to avoid a double write.
-        if !plan.steps.iter().any(|s| matches!(s, ExecutionStep::SetVersion(_))) {
-            adapter
-                .set_project_meta(&self.env, db_version, scope.map(|s| s.name.as_str()))
-                .await?;
-        }
-
-        // Stamp the `dbd:hash` sentinel on the materialized views THIS run newly
-        // created (absent from `pre_existing_matviews`), so a later `dbd
-        // reconcile` recognizes them as dbd-managed instead of warning "exists
-        // but is not stamped by dbd". An already-existing matview is left
-        // untouched on purpose (see `matviews_to_stamp`): stamping a "current"
-        // hash onto one whose deployed definition may have drifted would mask
-        // that drift. Runs after commit, so the object exists for the COMMENT.
-        let adopted = self
-            .verified_unstamped_matviews(adapter, &applied_matviews, &pre_existing_states)
-            .await?;
-        for e in matviews_to_stamp(&applied_matviews, &pre_existing_matviews)
-            .into_iter()
-            .chain(adopted)
-        {
-            adapter
-                .stamp_matview(
-                    &crate::reconcile::qualified_entity_name(e),
-                    &crate::reconcile::matview_stamp(&crate::reconcile::matview_hash(e)),
-                )
-                .await?;
-        }
-
-        // Sync pg_cron refresh jobs across the WHOLE design (not the scoped
-        // subset): `sync_refresh_jobs` unschedules every `dbd:refresh:%` job
-        // absent from the set it is given, so a scoped run fed only its subset
-        // would unschedule out-of-scope matviews' jobs. Centralized here (rather
-        // than in the CLI) so BOTH `dbd apply` and `dbd deploy` schedule refresh
-        // jobs. The adapter guards on pg_cron presence, so it is a safe no-op on
-        // databases (and non-Postgres targets) without the extension.
-        adapter.sync_refresh_jobs(&self.all_matview_jobs()).await?;
-
-        // `apply.after` closes with the phase: every entity is applied, every
-        // matview stamped, and — critically — `policies/` has not run yet.
-        // Publications and grants attach to objects that must already exist;
-        // RLS is independent of them, so it stays last (see `deploy_with_progress`).
-        let after = hooks::run_hooks(
-            adapter,
-            self.hook_source(),
-            &self.config.apply.after,
-            hooks::HookKind::After,
-            hook_scope,
-            dry_run,
-            &mut progress,
-        )
-        .await?;
-
-        (progress.on_complete)(ApplyComplete {
-            strategy: plan.strategy,
-            from_version: db_version,
-            to_version: latest_version,
-            applied: counts.applied,
-            migrated: counts.migrated,
-            created: counts.created,
-            dropped: counts.dropped,
-            before_scripts: before.ran,
-            after_scripts: after.ran,
-            warnings: [before.warnings, after.warnings].concat(),
-            previously_built,
-        });
-        Ok(())
     }
 
     /// Execute one step of an apply execution plan: run its DDL/meta write via

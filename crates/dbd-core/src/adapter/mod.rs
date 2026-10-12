@@ -100,6 +100,15 @@ pub struct Use {
     pub via: String,
 }
 
+/// What a claim found: the entities another owner holds — when there are any,
+/// nothing was claimed — and the ones this claim newly took, which a run that
+/// then fails gives back.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Claim {
+    pub held: Vec<HeldObject>,
+    pub claimed: Vec<OwnedObject>,
+}
+
 /// An entity another owner holds, and that owner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeldObject {
@@ -449,12 +458,21 @@ pub trait DatabaseAdapter: Send + Sync {
 
     /// Claim `objects` for `owner` — every entity its whole design declares —
     /// in the database's ownership registry, or, with `write` false, only look.
-    /// Returns those another owner holds; when there are any, nothing is
-    /// claimed (#7). Adapters without a registry claim nothing and find nothing
-    /// held.
-    async fn claim_objects(&self, owner: &str, objects: &[OwnedObject], write: bool) -> Result<Vec<HeldObject>> {
+    /// Returns those another owner holds — when there are any, nothing is
+    /// claimed — and those newly claimed (#7). Adapters without a registry
+    /// claim nothing and find nothing held.
+    async fn claim_objects(&self, owner: &str, objects: &[OwnedObject], write: bool) -> Result<Claim> {
         let _ = (owner, objects, write);
-        Ok(Vec::new())
+        Ok(Claim::default())
+    }
+
+    /// Give back `owner`'s claims of `objects` — what a run newly claimed and
+    /// then failed. A claim of something already there, or half-built before
+    /// the failure, goes too: unowned until a run that succeeds claims it is
+    /// safer than owned by a run that never completed.
+    async fn release_objects(&self, owner: &str, objects: &[OwnedObject]) -> Result<()> {
+        let _ = (owner, objects);
+        Ok(())
     }
 
     /// Record `uses` as everything `owner` uses, replacing what it used before.
