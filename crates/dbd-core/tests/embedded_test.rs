@@ -9992,3 +9992,119 @@ async fn an_entity_no_design_declares_stays_unowned() {
     )
     .await;
 }
+
+fn used_by(owner: &str, kind: &str, target: &str, via: &str) -> String {
+    format!(
+        "SELECT 1 FROM dbd.uses WHERE owner = '{owner}' AND kind = '{kind}' \
+         AND target = '{target}' AND via = '{via}'"
+    )
+}
+
+/// What a project shares with others rather than owns — the schemas its
+/// entities live in, its extensions, its roles — it records as uses: a schema
+/// another project also uses is one neither may prune or drop alone (#7).
+#[tokio::test]
+async fn a_project_records_the_schemas_extensions_and_roles_it_uses() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "uses_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let design = write_project(
+        tmp.path(),
+        "project:\n  name: uses_test\nsource:\n  dialect: postgresql\nschemas:\n  - app\n\
+         target:\n  postgres:\n    url: $DATABASE_URL\n    roles:\n      - name: uses_role\n    \
+         extensions:\n      - plpgsql\n",
+        &[(
+            "ddl/table/app/items.ddl",
+            "set search_path to app;\ncreate table if not exists items (id int primary key);\n",
+        )],
+    );
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply");
+
+    for (kind, target) in [("schema", "app"), ("extension", "plpgsql"), ("role", "uses_role")] {
+        assert_catalog(
+            &*adapter,
+            true,
+            &used_by("uses_test", kind, target, ""),
+            &format!("{kind} {target} used by uses_test"),
+        )
+        .await;
+    }
+}
+
+const BILLING_USES_YAML: &str = "project:\n  name: billing\nsource:\n  dialect: postgresql\nschemas:\n  - billing\n\
+    external:\n  - name: app.orders\n  - name: app.status\n  - name: public.loose\n";
+
+/// A reference from one project's entity to another project's is recorded as
+/// a use — the target in the registry's own namespace, and the entity that
+/// makes it — so the owner cannot drop what another project depends on (#7).
+/// A reference to something nobody owns is no use of anyone's. A run records
+/// its design's uses afresh: one its design no longer makes is gone.
+#[tokio::test]
+async fn a_reference_to_another_projects_entity_is_recorded_as_a_use() {
+    let (_pg, url) = start_pg().await;
+    let shop_adapter = connect(&url, "shop").await.unwrap();
+    let billing_adapter = connect(&url, "billing").await.unwrap();
+    let shop_dir = tempfile::tempdir().unwrap();
+    let billing_dir = tempfile::tempdir().unwrap();
+    write_project(shop_dir.path(), SHOP_YAML, SHOP_FILES)
+        .apply(&*shop_adapter, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    shop_adapter
+        .execute_script("CREATE TABLE public.loose (id int);")
+        .await
+        .unwrap();
+
+    let view = (
+        "ddl/view/billing/v_orders.ddl",
+        "create or replace view billing.v_orders as \
+         select o.id from app.orders o join public.loose l on l.id = o.id;\n",
+    );
+    let invoices = (
+        "ddl/table/billing/invoices.ddl",
+        "create table if not exists billing.invoices (id int primary key, status app.status);\n",
+    );
+    write_project(billing_dir.path(), BILLING_USES_YAML, &[view, invoices])
+        .apply(&*billing_adapter, None, false, None, Progress::none())
+        .await
+        .expect("billing's apply");
+
+    let orders_use = used_by("billing", "entity", "relation:app.orders", "view billing.v_orders");
+    assert_catalog(&*billing_adapter, true, &orders_use, "billing's use of app.orders").await;
+    assert_catalog(
+        &*billing_adapter,
+        true,
+        &used_by("billing", "entity", "type:app.status", "table billing.invoices"),
+        "billing's use of app.status",
+    )
+    .await;
+    assert_catalog(
+        &*billing_adapter,
+        false,
+        "SELECT 1 FROM dbd.uses WHERE target LIKE '%loose%'",
+        "a use of the unowned public.loose",
+    )
+    .await;
+
+    // The view goes from the design: its use goes from the record.
+    std::fs::remove_file(billing_dir.path().join(view.0)).unwrap();
+    billing_adapter
+        .execute_script("DROP VIEW billing.v_orders;")
+        .await
+        .unwrap();
+    Design::from_config_with_dir(&billing_dir.path().join("design.yaml"), "dev", Some(billing_dir.path()))
+        .unwrap()
+        .apply(&*billing_adapter, None, false, None, Progress::none())
+        .await
+        .expect("billing's second apply");
+    assert_catalog(
+        &*billing_adapter,
+        false,
+        &orders_use,
+        "billing's dropped use of app.orders",
+    )
+    .await;
+}
