@@ -625,6 +625,77 @@ mod tests {
         }
     }
 
+    /// Inputs a second pass treated differently from the first: a final
+    /// statement with no `;` and a comment after it, on its line or the next;
+    /// a comment on the line a statement ends; leading comments; bodies.
+    const SECOND_PASS: &[&str] = &[
+        "create table app.t (\n  id int primary key,\n  note text\n)\n-- c\n",
+        "create table app.t (id int primary key, note text) -- c",
+        "create table a (id int); -- the a table\ncreate table b (id int);",
+        "-- header\ncreate table b (id int primary key, note text);",
+        "/* lead */ create table c (id int);",
+        "create function f() returns int language sql as $$ select 1; $$",
+        "create function g() returns int language plpgsql as $tag$ begin return 1; end $tag$; -- done",
+        "create function h() returns int language sql begin atomic select 1; select 2; end",
+        "create function h2() returns int language sql begin atomic select 1; end -- atomic",
+        "create table d (id int, note text default $$x$$); /* after */",
+        "set search_path to app;\n\ncreate table e (\n  id int -- the id\n, note text\n);\n-- trailing\n",
+        "-- only a comment\n",
+        "select 1 /* a */ ; select 2 -- b",
+        "create table f (id int)\n\n\n-- c1\n-- c2\n",
+        "comment on table t is 'a; b'",
+        "create table g (n text default E'it\\'s; tricky') -- x",
+        "create view v as select 1 as a -- c",
+        "create index i on t (a) -- c",
+        "create type mood as enum ('a', 'b') -- c",
+        "CREATE TABLE T (ID INT) -- C",
+        "create table h (id int); -- one\n-- two\ncreate table i (id int);",
+    ];
+
+    /// `format` then `format` again changes nothing, and every comment comes
+    /// out once, as written, in order. A final statement with no `;` and a
+    /// `-- c` after it became `…; -- c`, and the next pass moved the comment
+    /// to a line of its own — so `format --check` failed right after `format`.
+    /// A comment on the line a statement ends stays on that line: it moved
+    /// below it, onto the next statement.
+    #[test]
+    fn formatting_twice_changes_nothing_and_keeps_every_comment() {
+        let configs = [KeywordCase::Lower, KeywordCase::Upper, KeywordCase::Preserve]
+            .into_iter()
+            .flat_map(|case| {
+                [CommaStyle::Leading, CommaStyle::Trailing].map(|comma_style| FormatConfig {
+                    keyword_case: case.clone(),
+                    comma_style,
+                    ..Default::default()
+                })
+            })
+            .collect::<Vec<_>>();
+        for input in SECOND_PASS.iter().chain(TRICKY) {
+            for config in &configs {
+                let label = format!("{:?}/{:?}", config.keyword_case, config.comma_style);
+                let once = format_ddl(input, config);
+                let twice = format_ddl(&once, config);
+                assert_eq!(
+                    twice, once,
+                    "{label}: a second pass changed\n{input}\n--- once ---\n{once}"
+                );
+                assert_eq!(
+                    opaque_tokens(&once),
+                    opaque_tokens(input),
+                    "{label} changed a literal, name or comment in:\n{input}\n--- into ---\n{once}"
+                );
+            }
+        }
+        let out = format_ddl(SECOND_PASS[2], &FormatConfig::default());
+        let line = out.lines().find(|l| l.contains("-- the a table")).unwrap();
+        assert!(
+            line.ends_with("); -- the a table"),
+            "stays where it was written:\n{out}"
+        );
+        let out = format_ddl(SECOND_PASS[1], &FormatConfig::default());
+        assert!(out.trim_end().ends_with("); -- c"), "{out}");
+    }
+
     // ── River formatter tests ─────────────────────────────
 
     fn river_config() -> FormatConfig {
