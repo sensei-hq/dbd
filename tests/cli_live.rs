@@ -2211,7 +2211,7 @@ async fn dry_runs_refuse_a_design_declaring_another_owners_entity() {
     let dir = intruder.path();
     std::fs::write(
         dir.join("design.yaml"),
-        "project:\n  name: intruder\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+        "project:\n  name: intruder\n  version: 1\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
     )
     .unwrap();
     for (rel, body) in [
