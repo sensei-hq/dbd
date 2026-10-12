@@ -6660,6 +6660,112 @@ async fn a_scoped_reset_refuses_rather_than_cascade_into_what_is_outside_its_sco
     assert_column_exists(&*adapter, "app", "people", "mood").await;
 }
 
+const POLICIES_YAML: &str = "project:\n  name: scoped_reset_policies\nsource:\n  dialect: postgresql\n\
+    schemas:\n  - app\n  - other\nscopes:\n  app_only:\n    includes: [app]\n";
+
+const POLICIES_FILES: &[(&str, &str)] = &[
+    (
+        "ddl/table/app/metrics.ddl",
+        "set search_path to app;\ncreate table if not exists metrics (id int primary key, owner text);\n",
+    ),
+    (
+        "ddl/function/app/can_read.ddl",
+        "set search_path to app;\n\
+         create or replace function can_read(owner text) returns boolean\n\
+         language sql stable as $$ select owner = current_user $$;\n",
+    ),
+    (
+        "ddl/table/other/notes.ddl",
+        "set search_path to other;\ncreate table if not exists notes (id int primary key, owner text);\n",
+    ),
+    (
+        "policies/app/metrics.sql",
+        "alter table app.metrics enable row level security;\n\
+         drop policy if exists metrics_read on app.metrics;\n\
+         create policy metrics_read on app.metrics for select using (app.can_read(owner));\n",
+    ),
+    (
+        "policies/other/notes.sql",
+        "alter table other.notes enable row level security;\n\
+         drop policy if exists notes_read on other.notes;\n\
+         create policy notes_read on other.notes for select using (app.can_read(owner));\n",
+    ),
+];
+
+fn policy_predicate(schema: &str, table: &str, policy: &str) -> String {
+    format!(
+        "SELECT 1 FROM pg_policies WHERE schemaname = '{schema}' AND tablename = '{table}' AND policyname = '{policy}'"
+    )
+}
+
+/// sensei's `dojo` scope: a policy on an in-scope table calls an in-scope
+/// function. `dbd policies` creates a policy after every entity, so it is not
+/// one, and the reset — dropping in reverse apply order, functions before
+/// tables — dropped the function while the table and its policy still stood.
+/// Postgres refused, and the refusal blamed "dependents outside the scope" for
+/// a table inside it. A table's policies go with the table, so a scoped reset
+/// drops them first; a policy on a table outside the scope still refuses it.
+#[tokio::test]
+async fn a_scoped_reset_drops_its_tables_policies_before_the_functions_they_call() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "scoped_reset_policies").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let design = write_project(tmp.path(), POLICIES_YAML, POLICIES_FILES);
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply");
+    let policies = dbd_core::design::apply_policies(&*adapter, tmp.path(), false, None)
+        .await
+        .expect("policies");
+    assert!(policies.failed.is_empty(), "{:?}", policies.failed);
+
+    // A policy outside the scope calls the scope's function: refused, naming
+    // that policy alone, and nothing is dropped — the in-scope policy included.
+    let app_only = design.resolve_scope(Some("app_only"), None).unwrap();
+    let err = design
+        .reset(&*adapter, "postgres", false, false, false, Some(&app_only))
+        .await
+        .expect_err("other.notes's policy calls app.can_read")
+        .to_string();
+    assert!(
+        err.contains("policy notes_read on table other.notes"),
+        "the refusal must name the dependent outside the scope: {err}"
+    );
+    assert!(
+        !err.contains("metrics_read"),
+        "a policy on a table the scope drops is not a dependent outside it: {err}"
+    );
+    assert_table_exists(&*adapter, "app", "metrics").await;
+    assert_catalog(
+        &*adapter,
+        true,
+        &policy_predicate("app", "metrics", "metrics_read"),
+        "policy metrics_read (the refused reset drops nothing)",
+    )
+    .await;
+
+    // With only the scope's own policies calling it, the scope resets.
+    adapter
+        .execute_script("DROP POLICY notes_read ON other.notes;")
+        .await
+        .unwrap();
+    design
+        .reset(&*adapter, "postgres", false, false, false, Some(&app_only))
+        .await
+        .expect("a policy on an in-scope table must not block the scoped reset");
+    assert_table_absent(&*adapter, "app", "metrics").await;
+    assert_catalog(
+        &*adapter,
+        false,
+        "SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+           WHERE n.nspname = 'app' AND p.proname = 'can_read'",
+        "function app.can_read",
+    )
+    .await;
+    assert_table_exists(&*adapter, "other", "notes").await;
+}
+
 // ── Roles are server-wide: a reset keeps one another database holds ───────────
 
 /// Two databases on one server built from the same design share its roles,
