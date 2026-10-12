@@ -4647,3 +4647,106 @@ mod enum_recreation_tests {
         assert!(stmt.sql.contains("CREATE TYPE app.colour AS ENUM ('red', 'green')"));
     }
 }
+
+#[cfg(test)]
+mod extension_type_tests {
+    use super::*;
+    use crate::entity::ColumnDef;
+    use crate::snapshot::EnumSnapshot;
+
+    fn col(name: &str, data_type: &str) -> ColumnDef {
+        ColumnDef {
+            name: name.to_string(),
+            data_type: data_type.to_string(),
+            nullable: true,
+            default_value: None,
+            is_pk: false,
+            is_unique: false,
+            identity: None,
+            generated: None,
+            comment: None,
+            inline_fk: None,
+            collation: None,
+        }
+    }
+
+    fn snap(columns: Vec<ColumnDef>, enums: Vec<EnumSnapshot>) -> Snapshot {
+        Snapshot {
+            version: 0,
+            description: String::new(),
+            timestamp: String::new(),
+            tables: vec![TableSnapshot {
+                name: "docs".to_string(),
+                schema: "app".to_string(),
+                columns,
+                indexes: vec![],
+                table_constraints: vec![],
+            }],
+            enums,
+        }
+    }
+
+    fn owned(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(s, n)| (s.to_string(), n.to_string())).collect()
+    }
+
+    fn types_of(snap: &Snapshot) -> Vec<&str> {
+        snap.tables[0].columns.iter().map(|c| c.data_type.as_str()).collect()
+    }
+
+    /// pgvector's type carries a modifier: `format_type` reads
+    /// `extensions.vector(384)` where DDL wrote `vector(384)` — #41's own
+    /// column. The bare spelling gets the schema and keeps the modifier, in an
+    /// array too, and the two sides plan nothing.
+    #[test]
+    fn an_extension_type_keeps_its_modifier() {
+        let types = owned(&[("extensions", "vector")]);
+        let mut desired = snap(
+            vec![col("embedding", "vector(384)"), col("history", "vector(3)[]")],
+            vec![],
+        );
+        let mut live = snap(
+            vec![
+                col("embedding", "extensions.vector(384)"),
+                col("history", "extensions.vector(3)[]"),
+            ],
+            vec![],
+        );
+        qualify_extension_types(&mut desired, &types);
+        qualify_extension_types(&mut live, &types);
+        assert_eq!(types_of(&desired), ["extensions.vector(384)", "extensions.vector(3)[]"]);
+
+        canonicalize(&mut desired);
+        canonicalize(&mut live);
+        let plan = plan_reconcile(&live, &desired);
+        assert!(plan.altered.is_empty(), "{:?}", plan.altered);
+    }
+
+    /// Two extensions that each own a `ltree`, in different schemas: which one
+    /// a bare `ltree` names depends on the file's path, which the snapshot does
+    /// not carry. It is left as written rather than guessed at.
+    #[test]
+    fn a_name_two_extensions_own_is_left_as_written() {
+        let types = owned(&[("ext_a", "ltree"), ("ext_b", "ltree"), ("extensions", "citext")]);
+        let mut desired = snap(vec![col("path", "ltree"), col("email", "citext")], vec![]);
+        qualify_extension_types(&mut desired, &types);
+        assert_eq!(types_of(&desired), ["ltree", "extensions.citext"]);
+    }
+
+    /// A project enum named like an extension's type is the project's: a file
+    /// declaring `app.cube` reaches it before `extensions.cube`. The bare name
+    /// is left to the enum's own qualification.
+    #[test]
+    fn a_name_the_projects_enum_declares_stays_the_enums() {
+        let types = owned(&[("extensions", "cube")]);
+        let enums = vec![EnumSnapshot {
+            name: "cube".to_string(),
+            schema: "app".to_string(),
+            values: vec!["small".to_string()],
+        }];
+        let mut desired = snap(vec![col("size", "cube")], enums);
+        qualify_extension_types(&mut desired, &types);
+        canonicalize(&mut desired);
+        assert_eq!(types_of(&desired), ["app.cube"]);
+    }
+}
