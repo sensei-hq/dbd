@@ -714,9 +714,10 @@ impl Design {
     }
 
     /// The path a migration file of `entity` runs on when it states none of
-    /// its own: the one `entity`'s DDL file runs on — the path that file
-    /// states, else `source.search_path` — and, for a table the design no
-    /// longer has, `source.search_path`. `None` is the session's default.
+    /// its own: the one `entity`'s CREATE runs on — the path its DDL file sets
+    /// before it (the last, when the file sets several), else
+    /// `source.search_path` — and, for a table the design no longer has,
+    /// `source.search_path`. `None` is the session's default.
     ///
     /// `dbd snapshot` writes a column's type as the DDL file wrote it, so a
     /// generated `ADD COLUMN was mood` needs the file's own path to find
