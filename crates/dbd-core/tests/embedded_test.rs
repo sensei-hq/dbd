@@ -6660,6 +6660,307 @@ async fn a_scoped_reset_refuses_rather_than_cascade_into_what_is_outside_its_sco
     assert_column_exists(&*adapter, "app", "people", "mood").await;
 }
 
+const POLICIES_YAML: &str = "project:\n  name: scoped_reset_policies\nsource:\n  dialect: postgresql\n\
+    schemas:\n  - app\n  - other\nscopes:\n  app_only:\n    includes: [app]\n";
+
+const POLICIES_FILES: &[(&str, &str)] = &[
+    (
+        "ddl/table/app/metrics.ddl",
+        "set search_path to app;\ncreate table if not exists metrics (id int primary key, owner text);\n",
+    ),
+    (
+        "ddl/function/app/can_read.ddl",
+        "set search_path to app;\n\
+         create or replace function can_read(owner text) returns boolean\n\
+         language sql stable as $$ select owner = current_user $$;\n",
+    ),
+    (
+        "ddl/table/other/notes.ddl",
+        "set search_path to other;\ncreate table if not exists notes (id int primary key, owner text);\n",
+    ),
+    (
+        "policies/app/metrics.sql",
+        "alter table app.metrics enable row level security;\n\
+         drop policy if exists metrics_read on app.metrics;\n\
+         create policy metrics_read on app.metrics for select using (app.can_read(owner));\n",
+    ),
+    (
+        "policies/other/notes.sql",
+        "alter table other.notes enable row level security;\n\
+         drop policy if exists notes_read on other.notes;\n\
+         create policy notes_read on other.notes for select using (app.can_read(owner));\n",
+    ),
+];
+
+fn policy_predicate(schema: &str, table: &str, policy: &str) -> String {
+    format!(
+        "SELECT 1 FROM pg_policies WHERE schemaname = '{schema}' AND tablename = '{table}' AND policyname = '{policy}'"
+    )
+}
+
+/// sensei's `dojo` scope: a policy on an in-scope table calls an in-scope
+/// function. `dbd policies` creates a policy after every entity, so it is not
+/// one, and the reset — dropping in reverse apply order, functions before
+/// tables — dropped the function while the table and its policy still stood.
+/// Postgres refused, and the refusal blamed "dependents outside the scope" for
+/// a table inside it. A table's policies go with the table, so a scoped reset
+/// drops them first; a policy on a table outside the scope still refuses it.
+#[tokio::test]
+async fn a_scoped_reset_drops_its_tables_policies_before_the_functions_they_call() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "scoped_reset_policies").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let design = write_project(tmp.path(), POLICIES_YAML, POLICIES_FILES);
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply");
+    let policies = dbd_core::design::apply_policies(&*adapter, tmp.path(), false, None)
+        .await
+        .expect("policies");
+    assert!(policies.failed.is_empty(), "{:?}", policies.failed);
+
+    // A policy outside the scope calls the scope's function: refused, naming
+    // that policy alone, and nothing is dropped — the in-scope policy included.
+    let app_only = design.resolve_scope(Some("app_only"), None).unwrap();
+    let err = design
+        .reset(&*adapter, "postgres", false, false, false, Some(&app_only))
+        .await
+        .expect_err("other.notes's policy calls app.can_read")
+        .to_string();
+    assert!(
+        err.contains("policy notes_read on table other.notes"),
+        "the refusal must name the dependent outside the scope: {err}"
+    );
+    assert!(
+        !err.contains("metrics_read"),
+        "a policy on a table the scope drops is not a dependent outside it: {err}"
+    );
+    assert_table_exists(&*adapter, "app", "metrics").await;
+    assert_catalog(
+        &*adapter,
+        true,
+        &policy_predicate("app", "metrics", "metrics_read"),
+        "policy metrics_read (the refused reset drops nothing)",
+    )
+    .await;
+
+    // With only the scope's own policies calling it, the scope resets.
+    adapter
+        .execute_script("DROP POLICY notes_read ON other.notes;")
+        .await
+        .unwrap();
+    design
+        .reset(&*adapter, "postgres", false, false, false, Some(&app_only))
+        .await
+        .expect("a policy on an in-scope table must not block the scoped reset");
+    assert_table_absent(&*adapter, "app", "metrics").await;
+    assert_catalog(
+        &*adapter,
+        false,
+        "SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+           WHERE n.nspname = 'app' AND p.proname = 'can_read'",
+        "function app.can_read",
+    )
+    .await;
+    assert_table_exists(&*adapter, "other", "notes").await;
+}
+
+const TRIGGERS_YAML: &str = "project:\n  name: scoped_reset_triggers\nsource:\n  dialect: postgresql\n\
+    schemas:\n  - app\n  - other\nscopes:\n  app_only:\n    includes: [app]\n";
+
+const TRIGGERS_FILES: &[(&str, &str)] = &[
+    (
+        "ddl/table/app/items.ddl",
+        "set search_path to app;\ncreate table if not exists items (id int primary key, seq int);\n",
+    ),
+    (
+        "ddl/view/app/item_ids.ddl",
+        "set search_path to app;\ncreate or replace view item_ids as select id from items;\n",
+    ),
+    (
+        "ddl/function/app/bump.ddl",
+        "set search_path to app;\n\
+         create or replace function bump() returns trigger language plpgsql as $$\n\
+         begin new.seq := coalesce(new.seq, 0) + 1; return new; end $$;\n\
+         drop trigger if exists items_bump on app.items;\n\
+         create trigger items_bump before update on app.items for each row execute function app.bump();\n",
+    ),
+    (
+        "ddl/function/app/add_id.ddl",
+        "set search_path to app;\n\
+         create or replace function add_id() returns trigger language plpgsql as $$\n\
+         begin insert into app.items (id) values (new.id); return new; end $$;\n\
+         drop trigger if exists item_ids_add on app.item_ids;\n\
+         create trigger item_ids_add instead of insert on app.item_ids for each row execute function app.add_id();\n",
+    ),
+    (
+        "ddl/table/other/logs.ddl",
+        "set search_path to other;\ncreate table if not exists logs (id int primary key, seq int);\n",
+    ),
+];
+
+/// sensei's `dojo` scope again, with the policies out of the way: a trigger
+/// written in its function's file, `create trigger … on dojo.shared_rules`,
+/// makes the function depend on the table, so the reset dropped the function
+/// first and the table's trigger refused it. A table's or a view's triggers go
+/// with it, so a scoped reset drops them first — the ones Postgres makes for a
+/// foreign key excepted; a trigger on a table outside the scope still refuses
+/// it.
+#[tokio::test]
+async fn a_scoped_reset_drops_its_tables_and_views_triggers_before_their_functions() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "scoped_reset_triggers").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let design = write_project(tmp.path(), TRIGGERS_YAML, TRIGGERS_FILES);
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply");
+    adapter
+        .execute_script(
+            "CREATE TRIGGER logs_bump BEFORE UPDATE ON other.logs FOR EACH ROW EXECUTE FUNCTION app.bump();",
+        )
+        .await
+        .unwrap();
+
+    let app_only = design.resolve_scope(Some("app_only"), None).unwrap();
+    let err = design
+        .reset(&*adapter, "postgres", false, false, false, Some(&app_only))
+        .await
+        .expect_err("other.logs's trigger calls app.bump")
+        .to_string();
+    assert!(
+        err.contains("trigger logs_bump on table other.logs"),
+        "the refusal must name the dependent outside the scope: {err}"
+    );
+    assert!(
+        !err.contains("items_bump"),
+        "a trigger on a table the scope drops is not a dependent outside it: {err}"
+    );
+    assert_table_exists(&*adapter, "app", "items").await;
+
+    adapter
+        .execute_script("DROP TRIGGER logs_bump ON other.logs;")
+        .await
+        .unwrap();
+    design
+        .reset(&*adapter, "postgres", false, false, false, Some(&app_only))
+        .await
+        .expect("a trigger on an in-scope table or view must not block the scoped reset");
+    assert_table_absent(&*adapter, "app", "items").await;
+    assert_catalog(
+        &*adapter,
+        false,
+        "SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'app'",
+        "a function in app",
+    )
+    .await;
+    assert_table_exists(&*adapter, "other", "logs").await;
+}
+
+/// A row trigger on a partitioned table is cloned onto each partition, and the
+/// clone is the parent's: Postgres refuses to drop it on its own ("trigger … on
+/// table … requires it"), and drops it with the parent's. dbd refuses `PARTITION
+/// OF`, but a plain table entity becomes a partition by `ATTACH PARTITION`, so
+/// its clone was among the triggers a scoped reset drops first — refusing every
+/// reset of a scope holding the partition. Only a trigger no parent made is
+/// dropped there.
+async fn attached_partition_project(
+    parent_schema: &str,
+) -> (
+    PostgreSQL,
+    Box<dyn dbd_core::DatabaseAdapter>,
+    Design,
+    tempfile::TempDir,
+) {
+    let (pg, url) = start_pg().await;
+    let adapter = connect(&url, "scoped_reset_partitions").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let design = write_project(
+        tmp.path(),
+        &format!(
+            "project:\n  name: scoped_reset_partitions\nsource:\n  dialect: postgresql\n\
+             schemas:\n  - app\n  - {parent_schema}\nscopes:\n  app_only:\n    includes: [app]\n"
+        ),
+        &[
+            (
+                &format!("ddl/table/{parent_schema}/events.ddl"),
+                &format!(
+                    "set search_path to {parent_schema};\n\
+                     create table if not exists events (id int, at date not null, seq int) partition by range (at);\n"
+                ),
+            ),
+            (
+                &format!("ddl/function/{parent_schema}/bump.ddl"),
+                &format!(
+                    "set search_path to {parent_schema};\n\
+                     create or replace function bump() returns trigger language plpgsql as $$\n\
+                     begin new.seq := coalesce(new.seq, 0) + 1; return new; end $$;\n\
+                     drop trigger if exists events_bump on {parent_schema}.events;\n\
+                     create trigger events_bump before update on {parent_schema}.events\n\
+                       for each row execute function {parent_schema}.bump();\n"
+                ),
+            ),
+            (
+                "ddl/table/app/events_2026.ddl",
+                "set search_path to app;\ncreate table if not exists events_2026 (id int, at date not null, seq int);\n",
+            ),
+        ],
+    );
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply");
+    adapter
+        .execute_script(&format!(
+            "ALTER TABLE {parent_schema}.events ATTACH PARTITION app.events_2026 \
+               FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');"
+        ))
+        .await
+        .unwrap();
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_trigger WHERE tgrelid = 'app.events_2026'::regclass AND tgname = 'events_bump' \
+           AND NOT tgisinternal",
+        "the clone of events_bump on the partition",
+    )
+    .await;
+    (pg, adapter, design, tmp)
+}
+
+#[tokio::test]
+async fn a_scoped_reset_leaves_a_partitions_cloned_trigger_to_its_parent() {
+    let (_pg, adapter, design, _tmp) = attached_partition_project("app").await;
+    let app_only = design.resolve_scope(Some("app_only"), None).unwrap();
+    design
+        .reset(&*adapter, "postgres", false, false, false, Some(&app_only))
+        .await
+        .expect("a partition's cloned trigger must not refuse the scoped reset");
+    assert_table_absent(&*adapter, "app", "events").await;
+    assert_table_absent(&*adapter, "app", "events_2026").await;
+}
+
+#[tokio::test]
+async fn a_scoped_reset_of_a_partition_keeps_the_trigger_of_a_parent_outside_it() {
+    let (_pg, adapter, design, _tmp) = attached_partition_project("base").await;
+    let app_only = design.resolve_scope(Some("app_only"), None).unwrap();
+    design
+        .reset(&*adapter, "postgres", false, false, false, Some(&app_only))
+        .await
+        .expect("the clone of a trigger outside the scope must not refuse the scoped reset");
+    assert_table_absent(&*adapter, "app", "events_2026").await;
+    assert_table_exists(&*adapter, "base", "events").await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_trigger WHERE tgrelid = 'base.events'::regclass AND tgname = 'events_bump'",
+        "trigger events_bump on base.events",
+    )
+    .await;
+}
+
 // ── Roles are server-wide: a reset keeps one another database holds ───────────
 
 /// Two databases on one server built from the same design share its roles,

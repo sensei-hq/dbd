@@ -1,32 +1,33 @@
 # Checkpoint
 
-**Slice:** 0.25.0 shipped; #41 merged to `develop` for 0.25.1.
+**Slice:** scoped reset refused by policies and triggers calling in-scope
+functions (`fix/scoped-reset-policies`, off `develop`), for 0.25.1.
 
 ## Done
 
-- v0.25.0: crates.io (`release.yml` green), PR #45 merged to `main`
-  (`b4f075e3`); CI and the Workers production deploy green; the site serves
-  0.25.0. The develop preview's 504 was Cloudflare's API; a retry deployed it.
-- #41 (and duplicate #39): PR #46 merged to `develop` (`7795094b`) — extension
-  types spelled as the database spells them in `reconcile` and `diff`, reviewed
-  twice, mutation-checked; embedded suite 128/128.
+- Reverse apply order dropped an in-scope function before its in-scope table,
+  while a policy (`policies/`) or a trigger written in the function's file
+  still called it; the refusal blamed "dependents outside the scope".
+- Red `1f0505ff` → fix `4a7f08dc`: the scope's tables' policies go first.
+- Red `f9526ff4` → fix `7484eec1`: non-internal triggers on its tables and
+  views go first.
+- Review (failure-mode): a partition's clone of its parent's trigger is not
+  internal on PG 13+ and cannot be dropped alone. Red `36bffabc` → fix
+  `7df416ba`: clones (`tgparentid`, read via `to_jsonb`) are left to the parent.
+- Docs `1f64ec0f` + CHANGELOG: guides 04/07, llms, both SKILL.md.
+- Embedded 132/132. Real sensei `dojo` scope on a private server: 0.25.0
+  refuses; the branch drops 12 functions, 7 procedures, 7 views, 53 tables,
+  40 enums, and `deploy --scope dojo` restores 39 tables and 41 policies.
 
 ## Next
 
-    # scoped reset refused by a policy calling an in-scope function (below)
+    gh pr create --base develop --head fix/scoped-reset-policies
+    # CI green → git merge --no-ff locally, push (not gh pr merge)
 
 ## Open
 
-- **Scoped reset vs policies.** `build_scoped_reset_script` (`script.rs`
-  ~767) drops in reverse apply order, so in-scope functions go before in-scope
-  tables; a policy on such a table calling such a function (sensei `dojo`: six
-  files, five functions) makes Postgres refuse the function's drop, and the
-  message blames dependents outside the scope. Fix: drop the policies of the
-  scope's tables first — they go with their tables anyway.
-- `6fccb0ff` (#44) and `b4f075e3` (#45) are authored by GitHub's noreply
-  identity (`gh pr merge`); not rewritten, as `6fccb0ff` is an ancestor of the
-  published `v0.25.0` tag. Merges are now done locally.
-- #41 closes when 0.25.1 reaches `main`.
+- 0.25.1 on `develop`: #41 and this. #41 closes when it reaches `main`.
+- `6fccb0ff`/`b4f075e3` carry GitHub's noreply identity; not rewritten.
 
 ## Known limits
 

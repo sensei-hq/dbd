@@ -1662,7 +1662,9 @@ tables, sequences, enums — in reverse dependency order, with `CASCADE` on a fu
 out-of-scope table's column with it), so it drops without it, all or nothing, and refuses
 naming the dependents (`scoped reset refused, nothing was dropped — cannot drop type app.mood
 because other objects depend on it: … add the dependents to the scope, or reset without
---scope.`). Never `DROP SCHEMA`/`DROP EXTENSION` by default, so `public`, custom schemas
+--scope.`); the policies and triggers on the tables and views it drops go first, with them,
+so one calling an in-scope function (a `policies/` file, a trigger in its function's file)
+does not refuse it. Never `DROP SCHEMA`/`DROP EXTENSION` by default, so `public`, custom schemas
 and extensions (e.g. pgvector) survive and never abort on `public`; the next `apply`
 repopulates the schemas.
 

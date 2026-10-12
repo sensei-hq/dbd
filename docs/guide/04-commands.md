@@ -927,6 +927,10 @@ on what it would drop, it drops nothing and names the dependent:
 scoped reset refused, nothing was dropped — cannot drop type app.mood because other objects depend on it: column mood of table other.notes depends on type app.mood. A scoped reset drops only what its scope holds, and never cascades: add the dependents to the scope, or reset without --scope.
 ```
 
+A table's policies, and a table's or a view's triggers, go with it, so they are dropped first: one
+calling a function the scope also drops — a policy from `policies/`, or a trigger written in its
+function's file — does not refuse the reset. One on a table outside the scope still does.
+
 ---
 
 ## `dbd snapshot`

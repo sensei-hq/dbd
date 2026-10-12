@@ -179,7 +179,9 @@ What a scope does not narrow:
   without `CASCADE`, all or nothing: when an object outside the scope depends on
   one it would drop — an out-of-scope table's column typed with an in-scope
   enum — it drops nothing and names the dependent. Add the dependents to the
-  scope, or reset without `--scope`.
+  scope, or reset without `--scope`. The policies and triggers on the tables
+  and views it drops go first, with them, so one calling an in-scope function
+  does not refuse it.
 - **pg_cron refresh jobs.** A scoped apply syncs the jobs of every materialized
   view in the design, because the sync unschedules any `dbd:refresh:` job
   missing from the set it is given. A scope whose `extensions:` allowlist
