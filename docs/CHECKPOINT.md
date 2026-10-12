@@ -12,8 +12,7 @@ unreleased.
 - Claim timing (`889a433f`): an apply in one transaction claims last, in it,
   and before a part-way enum-value commit; reconcile, reset and a DBD_NO_TX
   apply claim first and keep it. Closes the reset/reconcile race.
-- Keys/uses fixes `31bd657e`; red `bfffee35`; docs `b4d0708b`.
-- CI now runs `cli_live` (`37c91e51`) — it had compiled to no tests.
+- Keys/uses `31bd657e`, red `bfffee35`, docs `b4d0708b`; CI runs `cli_live`.
 - Re-verification round: red `f01dbfda`; DBD_NO_TX claims before hooks
   `780ece9d`; DO blocks, multiranges, nextval strings, bare names by catalog
   `0e8fedf3`; docs `75d7fb5e`. Race tests poll pg_locks.
@@ -30,8 +29,7 @@ unreleased.
 - Slice 3: an empty design's meta has no uses — the not-upgraded marker.
 - Declined: the batch rollback error stays best-effort (pre-existing, no
   state survives it); dropping the old shared `dbd.import_tmp`.
-- A bare type of another project's (search path, unqualified) is no use:
-  bare types are dropped as built-ins; pg_depend still guards the column.
+- A bare type of another project's is no use (dropped as a built-in).
 - `dbd.objects` still allows namespace `type`, unused.
 - An apply in one transaction runs `apply.before` hooks before its claim
   (documented in the spec; claiming first would strand a killed run's claims).
