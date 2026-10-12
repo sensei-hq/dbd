@@ -1,40 +1,39 @@
 # Checkpoint
 
-**Slice:** #7 Phase 1 merged to `develop` (PR #49, `2cd4b683`); unreleased.
-Next: Phase 2, entity ownership.
+**Slice:** #7 Phase 2, slices 1–2 (registry + claim, uses) on `feat/ownership-uses`
+= PR #50 (into the `feat/ownership` integration branch). Phase 1 is on `develop`,
+unreleased.
 
 ## Done
 
-- Phase 1 of #7 (spec `docs/superpowers/specs/2026-10-06-multi-project-isolation-design.md`):
-  - 1c heal: folds only its own legacy rows; layered reads; locks legacy tables
-    (READ COMMITTED, migrations before meta, 5s timeout, one heal at a time);
-    passes over tables the role cannot reach; refuses one holding its own row
-    it cannot take; keeps an emptied table it cannot drop.
-  - 1b cron: `dbd-refresh:<owner>:<schema>.<name>` (out of an older dbd's
-    `dbd:refresh:%` sweep), ≤63 bytes, prefix measured by Postgres, legacy
-    jobs replaced for declared views and unscheduled once their view is gone
-    (catalog lookup, names as Postgres cuts them), syncs serialized and
-    reading committed on the pool.
-  - 1d import: `dbd."import_tmp:<project>"`, hashed past 63 bytes.
-- Three review rounds, every finding fixed test-first; embedded 153/153,
-  `cli_live` 41/41; `quinn-proto` 0.11.19 for RUSTSEC-2026-0338/0340/0343.
-- Decisions settled (spec "Decisions"): per-module versions, `<project>/<module>`,
-  one root manifest, no `provides:`; unowned entities in a shared schema prune
-  only with `--prune-unowned`.
+- Slice 1: `dbd.objects` in `LAYOUT_DDL`; the whole design's entities keyed by
+  every `CREATE` in their files (folded names, the search path for unqualified
+  ones, the path only where nothing parses); tables, views, matviews,
+  sequences and enums share the `relation` namespace, routines are keyed by name.
+- Slice 2: `dbd.uses` — schemas, extensions, roles, and references to another
+  owner's entities (every overload, dotted names split as dbd splits them).
+- Claim-when-built (red `c1d7df8f`, green `9307a6e5`): every command checks
+  first (a dry run, diff, import, refresh and policies only read); apply claims
+  in its batch, reconcile after its writes, reset only checks. A failed, killed
+  or concurrent run takes nothing, so there is no give-back. Registry waits are
+  capped at 5s (55P03/40001 name the table).
+- CHANGELOG and spec describe claim-when-built (`7548ff03`).
+- Embedded 171/171, `cli_live` 44/44, workspace 1997/0, clippy and fmt clean.
 
 ## Next
 
-    # Phase 2, slice 1: dbd.objects/dbd.uses in LAYOUT_DDL; claim the whole
-    # design's entities at apply/deploy/reconcile/reset, refusing one another
-    # owner holds before any DDL; backfill existing unowned declared entities.
+    git push origin feat/ownership-uses:feat/ownership-registry   # PR #50
+    # update the PR #50 body; focused review; merge #50 locally into feat/ownership;
+    # then slice 3: prune rules (a)/(b), --prune-unowned, release.
 
 ## Open
 
+- Slice 3: an empty design's meta has no uses — the not-upgraded marker.
+- Reconcile writes before it claims: a rival claim in between is refused late.
+- Slice 5: a reset claims nothing, so "drops only what it owns" must also
+  take what nobody owns and the design declares.
 - Phase 1 is releasable as 0.25.2 when asked.
-- Not covered by a test: a legacy table dropped between listing and reading
-  (handled by construction: lock-or-skip under a savepoint, 42P01 = no rows).
-- Declined: dropping the old shared `dbd.import_tmp` (an older co-tenant may be
-  mid-import in it).
+- Declined: dropping the old shared `dbd.import_tmp`.
 
 ## Known limits
 
