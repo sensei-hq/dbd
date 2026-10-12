@@ -1224,6 +1224,27 @@ mod tests {
         (tmp, design)
     }
 
+    /// A data file aimed at a sequence was refused with "a view has no rows of
+    /// its own to load" — true of a view, and no explanation for a sequence.
+    /// The refusal says what each target is.
+    #[test]
+    fn a_data_file_for_a_sequence_is_refused_saying_what_a_sequence_is() {
+        let (_tmp, design) = project_from(&[
+            ("design.yaml", "project:\n  name: t\nschemas:\n  - app\n"),
+            (
+                "ddl/sequence/app/counter.ddl",
+                "set search_path to app;\ncreate sequence if not exists counter;\n",
+            ),
+            ("import/app/counter.csv", "n\n1\n"),
+        ]);
+        let err = design.check_import_plan(None).unwrap_err().to_string();
+        assert!(err.contains("app.counter") && err.contains("a sequence"), "{err}");
+        assert!(
+            !err.contains("view"),
+            "the target is a sequence, and the refusal says nothing of views: {err}"
+        );
+    }
+
     /// The audit's project: countries and cities staged, each with a live
     /// target (`app.cities` references `app.countries`), and a city loader that
     /// joins the staged countries to find each city's country.

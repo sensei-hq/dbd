@@ -1563,6 +1563,46 @@ fn reconcile_dry_run_does_not_create_a_sqlite_database_file() {
     );
 }
 
+/// `deploy --dry-run` printed "1 entities would be applied." and only then
+/// refused a pending migration's unresolved `-- TODO`, so a refused preview
+/// began by promising a plan. It refuses first, as `apply --dry-run` does.
+#[test]
+fn deploy_dry_run_refuses_an_unresolved_todo_before_listing_anything() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let config = |version: u32| {
+        format!(
+            "project:\n  name: lite\n  version: {version}\nsource:\n  dialect: sqlite\ntarget:\n  sqlite:\n    url: sqlite://{}\nschemas: []\n",
+            dir.join("app.db").display()
+        )
+    };
+    write(dir, "design.yaml", &config(1));
+    write(
+        dir,
+        "ddl/table/items.ddl",
+        "CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY);\n",
+    );
+    let o = dbd(dir, &["apply"]);
+    assert!(o.status.success(), "apply at v1: {}{}", stdout(&o), stderr(&o));
+
+    write(dir, "design.yaml", &config(2));
+    write(
+        dir,
+        "migrations/002/graph.json",
+        r#"{"fromVersion":1,"toVersion":2,"added":[],"altered":["items"],"dropped":[]}"#,
+    );
+    write(dir, "migrations/002/items.data.sql", "-- TODO: map the rows\n");
+
+    let o = dbd(dir, &["deploy", "--dry-run"]);
+    assert!(!o.status.success(), "the TODO is refused: {}{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("Unresolved TODO"), "{}", stderr(&o));
+    assert!(
+        !stdout(&o).contains("would be applied"),
+        "and nothing is listed before the refusal: {}",
+        stdout(&o)
+    );
+}
+
 // ── reset refuses a --target the connection is not ──────────────────────────
 
 /// `reset --target postgres` on a SQLite project was accepted, connected, and

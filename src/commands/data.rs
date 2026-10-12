@@ -603,6 +603,31 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// Two tables that would share a file in an import schema folder were
+    /// refused with the advice to export to the folder above it, `-o import`,
+    /// "to keep each under its schema" — which writes `import/core/…`, a
+    /// folder the next import refuses unless `core` is a staging schema. The
+    /// refusal advises what an import can load.
+    #[test]
+    fn the_shared_file_refusal_advises_only_what_an_import_can_load() {
+        let core = Entity::new(EntityType::Table, "core.accounts");
+        let staging = Entity::new(EntityType::Table, "staging.accounts");
+        let root = PathBuf::from("/p/import/staging");
+        let err = refuse_shared_files(&[&core, &staging], &root).unwrap_err().to_string();
+        assert!(
+            err.contains("core.accounts") && err.contains("staging.accounts"),
+            "naming both: {err}"
+        );
+        assert!(
+            !err.contains("-o /p/import"),
+            "never into the import tree above the folder, whose other schema folders an import refuses: {err}"
+        );
+        assert!(
+            err.contains("-n"),
+            "and names the way that works — one table, by -n: {err}"
+        );
+    }
+
     #[test]
     fn format_from_ext_maps_known_extensions() {
         assert_eq!(format_from_ext(&PathBuf::from("data/users.jsonl")), "jsonl");

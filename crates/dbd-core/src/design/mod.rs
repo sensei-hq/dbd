@@ -3779,6 +3779,36 @@ import:
         assert!(!err.contains("applied migrations"), "{err}");
     }
 
+    /// `reset` refused any versioned database as "a released project's
+    /// database" — a database `init --from-db` captured is versioned with
+    /// `released` never set. It says "versioned at vN", and calls the project
+    /// released only when `project.released` says so.
+    #[tokio::test]
+    async fn reset_calls_a_versioned_database_released_only_when_the_project_is() {
+        for released in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let config = tmp.path().join("design.yaml");
+            std::fs::write(
+                &config,
+                format!("project:\n  name: test\n  version: 3\n  released: {released}\nschemas:\n  - app\n"),
+            )
+            .unwrap();
+            let design = Design::from_config_with_dir(&config, "dev", Some(tmp.path())).unwrap();
+            let mock = MockAdapter::new().with_meta("dev", 3);
+            let err = design
+                .reset(&mock, "postgres", false, false, false, None)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("versioned at v3"), "{err}");
+            assert_eq!(
+                err.contains("released"),
+                released,
+                "released: {released} — the refusal says so only when it is: {err}"
+            );
+        }
+    }
+
     /// The position of the first step `matches` picks out, for asserting order.
     fn step_at(plan: &ExecutionPlan, matches: impl Fn(&ExecutionStep) -> bool) -> usize {
         plan.steps
