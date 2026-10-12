@@ -26,6 +26,17 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   type: a bare `date` stays `pg_catalog.date` on a database with orafce's
   `oracle.date`, and a name the project's own enum or domain, or a second
   extension, also has is compared as written, as before. ([#41])
+- **A scoped reset drops its tables' policies and triggers first.** A policy
+  from `policies/`, or a trigger written in its function's file, that calls a
+  function the scope also drops refused the reset — "cannot drop function …
+  because other objects depend on it" — and the refusal blamed a dependent
+  outside the scope for one inside it. The reset drops in reverse apply order,
+  where neither has a place: policies are applied after every entity, and a
+  trigger in its function's file makes the function depend on the table, so
+  the function went first while its table still stood. A table's policies, and
+  a table's or a view's triggers, now go first, with their table — nothing
+  else is taken; a foreign key's own triggers are left, and a policy or trigger
+  on a table outside the scope still refuses the reset.
 
 ### Library API
 
