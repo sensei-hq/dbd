@@ -1,32 +1,41 @@
 # Checkpoint
 
-**Slice:** v0.25.1 shipped. Nothing in flight.
+**Slice:** #7 Phase 1 merged to `develop` (PR #49, `2cd4b683`); unreleased.
+Next: Phase 2, entity ownership.
 
 ## Done
 
-- v0.25.1 (`0b6b2f9a`, tag `v0.25.1`): #41 (PR #46) and the scoped-reset fix
-  (PR #47). Release notes `65e59083`.
-- Pre-release suite green: workspace, embedded 132, `cli_live`, clippy, fmt,
-  `cargo doc -D warnings`, `cargo audit`.
-- `release.yml` run 38276639619 green; `dbd-core` and `dbd-cli` 0.25.1 on
-  crates.io.
-- Shipped artifact (`cargo install dbd-cli --version 0.25.1`) on a private
-  server: the #41 repro reconciles `0 altered` and `diff` is in sync; sensei's
-  `dojo` scope resets fully (15 functions, 7 procedures, 8 views, 53 tables,
-  40 enums). crates.io 0.25.0, same environment, fails both.
-- PR #48 merged to `main` locally (`636528df`); `main` CI and the Workers
-  production deploy green; the site serves 0.25.1; #41 closed.
+- Phase 1 of #7 (spec `docs/superpowers/specs/2026-10-06-multi-project-isolation-design.md`):
+  - 1c heal: folds only its own legacy rows; layered reads; locks legacy tables
+    (READ COMMITTED, migrations before meta, 5s timeout, one heal at a time);
+    passes over tables the role cannot reach; refuses one holding its own row
+    it cannot take; keeps an emptied table it cannot drop.
+  - 1b cron: `dbd-refresh:<owner>:<schema>.<name>` (out of an older dbd's
+    `dbd:refresh:%` sweep), ≤63 bytes, prefix measured by Postgres, legacy
+    jobs replaced for declared views and unscheduled once their view is gone
+    (catalog lookup, names as Postgres cuts them), syncs serialized and
+    reading committed on the pool.
+  - 1d import: `dbd."import_tmp:<project>"`, hashed past 63 bytes.
+- Three review rounds, every finding fixed test-first; embedded 153/153,
+  `cli_live` 41/41; `quinn-proto` 0.11.19 for RUSTSEC-2026-0338/0340/0343.
+- Decisions settled (spec "Decisions"): per-module versions, `<project>/<module>`,
+  one root manifest, no `provides:`; unowned entities in a shared schema prune
+  only with `--prune-unowned`.
 
 ## Next
 
-    # nothing queued — docs/BACKLOG.md holds the 0.25.x follow-ups
+    # Phase 2, slice 1: dbd.objects/dbd.uses in LAYOUT_DDL; claim the whole
+    # design's entities at apply/deploy/reconcile/reset, refusing one another
+    # owner holds before any DDL; backfill existing unowned declared entities.
 
 ## Open
 
-- `6fccb0ff`/`b4f075e3` carry GitHub's noreply identity; not rewritten (an
-  ancestor of the published `v0.25.0` tag). Merges are now done locally.
+- Phase 1 is releasable as 0.25.2 when asked.
+- Not covered by a test: a legacy table dropped between listing and reading
+  (handled by construction: lock-or-skip under a savepoint, 42P01 = no rows).
+- Declined: dropping the old shared `dbd.import_tmp` (an older co-tenant may be
+  mid-import in it).
 
 ## Known limits
 
 - A type in a schema that needs quoting (`"Ext"`) still reads as drift — backlog.
-- CHANGELOG Known limitations; `docs/BACKLOG.md`.
