@@ -1,29 +1,32 @@
 # Checkpoint
 
-**Slice:** 0.25.0 release candidate — PR #44 (`fix/audit-bugs` → `develop`).
+**Slice:** 0.25.0 release — PR #45 (`develop` → `main`).
 
 ## Done
 
-- Three full audits plus a focused verification; every confirmed defect fixed
-  test-first and merged into `fix/audit-bugs`. CHANGELOG `[Unreleased]`, guides,
-  README, llms, both SKILL.md, both pattern-verifier copies and the site match
-  the code. Older defects for 0.25.1 are in `docs/BACKLOG.md`.
-- History rewritten (2026-10-12): every author, committer and tagger is
-  Jerry Thomas <me@jerrythomas.name>; branch and tag trees unchanged. Force-
-  pushed with leases: main (incl. the 10 unpulled v0.24.1 release commits,
-  rewritten), develop, fix/audit-bugs, 5 other branches, 84 tags. Backup:
+- PR #44 merged into `develop` (`6fccb0ff`). Release notes `99edd363`;
+  `make bump minor` → `6d7769d9`, annotated tag `v0.25.0`.
+- `release.yml` run 38253359492 green on the tagged tree (tests, clippy, fmt,
+  `cargo doc`, publish). `dbd-core` and `dbd-cli` 0.25.0 are on crates.io.
+- Shipped artifact verified: `cargo install dbd-cli --version 0.25.0 --locked`
+  refuses `-e staging`; `emit --dialect tsql` puts `CREATE SCHEMA` and
+  `CREATE VIEW` in `GO` batches of their own and keeps key names; MySQL gets
+  `LONGTEXT` and reports the `PRIMARY` rename.
+- History rewritten earlier (2026-10-12): every author, committer and tagger is
+  Jerry Thomas <me@jerrythomas.name>. Backup:
   `~/Developer/dbd-backup-2026-10-12-pre-author-rewrite.bundle`.
-- CI's `cargo doc` step failed on nine public docs linking private items;
-  fixed (`c04b60f3`); `cargo doc --workspace --no-deps --all-features`, fmt and
-  `cargo audit` clean locally.
 
 ## Next
 
-    gh pr checks 44 --watch    # CI green → human review → merge to develop
+    gh pr checks 45 --watch    # all green → merge #45 → main CI + Workers production build
 
-## Open (user)
+## Open
 
-- Review and merge PR #44; then main and the 0.25.0 release (approval needed).
+- Cloudflare "Workers Builds: dbd" failed on `6fccb0ff`, `99edd363` and
+  `6d7769d9`. `6fccb0ff`'s tree is identical to `c932b65d`, which built; a
+  clean local `CF_PAGES=1 bun run build` at `6fccb0ff` passes, as does CI's
+  site build. The cause is Cloudflare-side; its log is only in the dashboard
+  (build `df5a6e58-bfdc-4466-9c04-74580ef4437a`).
 
 ## Known limits
 
