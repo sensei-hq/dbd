@@ -9,6 +9,13 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.25.1] — 2026-10-12
+
+**Two fixes for refusals that left no way through.** `reconcile` failed on every
+run after the first in a project whose extensions live in their own schema,
+once a view read one of their columns; and a scoped `reset` refused any scope
+whose tables carry a policy or trigger calling one of its own functions.
+
 ### Fixed
 
 - **A type an extension installs outside the `search_path` is no longer
@@ -2420,7 +2427,8 @@ Two `dbd reconcile` non-convergence bugs ([#12]) and a security sweep.
 [#13]: https://github.com/sensei-hq/dbd/issues/13
 [#16]: https://github.com/sensei-hq/dbd/issues/16
 [#17]: https://github.com/sensei-hq/dbd/issues/17
-[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.25.0...main
+[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.25.1...main
+[0.25.1]: https://github.com/sensei-hq/dbd/releases/tag/v0.25.1
 [0.25.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.25.0
 [0.24.1]: https://github.com/sensei-hq/dbd/releases/tag/v0.24.1
 [0.24.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.24.0
