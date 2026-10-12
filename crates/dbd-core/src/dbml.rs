@@ -2079,6 +2079,85 @@ mod tests {
         assert_eq!(def.indexes[0].columns[0].name, "we\"ird", "{}", doc.content);
     }
 
+    /// Every name the writer puts in a document is in DBML's quoting, read
+    /// from the design's SQL. A column typed by `"mo""od"` — the enum's SQL
+    /// spelling — was written as that SQL, `"mo""od"` or `app."mo""od"`,
+    /// which @dbml/core refuses; a project name holding a quote ended its
+    /// string; and a table named `we.ird` was written as `ird`, the part
+    /// after its last dot.
+    #[test]
+    fn names_and_enum_types_are_written_in_dbml_quoting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/enum/app")).unwrap();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        std::fs::write(dir.join("design.yaml"), "project:\n  name: t\nschemas:\n  - app\n").unwrap();
+        std::fs::write(
+            dir.join("ddl/enum/app/mo\"od.ddl"),
+            "set search_path to app;\ncreate type \"mo\"\"od\" as enum ('calm');\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/app/we\"ird.ddl"),
+            "set search_path to app;\n\
+             create table if not exists \"we\"\"ird\" (\n  \
+               id int,\n  \
+               m \"mo\"\"od\",\n  \
+               n app.\"mo\"\"od\"[],\n  \
+               constraint \"we\"\"ird_pk\" primary key (id)\n\
+             );\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/app/we.ird.ddl"),
+            "set search_path to app;\ncreate table if not exists \"we.ird\" (id int primary key);\n",
+        )
+        .unwrap();
+        let design = crate::Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+        let doc = generate_dbml(&DbmlParams {
+            entities: design.entities(),
+            project_name: "it's \"q\"",
+            database_type: "PostgreSQL",
+            project_note: None,
+            include_schemas: vec![],
+            exclude_schemas: vec![],
+            include_tables: vec![],
+            exclude_tables: vec![],
+            groups: vec![],
+            auto_group_by_schema: false,
+        });
+        let dbml = &doc.content;
+        assert!(dbml.contains("Project \"it's \\\"q\\\"\""), "{dbml}");
+        assert!(dbml.contains("\"m\" \"app\".\"mo\\\"od\"\n"), "{dbml}");
+        assert!(dbml.contains("\"n\" \"app\".\"mo\\\"od\"[]\n"), "{dbml}");
+        assert!(dbml.contains("Table \"app\".\"we.ird\" {"), "{dbml}");
+
+        let parsed = crate::dbml_parse::parse_dbml(dbml).unwrap_or_else(|e| panic!("{e}\n{dbml}"));
+        let table = parsed
+            .iter()
+            .find(|e| e.name == "app.we\"ird")
+            .expect("table read back");
+        let td = table.table_def.as_ref().unwrap();
+        let types: Vec<(&str, &str)> = td
+            .columns
+            .iter()
+            .map(|c| (c.name.as_str(), c.data_type.as_str()))
+            .collect();
+        assert_eq!(
+            types,
+            [("id", "int"), ("m", "app.\"mo\"\"od\""), ("n", "app.\"mo\"\"od\"[]")],
+            "{dbml}"
+        );
+        assert!(
+            td.constraints.contains(&TableConstraint::PrimaryKey {
+                name: Some("we\"ird_pk".into()),
+                columns: vec!["id".into()],
+            }),
+            "{:?}\n{dbml}",
+            td.constraints
+        );
+    }
+
     /// A column comment keeps its line breaks. They were flattened to spaces
     /// before the note was escaped, so a markdown comment came back from
     /// `init --from-dbml` as one run-on line. DBML's `\n` escape keeps the note

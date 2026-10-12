@@ -2839,4 +2839,120 @@ mod tests {
             .collect();
         assert_eq!(columns, ["we\"ird", "back\\slash"]);
     }
+
+    /// A `"` inside a `'…'` setting is text, as a `'` inside a `"…"` one is.
+    /// The settings splitter kept one flag for both, so an odd number of `"`
+    /// in a single-quoted value ended its settings: the `pk` entry
+    /// `id [pk, name: 'we"ird_pk']` became an index on a column named
+    /// `id [pk, name: 'we"ird_pk']`, and the table lost its primary key.
+    #[test]
+    fn a_quote_inside_a_setting_string_is_text_not_a_delimiter() {
+        let dbml = "Enum app.mood {\n  happy [note: 'say \"hi']\n}\n\
+                    Table app.t [note: 'a \"table'] {\n  \
+                      id int [not null]\n  \
+                      label text [note: 'odd \" quote', default: 'x\"y']\n  \
+                      other text [note: \"it's\"]\n  \
+                      checks {\n    `label <> ''` [name: 'c\"k']\n  }\n  \
+                      indexes {\n    id [pk, name: 'we\"ird_pk']\n    label [name: 'l\"x']\n  }\n\
+                    }\n";
+        let entities = parse_dbml(dbml).unwrap();
+        let td = find_table(&entities, "app.t").table_def.as_ref().unwrap();
+        assert_eq!(
+            td.constraints,
+            vec![
+                TableConstraint::PrimaryKey {
+                    name: Some("we\"ird_pk".into()),
+                    columns: strings(&["id"]),
+                },
+                TableConstraint::Check {
+                    name: Some("c\"k".into()),
+                    expression: "label <> ''".into(),
+                },
+            ]
+        );
+        let indexes: Vec<(Option<&str>, Vec<&str>)> = td
+            .indexes
+            .iter()
+            .map(|ix| (ix.name.as_deref(), ix.columns.iter().map(|k| k.name.as_str()).collect()))
+            .collect();
+        assert_eq!(indexes, vec![(Some("l\"x"), vec!["label"])]);
+        assert_eq!(td.columns[1].comment.as_deref(), Some("odd \" quote"));
+        assert_eq!(td.columns[1].default_value.as_deref(), Some("'x\"y'"));
+        assert_eq!(td.columns[2].comment.as_deref(), Some("it's"));
+        assert_eq!(td.comments.table.as_deref(), Some("a \"table"));
+        let mood = find_enum(&entities, "app.mood");
+        assert_eq!(mood.enum_values[0].note.as_deref(), Some("say \"hi"));
+    }
+
+    /// A Ref endpoint, an index key and a Ref's name read their escapes as
+    /// a quoted name anywhere else does. The relationship operator was looked
+    /// for with every `"` toggling a quote, escaped or not, so
+    /// `"app"."c\"y"."w" > …` had no operator outside quotes and failed; an
+    /// index tuple with an escaped quote was refused as malformed.
+    #[test]
+    fn ref_endpoints_and_index_keys_read_escaped_quotes() {
+        let dbml = "Table \"app\".\"we\\\"ird\" {\n  \"id\" int [pk]\n  \"a,b\" int\n  \"c\\\"d\" int\n  \
+                      indexes {\n    (\"a,b\", \"c\\\"d\") [unique, name: 'u']\n  }\n}\n\
+                    Table \"app\".\"c\\\"y\" {\n  \"id\" int [pk]\n  \"w\" int\n  \"x,y\" int\n  \"z\\\"q\" int\n}\n\
+                    Ref \"f\\\"k\": \"app\".\"c\\\"y\".\"w\" > \"app\".\"we\\\"ird\".\"id\"\n\
+                    Ref: \"app\".\"c\\\"y\".(\"x,y\", \"z\\\"q\") > \"app\".\"we\\\"ird\".(\"a,b\", \"c\\\"d\")\n";
+        let entities = parse_dbml(dbml).unwrap_or_else(|e| panic!("{e}"));
+        let mut found = fks(&entities, "app.c\"y");
+        found.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            found,
+            vec![
+                (
+                    strings(&["w"]),
+                    "app.we\"ird".into(),
+                    strings(&["id"]),
+                    Some("f\"k".into()),
+                    None
+                ),
+                (
+                    strings(&["x,y", "z\"q"]),
+                    "app.we\"ird".into(),
+                    strings(&["a,b", "c\"d"]),
+                    None,
+                    None
+                ),
+            ]
+        );
+        let td = find_table(&entities, "app.we\"ird").table_def.as_ref().unwrap();
+        let keys: Vec<&str> = td.indexes[0].columns.iter().map(|k| k.name.as_str()).collect();
+        assert_eq!(keys, ["a,b", "c\"d"]);
+    }
+
+    /// A column typed by an enum the document declares is written in SQL,
+    /// whatever the enum's name holds. `"app"."mo\"od"` — DBML's spelling of
+    /// a schema-qualified enum, which @dbml/core reads as the enum `mo"od` in
+    /// `app` — came back as `app."mo\"od"`, which is not SQL, and the table
+    /// file `init --from-dbml` wrote did not parse.
+    #[test]
+    fn a_column_typed_by_a_declared_enum_is_written_in_sql() {
+        let dbml = "Enum \"app\".\"mo\\\"od\" {\n  calm\n}\nEnum \"Mood\" {\n  calm\n}\n\
+                    Table app.t {\n  \
+                      id int [pk]\n  \
+                      a \"app\".\"mo\\\"od\"\n  \
+                      b \"app\".\"mo\\\"od\"[]\n  \
+                      c \"Mood\"\n  \
+                      d \"timestamp with time zone\"\n  \
+                      e app.thing\n  \
+                      f \"app.\\\"my dom\\\"\"\n}\n";
+        let entities = parse_dbml(dbml).unwrap_or_else(|e| panic!("{e}"));
+        let td = find_table(&entities, "app.t").table_def.as_ref().unwrap();
+        let types: Vec<&str> = td.columns.iter().map(|c| c.data_type.as_str()).collect();
+        assert_eq!(
+            types,
+            [
+                "int",
+                "app.\"mo\"\"od\"",
+                "app.\"mo\"\"od\"[]",
+                "\"Mood\"",
+                "timestamp with time zone",
+                "app.thing",
+                "app.\"my dom\"",
+            ]
+        );
+    }
 }
