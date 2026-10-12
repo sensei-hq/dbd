@@ -1956,6 +1956,66 @@ async fn two_syncs_at_once_unschedule_a_gone_job_once() {
     assert_catalog(&*p, false, "SELECT 1 FROM cron.job", "a gone job left").await;
 }
 
+/// The syncs' lock only makes them take turns if the second one's read comes
+/// after the first one's commit — under a database's `REPEATABLE READ`
+/// default its snapshot predated the wait, it still saw the job the first had
+/// unscheduled, and it failed. A sync reads committed.
+#[tokio::test]
+async fn two_syncs_at_once_under_repeatable_read_unschedule_a_gone_job_once() {
+    let (_pg, url) = start_pg().await;
+    connect(&url, "setup")
+        .await
+        .unwrap()
+        .execute_script(&format!(
+            "{} \
+             CREATE OR REPLACE FUNCTION cron.unschedule(job_id bigint) RETURNS boolean LANGUAGE plpgsql AS $$ \
+               BEGIN PERFORM pg_sleep(0.01); DELETE FROM cron.job WHERE jobid = job_id; \
+                 IF NOT FOUND THEN RAISE EXCEPTION 'could not find valid entry for job %', job_id; END IF; \
+                 RETURN true; END $$; \
+             SELECT cron.schedule('dbd:refresh:app.gone' || i, '0 1 * * *', \
+               'REFRESH MATERIALIZED VIEW \"app\".\"gone' || i || '\"') FROM generate_series(1, 40) AS i; \
+             ALTER DATABASE testdb SET default_transaction_isolation = 'repeatable read';",
+            PG_CRON_STAND_IN
+        ))
+        .await
+        .unwrap();
+    let p = connect(&url, "p").await.unwrap();
+    let q = connect(&url, "q").await.unwrap();
+
+    let (rp, rq) = tokio::join!(p.sync_refresh_jobs(&[]), q.sync_refresh_jobs(&[]));
+    rp.expect("p's sync");
+    rq.expect("q's sync");
+    assert_catalog(&*p, false, "SELECT 1 FROM cron.job", "a gone job left").await;
+}
+
+/// Postgres cuts a name past 63 bytes — the view, and the job's own `REFRESH`,
+/// both reach the cut name — so a legacy job's command can name a view by more
+/// than the catalog keeps. Compared byte for byte the view read as gone, and a
+/// working job was unscheduled. Names are compared as Postgres reads them.
+#[tokio::test]
+async fn a_legacy_job_for_a_view_named_past_63_bytes_is_kept() {
+    let (_pg, url) = start_pg().await;
+    let p = connect(&url, "p").await.unwrap();
+    p.execute_script(&format!(
+        "{PG_CRON_STAND_IN} \
+         CREATE SCHEMA app; \
+         CREATE MATERIALIZED VIEW app.\"日次売上集計マテリアライズドビュー顧客別地域別\" AS SELECT 1 AS x; \
+         SELECT cron.schedule('dbd:refresh:app.long', '0 1 * * *', \
+           'REFRESH MATERIALIZED VIEW \"app\".\"日次売上集計マテリアライズドビュー顧客別地域別\"');"
+    ))
+    .await
+    .unwrap();
+
+    p.sync_refresh_jobs(&[]).await.unwrap();
+    assert_catalog(
+        &*p,
+        true,
+        &cron_job_predicate("dbd:refresh:app.long"),
+        "the job of the long view",
+    )
+    .await;
+}
+
 // ── Test 7: Emitted index DDL applies to a real Postgres ──────────────────────
 
 /// Close the emit→apply loop: build a minimal `Entity` with a `text[]` column, a
@@ -4713,6 +4773,53 @@ async fn two_first_heals_at_once_both_succeed() {
     let (ra, rb) = tokio::join!(a.heal_bookkeeping(), b.heal_bookkeeping());
     ra.expect("a's heal");
     rb.expect("b's heal");
+}
+
+/// Another project's role owns a stray schema this project's role cannot use
+/// — not even to look a table up by name, which Postgres refuses outright. Its
+/// legacy tables are another project's: the heal passes over them, and so do
+/// the reads, rather than failing every run on them.
+#[tokio::test]
+async fn a_heal_beside_a_schema_the_role_cannot_use_succeeds() {
+    let (pg, url) = start_pg().await;
+    let admin = connect(&url, "admin").await.unwrap();
+    admin
+        .execute_script(
+            "CREATE ROLE role_a LOGIN PASSWORD 'secret'; CREATE ROLE role_b; \
+             GRANT CREATE ON DATABASE testdb TO role_a; GRANT USAGE, CREATE ON SCHEMA public TO role_a; \
+             CREATE SCHEMA b_stray AUTHORIZATION role_b; \
+             CREATE TABLE b_stray._dbd_meta ( \
+               project varchar NOT NULL PRIMARY KEY, env varchar NOT NULL DEFAULT 'dev', \
+               version integer NOT NULL DEFAULT 0, \
+               created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now() ); \
+             CREATE TABLE b_stray._dbd_migrations ( \
+               project varchar NOT NULL, version integer NOT NULL, applied_at timestamptz NOT NULL DEFAULT now(), \
+               description text, checksum text, PRIMARY KEY (project, version) ); \
+             INSERT INTO b_stray._dbd_meta (project, env, version) VALUES ('b', 'prod', 2); \
+             INSERT INTO b_stray._dbd_migrations (project, version) VALUES ('b', 1); \
+             ALTER TABLE b_stray._dbd_meta OWNER TO role_b; ALTER TABLE b_stray._dbd_migrations OWNER TO role_b; \
+             GRANT SELECT ON b_stray._dbd_meta TO role_a;",
+        )
+        .await
+        .unwrap();
+    let settings = pg.settings();
+    let a = connect(
+        &format!("postgresql://role_a:secret@{}:{}/testdb", settings.host, settings.port),
+        "a",
+    )
+    .await
+    .unwrap();
+
+    a.heal_bookkeeping().await.expect("a's heal");
+    a.set_project_meta("dev", 3, None).await.unwrap();
+    assert_eq!(a.get_project_meta().await.unwrap().expect("a's record").version, 3);
+    a.other_projects_meta().await.expect("other projects");
+    for check in [
+        "SELECT 1 FROM b_stray._dbd_meta WHERE project = 'b'",
+        "SELECT 1 FROM b_stray._dbd_migrations WHERE project = 'b'",
+    ] {
+        assert_catalog(&*admin, true, check, "b's row").await;
+    }
 }
 
 // ── heal_bookkeeping: move to `dbd` schema + fold legacy `public._dbd_*` ───────
