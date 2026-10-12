@@ -119,12 +119,13 @@ in `public` while `diff` wanted to create it in `app`, and reconcile never
 converged.
 
 Scripts follow the same rule. A migration file that states no path runs on the
-path its table's DDL file runs on — the one that file states, else this list —
-so a `data.sql` can name its table bare, as the DDL does. A hook script runs on
-this list, and its bare table names are read on it when a scope decides whether
-to skip the hook. With no list, both run on the session default (`RESET
-search_path`); before 0.25 they ran on whatever path the last DDL file had left
-on the connection.
+path its table's CREATE runs on — the last `SET search_path` the DDL file states
+before the CREATE, else this list — so a `data.sql` can name its table bare, as
+the DDL does; the table's references are read on that path too. A hook script
+runs on this list, and its bare table names are read along it when a scope
+decides whether to skip the hook. With no list, both run on the session default
+(`RESET search_path`); before 0.25 they ran on whatever path the last DDL file
+had left on the connection.
 
 Omit the key and the file runs as written, on PostgreSQL's own default
 (`"$user", public`), which depends on the connecting role and can be moved by
@@ -413,7 +414,7 @@ guide is [import and export](10-data.md).
 
 | Field     | Type   | Description |
 |-----------|--------|-------------|
-| `options` | object | `truncate` (default `true`: empty the tables before any is loaded — on PostgreSQL in one `TRUNCATE`, so tables linked by a foreign key empty together; on SQLite with `DELETE FROM`, a referencing table first; a Convex import always replaces) and `null_value` (default `''`) |
+| `options` | object | `truncate` (default `true`: empty the tables before any is loaded — on PostgreSQL in one `TRUNCATE`, so tables linked by a foreign key empty together; on SQLite with `DELETE FROM` one table at a time, a referencing table first, in the order of the foreign keys the database reports; a Convex import always replaces) and `null_value` (default `''`) |
 | `tables`  | list   | Per-table overrides of `truncate`, `format` and `null_value` (`{name: options}`). Not a list of what to load — it does not filter which files load |
 | `after`   | list   | SQL scripts run after the data is loaded and the import procedures have run — on `dbd import` and `dbd deploy`. See [Hook scripts](#hook-scripts) |
 | `staging` | list   | The schemas an import may load into. Empty or absent: no restriction |
@@ -473,7 +474,7 @@ Scripts run in the order written. A path dbd cannot find is an error, not a skip
 
 An `apply.before` or `apply.after` skip is named before `apply`, `deploy` or `reconcile` starts — so a run that then fails because of it still says so — and in their dry runs, which make the same decision without running anything (`Design::hook_skips` for an embedder). An `import.after` skip is named in `import --dry-run` and `deploy --dry-run`, as the real run names it; before 0.25 `import --dry-run` had the rule backwards. A hook file that is missing is an error in the preview as in the run. The run continues past a skip; a scoped run is a normal workflow, not an error. This exists so a loader doing `INSERT INTO target SELECT … FROM staging_a JOIN staging_b` does not run against half-loaded data when `staging_b` was scoped out. (Before 0.25 a hook ran only when every table it named was in the working set, so a hook touching an `external:` table was skipped under every named scope, and the skip was said only in the summary of a run that succeeded.)
 
-**Where a hook's bare names resolve.** A hook runs on `source.search_path` (else the session default, `RESET search_path`) unless it states its own `SET search_path`, and its unqualified table names are judged on that same path — so `update notes …` in a project whose path is `[app]` depends on `app.notes`. Before 0.25 the analysis assumed `public` while the hook ran on whatever path the last DDL file left, so under a narrow scope a hook was judged on one table and run against another.
+**Where a hook's bare names resolve.** A hook runs on `source.search_path` (else the session default, `RESET search_path`) unless it states its own `SET search_path`, and its unqualified table names are judged as Postgres resolves them: statement by statement, along the path in effect there (the last `SET search_path` before it, else `source.search_path`, else the session default, with `public` after it), to the first schema on it where the design has a table or view of that name — the path's first schema when none does. So `update notes …` in a project whose path is `[app, core]` depends on `app.notes`, or on `core.notes` when only `core` has one. Before 0.25 the analysis assumed `public` while the hook ran on whatever path the last DDL file left, so under a narrow scope a hook was judged on one table and run against another.
 
 **Where `writes:` is needed.** dbd derives a script's tables by parsing it, which works when they appear as SQL identifiers. It cannot work when they are *data* — inside a `format()` string or an `array[…]` literal, as a realtime-publication hook typically is. No parser can recover those, so declare them with `writes:`.
 

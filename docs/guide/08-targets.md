@@ -192,7 +192,10 @@ target:
   quotes, nothing trimmed, a quoted field never NULL — so a file PostgreSQL
   exported imports unchanged. SQLite has no `TRUNCATE`, so the default truncate
   runs `DELETE FROM` instead, one table at a time, a table that references
-  another emptied first; with `truncate: false`, rows are appended.
+  another emptied first; with `truncate: false`, rows are appended. The verbatim
+  DDL gives dbd no references, so the import takes its order — a referenced
+  table loaded first, emptied last — from the foreign keys the database reports;
+  `import --dry-run` lists that order when the database exists.
 - **Data folders.** With no schemas, the shared data files sit directly in
   `import/` and the environment-only ones directly in `import/dev/` or
   `import/prod/`, which load only under that `-e` (before 0.25 a file directly
