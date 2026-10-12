@@ -53,8 +53,10 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   succeeds; a run that fails keeps the uses it had. A call is a use of a routine, anything else of a relation.
   A column of another project's enum, or a default drawing on its sequence, is
   a use without being declared `external`, however `nextval`'s string spells
-  it. A name written bare is the first object on the search path that exists,
-  as Postgres finds it.
+  it. A name written bare is looked up as Postgres looks it up: a read is of
+  the first relation on the search path that exists; a call, which Postgres
+  also resolves by its arguments, is a use of every routine on the path it
+  could reach.
 
 ### Library API
 
@@ -67,7 +69,9 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   resolves to nothing — another project's, an extension's — marked
   `unresolved` and unwarned, where it was dropped. A bare one is still dropped
   as a built-in. A sequence a `nextval` default names is read as Postgres
-  reads the string: `nextval('App.Seq')` refers to `app.seq`.
+  reads the string — `nextval('App.Seq')` refers to `app.seq` — and a type or
+  sequence reference reaches the entity whose path names it, folded
+  (`Order_No.ddl`).
 
 ### Fixed
 

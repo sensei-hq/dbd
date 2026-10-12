@@ -181,8 +181,10 @@ depends on it, dbd refuses:
 
 A call is a use of a routine; anything else — a read, a write, a column's type,
 a default's sequence — is a use of a relation. A name written bare is looked
-up along the referring entity's search path, as Postgres looks it up: the first
-schema holding it is the one used.
+up along the referring entity's search path, as Postgres looks it up: a read
+is of the first relation on the path that exists, owned or not. A call is
+resolved by its arguments as well, which dbd does not weigh, so it is a use of
+every routine on the path it could reach.
 
 This is the contract between owners. It plays the role an API plays between
 services.
