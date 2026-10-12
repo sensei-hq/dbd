@@ -482,6 +482,46 @@ mod tests {
         }
     }
 
+    /// Every word libpg_query's grammar reads as a keyword is recased, not
+    /// just those on a hand-written list: `ATOMIC`, `COLLATE`, `BIT`,
+    /// `PARTITION BY RANGE` kept whatever case the file had. And a word the
+    /// grammar reads as a name keeps its case though it is a keyword
+    /// elsewhere — the columns `name`, `value` and `level`.
+    #[test]
+    fn every_keyword_the_grammar_reads_is_recased_and_no_name_is() {
+        let sql = "CREATE TABLE t (name text COLLATE \"C\", value BIT(3), level int) PARTITION BY RANGE (level);\n\
+                   CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT 1; END;\n\
+                   CREATE TABLE u (id int GENERATED ALWAYS AS IDENTITY, v text) WITH (fillfactor = 70);\n\
+                   COMMENT ON COLUMN t.name IS 'x';\n";
+        let lower = format_ddl(sql, &in_case(KeywordCase::Lower));
+        for spelled in ["collate \"C\"", "bit(3)", "partition by range", "begin atomic", "end;"] {
+            assert!(lower.contains(spelled), "lower writes {spelled}:\n{lower}");
+        }
+        for unspelled in ["COLLATE", "BIT", "PARTITION", "ATOMIC", "END"] {
+            assert!(!lower.contains(unspelled), "lower leaves no {unspelled}:\n{lower}");
+        }
+        let upper = format_ddl(
+            &sql.to_lowercase().replace("\"c\"", "\"C\""),
+            &in_case(KeywordCase::Upper),
+        );
+        for spelled in [
+            "COLLATE \"C\"",
+            "BIT(3)",
+            "PARTITION BY RANGE",
+            "BEGIN ATOMIC",
+            "END;",
+            "WITH (fillfactor",
+        ] {
+            assert!(upper.contains(spelled), "upper writes {spelled}:\n{upper}");
+        }
+        for name in ["NAME", "VALUE", "LEVEL", "FILLFACTOR"] {
+            assert!(
+                !upper.contains(name),
+                "upper leaves the name {name} as written:\n{upper}"
+            );
+        }
+    }
+
     /// `preserve` uppercased a lowercase file: the layout writes its keywords
     /// itself (`CREATE TABLE`, `PRIMARY KEY`, sqlparser's `VARCHAR`), and wrote
     /// them uppercase whatever the file said. Each keyword now keeps the
