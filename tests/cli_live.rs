@@ -2165,7 +2165,7 @@ async fn awkward_names_survive_dbml_init_from_dbml_and_a_real_apply() {
 /// owner, before either touches the database (#7).
 #[tokio::test]
 async fn refresh_and_policies_refuse_a_design_declaring_another_owners_entity() {
-    let (_pg, url) = start_pg().await;
+    let (pg, url) = start_pg().await;
     let owner = tempfile::tempdir().unwrap();
     project(owner.path());
     let applied = dbd(owner.path(), &url, &["apply"]);
@@ -2206,6 +2206,22 @@ async fn refresh_and_policies_refuse_a_design_declaring_another_owners_entity() 
             combined(&out)
         );
     }
+    // Refused before it touched anything: the owner's table is as it was.
+    let rls = psql(
+        &pg,
+        &url,
+        &[
+            "-tA",
+            "-c",
+            "select relrowsecurity from pg_class where oid = 'app.widgets'::regclass",
+        ],
+    );
+    assert!(rls.status.success(), "{}", combined(&rls));
+    assert_eq!(
+        stdout(&rls).trim(),
+        "f",
+        "row level security on the owner's app.widgets"
+    );
 }
 
 /// The CLI's previews — `apply`, `deploy`, `reset`, `import` and `policies`
@@ -2285,22 +2301,77 @@ async fn an_interrupted_apply_holds_no_claims() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("spawn dbd");
-    std::thread::sleep(std::time::Duration::from_secs(4));
+    // Killed inside its hook — past the check, before any work — not after a
+    // guess at how long getting there takes.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let in_hook = psql(
+            &pg,
+            &url,
+            &[
+                "-tA",
+                "-c",
+                "select count(*) from pg_stat_activity \
+                 where state = 'active' and query like '%pg_sleep(20)%' and pid <> pg_backend_pid()",
+            ],
+        );
+        assert!(in_hook.status.success(), "{}", combined(&in_hook));
+        if stdout(&in_hook).trim() != "0" {
+            break;
+        }
+        assert!(
+            child.try_wait().expect("poll dbd").is_none(),
+            "dbd exited before its hook"
+        );
+        assert!(std::time::Instant::now() < deadline, "dbd never reached its hook");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert!(
+        child.try_wait().expect("poll dbd").is_none(),
+        "dbd finished before the kill"
+    );
     child.kill().expect("kill dbd");
     let _ = child.wait();
 
-    let registry = psql(
+    // The registry exists — the run healed before its hook — and holds nothing.
+    let held = psql(&pg, &url, &["-tA", "-c", "select count(*) from dbd.objects"]);
+    assert!(held.status.success(), "{}", combined(&held));
+    assert_eq!(stdout(&held).trim(), "0", "the killed run's claims");
+}
+
+/// `DBD_NO_TX` runs each statement on its own — what `CREATE INDEX
+/// CONCURRENTLY` needs — so nothing it builds rolls back: it claims before it
+/// builds, and a run that fails part-way keeps its claims (#7).
+#[tokio::test]
+async fn an_apply_outside_a_transaction_claims_before_it_builds() {
+    let (pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir);
+    std::fs::write(
+        dir.join("ddl/view/app/broken.ddl"),
+        "create or replace view app.broken as select * from app.nowhere;\n",
+    )
+    .unwrap();
+
+    let out = std::process::Command::new(assert_cmd::cargo::cargo_bin("dbd"))
+        .args(["apply", "-c", dir.join("design.yaml").to_str().unwrap(), "-d", &url])
+        .env("DBD_NO_TX", "1")
+        .current_dir(dir)
+        .output()
+        .expect("run dbd");
+    assert!(!out.status.success(), "app.nowhere does not exist: {}", combined(&out));
+    assert!(combined(&out).contains("nowhere"), "{}", combined(&out));
+
+    let held = psql(
         &pg,
         &url,
-        &["-tA", "-c", "select to_regclass('dbd.objects') is not null"],
+        &[
+            "-tA",
+            "-c",
+            "select string_agg(name, ',' order by name) from dbd.objects where owner = 'clilive'",
+        ],
     );
-    if stdout(&registry).trim() == "t" {
-        let held = psql(&pg, &url, &["-tA", "-c", "select count(*) from dbd.objects"]);
-        assert_eq!(
-            stdout(&held).trim(),
-            "0",
-            "the killed run's claims: {}",
-            combined(&held)
-        );
-    }
+    assert!(held.status.success(), "{}", combined(&held));
+    assert_eq!(stdout(&held).trim(), "broken,named,widgets", "clilive's claims");
 }
