@@ -291,7 +291,9 @@ impl Design {
         }
         // The last gate, before the first hook: refuse a design declaring an
         // entity another owner holds (#7). A real run heals the bookkeeping
-        // first; it claims below — with its work, or before it.
+        // first. In one transaction it claims with its work, below; outside
+        // one nothing it writes rolls back — its hooks included — so it claims
+        // now, before the first of them: see `Design::claim_first`.
         self.preflight(
             adapter,
             if dry_run {
@@ -301,6 +303,10 @@ impl Design {
             },
         )
         .await?;
+        let outside_txn = !adapter.supports_transactional_apply() || std::env::var_os("DBD_NO_TX").is_some();
+        if !dry_run && outside_txn {
+            self.claim(adapter).await?;
+        }
 
         // A hook is filtered against the same working set the entities were.
         // `None` — unscoped or the all-scope — runs every hook, and skips the
@@ -440,9 +446,8 @@ impl Design {
 
         if use_txn {
             adapter.begin_batch().await?;
-        } else {
-            // Outside one transaction nothing this run builds rolls back, so it
-            // claims before it builds — see `Design::claim_first` (#7).
+        } else if !outside_txn {
+            // A plan with nothing to build opens no transaction: claim here.
             self.claim(adapter).await?;
         }
 
