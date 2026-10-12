@@ -42,14 +42,37 @@ fn pg_conf_action(code: &str) -> Option<crate::entity::FkAction> {
 /// `dbd` is excluded from introspection, so the machinery stays out of both.
 const JSONB_IMPORT_SCHEMA: &str = "dbd";
 
-/// Fully-qualified, dbd-owned staging table that jsonl rows are loaded into
-/// before `import_jsonb_to_table` moves them to the target. Schema-qualified so
-/// it resolves regardless of the session `search_path`, and in dbd's own schema
-/// so it never collides with a user table. Pooled connections don't share
-/// `search_path`, so an unqualified `_temp` resolves nondeterministically — the
-/// same failure mode fixed for `_dbd_meta` (see [`bookkeeping::Bookkeeping`]).
-/// See sensei-hq/dbd#6.
-const JSONB_IMPORT_TMP: &str = "dbd.import_tmp";
+/// Fully-qualified, dbd-owned staging table that `project`'s jsonl rows are
+/// loaded into before `import_jsonb_to_table` moves them to the target:
+/// `dbd."import_tmp:<project>"`. Schema-qualified so it resolves regardless of
+/// the session `search_path`, and in dbd's own schema so it never collides with
+/// a user table. Pooled connections don't share `search_path`, so an
+/// unqualified `_temp` resolves nondeterministically — the same failure mode
+/// fixed for `_dbd_meta` (see [`bookkeeping::Bookkeeping`]). See sensei-hq/dbd#6.
+///
+/// One per project: each load drops and recreates its table, and a single
+/// shared one let two projects importing at once empty each other's (#7, H7).
+/// A name past Postgres's 63-byte limit, which Postgres would cut short —
+/// merging two long names that share a start — keeps what fits of the
+/// project's name and ends in a hash of all of it. Imports run through the
+/// pool, so a `TEMP` table, which lives on one connection, cannot serve.
+fn jsonb_import_tmp(project: &str) -> String {
+    use sha2::{Digest, Sha256};
+    const MAX_IDENTIFIER: usize = 63;
+    const HASH_HEX: usize = 16;
+    let full = format!("import_tmp:{project}");
+    let name = if full.len() <= MAX_IDENTIFIER {
+        full
+    } else {
+        let hash = format!("{:x}", Sha256::digest(project.as_bytes()));
+        let mut cut = MAX_IDENTIFIER - "import_tmp:".len() - 1 - HASH_HEX;
+        while !project.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("import_tmp:{}:{}", &project[..cut], &hash[..HASH_HEX])
+    };
+    format!("{JSONB_IMPORT_SCHEMA}.\"{}\"", name.replace('"', "\"\""))
+}
 
 /// One column of a table or view, as [`PostgresAdapter::column_kinds`] reads it.
 struct ColumnKind {
@@ -60,13 +83,15 @@ struct ColumnKind {
     generated: bool,
 }
 
-/// `CALL` that moves staged rows into `target` via the internal import
-/// procedure. Both the procedure schema and the source table are pinned and
-/// fully-qualified so resolution never depends on the session `search_path`.
-/// `target` must be the schema-qualified destination table.
-fn jsonb_import_call_sql(target: &str) -> String {
+/// `CALL` that moves the rows staged in `source` ([`jsonb_import_tmp`]) into
+/// `target` via the internal import procedure. Both the procedure schema and
+/// the source table are pinned and fully-qualified so resolution never depends
+/// on the session `search_path`. `target` must be the schema-qualified
+/// destination table.
+fn jsonb_import_call_sql(source: &str, target: &str) -> String {
     format!(
-        "CALL {JSONB_IMPORT_SCHEMA}.import_jsonb_to_table('{JSONB_IMPORT_TMP}', '{}')",
+        "CALL {JSONB_IMPORT_SCHEMA}.import_jsonb_to_table('{}', '{}')",
+        source.replace('\'', "''"),
         target.replace('\'', "''")
     )
 }
@@ -1845,8 +1870,9 @@ impl DatabaseAdapter for PostgresAdapter {
                 // value — its spacing and key order — on the way through. Dropped
                 // and created rather than reused, so a `jsonb` table an earlier
                 // dbd left behind after a failed import is not read as this one.
+                let staging = jsonb_import_tmp(self.bookkeeping.project());
                 self.execute_script(&format!(
-                    "DROP TABLE IF EXISTS {JSONB_IMPORT_TMP}; CREATE TABLE {JSONB_IMPORT_TMP} (data json)"
+                    "DROP TABLE IF EXISTS {staging}; CREATE TABLE {staging} (data json)"
                 ))
                 .await?;
 
@@ -1855,7 +1881,7 @@ impl DatabaseAdapter for PostgresAdapter {
                 // was read as SQL (a value quoting `set search_path to …;` was
                 // once rewritten on the way in). On the pool, as the CSV `COPY`
                 // is: an import never runs inside an apply batch.
-                let insert = format!("INSERT INTO {JSONB_IMPORT_TMP} (data) VALUES ($1::json)");
+                let insert = format!("INSERT INTO {staging} (data) VALUES ($1::json)");
                 for record in records {
                     sqlx::query(&insert)
                         .bind(record)
@@ -1866,9 +1892,9 @@ impl DatabaseAdapter for PostgresAdapter {
 
                 // Move data from the temp table to the target. `entity.name` is the
                 // schema-qualified destination; the procedure always lives in `staging`.
-                self.execute_script(&jsonb_import_call_sql(&entity.name)).await?;
-                self.execute_script(&format!("DROP TABLE IF EXISTS {JSONB_IMPORT_TMP}"))
+                self.execute_script(&jsonb_import_call_sql(&staging, &entity.name))
                     .await?;
+                self.execute_script(&format!("DROP TABLE IF EXISTS {staging}")).await?;
                 self.advance_sequences(&entity.name, &loaded).await?;
             }
             _ => {
@@ -2747,7 +2773,7 @@ mod tests {
         // Targeted imports resolve the target to its own schema (e.g. `activity`).
         // The procedure only ever exists in `staging`, so the CALL must be pinned
         // there — not to `activity`, which has no such procedure (Defect A).
-        let sql = jsonb_import_call_sql("activity.assistant_events");
+        let sql = jsonb_import_call_sql(&jsonb_import_tmp("p"), "activity.assistant_events");
         assert!(
             sql.contains("CALL dbd.import_jsonb_to_table("),
             "CALL must target the staging procedure, got: {sql}"
@@ -2762,9 +2788,10 @@ mod tests {
     fn jsonb_call_passes_schema_qualified_source_table() {
         // The source (staging temp) table must be fully-qualified so the
         // procedure's `from <source>` resolves regardless of search_path (Defect B).
-        let sql = jsonb_import_call_sql("staging.assistant_events");
+        let staging = jsonb_import_tmp("p");
+        let sql = jsonb_import_call_sql(&staging, "staging.assistant_events");
         assert!(
-            sql.contains(&format!("'{JSONB_IMPORT_TMP}'")),
+            sql.contains(&format!("'{staging}'")),
             "source must be the qualified temp table, got: {sql}"
         );
         assert!(
@@ -2775,21 +2802,23 @@ mod tests {
 
     #[test]
     fn jsonb_temp_table_is_schema_qualified_and_dbd_namespaced() {
+        let staging = jsonb_import_tmp("p");
         assert!(
-            JSONB_IMPORT_TMP.starts_with(&format!("{JSONB_IMPORT_SCHEMA}.")),
-            "temp table must be qualified with the import schema: {JSONB_IMPORT_TMP}"
+            staging.starts_with(&format!("{JSONB_IMPORT_SCHEMA}.")),
+            "temp table must be qualified with the import schema: {staging}"
         );
         // dbd's own schema holds no user table, so nothing can be clobbered.
         assert_eq!(
             JSONB_IMPORT_SCHEMA, "dbd",
-            "temp table must be dbd-namespaced to avoid clobbering user tables: {JSONB_IMPORT_TMP}"
+            "temp table must be dbd-namespaced to avoid clobbering user tables: {staging}"
         );
     }
 
     #[test]
     fn jsonb_call_escapes_single_quotes_in_target() {
-        let sql = jsonb_import_call_sql("weird.o'brien");
+        let sql = jsonb_import_call_sql(&jsonb_import_tmp("o'proj"), "weird.o'brien");
         assert!(sql.contains("weird.o''brien"), "single quotes must be escaped: {sql}");
+        assert!(sql.contains("import_tmp:o''proj"), "and in the source: {sql}");
     }
 
     // ── pg_cron refresh-job planning ──────────────────────────────────────────
