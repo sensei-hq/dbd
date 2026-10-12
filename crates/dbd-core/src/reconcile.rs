@@ -159,6 +159,16 @@ pub fn snapshot_from_entities(entities: &[Entity]) -> Snapshot {
     snap
 }
 
+/// [`snapshot_from_entities`] for a comparison with a live database whose
+/// extensions own `extension_types`, spelled as [`qualify_extension_types`]
+/// spells them.
+pub(crate) fn compared_snapshot(entities: &[Entity], extension_types: &[(String, String)]) -> Snapshot {
+    let mut snap = raw_snapshot_from_entities(entities);
+    qualify_extension_types(&mut snap, extension_types);
+    canonicalize(&mut snap);
+    snap
+}
+
 /// Representation normalization shared by reconcile's `canonicalize` and (in a
 /// future task) the read-only `dbd diff`'s `schema_diff::normalize_for_diff`.
 /// Makes a **parsed** (desired) and an **introspected** (live) form of the
@@ -194,6 +204,66 @@ pub(crate) fn normalize_common(snap: &mut Snapshot) {
     for t in &mut snap.tables {
         lift_pk_unique_keep_others(t);
         normalize_column_types(t, &enum_types);
+    }
+}
+
+/// Spell each column type an extension owns as `format_type` does — bare in
+/// `public`, `schema.name` elsewhere — on a snapshot compared with the live
+/// database whose extensions own `extension_types` (#41).
+///
+/// `format_type` qualifies a type wherever the session `search_path` does not
+/// reach its schema, so introspection reads `extensions.citext`; DDL reaches it
+/// through its own `set search_path` and writes `citext`. They are one type,
+/// and compared as text they read as a change on every run. Given the same
+/// spelling on both sides they match, and the `ALTER … TYPE` a real change
+/// emits names the type wherever the session path points.
+///
+/// A bare name is left as written where the snapshot cannot say which type it
+/// is: one the snapshot's own enums declare, which the file's path reaches
+/// first, or one two extensions own in different schemas.
+///
+/// Runs on a raw snapshot, before [`canonicalize`] or
+/// [`crate::schema_diff::normalize_for_diff`]: both leave a qualified name as
+/// it is.
+pub(crate) fn qualify_extension_types(snap: &mut Snapshot, extension_types: &[(String, String)]) {
+    let enums: HashSet<String> = snap.enums.iter().map(|e| e.name.to_lowercase()).collect();
+    // `None` for a name two extensions own: ambiguous without the file's path.
+    let mut spelled: HashMap<String, Option<String>> = HashMap::new();
+    for (schema, name) in extension_types {
+        let short = name.to_lowercase();
+        if enums.contains(&short) {
+            continue;
+        }
+        let canonical = if schema.eq_ignore_ascii_case(DEFAULT_SCHEMA) {
+            short.clone()
+        } else {
+            format!("{}.{short}", schema.to_lowercase())
+        };
+        spelled
+            .entry(short)
+            .and_modify(|seen| {
+                if seen.as_ref() != Some(&canonical) {
+                    *seen = None;
+                }
+            })
+            .or_insert(Some(canonical));
+    }
+    if spelled.is_empty() {
+        return;
+    }
+    for t in &mut snap.tables {
+        for c in &mut t.columns {
+            let lowered = c.data_type.trim().to_lowercase();
+            let (element, array_suffix) = split_array_suffix(&lowered);
+            // A modifier follows the name: `vector(384)`.
+            let (base, modifier) = match element.split_once('(') {
+                Some((base, rest)) => (base.trim(), format!("({rest}")),
+                None => (element, String::new()),
+            };
+            if let Some(Some(canonical)) = spelled.get(base) {
+                c.data_type = format!("{canonical}{modifier}{array_suffix}");
+            }
+        }
     }
 }
 
@@ -4594,5 +4664,141 @@ mod enum_recreation_tests {
             stmt.sql
         );
         assert!(stmt.sql.contains("CREATE TYPE app.colour AS ENUM ('red', 'green')"));
+    }
+}
+
+#[cfg(test)]
+mod extension_type_tests {
+    use super::*;
+    use crate::entity::ColumnDef;
+    use crate::snapshot::EnumSnapshot;
+
+    fn col(name: &str, data_type: &str) -> ColumnDef {
+        ColumnDef {
+            name: name.to_string(),
+            data_type: data_type.to_string(),
+            nullable: true,
+            default_value: None,
+            is_pk: false,
+            is_unique: false,
+            identity: None,
+            generated: None,
+            comment: None,
+            inline_fk: None,
+            collation: None,
+        }
+    }
+
+    fn snap(columns: Vec<ColumnDef>, enums: Vec<EnumSnapshot>) -> Snapshot {
+        Snapshot {
+            version: 0,
+            description: String::new(),
+            timestamp: String::new(),
+            tables: vec![TableSnapshot {
+                name: "docs".to_string(),
+                schema: "app".to_string(),
+                columns,
+                indexes: vec![],
+                table_constraints: vec![],
+            }],
+            enums,
+        }
+    }
+
+    fn owned(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(s, n)| (s.to_string(), n.to_string())).collect()
+    }
+
+    fn types_of(snap: &Snapshot) -> Vec<&str> {
+        snap.tables[0].columns.iter().map(|c| c.data_type.as_str()).collect()
+    }
+
+    /// pgvector's type carries a modifier: `format_type` reads
+    /// `extensions.vector(384)` where DDL wrote `vector(384)` — #41's own
+    /// column. The bare spelling gets the schema and keeps the modifier, in an
+    /// array too, and the two sides plan nothing.
+    #[test]
+    fn an_extension_type_keeps_its_modifier() {
+        let types = owned(&[("extensions", "vector")]);
+        let mut desired = snap(
+            vec![col("embedding", "vector(384)"), col("history", "vector(3)[]")],
+            vec![],
+        );
+        let mut live = snap(
+            vec![
+                col("embedding", "extensions.vector(384)"),
+                col("history", "extensions.vector(3)[]"),
+            ],
+            vec![],
+        );
+        qualify_extension_types(&mut desired, &types);
+        qualify_extension_types(&mut live, &types);
+        assert_eq!(types_of(&desired), ["extensions.vector(384)", "extensions.vector(3)[]"]);
+
+        canonicalize(&mut desired);
+        canonicalize(&mut live);
+        let plan = plan_reconcile(&live, &desired);
+        assert!(plan.altered.is_empty(), "{:?}", plan.altered);
+    }
+
+    /// A database whose own path reaches the schema — Supabase's does — reads
+    /// the type bare, and so does a pooled connection that ran a file's `set
+    /// search_path`. The live side is qualified the same way as the design's.
+    #[test]
+    fn a_live_type_read_bare_is_qualified_too() {
+        let types = owned(&[("extensions", "vector"), ("extensions", "citext")]);
+        let mut live = snap(vec![col("embedding", "vector(384)"), col("tags", "citext[]")], vec![]);
+        qualify_extension_types(&mut live, &types);
+        assert_eq!(types_of(&live), ["extensions.vector(384)", "extensions.citext[]"]);
+    }
+
+    /// A real change to an extension type names it qualified, so the ALTER
+    /// resolves under a path that does not reach the extension's schema.
+    #[test]
+    fn a_real_change_to_an_extension_type_alters_to_the_qualified_type() {
+        let types = owned(&[("extensions", "citext")]);
+        let mut desired = snap(vec![col("note", "citext")], vec![]);
+        let mut live = snap(vec![col("note", "text")], vec![]);
+        qualify_extension_types(&mut desired, &types);
+        qualify_extension_types(&mut live, &types);
+        canonicalize(&mut desired);
+        canonicalize(&mut live);
+        let plan = plan_reconcile(&live, &desired);
+        assert_eq!(plan.altered.len(), 1, "{:?}", plan.altered);
+        assert!(
+            plan.altered[0]
+                .sql
+                .contains("TYPE extensions.citext USING note::extensions.citext"),
+            "{}",
+            plan.altered[0].sql
+        );
+    }
+
+    /// Two extensions that each own a `ltree`, in different schemas: which one
+    /// a bare `ltree` names depends on the file's path, which the snapshot does
+    /// not carry. It is left as written rather than guessed at.
+    #[test]
+    fn a_name_two_extensions_own_is_left_as_written() {
+        let types = owned(&[("ext_a", "ltree"), ("ext_b", "ltree"), ("extensions", "citext")]);
+        let mut desired = snap(vec![col("path", "ltree"), col("email", "citext")], vec![]);
+        qualify_extension_types(&mut desired, &types);
+        assert_eq!(types_of(&desired), ["ltree", "extensions.citext"]);
+    }
+
+    /// A project enum named like an extension's type is the project's: a file
+    /// declaring `app.cube` reaches it before `extensions.cube`. The bare name
+    /// is left to the enum's own qualification.
+    #[test]
+    fn a_name_the_projects_enum_declares_stays_the_enums() {
+        let types = owned(&[("extensions", "cube")]);
+        let enums = vec![EnumSnapshot {
+            name: "cube".to_string(),
+            schema: "app".to_string(),
+            values: vec!["small".to_string()],
+        }];
+        let mut desired = snap(vec![col("size", "cube")], enums);
+        qualify_extension_types(&mut desired, &types);
+        canonicalize(&mut desired);
+        assert_eq!(types_of(&desired), ["app.cube"]);
     }
 }

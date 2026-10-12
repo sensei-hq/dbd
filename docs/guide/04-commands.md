@@ -927,6 +927,10 @@ on what it would drop, it drops nothing and names the dependent:
 scoped reset refused, nothing was dropped — cannot drop type app.mood because other objects depend on it: column mood of table other.notes depends on type app.mood. A scoped reset drops only what its scope holds, and never cascades: add the dependents to the scope, or reset without --scope.
 ```
 
+A table's policies, and a table's or a view's triggers, go with it, so they are dropped first: one
+calling a function the scope also drops — a policy from `policies/`, or a trigger written in its
+function's file — does not refuse the reset. One on a table outside the scope still does.
+
 ---
 
 ## `dbd snapshot`
@@ -1150,7 +1154,7 @@ version: the older-project guard covers `apply` and `deploy`.
 **What reconcile compares** (against the introspected live schema): columns
 (name, type, nullability, default, identity), primary-key / unique constraints, **foreign
 keys**, secondary **indexes**, **CHECK** constraints and **column comments** — the same
-tables-and-enums model `dbd diff` reports on. Table comments are not compared. Bare enum types are schema-qualified to match introspection, and common type aliases are
+tables-and-enums model `dbd diff` reports on. Table comments are not compared. Bare enum types are schema-qualified to match introspection, and so is a type an extension installs outside `public`, however the DDL reached it (`citext` → `extensions.citext`, `vector(384)` → `extensions.vector(384)`); common type aliases are
 normalized (`int4` → `integer`, `timestamptz` → `timestamp with time zone`). Foreign keys are
 matched by shape (columns, referenced table/columns, actions), so the design's inline `references …`
 and the live DB's auto-named constraint reconcile to no change; a declared FK the live DB lacks is
@@ -1238,7 +1242,7 @@ The desired schema is parsed from your DDL; the live schema is introspected. dbd
 representation noise so only real drift is reported: type aliases and array/date-time
 spellings (`int4` → `integer`, `text[3]` → `text[]`, `time` → `time without time zone`),
 default casts (so a `nextval('s')` default matches the `nextval('s'::regclass)` Postgres
-reports), enum qualification, PK/UNIQUE-backing indexes (matched by the constraint's name, so a
+reports), enum and extension-type qualification (`citext` → `extensions.citext`), PK/UNIQUE-backing indexes (matched by the constraint's name, so a
 dropped index over a key's columns is still drift), FK `NO ACTION` defaults and
 auto-generated FK names, and CHECK-expression *spelling* via the Postgres parser — parens
 and case, `IN` ↔ `= ANY (ARRAY[…])`, casts on literals, `BETWEEN` ↔ the `>=`/`<=` pair
@@ -1767,7 +1771,7 @@ User's `.pre-commit-config.yaml`:
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.25.0
+  rev: v0.25.1
   hooks:
     - id: dbd-format
 ```

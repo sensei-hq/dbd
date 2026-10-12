@@ -1162,7 +1162,9 @@ counts the hooks:
 Reconcile compares the introspected live schema against the design and
 canonicalizes the two representations first: it lifts inline PK/UNIQUE to
 structural constraints, schema-qualifies bare enum types (`status` →
-`config.status`) to match introspection, and normalizes type aliases (`int4` →
+`config.status`) and the types an extension installs outside `public` (`citext` →
+`extensions.citext`, `vector(384)` → `extensions.vector(384)`) to match
+introspection, and normalizes type aliases (`int4` →
 `integer`, `timestamptz` → `timestamp with time zone`). It reconciles **columns**
 (name/type/collation/nullability/default/identity — a collation change is `ALTER COLUMN …
 TYPE … COLLATE`), **PK/UNIQUE** constraints, **foreign keys** (`MATCH FULL`, `DEFERRABLE` and
@@ -1243,7 +1245,7 @@ dbd diff -d $DATABASE_URL --exit-code  # 0 in sync, 2 on drift, 1 on error
 The desired schema is parsed from DDL, the live schema introspected; dbd
 normalizes representation noise (type aliases plus array and date-time spellings
 — `int4`→`integer`, `text[3]`→`text[]`, `time`→`time without time zone`; default
-casts, enum qualification, PK/UNIQUE-backing indexes (matched by the constraint's name, so
+casts, enum and extension-type qualification (`citext`→`extensions.citext`), PK/UNIQUE-backing indexes (matched by the constraint's name, so
 a declared index over a key's columns that the database lost is drift), FK `NO
 ACTION`/auto-generated names, EXCLUDE spelling, and CHECK-expression spelling via libpg_query — parens/case, `IN` ↔
 `= ANY (ARRAY[…])`, literal casts, `BETWEEN` ↔ its `>=`/`<=` expansion, casts on
@@ -1645,7 +1647,7 @@ Both set `pass_filenames: false` because `dbd format` scans the project itself. 
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.25.0
+  rev: v0.25.1
   hooks:
     - id: dbd-format
 ```
@@ -1660,7 +1662,9 @@ tables, sequences, enums — in reverse dependency order, with `CASCADE` on a fu
 out-of-scope table's column with it), so it drops without it, all or nothing, and refuses
 naming the dependents (`scoped reset refused, nothing was dropped — cannot drop type app.mood
 because other objects depend on it: … add the dependents to the scope, or reset without
---scope.`). Never `DROP SCHEMA`/`DROP EXTENSION` by default, so `public`, custom schemas
+--scope.`); the policies and triggers on the tables and views it drops go first, with them,
+so one calling an in-scope function (a `policies/` file, a trigger in its function's file)
+does not refuse it. Never `DROP SCHEMA`/`DROP EXTENSION` by default, so `public`, custom schemas
 and extensions (e.g. pgvector) survive and never abort on `public`; the next `apply`
 repopulates the schemas.
 

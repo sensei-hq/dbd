@@ -1,34 +1,30 @@
 # Checkpoint
 
-**Slice:** 0.25.0 release — PR #45 (`develop` → `main`).
+**Slice:** 0.25.1 on `develop` — #41 and the scoped-reset fix merged; not
+released.
 
 ## Done
 
-- PR #44 merged into `develop` (`6fccb0ff`). Release notes `99edd363`;
-  `make bump minor` → `6d7769d9`, annotated tag `v0.25.0`.
-- `release.yml` run 38253359492 green on the tagged tree (tests, clippy, fmt,
-  `cargo doc`, publish). `dbd-core` and `dbd-cli` 0.25.0 are on crates.io.
-- Shipped artifact verified: `cargo install dbd-cli --version 0.25.0 --locked`
-  refuses `-e staging`; `emit --dialect tsql` puts `CREATE SCHEMA` and
-  `CREATE VIEW` in `GO` batches of their own and keeps key names; MySQL gets
-  `LONGTEXT` and reports the `PRIMARY` rename.
-- History rewritten earlier (2026-10-12): every author, committer and tagger is
-  Jerry Thomas <me@jerrythomas.name>. Backup:
-  `~/Developer/dbd-backup-2026-10-12-pre-author-rewrite.bundle`.
+- v0.25.0 shipped (crates.io, `main` `b4f075e3`, site serves 0.25.0).
+- #41 (PR #46, `7795094b`): an extension's types spelled as the database
+  spells them in `reconcile` and `diff`.
+- Scoped reset (PR #47, `a6e39677`): the scope's tables' policies and its
+  tables' and views' triggers go first, so one calling an in-scope function no
+  longer refuses the reset; FK triggers and a partition's clone of its parent's
+  trigger are left. sensei's real `dojo` scope now resets and redeploys.
+- Embedded suite 132/132; CI green on both PRs; merges done locally.
 
 ## Next
 
-    gh pr checks 45 --watch    # all green → merge #45 → main CI + Workers production build
+    # 0.25.1 when asked: release notes → make bump patch → release.yml →
+    # PR develop → main (merge locally) → install from crates.io and re-run
 
 ## Open
 
-- Cloudflare "Workers Builds: dbd" failed on `6fccb0ff`, `99edd363` and
-  `6d7769d9`. `6fccb0ff`'s tree is identical to `c932b65d`, which built; a
-  clean local `CF_PAGES=1 bun run build` at `6fccb0ff` passes, as does CI's
-  site build. The cause is Cloudflare-side; its log is only in the dashboard
-  (build `df5a6e58-bfdc-4466-9c04-74580ef4437a`).
+- #41 closes when 0.25.1 reaches `main`.
+- `6fccb0ff`/`b4f075e3` carry GitHub's noreply identity; not rewritten.
 
 ## Known limits
 
+- A type in a schema that needs quoting (`"Ext"`) still reads as drift — backlog.
 - CHANGELOG Known limitations; `docs/BACKLOG.md` (0.25.1).
-- Local `make _check-ci` does not run `cargo doc`; CI does (once per push).

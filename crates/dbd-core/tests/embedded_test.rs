@@ -2525,6 +2525,271 @@ async fn reconcile_creates_alters_and_drops_in_place() {
     assert_table_absent(&*adapter, "app", "notes").await;
 }
 
+/// A type an extension installs outside the session `search_path` is the same
+/// type however it is spelled (#41). Introspection reads it through
+/// `format_type`, which qualifies what the session path does not reach —
+/// `extensions.citext`, `extensions.citext[]`, `extensions.cube` — while the
+/// DDL reaches it through its own `set search_path` and writes it bare.
+/// Compared as text the two differed, so every reconcile after the first
+/// planned an `ALTER … TYPE` that changed nothing, and Postgres refused it for
+/// a column a view reads, failing the reconcile. `dbd diff` reported the same
+/// false drift.
+///
+/// Which spelling introspection reads depends on the connection: pooled
+/// connections do not share a session path, and a database whose own path
+/// reaches the schema — Supabase's does — reads every one bare. So each check
+/// runs on a fresh connection, under the default path and then under one that
+/// reaches `extensions`. The schema is the platform's, not the project's, so
+/// the path dbd sets for an ALTER does not reach it either: a real change
+/// applies only if its ALTER names the type qualified.
+#[tokio::test]
+async fn an_extension_type_outside_the_search_path_is_not_drift() {
+    let (_pg, url) = start_pg().await;
+    // A new pool, whose connections have run nothing: introspection reads
+    // through the database's own default path.
+    let fresh = || connect(&url, "ext_types_test");
+    fresh()
+        .await
+        .unwrap()
+        .execute_script(
+            "CREATE SCHEMA extensions; \
+             CREATE EXTENSION citext SCHEMA extensions; \
+             CREATE EXTENSION cube SCHEMA extensions;",
+        )
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::create_dir_all(dir.join("ddl/view/app")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: ext_types_test\n  version: 1\n\
+         source:\n  dialect: postgresql\n\
+         target:\n  postgres:\n    url: $DATABASE_URL\n    extensions:\n\
+         \x20     - name: citext\n        schema: extensions\n\
+         \x20     - name: cube\n        schema: extensions\n\
+         schemas:\n  - app\n",
+    )
+    .unwrap();
+    let write_items = |note_type: &str| {
+        std::fs::write(
+            dir.join("ddl/table/app/items.ddl"),
+            format!(
+                "set search_path to app, extensions;\n\
+                 create table if not exists items (\n\
+                   id    integer primary key\n\
+                 , email citext not null\n\
+                 , tags  citext[]\n\
+                 , box   cube\n\
+                 , code  extensions.citext\n\
+                 , note  {note_type}\n\
+                 );\n"
+            ),
+        )
+        .unwrap();
+    };
+    std::fs::write(
+        dir.join("ddl/view/app/item_emails.ddl"),
+        "set search_path to app, extensions;\n\
+         create or replace view item_emails as select id, email, tags, box, code from items;\n",
+    )
+    .unwrap();
+    let load = || Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design");
+
+    /// What a fresh connection's introspection reads `app.items.email` as.
+    fn reads_email_as(spelling: &str) -> String {
+        format!(
+            "SELECT 1 FROM pg_attribute WHERE attrelid = 'app.items'::regclass \
+               AND attname = 'email' AND format_type(atttypid, atttypmod) = '{spelling}'"
+        )
+    }
+
+    /// Reconcile the unchanged design, then diff it, each on a fresh
+    /// connection: nothing is planned, refused or reported.
+    async fn assert_converged(url: &str, load: &dyn Fn() -> Design, reads: &str) {
+        let adapter = connect(url, "ext_types_test").await.unwrap();
+        assert_catalog(
+            &*adapter,
+            true,
+            &reads_email_as(reads),
+            &format!("email read as {reads}"),
+        )
+        .await;
+        let plan = load()
+            .reconcile(&*adapter, false, false, false, None, Progress::none())
+            .await
+            .unwrap_or_else(|e| panic!("reconciling an unchanged design (read as {reads}) must not fail: {e}"));
+        assert!(
+            plan.altered.is_empty(),
+            "an unchanged design (read as {reads}) altered: {:?}",
+            plan.altered
+        );
+        let type_changes: Vec<&String> = plan.warnings.iter().filter(|w| w.contains("type change")).collect();
+        assert!(type_changes.is_empty(), "read as {reads}: {type_changes:?}");
+
+        let adapter = connect(url, "ext_types_test").await.unwrap();
+        let diff = load().diff_live(&*adapter, None).await.expect("diff_live");
+        assert!(
+            diff.changes.is_empty(),
+            "an unchanged design (read as {reads}) reported drift: {:?}",
+            diff.changes
+        );
+    }
+
+    write_items("text");
+    load()
+        .reconcile(&*fresh().await.unwrap(), false, false, false, None, Progress::none())
+        .await
+        .expect("the first reconcile creates the table and the view");
+    assert_converged(&url, &load, "extensions.citext").await;
+
+    // A real change to an extension type applies under a path that does not
+    // reach the type, so its ALTER names it qualified.
+    write_items("citext");
+    let adapter = fresh().await.unwrap();
+    let plan = load()
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("a column changed to an extension type reconciles");
+    assert_eq!(
+        plan.altered.iter().map(|s| s.entity_name.as_str()).collect::<Vec<_>>(),
+        ["app.items"],
+        "{:?}",
+        plan.altered
+    );
+    assert!(
+        plan.altered[0]
+            .sql
+            .contains("TYPE extensions.citext USING note::extensions.citext"),
+        "{}",
+        plan.altered[0].sql
+    );
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_attribute WHERE attrelid = 'app.items'::regclass \
+           AND attname = 'note' AND atttypid = 'extensions.citext'::regtype",
+        "app.items.note typed extensions.citext",
+    )
+    .await;
+    assert_converged(&url, &load, "extensions.citext").await;
+
+    // A database whose own path reaches `extensions` reads every one bare.
+    adapter
+        .execute_script("ALTER DATABASE testdb SET search_path TO \"$user\", public, extensions;")
+        .await
+        .unwrap();
+    assert_converged(&url, &load, "citext").await;
+}
+
+/// What an extension owns is spelled as the extension's only where the name is
+/// the extension's alone. orafce installs a domain `oracle.date`: had every
+/// bare `date` been read as it, a column changed to `date` would land on
+/// Oracle's `timestamp(0)`, with `diff` clean afterwards. Postgres resolves a
+/// bare `date` to `pg_catalog.date` first, so a name another type shares —
+/// built in, or the project's own domain — is left as written. And a domain an
+/// extension defines over an array is the extension's type, named by its own
+/// name, not as an array of something (#41).
+#[tokio::test]
+async fn only_a_name_an_extension_alone_owns_is_spelled_as_its_type() {
+    let (_pg, url) = start_pg().await;
+    let fresh = || connect(&url, "ext_names_test");
+    let adapter = fresh().await.unwrap();
+    adapter
+        .execute_script(
+            "CREATE SCHEMA extensions; \
+             CREATE EXTENSION citext SCHEMA extensions; \
+             CREATE DOMAIN extensions.date AS timestamp(0); \
+             ALTER EXTENSION citext ADD DOMAIN extensions.date; \
+             CREATE DOMAIN extensions.tagset AS text[]; \
+             ALTER EXTENSION citext ADD DOMAIN extensions.tagset; \
+             CREATE DOMAIN public.http_method AS text; \
+             CREATE DOMAIN extensions.http_method AS text; \
+             ALTER EXTENSION citext ADD DOMAIN extensions.http_method;",
+        )
+        .await
+        .unwrap();
+    let owned = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+        pairs.iter().map(|(s, n)| (s.to_string(), n.to_string())).collect()
+    };
+    assert_eq!(
+        adapter.extension_types().await.unwrap(),
+        owned(&[("extensions", "citext"), ("extensions", "tagset")]),
+        "date and http_method are also another type's names; tagset is a domain, not an array"
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::create_dir_all(dir.join("ddl/view/app")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: ext_names_test\n  version: 1\n\
+         source:\n  dialect: postgresql\n\
+         target:\n  postgres:\n    url: $DATABASE_URL\n    extensions:\n\
+         \x20     - name: citext\n        schema: extensions\n\
+         schemas:\n  - app\n",
+    )
+    .unwrap();
+    let write_events = |d_type: &str| {
+        std::fs::write(
+            dir.join("ddl/table/app/events.ddl"),
+            format!(
+                "set search_path to app, extensions;\n\
+                 create table if not exists events (\n\
+                   id   integer primary key\n\
+                 , tags tagset\n\
+                 , d    {d_type}\n\
+                 );\n"
+            ),
+        )
+        .unwrap();
+    };
+    std::fs::write(
+        dir.join("ddl/view/app/event_tags.ddl"),
+        "set search_path to app, extensions;\n\
+         create or replace view event_tags as select id, tags from events;\n",
+    )
+    .unwrap();
+    let load = || Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design");
+    let reconcile = || async {
+        load()
+            .reconcile(&*fresh().await.unwrap(), false, false, false, None, Progress::none())
+            .await
+    };
+
+    write_events("text");
+    reconcile()
+        .await
+        .expect("the first reconcile creates the table and the view");
+    let plan = reconcile()
+        .await
+        .expect("reconciling an unchanged design must not fail");
+    assert!(plan.altered.is_empty(), "tagset read as drift: {:?}", plan.altered);
+
+    write_events("date");
+    let plan = reconcile().await.expect("a column changed to date reconciles");
+    assert_eq!(plan.altered.len(), 1, "{:?}", plan.altered);
+    assert_catalog(
+        &*fresh().await.unwrap(),
+        true,
+        "SELECT 1 FROM pg_attribute WHERE attrelid = 'app.events'::regclass \
+           AND attname = 'd' AND atttypid = 'pg_catalog.date'::regtype",
+        "app.events.d typed pg_catalog.date",
+    )
+    .await;
+    let plan = reconcile()
+        .await
+        .expect("reconciling the changed design again must not fail");
+    assert!(
+        plan.altered.is_empty(),
+        "a converged design altered: {:?}",
+        plan.altered
+    );
+}
+
 /// Source-hash drift handling for materialized views, end to end:
 /// 1. First reconcile CREATEs the matview and stamps a `dbd:hash=` comment.
 /// 2. Reconciling the SAME design SKIPs (no warning; oid unchanged).
@@ -6393,6 +6658,307 @@ async fn a_scoped_reset_refuses_rather_than_cascade_into_what_is_outside_its_sco
     )
     .await;
     assert_column_exists(&*adapter, "app", "people", "mood").await;
+}
+
+const POLICIES_YAML: &str = "project:\n  name: scoped_reset_policies\nsource:\n  dialect: postgresql\n\
+    schemas:\n  - app\n  - other\nscopes:\n  app_only:\n    includes: [app]\n";
+
+const POLICIES_FILES: &[(&str, &str)] = &[
+    (
+        "ddl/table/app/metrics.ddl",
+        "set search_path to app;\ncreate table if not exists metrics (id int primary key, owner text);\n",
+    ),
+    (
+        "ddl/function/app/can_read.ddl",
+        "set search_path to app;\n\
+         create or replace function can_read(owner text) returns boolean\n\
+         language sql stable as $$ select owner = current_user $$;\n",
+    ),
+    (
+        "ddl/table/other/notes.ddl",
+        "set search_path to other;\ncreate table if not exists notes (id int primary key, owner text);\n",
+    ),
+    (
+        "policies/app/metrics.sql",
+        "alter table app.metrics enable row level security;\n\
+         drop policy if exists metrics_read on app.metrics;\n\
+         create policy metrics_read on app.metrics for select using (app.can_read(owner));\n",
+    ),
+    (
+        "policies/other/notes.sql",
+        "alter table other.notes enable row level security;\n\
+         drop policy if exists notes_read on other.notes;\n\
+         create policy notes_read on other.notes for select using (app.can_read(owner));\n",
+    ),
+];
+
+fn policy_predicate(schema: &str, table: &str, policy: &str) -> String {
+    format!(
+        "SELECT 1 FROM pg_policies WHERE schemaname = '{schema}' AND tablename = '{table}' AND policyname = '{policy}'"
+    )
+}
+
+/// sensei's `dojo` scope: a policy on an in-scope table calls an in-scope
+/// function. `dbd policies` creates a policy after every entity, so it is not
+/// one, and the reset — dropping in reverse apply order, functions before
+/// tables — dropped the function while the table and its policy still stood.
+/// Postgres refused, and the refusal blamed "dependents outside the scope" for
+/// a table inside it. A table's policies go with the table, so a scoped reset
+/// drops them first; a policy on a table outside the scope still refuses it.
+#[tokio::test]
+async fn a_scoped_reset_drops_its_tables_policies_before_the_functions_they_call() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "scoped_reset_policies").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let design = write_project(tmp.path(), POLICIES_YAML, POLICIES_FILES);
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply");
+    let policies = dbd_core::design::apply_policies(&*adapter, tmp.path(), false, None)
+        .await
+        .expect("policies");
+    assert!(policies.failed.is_empty(), "{:?}", policies.failed);
+
+    // A policy outside the scope calls the scope's function: refused, naming
+    // that policy alone, and nothing is dropped — the in-scope policy included.
+    let app_only = design.resolve_scope(Some("app_only"), None).unwrap();
+    let err = design
+        .reset(&*adapter, "postgres", false, false, false, Some(&app_only))
+        .await
+        .expect_err("other.notes's policy calls app.can_read")
+        .to_string();
+    assert!(
+        err.contains("policy notes_read on table other.notes"),
+        "the refusal must name the dependent outside the scope: {err}"
+    );
+    assert!(
+        !err.contains("metrics_read"),
+        "a policy on a table the scope drops is not a dependent outside it: {err}"
+    );
+    assert_table_exists(&*adapter, "app", "metrics").await;
+    assert_catalog(
+        &*adapter,
+        true,
+        &policy_predicate("app", "metrics", "metrics_read"),
+        "policy metrics_read (the refused reset drops nothing)",
+    )
+    .await;
+
+    // With only the scope's own policies calling it, the scope resets.
+    adapter
+        .execute_script("DROP POLICY notes_read ON other.notes;")
+        .await
+        .unwrap();
+    design
+        .reset(&*adapter, "postgres", false, false, false, Some(&app_only))
+        .await
+        .expect("a policy on an in-scope table must not block the scoped reset");
+    assert_table_absent(&*adapter, "app", "metrics").await;
+    assert_catalog(
+        &*adapter,
+        false,
+        "SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+           WHERE n.nspname = 'app' AND p.proname = 'can_read'",
+        "function app.can_read",
+    )
+    .await;
+    assert_table_exists(&*adapter, "other", "notes").await;
+}
+
+const TRIGGERS_YAML: &str = "project:\n  name: scoped_reset_triggers\nsource:\n  dialect: postgresql\n\
+    schemas:\n  - app\n  - other\nscopes:\n  app_only:\n    includes: [app]\n";
+
+const TRIGGERS_FILES: &[(&str, &str)] = &[
+    (
+        "ddl/table/app/items.ddl",
+        "set search_path to app;\ncreate table if not exists items (id int primary key, seq int);\n",
+    ),
+    (
+        "ddl/view/app/item_ids.ddl",
+        "set search_path to app;\ncreate or replace view item_ids as select id from items;\n",
+    ),
+    (
+        "ddl/function/app/bump.ddl",
+        "set search_path to app;\n\
+         create or replace function bump() returns trigger language plpgsql as $$\n\
+         begin new.seq := coalesce(new.seq, 0) + 1; return new; end $$;\n\
+         drop trigger if exists items_bump on app.items;\n\
+         create trigger items_bump before update on app.items for each row execute function app.bump();\n",
+    ),
+    (
+        "ddl/function/app/add_id.ddl",
+        "set search_path to app;\n\
+         create or replace function add_id() returns trigger language plpgsql as $$\n\
+         begin insert into app.items (id) values (new.id); return new; end $$;\n\
+         drop trigger if exists item_ids_add on app.item_ids;\n\
+         create trigger item_ids_add instead of insert on app.item_ids for each row execute function app.add_id();\n",
+    ),
+    (
+        "ddl/table/other/logs.ddl",
+        "set search_path to other;\ncreate table if not exists logs (id int primary key, seq int);\n",
+    ),
+];
+
+/// sensei's `dojo` scope again, with the policies out of the way: a trigger
+/// written in its function's file, `create trigger … on dojo.shared_rules`,
+/// makes the function depend on the table, so the reset dropped the function
+/// first and the table's trigger refused it. A table's or a view's triggers go
+/// with it, so a scoped reset drops them first — the ones Postgres makes for a
+/// foreign key excepted; a trigger on a table outside the scope still refuses
+/// it.
+#[tokio::test]
+async fn a_scoped_reset_drops_its_tables_and_views_triggers_before_their_functions() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "scoped_reset_triggers").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let design = write_project(tmp.path(), TRIGGERS_YAML, TRIGGERS_FILES);
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply");
+    adapter
+        .execute_script(
+            "CREATE TRIGGER logs_bump BEFORE UPDATE ON other.logs FOR EACH ROW EXECUTE FUNCTION app.bump();",
+        )
+        .await
+        .unwrap();
+
+    let app_only = design.resolve_scope(Some("app_only"), None).unwrap();
+    let err = design
+        .reset(&*adapter, "postgres", false, false, false, Some(&app_only))
+        .await
+        .expect_err("other.logs's trigger calls app.bump")
+        .to_string();
+    assert!(
+        err.contains("trigger logs_bump on table other.logs"),
+        "the refusal must name the dependent outside the scope: {err}"
+    );
+    assert!(
+        !err.contains("items_bump"),
+        "a trigger on a table the scope drops is not a dependent outside it: {err}"
+    );
+    assert_table_exists(&*adapter, "app", "items").await;
+
+    adapter
+        .execute_script("DROP TRIGGER logs_bump ON other.logs;")
+        .await
+        .unwrap();
+    design
+        .reset(&*adapter, "postgres", false, false, false, Some(&app_only))
+        .await
+        .expect("a trigger on an in-scope table or view must not block the scoped reset");
+    assert_table_absent(&*adapter, "app", "items").await;
+    assert_catalog(
+        &*adapter,
+        false,
+        "SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'app'",
+        "a function in app",
+    )
+    .await;
+    assert_table_exists(&*adapter, "other", "logs").await;
+}
+
+/// A row trigger on a partitioned table is cloned onto each partition, and the
+/// clone is the parent's: Postgres refuses to drop it on its own ("trigger … on
+/// table … requires it"), and drops it with the parent's. dbd refuses `PARTITION
+/// OF`, but a plain table entity becomes a partition by `ATTACH PARTITION`, so
+/// its clone was among the triggers a scoped reset drops first — refusing every
+/// reset of a scope holding the partition. Only a trigger no parent made is
+/// dropped there.
+async fn attached_partition_project(
+    parent_schema: &str,
+) -> (
+    PostgreSQL,
+    Box<dyn dbd_core::DatabaseAdapter>,
+    Design,
+    tempfile::TempDir,
+) {
+    let (pg, url) = start_pg().await;
+    let adapter = connect(&url, "scoped_reset_partitions").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let design = write_project(
+        tmp.path(),
+        &format!(
+            "project:\n  name: scoped_reset_partitions\nsource:\n  dialect: postgresql\n\
+             schemas:\n  - app\n  - {parent_schema}\nscopes:\n  app_only:\n    includes: [app]\n"
+        ),
+        &[
+            (
+                &format!("ddl/table/{parent_schema}/events.ddl"),
+                &format!(
+                    "set search_path to {parent_schema};\n\
+                     create table if not exists events (id int, at date not null, seq int) partition by range (at);\n"
+                ),
+            ),
+            (
+                &format!("ddl/function/{parent_schema}/bump.ddl"),
+                &format!(
+                    "set search_path to {parent_schema};\n\
+                     create or replace function bump() returns trigger language plpgsql as $$\n\
+                     begin new.seq := coalesce(new.seq, 0) + 1; return new; end $$;\n\
+                     drop trigger if exists events_bump on {parent_schema}.events;\n\
+                     create trigger events_bump before update on {parent_schema}.events\n\
+                       for each row execute function {parent_schema}.bump();\n"
+                ),
+            ),
+            (
+                "ddl/table/app/events_2026.ddl",
+                "set search_path to app;\ncreate table if not exists events_2026 (id int, at date not null, seq int);\n",
+            ),
+        ],
+    );
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply");
+    adapter
+        .execute_script(&format!(
+            "ALTER TABLE {parent_schema}.events ATTACH PARTITION app.events_2026 \
+               FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');"
+        ))
+        .await
+        .unwrap();
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_trigger WHERE tgrelid = 'app.events_2026'::regclass AND tgname = 'events_bump' \
+           AND NOT tgisinternal",
+        "the clone of events_bump on the partition",
+    )
+    .await;
+    (pg, adapter, design, tmp)
+}
+
+#[tokio::test]
+async fn a_scoped_reset_leaves_a_partitions_cloned_trigger_to_its_parent() {
+    let (_pg, adapter, design, _tmp) = attached_partition_project("app").await;
+    let app_only = design.resolve_scope(Some("app_only"), None).unwrap();
+    design
+        .reset(&*adapter, "postgres", false, false, false, Some(&app_only))
+        .await
+        .expect("a partition's cloned trigger must not refuse the scoped reset");
+    assert_table_absent(&*adapter, "app", "events").await;
+    assert_table_absent(&*adapter, "app", "events_2026").await;
+}
+
+#[tokio::test]
+async fn a_scoped_reset_of_a_partition_keeps_the_trigger_of_a_parent_outside_it() {
+    let (_pg, adapter, design, _tmp) = attached_partition_project("base").await;
+    let app_only = design.resolve_scope(Some("app_only"), None).unwrap();
+    design
+        .reset(&*adapter, "postgres", false, false, false, Some(&app_only))
+        .await
+        .expect("the clone of a trigger outside the scope must not refuse the scoped reset");
+    assert_table_absent(&*adapter, "app", "events_2026").await;
+    assert_table_exists(&*adapter, "base", "events").await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_trigger WHERE tgrelid = 'base.events'::regclass AND tgname = 'events_bump'",
+        "trigger events_bump on base.events",
+    )
+    .await;
 }
 
 // ── Roles are server-wide: a reset keeps one another database holds ───────────

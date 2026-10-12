@@ -9,6 +9,52 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.25.1] — 2026-10-12
+
+**Two fixes for refusals that left no way through.** `reconcile` failed on every
+run after the first in a project whose extensions live in their own schema,
+once a view read one of their columns; and a scoped `reset` refused any scope
+whose tables carry a policy or trigger calling one of its own functions.
+
+### Fixed
+
+- **A type an extension installs outside the `search_path` is no longer
+  drift.** With pgvector or citext in an `extensions` schema, introspection
+  reads `extensions.vector(384)` where the DDL, reaching the schema through its
+  own `set search_path`, wrote `vector(384)`. Compared as text they differed,
+  so every `reconcile` after the first planned an `ALTER … TYPE` that changed
+  nothing — and failed, "cannot alter type of a column used by a view or rule",
+  once a view read the column. `dbd diff` reported the same false drift. Both
+  now spell an extension's type as the database does — a modifier, an array
+  and an extension's domain included, whichever path a pooled connection or
+  the database (Supabase's reaches `extensions`) reads it through — and a real
+  change to one emits `TYPE extensions.citext`, which resolves wherever the
+  session path points. Only a name the extension alone owns is read as its
+  type: a bare `date` stays `pg_catalog.date` on a database with orafce's
+  `oracle.date`, and a name the project's own enum or domain, or a second
+  extension, also has is compared as written, as before. ([#41])
+- **A scoped reset drops its tables' policies and triggers first.** A policy
+  from `policies/`, or a trigger written in its function's file, that calls a
+  function the scope also drops refused the reset — "cannot drop function …
+  because other objects depend on it" — and the refusal blamed a dependent
+  outside the scope for one inside it. The reset drops in reverse apply order,
+  where neither has a place: policies are applied after every entity, and a
+  trigger in its function's file makes the function depend on the table, so
+  the function went first while its table still stood. A table's policies, and
+  a table's or a view's triggers, now go first, with their table — nothing
+  else is taken. A foreign key's own triggers are left, and so is a partition's
+  clone of its parent's trigger (a table attached with `ATTACH PARTITION`),
+  which goes with the parent's; a policy or trigger on a table outside the
+  scope still refuses the reset.
+
+### Library API
+
+- `DatabaseAdapter` gains `extension_types()`, the `(schema, name)` of each
+  type the database's extensions own. It has a default (none), so an adapter
+  that does not override it builds unchanged.
+
+[#41]: https://github.com/sensei-hq/dbd/issues/41
+
 ## [0.25.0] — 2026-10-12
 
 **Every command does what its documentation says, and every feature works the
@@ -2381,7 +2427,8 @@ Two `dbd reconcile` non-convergence bugs ([#12]) and a security sweep.
 [#13]: https://github.com/sensei-hq/dbd/issues/13
 [#16]: https://github.com/sensei-hq/dbd/issues/16
 [#17]: https://github.com/sensei-hq/dbd/issues/17
-[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.25.0...main
+[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.25.1...main
+[0.25.1]: https://github.com/sensei-hq/dbd/releases/tag/v0.25.1
 [0.25.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.25.0
 [0.24.1]: https://github.com/sensei-hq/dbd/releases/tag/v0.24.1
 [0.24.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.24.0
