@@ -11799,3 +11799,91 @@ async fn a_reconcile_refused_its_hook_claims_nothing() {
     )
     .await;
 }
+
+/// A bare built-in column type — `text`, `date` — is Postgres's own, found in
+/// `pg_catalog` first, whatever the project names a table: matched to a
+/// quoted `"Text"` table, every `text` column made a dependency on it, and two
+/// tables referring to each other read as a cycle (#7).
+#[test]
+fn a_built_in_column_type_is_no_dependency_on_a_table_of_its_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let design = write_project(
+        tmp.path(),
+        "project:\n  name: shop\nsource:\n  dialect: postgresql\nschemas:\n  - public\n",
+        &[
+            (
+                "ddl/table/public/User.ddl",
+                "create table if not exists \"User\" (id int primary key, name text);\n",
+            ),
+            (
+                "ddl/table/public/Text.ddl",
+                "create table if not exists \"Text\" (id int primary key, user_id int references \"User\" (id), body text);\n",
+            ),
+            (
+                "ddl/table/public/Date.ddl",
+                "create table if not exists \"Date\" (d date primary key);\n",
+            ),
+            (
+                "ddl/table/public/orders.ddl",
+                "create table if not exists orders (id int primary key, placed date);\n",
+            ),
+        ],
+    );
+    let errors: Vec<&String> = design.entities().iter().flat_map(|e| e.errors.iter()).collect();
+    assert!(errors.is_empty(), "{errors:?}");
+    let refers = |name: &str| -> Vec<String> {
+        design
+            .entities()
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("{name}"))
+            .refers()
+            .map(str::to_string)
+            .collect()
+    };
+    assert!(
+        !refers("public.User").contains(&"public.Text".to_string()),
+        "{:?}",
+        refers("public.User")
+    );
+    assert!(
+        !refers("public.orders").contains(&"public.Date".to_string()),
+        "{:?}",
+        refers("public.orders")
+    );
+    assert!(
+        !refers("public.Date").contains(&"public.Date".to_string()),
+        "{:?}",
+        refers("public.Date")
+    );
+}
+
+/// The same holds for a sequence named bare: `nextval('Order_No')` under
+/// `search_path app` draws on the `app.Order_No` its unquoted file creates
+/// (#7).
+#[test]
+fn a_table_depends_on_its_own_sequence_named_bare() {
+    let tmp = tempfile::tempdir().unwrap();
+    let design = named_project(
+        tmp.path(),
+        "shop",
+        "",
+        &[
+            (
+                "ddl/sequence/app/Order_No.ddl",
+                "create sequence if not exists app.Order_No;\n",
+            ),
+            (
+                "ddl/table/app/orders.ddl",
+                "set search_path to app;\ncreate table if not exists orders (id int primary key default nextval('Order_No'));\n",
+            ),
+        ],
+    );
+    let orders = design
+        .entities()
+        .iter()
+        .find(|e| e.name == "app.orders")
+        .expect("app.orders");
+    let refers: Vec<&str> = orders.refers().collect();
+    assert!(refers.contains(&"app.Order_No"), "{refers:?}");
+}
