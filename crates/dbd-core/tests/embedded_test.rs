@@ -7250,7 +7250,8 @@ fn named_design(dir: &std::path::Path, name: &str, version: u32, schema: &str, e
 /// database still holds the design's objects and the old name's record of
 /// them, so those marks are the guards' marks — refused, naming the project
 /// the database does record and the likely rename — and `--force` still
-/// overrides the reset guard, as it does for the project's own mark.
+/// overrides the reset guard, as it does for the project's own mark, though
+/// not the objects' ownership, which stays with the old name (#7).
 #[tokio::test]
 async fn a_renamed_project_is_held_to_the_record_its_old_name_left() {
     let (pg, _url) = start_pg().await;
@@ -7312,10 +7313,18 @@ async fn a_renamed_project_is_held_to_the_record_its_old_name_left() {
             failures.push(format!("{run} recorded the renamed project"));
         }
 
+        // `--force` overrides the reset guard, as it does on the project's own
+        // mark — but not ownership: the database's objects are `alpha`'s, and
+        // a renamed project takes them over only by adopting them (#7).
         if run == "reset" {
-            prod.reset(&*renamed, "postgres", true, false, false, None)
+            let err = prod
+                .reset(&*renamed, "postgres", true, false, false, None)
                 .await
-                .expect("--force overrides the reset guard, as it does on the project's own mark");
+                .expect_err("the objects are alpha's")
+                .to_string();
+            if !err.contains("is owned by \"alpha\"") {
+                failures.push(format!("a forced reset was not refused for alpha's objects: {err}"));
+            }
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");
