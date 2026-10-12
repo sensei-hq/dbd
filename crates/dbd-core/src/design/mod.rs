@@ -3524,12 +3524,30 @@ import:
             preview.steps
         );
 
-        design.apply(&mock, None, false, None, Progress::none()).await.unwrap();
+        let mut started: Vec<String> = Vec::new();
+        design
+            .apply(
+                &mock,
+                None,
+                false,
+                None,
+                Progress {
+                    on_start: |d: &str| started.push(d.to_string()),
+                    on_done: |_: &str, _: Option<&str>| {},
+                    on_complete: |_| {},
+                },
+            )
+            .await
+            .unwrap();
         let scripts = mock.scripts.lock().unwrap().clone();
-        let at = |needle: &str| scripts.iter().position(|s| s.contains(needle));
-        let created = at("create table if not exists kinds").expect("app.kinds is created");
-        let seeded = at("insert into kinds").unwrap_or_else(|| panic!("its data script runs: {scripts:#?}"));
-        assert!(created < seeded, "after the create: {scripts:#?}");
+        assert!(
+            scripts.iter().any(|s| s.contains("insert into kinds")),
+            "its data script runs: {scripts:#?}"
+        );
+        let at = |step: &str| started.iter().position(|d| d.starts_with(step));
+        let created = at("table:app.kinds").unwrap_or_else(|| panic!("app.kinds is created: {started:#?}"));
+        let seeded = at("migrate data table:app.kinds").unwrap_or_else(|| panic!("its data step: {started:#?}"));
+        assert!(created < seeded, "after the create: {started:#?}");
     }
 
     /// A migration's drop runs only where the table still exists. Generated
