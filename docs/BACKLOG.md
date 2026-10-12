@@ -8,8 +8,10 @@ the [architecture notes](design/architecture.md). They are not tracked here.
 
 ## 0.25.1 — defects found while auditing 0.25.0
 
-Found by the 0.25.0 audits and not fixed in it: older code, not introduced by
-the release. Each was reproduced; locations are as of the 0.25.0 branch.
+Found by the 0.25.0 audits and not fixed in it — older code, not introduced by
+the release, except the entries marked *(0.25 code)*, which sit in code the
+release added. Each was reproduced or read in the code; locations are as of the
+0.25.0 branch.
 
 **Migrations and snapshots**
 - A jump over a table created in one version and altered in a later one fails
@@ -27,6 +29,8 @@ the release. Each was reproduced; locations are as of the 0.25.0 branch.
   design (snapshots hold tables and enums only).
 - `reconcile` has no older-project guard and records the project's version over
   a newer one.
+- A `data.sql` for a table its version neither adds nor alters (one it drops,
+  say) never runs, and no preview lists it (`design/plan.rs` ~268).
 
 **Guards and bookkeeping**
 - A renamed `project.name` whose env, scope and version all match the old record
@@ -59,6 +63,32 @@ the release. Each was reproduced; locations are as of the 0.25.0 branch.
 - `reconcile --dry-run --allow-destructive` still says "re-run with
   --allow-destructive".
 
+**SQLite**
+- `diff`, `export` and `migrate --status` create a missing SQLite file, where a
+  dry run opens only one that exists (`src/commands/diff.rs` ~80, `data.rs`
+  ~332, `migration.rs` ~279 — each through `get_adapter`).
+- `init --from-db` and `merge` write a table or view as `sqlite_master` holds
+  it, with no `IF NOT EXISTS`, so applying the project back to its own database
+  fails (`table log already exists`) (`adapter/sqlite.rs` ~618, 635).
+- *(0.25 code)* An import empties its tables one `DELETE FROM` at a time, each
+  committed as it runs, so a failure partway leaves the tables before it empty
+  (`adapter/mod.rs` ~246-253).
+- `import --dry-run` with no database to ask lists a SQLite project's tables
+  alphabetically, not in the foreign-key order the import takes
+  (`src/commands/data.rs` ~150).
+
+**Quoting**
+- Names interpolated into SQL without doubling a `"`: `script.rs` ~566-569
+  (`CREATE ROLE`, `GRANT` role, and the `rolname = '…'` check, which doubles no
+  `'` either), ~919-924 (`REVOKE`), ~962 (`DROP ROLE`), ~1031 (the reset
+  script's `DROP … CASCADE`), ~1048 and ~1057 (`GRANT USAGE`); `reconcile.rs`
+  ~1245 (comment convergence), ~1758 and ~1767 (index convergence);
+  `diff/generate.rs` ~236 (`DROP CONSTRAINT`) and ~258 (`DROP INDEX`).
+- A dot in a schema, table or enum name is unsupported: dbd joins a schema and
+  a name with a dot and splits them again throughout
+  (`entity::split_qualified_name` and its kin), and `emit.rs` `bare()` (~16)
+  cuts at the last dot, so `app."we.ird"` is emitted as `app_ird`.
+
 **Reverse engineering (`init --from-db`, `merge`)**
 - Domains and composite types are neither captured nor named, so apply on a
   fresh database fails; identity `START`/`INCREMENT`, fillfactor, column
@@ -81,6 +111,16 @@ the release. Each was reproduced; locations are as of the 0.25.0 branch.
   unreported; SQLite doesn't report `timetz` losing its zone; T-SQL writes an
   empty `GO` batch for an extension comment.
 - `json[]`/`jsonb[]` elements can't tell a JSON-null element from an SQL NULL.
+- *(0.25 code)* The DBML writer can't write an expression default or CHECK
+  holding a backtick (DBML has no escape; `init --from-dbml` refuses the
+  document), writes a line break inside a CHECK or index predicate as a space —
+  changing a string literal that holds one — and reads `with:` storage options
+  split on commas (`dbml.rs` ~541-545, ~776, ~835-840).
+
+**Formatting**
+- A word on the formatter's own keyword list (`data`, `type`, `key`, `comment`
+  …) is recased even where it names a column — `DATA JSONB` in `upper` mode
+  (`formatter/keyword_case.rs` ~16, ~274).
 
 ## Now
 
