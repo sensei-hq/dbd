@@ -1524,6 +1524,45 @@ fn a_dry_run_does_not_create_a_sqlite_database_file() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// `reconcile --dry-run` connected as its real run does, and the SQLite
+/// adapter creates a missing file on connect — so the preview left an empty
+/// database behind, where every other dry run opens only a file that is
+/// there. It now does the same, and with no file previews against an empty
+/// database — what the real run would create — refusing as the run refuses.
+#[test]
+fn reconcile_dry_run_does_not_create_a_sqlite_database_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let db = dir.join("not-yet.db");
+    write(
+        dir,
+        "design.yaml",
+        &format!(
+            "project:\n  name: lite\nsource:\n  dialect: sqlite\ntarget:\n  sqlite:\n    url: sqlite://{}\nschemas: []\n",
+            db.display()
+        ),
+    );
+    write(
+        dir,
+        "ddl/table/items.ddl",
+        "CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY);\n",
+    );
+
+    let dry = dbd(dir, &["reconcile", "--dry-run"]);
+    assert!(!db.exists(), "reconcile --dry-run created {}", db.display());
+    let real = dbd(dir, &["reconcile"]);
+    assert!(
+        !real.status.success() && !dry.status.success(),
+        "both refuse a SQLite project"
+    );
+    assert!(
+        stderr(&dry).contains("needs a structured model") && stderr(&real).contains("needs a structured model"),
+        "for the same reason — dry: {}\nreal: {}",
+        stderr(&dry),
+        stderr(&real)
+    );
+}
+
 // ── reset refuses a --target the connection is not ──────────────────────────
 
 /// `reset --target postgres` on a SQLite project was accepted, connected, and
