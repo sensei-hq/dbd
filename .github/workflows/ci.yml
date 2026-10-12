@@ -40,16 +40,20 @@ jobs:
       # print) that the test harness never executes, so it can only ever report
       # 0% and would drag the metric down as unreachable noise.
       #
-      # Coverage is collected across two instrumented runs and merged so the
+      # Coverage is collected across three instrumented runs and merged so the
       # PostgreSQL adapter's real coverage is reflected: the default workspace
-      # suite, then the embedded-PostgreSQL integration suite (feature-gated and
-      # serial — each test boots its own in-process postgres). `--no-report`
-      # accumulates raw profiles; the final `report` merges them into one lcov.
-      - name: cargo test + coverage (workspace + embedded, merged)
+      # suite, then the embedded-PostgreSQL integration suites (feature-gated
+      # and serial — each test boots its own in-process postgres): the
+      # library's, and the CLI's, which drives the built `dbd` against a live
+      # database. Without the feature `cli_live` compiles to no tests at all,
+      # and the workspace run reports it green. `--no-report` accumulates raw
+      # profiles; the final `report` merges them into one lcov.
+      - name: cargo test + coverage (workspace + embedded + CLI, merged)
         run: |
           cargo llvm-cov clean --workspace
           cargo llvm-cov --no-report --workspace
           cargo llvm-cov --no-report -p dbd-core --features embedded-tests --test embedded_test -- --test-threads=1
+          cargo llvm-cov --no-report --features embedded-tests --test cli_live -- --test-threads=1
           # llvm-cov records absolute paths, so this is anchored at the end
           # only — a leading ^ would never match, silently letting main.rs
           # back into the metric with CI still green.
