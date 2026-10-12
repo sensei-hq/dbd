@@ -303,16 +303,25 @@ impl Design {
             },
         )
         .await?;
-        let outside_txn = !adapter.supports_transactional_apply() || std::env::var_os("DBD_NO_TX").is_some();
-        if !dry_run && outside_txn {
-            self.claim(adapter).await?;
-        }
 
         // A hook is filtered against the same working set the entities were.
         // `None` — unscoped or the all-scope — runs every hook, and skips the
         // derivation cost entirely on that common path.
         let hook_scope = self.hook_scope(scope, working_set.as_ref());
         let hook_scope = hook_scope.as_ref().map(|(name, outside)| (*name, outside));
+
+        let outside_txn = !adapter.supports_transactional_apply() || std::env::var_os("DBD_NO_TX").is_some();
+        if !dry_run && outside_txn {
+            // The before-hooks' own refusals — a file missing, a path outside
+            // the project — come first: a refused run claims nothing.
+            hooks::plan_hooks(
+                self.hook_source(),
+                &self.config.apply.before,
+                hooks::HookKind::Before,
+                hook_scope,
+            )?;
+            self.claim(adapter).await?;
+        }
 
         // `apply.before` runs here: after the scope and parse gates, so a bad
         // design still refuses before any hook fires, and before the first

@@ -485,6 +485,14 @@ impl Design {
         }
 
         ensure_reconcile_not_destructive(&plan, allow_destructive)?;
+        // The before-hooks' own refusals — a file missing, a path outside the
+        // project — are the last.
+        hooks::plan_hooks(
+            self.hook_source(),
+            &self.config.apply.before,
+            hooks::HookKind::Before,
+            hook_scope,
+        )?;
         // Past the last refusal, before the first write: heal the bookkeeping
         // and claim. Reconcile's writes commit as they run, so it claims first
         // — see `Design::claim_first` (#7).
