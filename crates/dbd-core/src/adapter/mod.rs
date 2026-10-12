@@ -84,6 +84,22 @@ pub struct OwnedObject {
     pub kind: String,
 }
 
+/// What an owner uses without owning it, in `dbd.uses` (#7): a `schema`, an
+/// `extension` or a `role` it shares with other owners, or an `entity` another
+/// owner holds, through one of its own.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Use {
+    /// `schema`, `extension`, `role` or `entity`.
+    pub kind: String,
+    /// The schema, extension or role's name; for an `entity`, `schema.name` as
+    /// the design refers to it — recorded as `namespace:schema.name` when
+    /// another owner holds it, and not at all when nobody else does.
+    pub target: String,
+    /// For an `entity`, the owner's own entity that makes the reference —
+    /// `view billing.v_invoices`; empty otherwise.
+    pub via: String,
+}
+
 /// An entity another owner holds, and that owner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeldObject {
@@ -439,6 +455,15 @@ pub trait DatabaseAdapter: Send + Sync {
     async fn claim_objects(&self, owner: &str, objects: &[OwnedObject], write: bool) -> Result<Vec<HeldObject>> {
         let _ = (owner, objects, write);
         Ok(Vec::new())
+    }
+
+    /// Record `uses` as everything `owner` uses, replacing what it used before.
+    /// An `entity` use is recorded only where another owner holds the target,
+    /// in that owner's namespace (#7). Adapters without a registry record
+    /// nothing.
+    async fn record_uses(&self, owner: &str, uses: &[Use]) -> Result<()> {
+        let _ = (owner, uses);
+        Ok(())
     }
     async fn get_db_version(&self) -> Result<u32>;
     async fn apply_migration(&self, version: u32, sql: &str, description: &str, checksum: &str) -> Result<()>;

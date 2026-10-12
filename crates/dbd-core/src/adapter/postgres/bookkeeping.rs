@@ -519,6 +519,64 @@ impl Bookkeeping {
         Ok(held)
     }
 
+    /// Replace `owner`'s rows in `dbd.uses` with `uses`, in one transaction. A
+    /// shared use — schema, extension, role — is recorded as given. An entity
+    /// use names its target as the design refers to it, `schema.name`, and is
+    /// recorded once for each namespace another owner holds that name in —
+    /// `relation:app.orders` — and not at all when nobody else holds it.
+    pub(super) async fn record_uses(&self, owner: &str, uses: &[crate::adapter::Use]) -> Result<()> {
+        use sqlx::Executor as _;
+        let (shared, entities): (Vec<&crate::adapter::Use>, Vec<&crate::adapter::Use>) =
+            uses.iter().partition(|u| u.kind != "entity");
+        let column = |list: &[&crate::adapter::Use], f: fn(&crate::adapter::Use) -> &str| -> Vec<String> {
+            list.iter().map(|u| f(u).to_string()).collect()
+        };
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| DbdError::Config(format!("record uses: begin failed: {e}")))?;
+        (&mut *tx)
+            .execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            .await
+            .map_err(|e| DbdError::Config(format!("record uses: begin failed: {e}")))?;
+        sqlx::query("DELETE FROM dbd.uses WHERE owner = $1")
+            .bind(owner)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DbdError::Config(format!("record uses failed: {e}")))?;
+        sqlx::query(
+            "INSERT INTO dbd.uses (owner, kind, target, via) \
+               SELECT $1, d.kind, d.target, d.via \
+               FROM unnest($2::text[], $3::text[], $4::text[]) AS d(kind, target, via) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(owner)
+        .bind(column(&shared, |u| &u.kind))
+        .bind(column(&shared, |u| &u.target))
+        .bind(column(&shared, |u| &u.via))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| DbdError::Config(format!("record uses failed: {e}")))?;
+        sqlx::query(
+            "INSERT INTO dbd.uses (owner, kind, target, via) \
+               SELECT $1, 'entity', o.namespace || ':' || o.schema || '.' || o.name, d.via \
+               FROM unnest($2::text[], $3::text[]) AS d(target, via) \
+               JOIN dbd.objects o ON o.schema || '.' || o.name = d.target AND o.owner <> $1 \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(owner)
+        .bind(column(&entities, |u| &u.target))
+        .bind(column(&entities, |u| &u.via))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| DbdError::Config(format!("record uses failed: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| DbdError::Config(format!("record uses: commit failed: {e}")))?;
+        Ok(())
+    }
+
     /// Read the recorded version for this project (authoritative version source).
     /// Catalog-resolved (both-names aware) so a not-yet-healed legacy DB is read
     /// correctly instead of silently missed as version 0. `0` when there is no

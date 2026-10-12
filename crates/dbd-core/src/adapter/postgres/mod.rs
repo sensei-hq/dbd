@@ -2564,6 +2564,10 @@ ORDER BY 1, 2, 4, 5"#;
         self.bookkeeping.claim_objects(owner, objects, write).await
     }
 
+    async fn record_uses(&self, owner: &str, uses: &[super::Use]) -> Result<()> {
+        self.bookkeeping.record_uses(owner, uses).await
+    }
+
     async fn get_db_version(&self) -> Result<u32> {
         self.bookkeeping.version().await
     }
