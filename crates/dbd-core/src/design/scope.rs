@@ -179,7 +179,7 @@ impl Design {
     /// The entities a command run under `scope` covers but dbd could not read
     /// — what a document generated from the design leaves out.
     ///
-    /// The same judgement [`Self::ensure_fully_parsed`] refuses on. A command
+    /// The same judgement `Design::ensure_fully_parsed` refuses on. A command
     /// that writes documentation (`dbml`, `diagram`) names these instead and
     /// writes what it can, as `emit` reports them: left out without a word, a
     /// document missing a table reads exactly like a complete one.

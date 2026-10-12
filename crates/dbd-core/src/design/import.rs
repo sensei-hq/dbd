@@ -331,7 +331,7 @@ impl Design {
     ///
     /// Public so `dbd import --dry-run` previews exactly what the real run does
     /// without opening a connection. The preview and the run share both the
-    /// scope rule ([`Design::hook_scope`]) and the decision (`plan_hooks`), so
+    /// scope rule (`Design::hook_scope`) and the decision (`plan_hooks`), so
     /// neither can drift from the other.
     pub fn import_after_preview(&self, scope: Option<&ResolvedScope>) -> Result<(Vec<String>, Vec<String>)> {
         let working_set = self.scope_working_set(scope)?;
@@ -450,7 +450,7 @@ impl Design {
 
     /// Build the import plan: staging tables paired with procedures, ordered by dependencies.
     ///
-    /// Each staging table's loader is picked by [`Design::import_loaders`]:
+    /// Each staging table's loader is picked by `Design::import_loaders`:
     /// among the procedures that *read* it, the one named `import_<table>`,
     /// else the only one that reads no other staging table, else the only one
     /// no other table claimed. Procedures are then ordered so that if proc A

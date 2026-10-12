@@ -28,7 +28,7 @@
 //! ending in a line break nobody typed is not what anyone documented.
 //!
 //! The document is lexed by @dbml/parse's token rules and laid out again one
-//! entry per line ([`logical_lines`]); the reader then works an entry at a
+//! entry per line (`logical_lines`); the reader then works an entry at a
 //! time. A [`EntityType::Schema`] entity is synthesised for every distinct
 //! schema seen (including `public`) so the generated project is applyable.
 

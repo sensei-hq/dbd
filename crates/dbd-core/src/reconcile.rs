@@ -1309,7 +1309,7 @@ pub(crate) const ENUM_RECREATE_SUFFIX: &str = "__dbd_old";
 /// declares one of that name, else as it was. The indexes come from the tables
 /// of `live` and `desired`: a canonicalized snapshot has none (`canonicalize`
 /// strips them), so a caller passes ones that carry them — see
-/// [`with_indexes_of`].
+/// `with_indexes_of`.
 ///
 /// Every failure this can hit is a *loud* one, inside the single implicit
 /// transaction `execute_script` runs the batch in: a row holding a removed value
@@ -1332,7 +1332,7 @@ pub(crate) const ENUM_RECREATE_SUFFIX: &str = "__dbd_old";
 /// same run, and the next declined again.
 ///
 /// The type's comment is carried from the type renamed aside to its
-/// replacement ([`enum_comment_carry`]); it used to go with the old type.
+/// replacement (`enum_comment_carry`); it used to go with the old type.
 ///
 /// Dropped views are not re-created here — reconcile re-applies every managed
 /// view on every run, after the enum and tables it depends on, which is exactly

@@ -193,7 +193,7 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 impl PostgresAdapter {
     /// Create a new adapter from a connection URL.
     ///
-    /// One connection is made first, bounded by [`CONNECT_TIMEOUT`], so a
+    /// One connection is made first, bounded by `CONNECT_TIMEOUT`, so a
     /// database that cannot be reached fails fast with the reason and the
     /// `host:port` it tried — never the URL, which may hold a password. The
     /// pool itself keeps sqlx's own timeouts for the run.

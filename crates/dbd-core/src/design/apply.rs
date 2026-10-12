@@ -801,7 +801,7 @@ impl Design {
 
     /// The `apply.before` and `apply.after` hooks a run under `scope` skips,
     /// one line each saying why — the run's own decision
-    /// ([`hooks::plan_hooks`]), made without running anything.
+    /// (`hooks::plan_hooks`), made without running anything.
     ///
     /// The run reports these in [`ApplyComplete::warnings`], which only a run
     /// that succeeds produces: a preview had no word of a skip, and neither
@@ -824,7 +824,7 @@ impl Design {
 
     /// The `apply.before` and `apply.after` hooks a run under `scope` executes,
     /// as `"apply.before sql/x.sql"`, in the order it runs them — the run's own
-    /// decision ([`hooks::plan_hooks`]), made without running anything.
+    /// decision (`hooks::plan_hooks`), made without running anything.
     ///
     /// For a preview of a run that executes hooks: `reconcile --dry-run`
     /// listed the schema changes and never the hooks its run went on to.
