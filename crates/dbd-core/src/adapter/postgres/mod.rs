@@ -115,17 +115,61 @@ fn split_qualified(qualified: &str) -> (&str, &str) {
     }
 }
 
-/// The start of every refresh job `owner` names: `dbd:refresh:<owner>:`. A `%`
-/// or `:` in the owner is percent-encoded, so the owner's part ends at the first
-/// `:` after `dbd:refresh:` — owner `b` cannot reach `b:c`'s jobs.
-fn refresh_job_prefix(owner: &str) -> String {
-    let owner = owner.replace('%', "%25").replace(':', "%3A");
-    format!("dbd:refresh:{owner}:")
+/// The longest job name pg_cron 1.3 and 1.4 keep: they store it as `name`,
+/// which Postgres cuts at 63 bytes — and a cut name is not the one a sync
+/// keeps, so the sync unscheduled the job it had just made. 1.5 made it `text`.
+const MAX_JOB_NAME: usize = 63;
+
+/// The longest owner part written as it is; a longer one is cut and hashed, so
+/// every prefix leaves room for the view's name.
+const MAX_JOB_OWNER: usize = 24;
+
+/// The first `hex` hex digits of the SHA-256 of `s`.
+fn short_hash(s: &str, hex: usize) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(s.as_bytes()))[..hex].to_string()
 }
 
-/// The name of `owner`'s job refreshing `qualified`.
+/// `s` cut to at most `max` bytes, at a character boundary.
+fn cut_to(s: &str, max: usize) -> &str {
+    let mut cut = max.min(s.len());
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &s[..cut]
+}
+
+/// The start of every refresh job `owner` names: `dbd-refresh:<owner>:`.
+///
+/// Not `dbd:refresh:`, which a dbd before owner-named jobs swept whole —
+/// unscheduling every such job it was not given — so a project sharing the
+/// database that has not upgraded would still take this owner's jobs (H4); and
+/// a legacy name with a `:` in its schema would read as an owner's. A `%` or
+/// `:` in the owner is percent-encoded, so the owner's part ends at the first
+/// `:` after the namespace — owner `b` cannot reach `b:c`'s jobs. An owner part
+/// past [`MAX_JOB_OWNER`] keeps its start and ends in `%%` and a hash of the
+/// whole name; an encoded owner never holds `%%`, so the two never meet.
+fn refresh_job_prefix(owner: &str) -> String {
+    let encoded = owner.replace('%', "%25").replace(':', "%3A");
+    let part = if encoded.len() <= MAX_JOB_OWNER {
+        encoded
+    } else {
+        format!("{}%%{}", cut_to(&encoded, MAX_JOB_OWNER - 10), short_hash(owner, 8))
+    };
+    format!("dbd-refresh:{part}:")
+}
+
+/// The name of `owner`'s job refreshing `qualified`, at most [`MAX_JOB_NAME`]
+/// bytes: one that would be longer keeps what fits of `qualified` and ends in
+/// `%%` and a hash of all of it.
 fn refresh_job_name(owner: &str, qualified: &str) -> String {
-    format!("{}{qualified}", refresh_job_prefix(owner))
+    let prefix = refresh_job_prefix(owner);
+    let full = format!("{prefix}{qualified}");
+    if full.len() <= MAX_JOB_NAME {
+        return full;
+    }
+    let room = MAX_JOB_NAME - prefix.len() - 2 - 16;
+    format!("{prefix}{}%%{}", cut_to(qualified, room), short_hash(qualified, 16))
 }
 
 /// The name dbd gave `qualified`'s job before it named the owner. Whose it is
@@ -168,19 +212,32 @@ fn refresh_job_sql(owner: &str, qualified: &str, schedule: &str, concurrently: b
     )
 }
 
+/// The form of the command dbd gives a refresh job, `REFRESH MATERIALIZED
+/// VIEW [CONCURRENTLY] "schema"."name"`, as a Postgres regular expression.
+const REFRESH_COMMAND: &str = r#"^REFRESH MATERIALIZED VIEW (CONCURRENTLY )?"([^"]|"")+"\."([^"]|"")+"$"#;
+
 /// Build the statement that unschedules `owner`'s refresh jobs NOT in
-/// `keep_job_names`, and the legacy untagged jobs named in `legacy_job_names`
-/// — those of the matviews `owner` declares. Another owner's jobs, tagged or
-/// legacy, are never matched. The owner's prefix is compared with `left`, not
-/// `LIKE`, whose `_` and `%` an owner's name may hold. Empty lists still yield
-/// valid SQL via a typed empty array (`ARRAY[]::text[]`).
+/// `keep_job_names`; the legacy untagged jobs named in `legacy_job_names` —
+/// those of the matviews `owner` declares, which an owner-named job replaces;
+/// and a legacy job in dbd's own form whose view no longer exists, which
+/// nobody can want — it fails on every tick. Another owner's jobs, and a job
+/// written by hand, are never matched.
+///
+/// The owner's prefix is compared with `left`, not `LIKE`, whose `_` and `%`
+/// an owner's name may hold, and Postgres measures it as it measures the job's
+/// name: in bytes in a `SQL_ASCII` database, in characters elsewhere. The view
+/// is looked up only for a command in dbd's form — `CASE` keeps `to_regclass`
+/// from reading anything else. Empty lists still yield valid SQL via a typed
+/// empty array (`ARRAY[]::text[]`).
 fn unschedule_stale_sql(owner: &str, keep_job_names: &[String], legacy_job_names: &[String]) -> String {
-    let prefix = refresh_job_prefix(owner);
+    let prefix = refresh_job_prefix(owner).replace('\'', "''");
     format!(
         "SELECT cron.unschedule(jobid) FROM cron.job \
-         WHERE (left(jobname, {}) = '{}' AND jobname <> ALL({})) OR jobname = ANY({});",
-        prefix.chars().count(),
-        prefix.replace('\'', "''"),
+         WHERE (left(jobname, length('{prefix}')) = '{prefix}' AND jobname <> ALL({})) \
+            OR jobname = ANY({}) \
+            OR (left(jobname, 12) = 'dbd:refresh:' AND CASE WHEN command ~ '{REFRESH_COMMAND}' \
+                  THEN to_regclass(substring(command from '^REFRESH MATERIALIZED VIEW (?:CONCURRENTLY )?(.*)$')) IS NULL \
+                  ELSE false END);",
         text_array(keep_job_names),
         text_array(legacy_job_names),
     )
