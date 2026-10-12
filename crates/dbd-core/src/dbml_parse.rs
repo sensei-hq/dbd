@@ -2995,6 +2995,40 @@ mod tests {
         assert_eq!(keys, ["a,b", "c\"d"]);
     }
 
+    /// What @dbml/core refuses on a column's, an enum value's or a header's
+    /// line is refused, naming what was not understood. A table written on
+    /// one line with two columns, `{ id int [pk] name text }`, read as one
+    /// column typed `int [pk] name text`, and `init --from-dbml` wrote it and
+    /// exited 0. The one-line forms @dbml/core accepts still read.
+    #[test]
+    fn what_follows_a_column_or_an_enum_value_on_its_line_is_refused() {
+        for (dbml, unexpected) in [
+            ("Table a.p { id int [pk] name text }", "`name text`"),
+            ("Table a.p {\n  id int, name text\n}", "`, name text`"),
+            ("Table a.p {\n  id int [pk] Note: 'x'\n}", "`Note: 'x'`"),
+            ("Enum a.e { x y }", "`y`"),
+            ("Enum a.e {\n  x [note: 'n'] z\n}", "`z`"),
+            ("Table a.p junk {\n  id int\n}", "`junk`"),
+        ] {
+            let err = parse_dbml(dbml).map(|_| ()).unwrap_err().to_string();
+            assert!(err.contains(unexpected), "{dbml:?}: {err}");
+        }
+        for dbml in [
+            "Table a.p { id int [pk] }",
+            "Table a.p { id int }",
+            "Table a.p { id int pk unique [not null] }",
+            "Table a.p [note: 'x'] { id int }",
+            "Table a.p { id int [pk]\n name text }",
+            "Enum a.e { x }",
+            "Enum a.e { x [note: 'n'] }",
+        ] {
+            parse_dbml(dbml).unwrap_or_else(|e| panic!("{dbml:?}: {e}"));
+        }
+        let entities = parse_dbml("Table a.p { id int pk unique [not null] }").unwrap();
+        let id = &find_table(&entities, "a.p").table_def.as_ref().unwrap().columns[0];
+        assert!(id.is_pk && id.is_unique && !id.nullable, "{id:?}");
+    }
+
     /// A column typed by an enum the document declares is written in SQL,
     /// whatever the enum's name holds. `"app"."mo\"od"` — DBML's spelling of
     /// a schema-qualified enum, which @dbml/core reads as the enum `mo"od` in
