@@ -124,6 +124,12 @@ records the database afresh. The rest arrive with defaults:
   PostgreSQL overrides it with a single `TRUNCATE` of them all, since tables
   linked by a foreign key cannot be emptied one by one, and names any table
   outside the list that holds a key to one of them.
+- `foreign_keys()` returns the keys between the database's own tables, each as
+  `(referencing table, referenced table)`, named as the database names them.
+  An import orders its tables by them as well as by the design's references
+  (see `live_import_plan` below). SQLite overrides it: its DDL is read
+  verbatim, so the design has no references to order a SQLite import by, and
+  it loaded a table before the one it references. None by default.
 - `existing_objects(objects)` says which of a list of `(kind, name)` exist.
   `reset` asks before and after it drops, so it reports what it dropped rather
   than what it ran — every drop is `IF EXISTS`. The default answers for tables
@@ -210,10 +216,12 @@ same gates and without a database — the list `dbd apply --dry-run` prints.
 
 Pending migrations run version by version, each whole before the next: a
 version's creates and `.sql` alters in dependency order (`ExecutionStep::
-CreateEntity`, `MigrateEntity`), then its `.data.sql` scripts (`MigrateData`),
-then its drops (`DropEntity`), then its record (`RecordMigration`); after the
-last version, every entity no version just created from its DDL re-applies it. A migration or data script that states no path runs on
-the path its entity's DDL file runs on, through `execute_project_script`. The
+CreateEntity`, `MigrateEntity`), then the `.data.sql` scripts of the tables it
+alters or adds (`MigrateData`), then its drops (`DropEntity`), then its record
+(`RecordMigration`); after the last version, every entity no version just
+created from its DDL re-applies it. A migration or data script that states no path runs on the path its
+entity's CREATE runs on — the last `SET search_path` its DDL file states before
+the CREATE, else `source.search_path` — through `execute_project_script`. The
 exception to the one transaction is a version that adds enum values: its
 `ALTER TYPE … ADD VALUE` statements run first, as `IF NOT EXISTS`
 (`AddEnumValues`), and the batch commits after them — Postgres will not use a
@@ -360,6 +368,9 @@ staging table. `import_warnings(name)` lists what the scan and the plan left out
 before any scope: a missing `import/`, another environment's files, a data file
 that failed to parse, a function reading a staging table no procedure loads, a
 procedure reading one it does not load.
+`live_import_plan(adapter, name, scope)` is that plan ordered by the foreign
+keys `adapter`'s database reports too — what `import_data` and `deploy` run, and
+what `dbd import --dry-run` lists when it has a database to ask.
 `design::import_entry_in_scope` is deprecated in favour of `scoped_import_plan`.
 
 `apply_policies` takes an optional `(scope_name, working_set)` pair; `None`
@@ -433,7 +444,7 @@ for kept in &done.roles_kept {
 `reset(adapter, target, force, drop_schemas, drop_extensions, scope)` is
 `dbd reset`. `target` names the protected set — `postgres`, `supabase` or
 `sqlite`; the CLI passes the design's target key unless `--target` overrides it.
-Unless `force`, it runs `check_reset_guard` first. It returns a
+Unless `force`, it runs its own `check_reset_guard` first. It returns a
 `ResetComplete`: `dropped`, every `(kind, name)` it found and dropped — read
 from the database before and after, because every drop is `IF EXISTS` and the
 script alone cannot tell a reset that emptied the schema from one that found
@@ -591,7 +602,15 @@ An introspected table carries what dbd 0.25 models beyond 0.24: its triggers
 `initially_deferred`, and `TableConstraint::Exclude`. What the model cannot
 hold — `NOT VALID`, `UNLOGGED`, inheritance, partitioning — is in the entity's
 `warnings`, which `init --from-db` prints. Objects an extension owns are not
-introspected at all.
+introspected at all. A SQLite introspection carries a table's and a view's
+triggers too, as `CREATE TRIGGER IF NOT EXISTS`.
+
+`keep_authored_triggers(root, &mut entities)` is for a merge from a source that
+cannot hold a trigger — a DBML document, in `merge --from-dbml`. It gives each
+table and view in `entities` that carries no triggers the trigger statements its
+file under `root` already holds, each after the `SET search_path` it was written
+under, and returns the files it could not read them from because they do not
+parse.
 
 ## Parse SQL without a project
 
@@ -682,9 +701,11 @@ embedder that wants them makes them itself:
   of database the connection reaches, before connecting.
 - **Reset's preview.** `Design::reset` checks its own guard (a database marked
   prod, or versioned) unless forced; `dbd reset --dry-run` checks it too, given
-  a database, through the public
-  `Design::check_reset_guard(&marks)` (`marks` from `Design::database_marks`),
-  so a preview refuses where the reset would.
+  a database, through the public method
+  `design.check_reset_guard(&marks)` (`marks` from `Design::database_marks`),
+  so a preview refuses where the reset would. A method because its refusal
+  calls the database a released project's only when `project.released` is
+  set.
   `reset_script` alone checks nothing.
 - **The release check.** `dbd reconcile` refuses on a released project;
   `Design::reconcile` does not.

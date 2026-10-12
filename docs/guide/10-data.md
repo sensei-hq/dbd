@@ -179,7 +179,11 @@ In order:
    a key to one of them fails the run, named, before anything is emptied. On
    Convex the load itself replaces the table.
 2. **Load** each data file into its table — a staging table another one
-   references before the table that references it.
+   references before the table that references it. On SQLite, whose DDL dbd
+   reads verbatim and so knows no references from, that order — and the
+   truncate's — comes from the foreign keys the database reports; `import
+   --dry-run` lists it when the database exists, and alphabetically when there
+   is none to ask.
 3. **Call the import procedures** — each staging table's one loader, once (see
    below). The plan is ordered by dependencies, so a procedure that fills
    `config.lookups` runs before one that fills `config.lookup_values`.
@@ -424,7 +428,9 @@ import/staging` writes `import/staging/accounts.csv`, which an import loads
 into `staging.accounts`. Under the usual layout it would have landed in
 `import/staging/core/`, a folder no import reads. Two tables that would be the
 same file there — `core.accounts` and `staging.accounts` — are refused before
-anything is written; export them one at a time with `-n`.
+anything is written. An import loads every file there into that one schema, so
+export into the folder, with `-n`, the one table whose rows the file should
+hold — a second export there overwrites the first.
 
 Generated columns are left out of every export: the import recomputes them, and
 refuses a file that sets one. CSV and TSV carry a header row — on SQLite even for

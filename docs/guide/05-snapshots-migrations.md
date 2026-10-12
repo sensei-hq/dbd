@@ -89,9 +89,9 @@ as upgrading one release at a time would:
 
 1. the enum values the version adds (below);
 2. its creates and schema changes (`<table>.sql`), in dependency order;
-3. its data scripts (`<table>.data.sql`), in dependency order — after every
-   schema change of the version, since one table's script may read a column
-   another table gains in the same version;
+3. the data scripts (`<table>.data.sql`) of the tables it alters or adds, in
+   dependency order — after every schema change of the version, since one
+   table's script may read a column another table gains in the same version;
 4. its drops;
 5. the record that it ran.
 
@@ -112,12 +112,12 @@ database records the version before it; fix the migration and re-run, and the
 additions run again as no-ops. A run whose pending versions add no enum value is
 one transaction from start to end.
 
-**Scripts run on the path their entity's DDL runs on.** A migration file that
-states no `SET search_path` runs on the path its table's DDL file runs on — the
-one that file states, else `source.search_path` — so a `data.sql` can name its
-table bare, as the DDL does; the drop of a table the design no longer has runs
-on `source.search_path`. With neither, it runs on the session default (`RESET
-search_path`).
+**Scripts run on the path their entity's CREATE runs on.** A migration file that
+states no `SET search_path` runs on the path its table's CREATE runs on — the
+last `SET search_path` the DDL file states before the CREATE, else
+`source.search_path` — so a `data.sql` can name its table bare, as the DDL does;
+the drop of a table the design no longer has runs on `source.search_path`. With
+neither, it runs on the session default (`RESET search_path`).
 
 One case a jump across versions still gets wrong: a table an earlier pending
 version adds is created from its *current* DDL, so a later pending version's
@@ -188,7 +188,10 @@ migrations/002/
 
 Within a version, every `.sql` runs before any `.data.sql`, and the data
 scripts run before the version's drops — see
-[how a run is ordered](#how-a-migration-run-is-ordered).
+[how a run is ordered](#how-a-migration-run-is-ordered). A version runs the
+`data.sql` of a table it alters or adds — one seeding a table the version
+creates runs after the create — and the previews list it; a `data.sql` for a
+table the version neither alters nor adds does not run.
 
 Auto-generated data.sql uses Postgres CAST for type conversions. Non-derivable corrections (enum value mapping) generate TODO comments that the developer must fill in before committing. These are enforced: `dbd inspect` surfaces any unresolved `-- TODO:` in migration files, and `dbd apply` and `dbd deploy` refuse to run while pending TODOs remain — their dry runs too, with a database configured to say which migrations are pending — so an unfinished migration can't reach the database.
 

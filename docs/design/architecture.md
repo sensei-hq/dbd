@@ -264,7 +264,9 @@ for e in &parsed.entities {
 ```
 
 Resolution is deliberately a second phase: each entity carries its references as
-written, provisionally qualified against `search_paths[0]`, and
+written, provisionally qualified against `search_paths[0]` — the path in effect at the
+entity's CREATE: the last `SET search_path` the file states before it, else the first the
+file states — and
 `references::resolve_references` re-resolves them once every file is read. The
 per-file parse touches no shared state, so the scan parallelises and a bare `t`
 that could be `a.t` or `b.t` stays undecided until the whole set is known.
@@ -624,11 +626,16 @@ pub trait DatabaseAdapter: Send + Sync {
 > `dbd.matview_stamps`, out of the matview's comment), `truncate_table`/`truncate_tables`
 > (the import's truncate — Postgres empties every staging table in one `TRUNCATE` and names
 > a table outside the import that holds a key to one; the default goes one at a time,
-> referencing table first, `DELETE FROM` on SQLite, nothing on Convex),
+> referencing table first, `DELETE FROM` on SQLite, nothing on Convex), `foreign_keys`
+> (the keys between the database's own tables — SQLite reports them from
+> `pragma_foreign_key_list`, since its verbatim DDL gives the design no references, and
+> `Design::live_import_plan` orders the loads and the truncate by them; none by default),
 > `matviews_reading_columns` (what blocks reconcile's enum swap, asked of the database
 > rather than the design), `other_projects_meta` (the records the guards read for a renamed
 > `project.name` — see the bookkeeping notes below), `execute_project_script` (a migration
-> or hook run on a search path, since it may name tables bare) and `dependencies`
+> or hook run on a search path, since it may name tables bare — a migration on the path
+> its entity's CREATE runs on, the last `SET search_path` its DDL file states before it) and
+> `dependencies`
 > (`pg_depend`, read so `init --from-db --schema` can say what the capture needs from
 > outside). `export_data` writes into the directory its caller passes, which the CLI makes
 > `<root>/<schema>/` — the layout `import/` reads — or, for `-o` naming a schema folder of
@@ -1026,8 +1033,14 @@ is two entries and one call. Only procedures are candidates — the step is
 > detection. It no longer reads DDL, and since 0.25 the formatter no longer trusts it
 > either: statement boundaries come from libpg_query, and a layout is kept only if
 > libpg_query parses it to the same tree with every literal, body, quoted name and
-> comment byte-for-byte unchanged. The rest of this section is kept as the
-> original record.
+> comment byte-for-byte unchanged. Each literal and quoted name in sqlparser's layout
+> is given back its written spelling before that check. Keyword case is decided per
+> token from libpg_query's keyword category: a word the grammar could read as a name
+> is quoted in place, and keeps its case if the statement still deparses the same, so
+> a column named `name` or `level` is left alone. The hand-written keyword list stays,
+> for text libpg_query cannot parse and for type names the grammar reads as names
+> (`text`, `uuid`); its words are recased even where they name a column. The rest of
+> this section is kept as the original record.
 
 **`sqlparser-rs`** (Apache DataFusion) is the parser. It replaces both `pg_query` (C FFI) and the regex fallbacks from the Node.js version.
 
@@ -1666,8 +1679,9 @@ Scenario: Multi-version catch-up
 ```
 
 > **Current implementation note (0.25).** Each version runs whole before the next — its
-> creates and `.sql` alters in dependency order, then all its `.data.sql` scripts, then its
-> drops, then its `RecordMigration` — and every entity re-applies after the last
+> creates and `.sql` alters in dependency order, then the `.data.sql` scripts of the tables
+> it alters or adds (`migration.altered` or `migration.added` — one seeding a table it adds
+> never ran before), then its drops, then its `RecordMigration` — and every entity re-applies after the last
 > (`design::plan::plan_migrate`). The plan ran entity by entity before: a jump ran a later
 > version's change ahead of an earlier version's change to another table, which a stepwise
 > upgrade never does. A version's `ALTER TYPE … ADD VALUE` statements run at its head as
@@ -1749,9 +1763,9 @@ Scenario: Dev reset blocked after v1
 ```
 
 > **Current implementation note (0.25).** The message is "reset is blocked — the database
-> is versioned at v1 (a released project's database)": the guard reads the recorded
-> version, and a fresh install of a released project records its version having run no
-> migration.
+> is versioned at v1", with "(a released project's database)" after it only when
+> `project.released` is set: the guard reads the recorded version, and a fresh install
+> records its version having run no migration.
 
 ```gherkin
 Scenario: Dev reset after v1 with an explicit override
@@ -1919,8 +1933,9 @@ reset called
 
 **Prod is always protected:** Even at version 0, a prod database may have data loaded outside of dbd. Reset always requires `--force`.
 
-> **Current implementation note (0.25).** The guard is `Design::check_reset_guard(marks)`,
-> public so `dbd reset --dry-run` runs it too whenever a database is configured (`-d`,
+> **Current implementation note (0.25).** The guard is the method
+> `design.check_reset_guard(&marks)` — a method because its refusal reads
+> `project.released` — public so `dbd reset --dry-run` runs it too whenever a database is configured (`-d`,
 > `DATABASE_URL`, or a `target.url` that resolves) — a preview of a reset the real run
 > would refuse is a false promise; with no database configured the dry run stays an
 > offline preview. The scope pin is checked beside it by the CLI. Reset is
@@ -2203,6 +2218,14 @@ Ref: "config"."lookup_values"."lookup_id" > "config"."lookups"."id"
 ```
 
 #### DBML syntax rules for the generator
+
+> **Current implementation note (0.25).** A name that is not a plain word is written as a
+> DBML quoted name, its `\` and `"` escaped as DBML's lexer reads them; an enum column's
+> type is DBML's reference to the enum — `"app"."mo\"od"`, both parts quoted when either
+> needs it, or a bare `app.mood` — and the reader takes a qualified quoted
+> type, or one naming an enum the document declares, as that enum and any other quoted
+> type as its own SQL text. One quote-aware scanner splits settings, commas, colons, Ref
+> operators, dots and tuples, so a `"` inside a `'…'` setting is text.
 
 **Strings and quoting:**
 - Identifiers with special chars or reserved words: double quotes (`"column"`)

@@ -160,7 +160,11 @@ scope's entities.
   from it is numbered by the table instead, and any other column loses the
   default — each reported.
 - **Schemas.** SQL Server gets a `CREATE SCHEMA` for every schema the script
-  uses, `dbo` aside; MySQL and SQLite fold the schema into the name.
+  uses, `dbo` aside; MySQL and SQLite fold the schema into the name. A dot in a
+  schema or table name is not supported: `app."we.ird"` comes out `app_ird`.
+- **Quoting.** Every name is quoted the way the target quotes, and the target's
+  quote character inside a name is escaped the way the target escapes it:
+  SQLite doubles `"`, MySQL a backtick, SQL Server `]`.
 - **Functions, procedures and triggers** are skipped and reported: their bodies
   do not translate. That includes a trigger written in a table's file, after its
   `CREATE TABLE`.

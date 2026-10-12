@@ -122,7 +122,9 @@ timed out while waiting for an open connection`.
 
 A dry run opens only a database that exists: it reads a configured database to
 check its run's guards, but a SQLite file that is not there yet is not created
-— the dry run treats it as no database configured.
+— the dry run treats it as no database configured. `reconcile --dry-run`, which
+needs a database to compare against, previews against an empty in-memory one
+instead — what its run would create — and refuses where the run refuses.
 
 ### Scope guard
 
@@ -475,7 +477,11 @@ while SQLite gives each record that leaves a key out the DEFAULT.
 linked by a foreign key only together, and loads a referenced table before one that references
 it. A table outside the import that holds a key to one of them fails the import, named, with
 nothing emptied (`held by app.orders (orders_customer_fk, a key to staging.customers), outside the
-tables this import reloads`). SQLite empties them one at a time, a referencing table first.
+tables this import reloads`). On SQLite, whose DDL dbd reads verbatim and so knows no references
+from, the order comes from the foreign keys the database reports: a referenced table is loaded
+first, and the tables are emptied one at a time, a referencing table first. `import --dry-run`
+lists that order when the database exists; with no database to ask it lists the tables
+alphabetically.
 
 **`import.after`** scripts run after the procedures, on every `dbd import` (with or without
 `-n`) and on `dbd deploy` — not on `dbd apply`, and not with `-f`. `--dry-run` lists them, and
@@ -699,14 +705,15 @@ What DBML has no syntax for travels where DBML keeps it, so `init --from-dbml` c
 - **Generated columns and `ALWAYS` identities** ride in custom column properties: `generated always as: '<expression>'`, and `generated as identity: 'always'` beside `increment` — a bare `increment` means `BY DEFAULT`.
 - Strings are escaped the way DBML's own lexer reads them, so a quote or backslash in a note or default survives, and a column comment keeps its line breaks (as DBML's `\n` escape). A note that spans lines is written as a triple-quoted string, which @dbml/core reads back exactly.
 - **A SQL value keyword default** — `current_date`, `current_user`, … — is written as an expression (`` [default: `current_date`] ``), decided from its parse tree, so it does not come back as the string `'current_date'`.
-- **An enum column's type** is written schema-qualified, as the table's `search_path` resolves it (`app.mood`), so the rebuilt DDL names the type that exists.
+- **An enum column's type** is written schema-qualified, as the table's `search_path` resolves it, in DBML's own spelling of an enum — `app.mood`, or `"app"."mo\"od"` for a name that needs quotes — so the rebuilt DDL names the type that exists.
+- **Every name** — schema, table, column, enum and enum value, index, primary-key, foreign-key, UNIQUE and CHECK names — is written in DBML's quoting and read back as itself, whatever it holds: a quote, a backslash, a space, a dot, a `'` or non-ASCII text. (A schema, table or enum name also names a file, so a backslash in one is refused, and a dot in one is not supported by dbd.) The DDL `init --from-dbml` writes doubles a quote in every identifier, `CREATE SCHEMA` included.
 - **A CHECK's name** comes back with it: `init --from-dbml` writes `CONSTRAINT "people_age_ck" CHECK (age >= 0)`.
 - **An index's method** goes in its `type:` setting (`[type: gin]`), and its `INCLUDE` columns, operator classes and storage parameters in its note (`include: a, b`, `opclass: -, text_pattern_ops` — `-` for a key's default — and `with: fillfactor = 70`).
 - **A named primary key** is a `pk` entry in the `indexes` block with its name (`id [pk, name: 'people_pk']`), and **a named foreign key** a named Ref (`Ref "people_org_fk": …`). PostgreSQL's default names — `<table>_pkey`, `<table>_<columns>_fkey` — are left out, so a key nobody named stays unnamed and the database names it again.
 
-**Reading DBML.** `init --from-dbml` and `merge --from-dbml` read a document the way @dbml/core reads it — dbd's own output and the DBML a person writes: table aliases (`Table app.users as U`), an inline `[ref: > t.c]`, notes and settings that span lines, `Note { … }` blocks, one-line tables, a `pk` index entry, `Ref name:` and `Ref name { … }`, an index's `type:`, and a table header's `[note: …]`. A one-to-one `Ref: a - b` puts the foreign key on `b`, as @dbml/core's SQL does; an inline `[ref: - t.c]` puts it on its own column. What dbd cannot build as written is refused, with why, rather than guessed: a many-to-many `<>` Ref, which has no foreign key (@dbml/core builds a junction table for it), and a table taking a `TablePartial`'s columns. A note is dedented as @dbml/core dedents one — blank leading lines dropped, the indentation its lines share removed — except that the line a closing `'''` sits on is layout, not a trailing line break. A one-line note loses its leading whitespace, and a quote escaped inside a quoted name (`"we\"ird"`) is not unescaped.
+**Reading DBML.** `init --from-dbml` and `merge --from-dbml` read a document the way @dbml/core reads it — dbd's own output and the DBML a person writes: table aliases (`Table app.users as U`), an inline `[ref: > t.c]`, notes and settings that span lines, `Note { … }` blocks, one-line tables @dbml/core accepts, a bare `pk` or `unique` after a column's type, a `pk` index entry, `Ref name:` and `Ref name { … }`, an index's `type:`, and a table header's `[note: …]`. A one-to-one `Ref: a - b` puts the foreign key on `b`, as @dbml/core's SQL does; an inline `[ref: - t.c]` puts it on its own column. What dbd cannot build as written is refused, with why, rather than guessed: a many-to-many `<>` Ref, which has no foreign key (@dbml/core builds a junction table for it), and a table taking a `TablePartial`'s columns. Anything after a column, an enum value or a header on its line is refused, naming it, as @dbml/core refuses it (``table `a.p`: unexpected `name text` after the column `id` — each column needs a line of its own``). A column type in DBML's enum spelling (`"app"."mo\"od"`), or a quoted name the document declares as an enum, is that enum; any other quoted type is its own SQL text (`"timestamp with time zone"`). A note is dedented as @dbml/core dedents one — blank leading lines dropped, the indentation its lines share removed — except that the line a closing `'''` sits on is layout, not a trailing line break. A one-line note loses its leading whitespace.
 
-DBML has no syntax for a foreign key's deferral or `MATCH FULL`, an `EXCLUDE` constraint or a column's collation, so `dbd dbml` leaves them out and they do not survive the round trip.
+DBML has no syntax for a foreign key's deferral or `MATCH FULL`, an `EXCLUDE` constraint or a column's collation, so `dbd dbml` leaves them out and they do not survive the round trip. An expression default or CHECK holding a backtick is written into a document `init --from-dbml` refuses, since DBML has no escape for one, and a line break inside a CHECK's or index predicate's string literal comes back as a space.
 
 `checks` blocks need `@dbml/core` 5.0 or later and custom column properties 9.1 or later; tooling older than that cannot read a document that uses them.
 
@@ -809,11 +816,13 @@ dbd reset --scope hub --dry-run    # Only the objects the 'hub' scope occupies
 **The guards** read the database, not the flags of this run: a reset is refused
 when the bookkeeping row says the database is `prod` (rows older versions wrote
 as `production` included) — and any database applied without `-e dev` is — or
-when it records version 1 or later — a released project's database, in any
-environment, whether or not a migration has run on it:
+when it records version 1 or later, in any environment, whether or not a
+migration has run on it. The refusal calls it a released project's database only
+when `project.released` is set:
 
 ```
 reset is blocked — database is marked as prod. Use --force to override.
+reset is blocked — the database is versioned at v3. Use --force to override.
 reset is blocked — the database is versioned at v3 (a released project's database). Use --force to override.
 ```
 
@@ -1320,7 +1329,9 @@ how a long-running system's data moves to a new database (see
 [import and export](10-data.md)). Written under a schema folder of its own instead —
 `import/staging/core/accounts.csv` — the file would sit where no import reads. Two exported tables
 that would share one file there (`core.accounts` and `audit.accounts`) are refused before anything
-is written; export them one at a time with `-n`, or to `-o import` to keep each under its schema.
+is written: an import loads each file there into that schema, so export into the folder, with `-n`,
+the one table whose rows the file should hold. Exported anywhere outside `import/` — the default
+`export/` — each table keeps its own schema folder.
 
 A JSONL file writes every column's key; `null` is SQL NULL, and a json/jsonb column holding the
 JSON value `null` is written `{"$json": null}`, which an import reads back as that value. A SQLite
@@ -1409,14 +1420,15 @@ dbd init --from-db ... --all-schemas              # include Supabase platform sc
 dbd init --from-db ... --dry-run                  # print the plan, write nothing
 ```
 
-The **dialect is taken from the connection URL scheme** (`postgres://` → a `postgres`
-target, `sqlite://`/`file:` → a `sqlite` target). **SQLite** is captured verbatim from
-`sqlite_master`: tables (with their CHECK constraints, type affinity, `AUTOINCREMENT`,
-`WITHOUT ROWID`), user indexes, and views — losslessly. SQLite has no schemas/enums/
-functions/sequences/roles, so those don't apply, and **triggers are skipped** (no `CREATE
-TRIGGER` support yet). Files land flat (`ddl/table/<name>.ddl`) and `design.yaml` has an
-empty `schemas:` list. (`dbd inspect` on a SQLite project may emit benign
-schema-qualification warnings for cross-object references; the DDL is valid and applies.)
+The **dialect is taken from the connection URL scheme** (`postgres://` → a `postgres` target,
+`sqlite://`/`file:` → a `sqlite` target). **SQLite** is captured verbatim from `sqlite_master`:
+tables (with their CHECK constraints, type affinity, `AUTOINCREMENT`, `WITHOUT ROWID`), user
+indexes, and views — losslessly — with each table's and view's triggers written into its file
+after it, as `CREATE TRIGGER IF NOT EXISTS`. SQLite has no
+schemas/enums/functions/sequences/roles, so those don't apply. Files land flat
+(`ddl/table/<name>.ddl`) and `design.yaml` has an empty `schemas:` list. (`dbd inspect` on a
+SQLite project may emit benign schema-qualification warnings for cross-object references; the DDL
+is valid and applies.)
 
 | Flag | Description |
 |------|-------------|
@@ -1509,18 +1521,27 @@ sessions only or always, is named, since the file creates it plainly enabled. **
 enums, functions and schemas — since the extension creates it; captured, a `reset` would fail on
 it. `diff` and `reconcile` leave the same objects out.
 
-**What the model cannot hold is named, not weakened in silence.** A partitioned table is captured
-as one plain table holding every row, its partitions folded into it, with a warning naming its
-partition key and each partition's bounds — partitions are not created, and anything defined on a
-partition alone is not captured. A constraint that is `NOT VALID`, `NOT ENFORCED` or `NO INHERIT`
-is captured as an ordinary one, and named; so are a deferrable primary key or UNIQUE, an
-`UNLOGGED` table (captured logged) and a table that inherits another (captured as a plain table
-with every column it has):
+**Much of what the model cannot hold is named rather than weakened in silence.** A partitioned
+table is captured as one plain table holding every row, its partitions folded into it, with a
+warning naming its partition key and each partition's bounds — partitions are not created, and
+anything defined on a partition alone is not captured. A constraint that is `NOT VALID`,
+`NOT ENFORCED` or `NO INHERIT` is captured as an ordinary one, and named; so are a deferrable
+primary key or UNIQUE, an `UNLOGGED` table (captured logged) and a table that inherits another
+(captured as a plain table with every column it has):
 
 ```
   warning: table app.scratch is UNLOGGED in the database — dbd's table model has no persistence, so it is captured as an ordinary, logged table: …
   warning: constraint booking_room_ck on app.booking is NOT VALID in the database — the rows already there were never checked against it. …
 ```
+
+Some of it is still dropped without a word. A domain or a composite type is neither captured nor
+named, so the project fails on a fresh database at the first column typed with one (`type
+"app.posint" does not exist`). An identity column's `START` and `INCREMENT`, a table's storage
+parameters (`fillfactor`), a column's `STORAGE`, row-level security and its policies, and the
+comments on constraints, indexes and functions are lost. And a default holding a backslash reads
+as drift in `diff` even against the database it came from:
+`ALTER COLUMN d SET DEFAULT e'a\\b'`.
+
 A view's or materialized view's own comment is written as `COMMENT ON VIEW` /
 `COMMENT ON MATERIALIZED VIEW` — except a drift stamp an earlier dbd left as a matview's
 comment, which is dbd's and not yours. Every key is written with its name —
@@ -1572,7 +1593,7 @@ is a no-op since DBML has no roles.
 
 Not yet captured from a database:
 
-- Aggregates, operators, domains, composite types; on SQLite, triggers.
+- Aggregates, operators, domains, composite types — not named either (see above).
 - dbd's own bookkeeping — the `dbd` schema (`dbd.meta`, `dbd.migrations`, `dbd.matview_stamps`)
   — is always excluded.
 
@@ -1665,12 +1686,15 @@ yourself:
 What `design.yaml` already declares draws no warning. A table declared `external:` is never
 captured — it is somebody else's, and written as a project file `reset` would drop it — and is
 named instead (`left out: table `auth.users` — declared under external:`). A table's triggers are
-written into its file, as `init --from-db` writes them, so a merge no longer deletes the triggers
-from the table files it overwrites. What a file cannot carry — partitioning, `UNLOGGED`, a
-`NOT VALID` constraint — is warned about as `init --from-db` warns, and extension-owned objects
-are left out. On a Supabase database — or in a project whose target is `supabase` — Supabase's
-platform schemas are left out, as `init --from-db` leaves them out. Unlike `init --from-db`, a
-merge narrowed by `--schema` prints no `needs:` lines.
+written into its file, as `init --from-db` writes them — a SQLite table's too — so a merge no
+longer deletes the triggers from the table files it overwrites. `merge --from-dbml`, whose
+document cannot hold a trigger, keeps the triggers written in each table or view file it rewrites,
+each after the `SET search_path` it was written under; a file that does not parse keeps none, and
+is named (`… does not parse, so a trigger written in it is not kept by the merge`). What a file
+cannot carry — partitioning, `UNLOGGED`, a `NOT VALID` constraint — is warned about as
+`init --from-db` warns, and extension-owned objects are left out. On a Supabase database — or in a
+project whose target is `supabase` — Supabase's platform schemas are left out, as `init --from-db`
+leaves them out. Unlike `init --from-db`, a merge narrowed by `--schema` prints no `needs:` lines.
 
 **Managed databases & version safety.** When the target is a **dbd-managed** database (`dbd.meta`
 exists, or a legacy `_dbd_meta` in any schema), `merge` compares the database's applied version
@@ -1709,9 +1733,11 @@ format:
 
 Handles CREATE TABLE (full formatting), CREATE INDEX, SET, COMMENT ON. Inline column comments (`-- …` / `/* … */`) survive a CREATE TABLE reformat — they're recovered from the source and re-attached to the column they documented (trailing comments end-of-line, standalone comments on their own line above the column).
 
-**Formatting changes layout and keyword case, and nothing else.** The file is read with PostgreSQL's own scanner and parser, through libpg_query: statement boundaries are the parser's (a `BEGIN ATOMIC … END` body is one statement; for a file it cannot parse whole — another engine's DDL — a `;` inside parentheses or inside a `CREATE TRIGGER`/`FUNCTION`/`PROCEDURE` `BEGIN … END` body, as SQLite writes triggers, ends nothing), and keywords are recased token by token. Every string literal of any kind (`E'…'`, `U&'…'`, `$$` and `$tag$` bodies), quoted identifier and comment is a single token, never split or recased. A statement's new layout is used only if it parses to the same tree — libpg_query's, deparsed; sqlparser's for SQL libpg_query cannot read — and every literal, body, quoted name and comment in it is byte-for-byte the same; failing that the statement is only recased, and failing that left exactly as written. A file the scanner cannot read at all (an unterminated string or comment) is left unchanged. Before 0.25 the hand-rolled splitter closed `E'it\'s; tricky'` at `\'`, broke the default across three lines, and split a `$tag$` body at its own `;`s. One tradeoff remains: a table holding a literal the layout engine would re-spell (`U&'…'`) is recased but not laid out.
+**Formatting changes layout and keyword case, and nothing else.** The file is read with PostgreSQL's own scanner and parser, through libpg_query: statement boundaries are the parser's (a `BEGIN ATOMIC … END` body is one statement; for a file it cannot parse whole — another engine's DDL — a `;` inside parentheses or inside a `CREATE TRIGGER`/`FUNCTION`/`PROCEDURE` `BEGIN … END` body, as SQLite writes triggers, ends nothing). A keyword is recased where PostgreSQL's grammar reads it as one, and a word it reads as a name keeps its case even when it is a keyword elsewhere — a column named `name`, `value` or `level` — while built-in type names are recased with the keywords. Every string literal of any kind (`E'…'`, `U&'…'`, `$$` and `$tag$` bodies), quoted identifier and comment is a single token, never split or recased. A statement's new layout is used only if it parses to the same tree — libpg_query's, deparsed; sqlparser's for SQL libpg_query cannot read — and every literal, body, quoted name and comment in it is byte-for-byte the same; failing that the statement is only recased, and failing that left exactly as written. A file the scanner cannot read at all (an unterminated string or comment) is left unchanged. Formatting twice changes nothing — `format` then `format --check` passes — and a comment beside a statement stays beside it, one above it above it. Before 0.25 the hand-rolled splitter closed `E'it\'s; tricky'` at `\'`, broke the default across three lines, and split a `$tag$` body at its own `;`s.
 
-All three `keyword_case` modes do what they say, for every keyword in every statement: `preserve` leaves each keyword as written (it used to uppercase a lowercase file), and `upper` and `lower` reach `SET` and the column types of a table with a `serial` or `inet` column. Comments, string literals, quoted identifiers and `$$` bodies keep their case. `keyword_case` reaches every keyword the formatter writes, not only the statement's head: `GENERATED`, `ALWAYS`, `IDENTITY`, `STORED`, `MATCH`, `RESTRICT`, `ACTION`, `VALID`, `DATA`, index methods (`btree`, `hash`, `gin`, `gist`, `spgist`, `brin`) and built-in type names (`bool`, `int2`/`int4`/`int8`, `float4`/`float8`, `bytea`, `timestamptz`, `timetz`, `json`, `jsonb`, `inet`, `cidr`, `money`) are cased with their neighbours, so a column reads `generated by default as identity`, never `GENERATED by default as IDENTITY`.
+A table is laid out whatever its literals and names — a `U&'…'` or `$$` default, a quoted table or column name, a column's own CHECK, a named column constraint, and `TEMP`, `WITH (…)`, `PARTITION BY`, `INHERITS` or `TABLESPACE` around the column list. The layout is sqlparser 0.62's, so a table it cannot read is recased, not laid out: `UNLOGGED`, `LIKE`, `EXCLUDE`, `USING <method>`, `OF <type>`, `PARTITION OF`, identity options beyond one (`(START WITH 1 INCREMENT BY 1)`), a key's `INCLUDE`/`WITH`/`USING INDEX TABLESPACE`, `NO INHERIT`, `ON DELETE SET NULL (<columns>)`, a column's `STORAGE`/`COMPRESSION`, an `ARRAY` type (`int ARRAY`), `WITHOUT OIDS` and `U&'…' UESCAPE`; so is an enum type with a label holding a `'`. A word on the formatter's own keyword list — `data`, `type`, `key`, `comment` … — is recased even where it names a column (`DATA JSONB` in `upper` mode).
+
+All three `keyword_case` modes do what they say, for every keyword in every statement: `preserve` leaves each keyword as written (it used to uppercase a lowercase file), and `upper` and `lower` reach `SET` and the column types of a table with a `serial` or `inet` column. Comments, string literals, quoted identifiers and `$$` bodies keep their case. `keyword_case` reaches every keyword the formatter writes, not only the statement's head: `GENERATED`, `ALWAYS`, `IDENTITY`, `STORED`, `MATCH`, `RESTRICT`, `ACTION`, `VALID`, `DATA` and every other keyword the grammar reads (`ATOMIC`, `COLLATE`, `BIT`, `PARTITION BY RANGE` …), index methods (`btree`, `hash`, `gin`, `gist`, `spgist`, `brin`) and built-in type names (`bool`, `int2`/`int4`/`int8`, `float4`/`float8`, `bytea`, `timestamptz`, `timetz`, `json`, `jsonb`, `inet`, `cidr`, `money`) are cased with their neighbours, so a column reads `generated by default as identity`, never `GENERATED by default as IDENTITY`.
 
 A file is written back in the encoding it was read in: a UTF-16 file saved by SSMS behind its byte-order mark stays UTF-16, and a UTF-8 byte-order mark is kept. `inspect --fix` writes the same way.
 

@@ -241,8 +241,11 @@ Both are filtered by what they touch:
   when they depend on a table the design manages outside the working set. A
   table the design does not manage — an `external:` one, or one the hook
   creates itself — never causes a skip. dbd derives a script's tables by
-  parsing it, reading a bare table name on the path the script runs on —
-  `source.search_path`, else the session default — not on `public`; when the
+  parsing it, reading a bare table name as Postgres resolves it where the
+  statement naming it runs — along the path in effect there (the script's last
+  `SET search_path`, else `source.search_path`, else the session default, with
+  `public` after it), to the first schema where the design has that table or
+  view — not on `public` alone; when the
   tables are *data* (inside `format()` or an `array[…]`), declare them with
   `writes:`. A script with no derivable tables and no `writes:` always runs.
   An `apply.*` skip is named before `apply`, `deploy` or `reconcile` starts and

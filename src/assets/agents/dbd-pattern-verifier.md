@@ -90,6 +90,11 @@ file evidence).
      refuse naming it; but a run that trips no guard records a second row, and a design ahead of
      the old record's version is planned as a fresh install, so its pending migrations never run.
      Fix: set `project.name` back.
+   - A **`migrations/NNN/…/<table>.data.sql` for a table that version's `graph.json` neither adds
+     nor alters** (`added`/`altered`) → violation: it never runs, and no preview lists it. A
+     version runs the data scripts of the tables it alters or adds (before 0.25, of those it
+     alters only — so a script seeding a table the version adds never ran either). Fix: put the
+     script in the version that adds or alters the table.
    - Evidence: `project.released`, `snapshots/` contents, and any command/README/script that
      names `reconcile`, `snapshot`, or raw SQL against the DB.
 2. **Non-idempotent DDL** (re-`apply` would error). Flag a `CREATE TABLE`/`CREATE MATERIALIZED

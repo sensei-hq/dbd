@@ -73,7 +73,7 @@ myproject/
 | `dbd release` (alias `baseline`) | Write a baseline snapshot — or, when snapshots exist, release at the latest — and lock in the snapshot/migration workflow (disables `reconcile`) |
 | `dbd snapshot` | Capture schema state, generate migration SQL |
 | `dbd migrate --status` | Show migration version status |
-| `dbd format` | Format DDL files (river-style; layout and keyword case only — string literals, `$$` bodies, quoted names and comments stay byte for byte; `--check` for CI/pre-commit) |
+| `dbd format` | Format DDL files (river-style; layout and keyword case only — string literals, `$$` bodies, quoted names and comments stay byte for byte, and formatting twice changes nothing; `--check` for CI/pre-commit) |
 | `dbd policies` | Apply RLS policies from `policies/` |
 | `dbd doctor` | Audit/migrate design.yaml + DDL layout |
 | `dbd reset` | Drop the project's own objects (with safety guards; PostgreSQL, Supabase and SQLite) and say what it dropped |
