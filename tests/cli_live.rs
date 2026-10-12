@@ -2447,3 +2447,67 @@ async fn an_apply_outside_a_transaction_claims_before_it_builds() {
     assert!(held.status.success(), "{}", combined(&held));
     assert_eq!(stdout(&held).trim(), "broken,named,widgets", "clilive's claims");
 }
+
+/// `reconcile --prune` keeps a table nobody owns in a schema another project
+/// uses, saying why; `--prune-unowned` drops it, naming it as it goes (#7).
+#[tokio::test]
+async fn reconcile_prunes_an_unowned_table_in_a_shared_schema_only_when_told() {
+    let (pg, url) = start_pg().await;
+    let shop = tempfile::tempdir().unwrap();
+    project(shop.path());
+    let applied = dbd(shop.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+
+    let other = tempfile::tempdir().unwrap();
+    std::fs::write(
+        other.path().join("design.yaml"),
+        "project:\n  name: other\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(other.path().join("ddl/table/app")).unwrap();
+    std::fs::write(
+        other.path().join("ddl/table/app/gadgets.ddl"),
+        "create table if not exists app.gadgets (id integer primary key);\n",
+    )
+    .unwrap();
+    let applied = dbd(other.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+
+    let made = psql(&pg, &url, &["-c", "create table app.tmp_report (id int)"]);
+    assert!(made.status.success(), "{}", combined(&made));
+    let exists = |pg: &PostgreSQL| {
+        let o = psql(
+            pg,
+            &url,
+            &["-tA", "-c", "select to_regclass('app.tmp_report') is not null"],
+        );
+        assert!(o.status.success(), "{}", combined(&o));
+        stdout(&o).trim() == "t"
+    };
+
+    let kept = dbd(shop.path(), &url, &["reconcile", "--prune"]);
+    assert!(kept.status.success(), "{}", combined(&kept));
+    assert!(
+        combined(&kept).contains(
+            "unowned: app.tmp_report — not dropped because app is shared with \"other\" (--prune-unowned drops it)"
+        ),
+        "{}",
+        combined(&kept)
+    );
+    assert!(exists(&pg), "--prune kept app.tmp_report");
+
+    let dropped = dbd(shop.path(), &url, &["reconcile", "--prune-unowned"]);
+    assert!(dropped.status.success(), "{}", combined(&dropped));
+    assert!(
+        combined(&dropped).contains("unowned: app.tmp_report — dropped by --prune-unowned"),
+        "{}",
+        combined(&dropped)
+    );
+    assert!(!exists(&pg), "--prune-unowned dropped app.tmp_report");
+    let gadgets = psql(
+        &pg,
+        &url,
+        &["-tA", "-c", "select to_regclass('app.gadgets') is not null"],
+    );
+    assert_eq!(stdout(&gadgets).trim(), "t", "other's app.gadgets survives");
+}
