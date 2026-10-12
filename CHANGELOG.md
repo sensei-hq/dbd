@@ -9,6 +9,8 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.25.0] — 2026-10-12
+
 **Every command does what its documentation says, and every feature works the
 same under every command.** Audits drove this release: the guides read
 against the code, and — three times over — every feature run through every
@@ -2379,7 +2381,8 @@ Two `dbd reconcile` non-convergence bugs ([#12]) and a security sweep.
 [#13]: https://github.com/sensei-hq/dbd/issues/13
 [#16]: https://github.com/sensei-hq/dbd/issues/16
 [#17]: https://github.com/sensei-hq/dbd/issues/17
-[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.23.0...main
+[Unreleased]: https://github.com/sensei-hq/dbd/compare/v0.25.0...main
+[0.25.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.25.0
 [0.24.1]: https://github.com/sensei-hq/dbd/releases/tag/v0.24.1
 [0.24.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.24.0
 [0.23.0]: https://github.com/sensei-hq/dbd/releases/tag/v0.23.0
