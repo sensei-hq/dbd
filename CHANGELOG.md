@@ -76,6 +76,16 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   migration or by hand; until then it stays the project's. A prune's `DROP`
   now quotes the table it names: `app."Report"` written unquoted dropped the
   `app.report` beside it.
+- **What another project depends on is guarded** (#7, phase 2). Before
+  `reconcile` drops a column, constraint, index or enum value, or `apply` runs
+  a migration that drops a table or column, dbd asks Postgres's dependency
+  graph — what a `CASCADE` would reach: a view, an inheriting table, a
+  foreign key, a column of the type — and the uses other projects recorded,
+  which see into function bodies. Anything another project depends on refuses
+  the run, before any write and dry run included: `app.orders.total is used by
+  "billing" (view billing.v_totals); remove that use first`. A `--prune`
+  keeps such a table, naming the use, where its `CASCADE` took the other
+  project's view with it.
 
 ### Library API
 
@@ -88,6 +98,11 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   or `Unowned`; a `bool` still reads as `Off` or `On`. `DatabaseAdapter` gains
   `ownership` and `release_objects` (defaults: nothing owned, nothing
   released), with the `adapter::Ownership` the first returns.
+- `DatabaseAdapter::dependents` (default: none) reports other owners'
+  dependences on what a run drops, with `adapter::Guarded`, `GuardedPart`
+  and `Dependence`. `ReconcilePlan::dropped_parts` lists what a plan drops
+  from an existing table or enum, part by part (`DroppedPart`,
+  `DroppedKind`).
 - `Entity::refs` keeps a schema-qualified type or sequence reference that
   resolves to nothing — another project's, an extension's — marked
   `unresolved` and unwarned, where it was dropped. A bare one is still dropped
