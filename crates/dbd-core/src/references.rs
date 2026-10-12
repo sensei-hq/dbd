@@ -1,6 +1,6 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use crate::entity::{Entity, ForeignKey, Ref, SchemaSource, TableConstraint};
+use crate::entity::{Entity, EntityType, ForeignKey, Ref, SchemaSource, TableConstraint};
 
 /// Match parsed references against known entities and external entities.
 ///
@@ -36,8 +36,26 @@ pub fn resolve_references(entities: &mut [Entity], external_names: &[String], ig
     // apart from a schema that happens to share its name.
     let known_catalogs: HashSet<String> = entities.iter().filter_map(|e| e.catalog.clone()).collect();
 
+    // A path cannot quote, so it names what Postgres folds: `Order_No.ddl`
+    // declares `app.Order_No`, which `nextval('app.Order_No')` reaches as
+    // `app.order_no`. Only a sequence or an enum — what a column's type or
+    // default uses — is reached so: a table is never a column's type, and a
+    // built-in `text` must not find a `"Text"` table. Two that fold alike
+    // reach neither.
+    let mut folded: HashMap<String, Option<String>> = HashMap::new();
+    for e in entities
+        .iter()
+        .filter(|e| matches!(e.entity_type, EntityType::Sequence | EntityType::Enum))
+    {
+        let key = e.qualified_key();
+        let lower = key.to_ascii_lowercase();
+        if lower != key {
+            folded.entry(lower).and_modify(|name| *name = None).or_insert(Some(key));
+        }
+    }
+
     for entity in entities.iter_mut() {
-        resolve_entity_references(entity, &known_names, &known_catalogs, ignore);
+        resolve_entity_references(entity, &known_names, &folded, &known_catalogs, ignore);
     }
 }
 
@@ -45,6 +63,7 @@ pub fn resolve_references(entities: &mut [Entity], external_names: &[String], ig
 fn resolve_entity_references(
     entity: &mut Entity,
     known: &HashSet<String>,
+    folded: &HashMap<String, Option<String>>,
     known_catalogs: &HashSet<String>,
     ignore: &[String],
 ) {
@@ -64,7 +83,15 @@ fn resolve_entity_references(
     };
 
     let catalog = entity.catalog.clone();
-    resolve_entity_refers(entity, &search_path, catalog.as_deref(), known, known_catalogs, ignore);
+    resolve_entity_refers(
+        entity,
+        &search_path,
+        catalog.as_deref(),
+        known,
+        folded,
+        known_catalogs,
+        ignore,
+    );
     resolve_entity_fks(entity, &default_schema, &search_path, known);
 }
 
@@ -82,6 +109,7 @@ fn resolve_entity_refers(
     search_path: &[String],
     catalog: Option<&str>,
     known: &HashSet<String>,
+    folded: &HashMap<String, Option<String>>,
     known_catalogs: &HashSet<String>,
     ignore: &[String],
 ) {
@@ -135,11 +163,10 @@ fn resolve_entity_refers(
             resolved.push(r);
             continue;
         }
-        // A path cannot quote, so it names what Postgres folds: `Order_No.ddl`
-        // declares `app.Order_No`, which `nextval('app.Order_No')` reaches as
-        // `app.order_no`. A type or sequence matches it so.
+        // A sequence or enum a mixed-case path declares, reached folded — see
+        // `resolve_references`.
         if r.kind == crate::entity::RefKind::Uses
-            && let Some(name) = known.iter().find(|k| k.eq_ignore_ascii_case(&r.name))
+            && let Some(Some(name)) = folded.get(&r.name)
         {
             r.name = name.clone();
             if r.schema_source.is_guess() {
