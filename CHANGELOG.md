@@ -9,6 +9,29 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+### Added
+
+- **Each entity in a shared database has one owner** (#7, phase 2). A
+  project's `apply`, `deploy`, `reconcile` and `reset` claim every entity its
+  whole design declares — tables, views, materialized views, sequences, enums,
+  functions and procedures; the whole design, not the scope it runs under — in
+  `dbd.objects`, before anything runs. A project declaring an entity another
+  project holds is refused before its first hook or statement, naming each:
+  `relation app.orders is owned by "shop"; owners sharing a database must not
+  declare the same entity`. A dry run, `diff`, `import`, `refresh` and
+  `policies` refuse the same way and write nothing. Entities a project already
+  has are claimed on its first run; what no design declares stays unowned. A
+  renamed project's objects stay with its old name, so even a forced `reset`
+  of the renamed design is refused for them.
+
+### Library API
+
+- `DatabaseAdapter` gains `claim_objects` (a default that claims nothing, so
+  an adapter that does not override it builds unchanged), with the
+  `adapter::OwnedObject` and `adapter::HeldObject` it takes and returns; and
+  `Design::check_ownership` refuses a design declaring an entity another
+  project owns.
+
 ### Fixed
 
 Projects sharing one database no longer undo each other's bookkeeping, refresh
