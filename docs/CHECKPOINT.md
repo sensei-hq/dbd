@@ -7,20 +7,19 @@ PR #50 (`5e6ad4dc`). Phase 1 is on `develop`, unreleased.
 ## Done
 
 - Slices 1–2 merged into `feat/ownership` (PR #50): registry, claim, uses.
-- Slice 3 (impl `f8c09c35`, fixes `78030d9f`, `63310fa8`): reconcile and diff hide
-  other owners' entities; `--prune` drops own undeclared (a) and unowned in an
-  unshared schema (b); unowned in a shared schema, or while a recorded owner
-  has not upgraded (no `owner` row in dbd.uses), kept and named unless
-  `--prune-unowned`; a successful run releases what is undeclared and gone.
-  Review: prune claims and drops in one transaction, quotes its DROP, keeps
-  what the design creates, refuses an enum swap another owner's column holds.
-- Embedded 211/211, `cli_live` 48/48, workspace 2002/0, clippy, fmt, doc clean.
+- Slice 3 = PR #51 (`f8c09c35`; fixes `78030d9f`, `63310fa8`, `31e70002`):
+  reconcile and diff hide other owners' entities; `--prune` drops own
+  undeclared (a) and unowned in an unshared schema (b); the rest kept, named,
+  unless `--prune-unowned`; release of what is undeclared and gone. A prune
+  claims and drops in one RC transaction, quotes its DROP, keeps what the
+  design creates; an enum swap another owner's column holds is refused.
+- Embedded 214/214, `cli_live` 48/48, workspace 2002/0, clippy, fmt, doc clean.
 
 ## Next
 
-    git push -u origin feat/ownership-prune   # PR into feat/ownership
-    # focused review; fix test-first; CI green; merge locally into feat/ownership;
-    # then slice 4: the uses guard (refuse dropping/altering what another uses).
+    # PR #51: CI green → merge locally into feat/ownership. Then slice 4: the
+    # uses guard (refuse dropping/altering what another uses, by dbd.uses and
+    # pg_depend) — incl. a prune's CASCADE reaching another owner's child/view.
 
 ## Open
 
