@@ -12,34 +12,38 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 ### Added
 
 - **Each entity in a shared database has one owner** (#7, phase 2). A
-  project's `apply`, `deploy`, `reconcile` and `reset` claim every entity its
-  whole design declares — tables, views, materialized views, sequences, enums,
+  project's `apply`, `deploy` and `reconcile` claim every entity its whole
+  design declares — tables, views, materialized views, sequences, enums,
   functions and procedures; the whole design, not the scope it runs under — in
-  `dbd.objects`, before anything runs. A project declaring an entity another
-  project holds is refused before its first hook or statement, naming each:
-  `relation app.orders is owned by "shop"; owners sharing a database must not
-  declare the same entity`. A dry run, `diff`, `import`, `refresh` and
+  `dbd.objects`. A project declaring an entity another project holds is
+  refused before its first hook or statement, naming each: `relation
+  app.orders is owned by "shop"; owners sharing a database must not declare
+  the same entity`. `reset`, a dry run, `diff`, `import`, `refresh` and
   `policies` — the CLI's `--dry-run` previews included — refuse the same way
-  and write nothing. An entity is owned as Postgres names it: the schema its
-  `CREATE` states, else its search path, and an unquoted name folded to lower
-  case; one in a file dbd cannot read is claimed by its path, since a reset
-  still drops it. A table and an enum of one name are one entity. Entities a
-  project already has are claimed on its first run; what no design declares
-  stays unowned. A run that fails after its claim gives back what it newly
-  claimed, and a claim waits at most 5 seconds for another session's write to
-  the registry. A renamed project's objects stay with its old name, so even a
-  forced `reset` of the renamed design is refused for them.
+  and claim nothing. A run claims once its work is built: `apply` in the
+  transaction its DDL runs in, so the claim commits with the work or not at
+  all; `reconcile`, whose writes commit as they run, just after them. A run
+  that fails, or is killed, claims nothing. An entity is owned as Postgres
+  names it: every `CREATE` in its file names one, in the schema it states,
+  else its search path, an unquoted name folded to lower case; one in a file
+  dbd cannot read is claimed by its path, since a reset still drops it. A
+  table and an enum of one name are one entity. Entities a project already
+  has are claimed on its first run; what no design declares stays unowned. A
+  claim waits at most 5 seconds for another session's write to the registry,
+  then fails naming it. A renamed project's objects stay with its old name, so
+  even a forced `reset` of the renamed design is refused for them.
 - **A project records what it uses**: the schemas its entities live in, its
   extensions and roles, and each reference one of its entities makes to
   another project's — `relation:app.orders`, through `view billing.v_orders`
-  — in `dbd.uses`, afresh on every run.
+  — in `dbd.uses`, afresh with every claim; a run that fails keeps the uses it
+  had.
 
 ### Library API
 
-- `DatabaseAdapter` gains `claim_objects`, `release_objects` and
-  `record_uses` (defaults that do nothing, so an adapter that does not
-  override them builds unchanged), with the `adapter::OwnedObject`,
-  `HeldObject`, `Claim` and `Use` they take and return; and
+- `DatabaseAdapter` gains `claim_objects` and `record_uses` (defaults that
+  do nothing, so an adapter that does not override them builds unchanged),
+  with the `adapter::OwnedObject`, `HeldObject` and `Use` they take and
+  return; and
   `Design::check_ownership` refuses a design declaring an entity another
   project owns.
 

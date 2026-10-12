@@ -102,15 +102,23 @@ other schema; it owns the entities it puts there.
 
 ### Rules
 
-**Claim (apply, deploy, reconcile, reset).** Before any DDL, the owner claims
+**Claim (apply, deploy, reconcile).** Before any hook or DDL, the owner checks
 every entity its whole design declares. "Whole design" means the full design,
-never the scope (#40). A claim on an entity held by another owner fails with no
-DDL executed:
+never the scope (#40). A design declaring an entity held by another owner is
+refused with no DDL executed:
 
 `relation app.orders is owned by "shop/billing"; owners sharing a database must not declare the same entity`
 
+The owner claims those entities, and records its uses, once its work is built.
+`apply` claims in the transaction its DDL runs in, so the claim commits with
+the work or not at all. `reconcile`'s writes commit as they run, so it claims
+in a transaction of its own just after them. A run that fails, or is killed,
+claims nothing, so there is nothing to give back. `reset` builds nothing: it
+checks, and claims nothing.
+
 The primary key makes this atomic: of two concurrent first runs, exactly one
-wins.
+wins. The other's claim finds the entity held, and in a batch its DDL rolls
+back with the claim.
 
 **Prune.** `reconcile --prune` drops a live entity only when one of these holds:
 
@@ -188,9 +196,11 @@ is unchanged.
 There is one core function, so library embedders are protected too:
 
 ```rust
-pub(crate) async fn preflight(&self, adapter: &dyn Adapter, mode: Preflight) -> Result<()>
-// Claim — apply, deploy, reconcile, reset: heal → claim → record uses
-// Check — import, policies, refresh, --dry-run, diff: read-only, same refusals, no writes
+pub(crate) async fn preflight(&self, adapter: &dyn DatabaseAdapter, mode: Preflight) -> Result<()>
+// Write — apply, deploy, reconcile, reset: heal → check, before any hook
+// Read — import, policies, refresh, --dry-run, diff: check only, no writes
+pub(crate) async fn claim_built(&self, adapter: &dyn DatabaseAdapter) -> Result<()>
+// apply, deploy, reconcile, once built: claim → record uses
 ```
 
 ---
