@@ -218,22 +218,36 @@ pub(crate) fn normalize_common(snap: &mut Snapshot) {
 /// spelling on both sides they match, and the `ALTER … TYPE` a real change
 /// emits names the type wherever the session path points.
 ///
+/// A bare name is left as written where the snapshot cannot say which type it
+/// is: one the snapshot's own enums declare, which the file's path reaches
+/// first, or one two extensions own in different schemas.
+///
 /// Runs on a raw snapshot, before [`canonicalize`] or
 /// [`crate::schema_diff::normalize_for_diff`]: both leave a qualified name as
 /// it is.
 pub(crate) fn qualify_extension_types(snap: &mut Snapshot, extension_types: &[(String, String)]) {
-    let spelled: HashMap<String, String> = extension_types
-        .iter()
-        .map(|(schema, name)| {
-            let short = name.to_lowercase();
-            let canonical = if schema.eq_ignore_ascii_case(DEFAULT_SCHEMA) {
-                short.clone()
-            } else {
-                format!("{}.{short}", schema.to_lowercase())
-            };
-            (short, canonical)
-        })
-        .collect();
+    let enums: HashSet<String> = snap.enums.iter().map(|e| e.name.to_lowercase()).collect();
+    // `None` for a name two extensions own: ambiguous without the file's path.
+    let mut spelled: HashMap<String, Option<String>> = HashMap::new();
+    for (schema, name) in extension_types {
+        let short = name.to_lowercase();
+        if enums.contains(&short) {
+            continue;
+        }
+        let canonical = if schema.eq_ignore_ascii_case(DEFAULT_SCHEMA) {
+            short.clone()
+        } else {
+            format!("{}.{short}", schema.to_lowercase())
+        };
+        spelled
+            .entry(short)
+            .and_modify(|seen| {
+                if seen.as_ref() != Some(&canonical) {
+                    *seen = None;
+                }
+            })
+            .or_insert(Some(canonical));
+    }
     if spelled.is_empty() {
         return;
     }
@@ -241,8 +255,13 @@ pub(crate) fn qualify_extension_types(snap: &mut Snapshot, extension_types: &[(S
         for c in &mut t.columns {
             let lowered = c.data_type.trim().to_lowercase();
             let (element, array_suffix) = split_array_suffix(&lowered);
-            if let Some(canonical) = spelled.get(element) {
-                c.data_type = format!("{canonical}{array_suffix}");
+            // A modifier follows the name: `vector(384)`.
+            let (base, modifier) = match element.split_once('(') {
+                Some((base, rest)) => (base.trim(), format!("({rest}")),
+                None => (element, String::new()),
+            };
+            if let Some(Some(canonical)) = spelled.get(base) {
+                c.data_type = format!("{canonical}{modifier}{array_suffix}");
             }
         }
     }
