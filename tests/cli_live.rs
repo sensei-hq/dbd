@@ -2195,3 +2195,54 @@ async fn refresh_and_policies_refuse_a_design_declaring_another_owners_entity() 
         );
     }
 }
+
+/// The CLI's previews — `apply`, `deploy`, `reset`, `import` and `policies`
+/// with `--dry-run` — said "no issues" for a run the real command refuses, a
+/// design declaring another owner's entity. A preview refuses it too (#7).
+#[tokio::test]
+async fn dry_runs_refuse_a_design_declaring_another_owners_entity() {
+    let (_pg, url) = start_pg().await;
+    let owner = tempfile::tempdir().unwrap();
+    project(owner.path());
+    let applied = dbd(owner.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+
+    let intruder = tempfile::tempdir().unwrap();
+    let dir = intruder.path();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: intruder\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    for (rel, body) in [
+        (
+            "ddl/table/app/widgets.ddl",
+            "set search_path to app;\ncreate table if not exists widgets (id integer primary key);\n",
+        ),
+        (
+            "policies/app/widgets.sql",
+            "alter table app.widgets enable row level security;\n",
+        ),
+        ("import/app/widgets.csv", "id\n1\n"),
+    ] {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    for args in [
+        &["apply", "--dry-run"][..],
+        &["deploy", "--dry-run"],
+        &["reset", "--dry-run"],
+        &["import", "--dry-run"],
+        &["policies", "--dry-run"],
+    ] {
+        let out = dbd(dir, &url, args);
+        assert!(!out.status.success(), "{args:?} succeeded: {}", combined(&out));
+        assert!(
+            combined(&out).contains("relation app.widgets is owned by \"clilive\""),
+            "{args:?} did not name the entity and its owner: {}",
+            combined(&out)
+        );
+    }
+}

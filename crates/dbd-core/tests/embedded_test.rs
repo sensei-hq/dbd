@@ -10077,7 +10077,7 @@ async fn a_reference_to_another_projects_entity_is_recorded_as_a_use() {
     assert_catalog(
         &*billing_adapter,
         true,
-        &used_by("billing", "entity", "type:app.status", "table billing.invoices"),
+        &used_by("billing", "entity", "relation:app.status", "table billing.invoices"),
         "billing's use of app.status",
     )
     .await;
@@ -10107,4 +10107,264 @@ async fn a_reference_to_another_projects_entity_is_recorded_as_a_use() {
         "billing's dropped use of app.orders",
     )
     .await;
+}
+
+/// `billing` owns `app.orders` and `app.invoices`.
+const ORDERS_OWNER_FILES: &[(&str, &str)] = &[
+    (
+        "ddl/table/app/orders.ddl",
+        "set search_path to app;\ncreate table if not exists orders (id int primary key);\n",
+    ),
+    (
+        "ddl/table/app/invoices.ddl",
+        "set search_path to app;\ncreate table if not exists invoices (id int primary key);\n",
+    ),
+];
+
+fn named_project(dir: &std::path::Path, name: &str, extra_yaml: &str, files: &[(&str, &str)]) -> Design {
+    write_project(
+        dir,
+        &format!("project:\n  name: {name}\nsource:\n  dialect: postgresql\n{extra_yaml}schemas:\n  - app\n"),
+        files,
+    )
+}
+
+/// A file dbd cannot read still declares its entity — its path does — and a
+/// reset drops it. The claim skipped such entities, so a design with one broken
+/// file reset another project's table and reported success. Every entity a
+/// design declares is claimed, read or not (#7).
+#[tokio::test]
+async fn a_design_with_a_broken_file_cannot_reset_another_projects_table() {
+    let (_pg, url) = start_pg().await;
+    let billing = connect(&url, "billing").await.unwrap();
+    let ra = connect(&url, "ra").await.unwrap();
+    let (bd, rd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    named_project(bd.path(), "billing", "", ORDERS_OWNER_FILES)
+        .apply(&*billing, None, false, None, Progress::none())
+        .await
+        .expect("billing's apply");
+    let broken = named_project(
+        rd.path(),
+        "ra",
+        "",
+        &[
+            (
+                "ddl/table/app/items.ddl",
+                "set search_path to app;\ncreate table if not exists items (id int primary key);\n",
+            ),
+            (
+                "ddl/table/app/orders.ddl",
+                "set search_path to app;\ncreate table if not exists orders (id int primary key,,);\n",
+            ),
+        ],
+    );
+
+    let err = broken
+        .reset(&*ra, "postgres", true, false, false, None)
+        .await
+        .expect_err("app.orders is billing's")
+        .to_string();
+    assert!(err.contains("relation app.orders is owned by \"billing\""), "{err}");
+    assert_table_exists(&*ra, "app", "orders").await;
+}
+
+/// A run claims before it builds, and a run can fail after its claim — refused
+/// by a later gate, or rolled back. Its claims of entities it never built
+/// outlived it, and barred the entities' real author for good. A failed run
+/// gives back the claims it made for what does not exist (#7).
+#[tokio::test]
+async fn a_failed_apply_gives_back_the_claims_it_made() {
+    let (_pg, url) = start_pg().await;
+    let viewer = connect(&url, "viewer").await.unwrap();
+    viewer
+        .execute_script("CREATE SCHEMA app; CREATE TABLE app.orders (id int primary key);")
+        .await
+        .unwrap();
+    let (vd, ad) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    named_project(
+        vd.path(),
+        "viewer",
+        "",
+        &[
+            (
+                "ddl/view/app/orders.ddl",
+                "set search_path to app;\ncreate or replace view orders as select 1 as id;\n",
+            ),
+            (
+                "ddl/table/app/ledger.ddl",
+                "set search_path to app;\ncreate table if not exists ledger (id int primary key);\n",
+            ),
+        ],
+    )
+    .apply(&*viewer, None, false, None, Progress::none())
+    .await
+    .expect_err("app.orders is a table, not a view");
+
+    assert_catalog(
+        &*viewer,
+        false,
+        "SELECT 1 FROM dbd.objects WHERE owner = 'viewer'",
+        "a claim of viewer",
+    )
+    .await;
+    let alpha = connect(&url, "alpha").await.unwrap();
+    named_project(ad.path(), "alpha", "", &ORDERS_OWNER_FILES[..1])
+        .apply(&*alpha, None, false, None, Progress::none())
+        .await
+        .expect("the table's real author applies");
+}
+
+/// A reconcile refused by its own gate — a destructive change without
+/// `--allow-destructive` — claims nothing: it checks before it plans, and
+/// claims after its last refusal (#7).
+#[tokio::test]
+async fn a_refused_reconcile_claims_nothing() {
+    let (_pg, url) = start_pg().await;
+    let billing = connect(&url, "billing").await.unwrap();
+    billing
+        .execute_script("CREATE SCHEMA app; CREATE TABLE app.orders (id int primary key, total int);")
+        .await
+        .unwrap();
+    let bd = tempfile::tempdir().unwrap();
+    named_project(bd.path(), "billing", "", ORDERS_OWNER_FILES)
+        .reconcile(&*billing, false, false, false, None, Progress::none())
+        .await
+        .expect_err("dropping app.orders.total is destructive");
+
+    assert_catalog(
+        &*billing,
+        false,
+        "SELECT 1 FROM dbd.objects WHERE owner = 'billing'",
+        "a claim of billing",
+    )
+    .await;
+}
+
+/// Postgres gives every table a row type, so a table and an enum of one name
+/// cannot both exist: `CREATE TYPE` fails, and the `DO … duplicate_object`
+/// idiom swallows it, leaving the enum's columns typed with the table's row.
+/// The two are one entity, held by one owner (#7).
+#[tokio::test]
+async fn a_table_and_an_enum_of_one_name_are_one_entity() {
+    let (_pg, url) = start_pg().await;
+    let ta = connect(&url, "ta").await.unwrap();
+    let tb = connect(&url, "tb").await.unwrap();
+    let (ad, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    named_project(
+        ad.path(),
+        "ta",
+        "",
+        &[(
+            "ddl/table/app/status.ddl",
+            "set search_path to app;\ncreate table if not exists status (id int primary key);\n",
+        )],
+    )
+    .apply(&*ta, None, false, None, Progress::none())
+    .await
+    .expect("ta's apply");
+    let err = named_project(
+        bd.path(),
+        "tb",
+        "",
+        &[(
+            "ddl/enum/app/status.ddl",
+            "do $$ begin create type app.status as enum ('a'); \
+             exception when duplicate_object then null; end $$;\n",
+        )],
+    )
+    .apply(&*tb, None, false, None, Progress::none())
+    .await
+    .expect_err("app.status is ta's")
+    .to_string();
+    assert!(err.contains("app.status is owned by \"ta\""), "{err}");
+}
+
+/// An unqualified name lands where the search path points — a file's own
+/// `set search_path`, or the project's `source.search_path` — and is owned
+/// there, not in `public` (#7).
+#[tokio::test]
+async fn an_unqualified_entity_is_owned_where_its_search_path_puts_it() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let flat = connect(&url, "flat").await.unwrap();
+    let (sd, fd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1])
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    let err = named_project(
+        fd.path(),
+        "flat",
+        "  search_path: [app]\n",
+        &[(
+            "ddl/table/orders.ddl",
+            "create table if not exists orders (id int primary key);\n",
+        )],
+    )
+    .apply(&*flat, None, false, None, Progress::none())
+    .await
+    .expect_err("app.orders is shop's")
+    .to_string();
+    assert!(err.contains("relation app.orders is owned by \"shop\""), "{err}");
+}
+
+/// Postgres folds an unquoted name to lower case: `ddl/table/app/Orders.ddl`
+/// creating `Orders` makes `app.orders`. It is owned as Postgres names it (#7).
+#[tokio::test]
+async fn a_name_is_owned_as_postgres_folds_it() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let casey = connect(&url, "casey").await.unwrap();
+    let (sd, cd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1])
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    let err = named_project(
+        cd.path(),
+        "casey",
+        "",
+        &[(
+            "ddl/table/app/Orders.ddl",
+            "set search_path to app;\ncreate table if not exists Orders (id int primary key);\n",
+        )],
+    )
+    .apply(&*casey, None, false, None, Progress::none())
+    .await
+    .expect_err("app.orders is shop's")
+    .to_string();
+    assert!(err.contains("relation app.orders is owned by \"shop\""), "{err}");
+}
+
+/// A claim waits for another session writing the registry — and with nothing
+/// to stop it, waited as long as that session stayed open. It gives up after a
+/// few seconds instead, saying what held it (#7).
+#[tokio::test]
+async fn a_claim_held_up_by_an_open_registry_write_fails_naming_it() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let holder = connect(&url, "holder").await.unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    let design = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1]);
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's first apply");
+    holder.begin_batch().await.unwrap();
+    holder
+        .execute_script("UPDATE dbd.objects SET owner = owner WHERE name = 'orders';")
+        .await
+        .unwrap();
+
+    let applied = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        design.apply(&*shop, None, false, None, Progress::none()),
+    )
+    .await;
+    holder.rollback_batch().await.unwrap();
+    let err = applied
+        .expect("the claim must give up, not wait for as long as the write stays open")
+        .expect_err("an open write holds the registry")
+        .to_string();
+    assert!(err.contains("dbd.objects"), "{err}");
 }
