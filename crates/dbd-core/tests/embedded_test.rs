@@ -1641,7 +1641,7 @@ async fn each_project_sharing_a_database_owns_its_refresh_jobs() {
             &*a,
             should_exist,
             &cron_job_predicate(jobname),
-            &format!("cron job {jobname}"),
+            &format!("cron job {}", jobname.replace('%', "%%")),
         )
         .await;
     }
@@ -1658,7 +1658,7 @@ async fn each_project_sharing_a_database_owns_its_refresh_jobs() {
             &*a,
             should_exist,
             &cron_job_predicate(jobname),
-            &format!("cron job {jobname}"),
+            &format!("cron job {}", jobname.replace('%', "%%")),
         )
         .await;
     }
