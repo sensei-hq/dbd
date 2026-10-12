@@ -46,6 +46,11 @@ impl Bookkeeping {
         Self { pool, project }
     }
 
+    /// The project this bookkeeping is kept for.
+    pub(super) fn project(&self) -> &str {
+        &self.project
+    }
+
     /// Create the `dbd` schema + tables if missing. Idempotent and
     /// NON-destructive (no fold, no drop). Runs against the pool, so it is safe
     /// to call anytime — including as a no-op mid-batch, since `heal` already ran

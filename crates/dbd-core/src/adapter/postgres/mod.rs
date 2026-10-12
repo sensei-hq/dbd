@@ -73,8 +73,9 @@ fn jsonb_import_call_sql(target: &str) -> String {
 
 // ── pg_cron refresh-job planning (pure, unit-tested) ──────────────────────────
 //
-// dbd owns the set of `dbd:refresh:<schema>.<name>` cron jobs that refresh
-// scheduled materialized views. These free functions build the SQL and decide
+// Each project owns the `dbd:refresh:<owner>:<schema>.<name>` cron jobs that
+// refresh its scheduled materialized views — and only those, since projects may
+// share a database (#7, H4). These free functions build the SQL and decide
 // the sync plan WITHOUT a live connection, so the decision logic is fully
 // unit-testable. `sync_refresh_jobs` below wires them to a real database, guarded
 // by a pg_cron-presence check (pg_cron is optional — querying `cron.job` on a DB
@@ -89,13 +90,45 @@ fn split_qualified(qualified: &str) -> (&str, &str) {
     }
 }
 
-/// Build the `SELECT cron.schedule(...)` statement that (re)schedules a matview
-/// refresh. `cron.schedule(name, sched, cmd)` upserts by job name, so this
-/// doubles as the update path. Single quotes are escaped in every SQL literal
-/// and double quotes in the schema/name identifiers.
-fn refresh_job_sql(qualified: &str, schedule: &str, concurrently: bool) -> String {
+/// The start of every refresh job `owner` names: `dbd:refresh:<owner>:`. A `%`
+/// or `:` in the owner is percent-encoded, so the owner's part ends at the first
+/// `:` after `dbd:refresh:` — owner `b` cannot reach `b:c`'s jobs.
+fn refresh_job_prefix(owner: &str) -> String {
+    let owner = owner.replace('%', "%25").replace(':', "%3A");
+    format!("dbd:refresh:{owner}:")
+}
+
+/// The name of `owner`'s job refreshing `qualified`.
+fn refresh_job_name(owner: &str, qualified: &str) -> String {
+    format!("{}{qualified}", refresh_job_prefix(owner))
+}
+
+/// The name dbd gave `qualified`'s job before it named the owner. Whose it is
+/// the name does not say, so only an owner declaring `qualified` replaces it.
+fn legacy_refresh_job_name(qualified: &str) -> String {
+    format!("dbd:refresh:{qualified}")
+}
+
+/// A typed `text[]` literal of `items`, `ARRAY[]::text[]` when empty.
+fn text_array(items: &[String]) -> String {
+    if items.is_empty() {
+        return "ARRAY[]::text[]".to_string();
+    }
+    let items = items
+        .iter()
+        .map(|n| format!("'{}'", n.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("ARRAY[{items}]::text[]")
+}
+
+/// Build the `SELECT cron.schedule(...)` statement that (re)schedules `owner`'s
+/// matview refresh. `cron.schedule(name, sched, cmd)` upserts by job name, so
+/// this doubles as the update path. Single quotes are escaped in every SQL
+/// literal and double quotes in the schema/name identifiers.
+fn refresh_job_sql(owner: &str, qualified: &str, schedule: &str, concurrently: bool) -> String {
     let (schema, name) = split_qualified(qualified);
-    let job_name = format!("dbd:refresh:{qualified}");
+    let job_name = refresh_job_name(owner, qualified);
     let concurrent = if concurrently { "CONCURRENTLY " } else { "" };
     let command = format!(
         "REFRESH MATERIALIZED VIEW {concurrent}\"{}\".\"{}\"",
@@ -110,27 +143,26 @@ fn refresh_job_sql(qualified: &str, schedule: &str, concurrently: bool) -> Strin
     )
 }
 
-/// Build the statement that unschedules every `dbd:refresh:%` job NOT in
-/// `keep_job_names`. An empty keep list still yields valid SQL via an explicitly
-/// typed empty array (`ARRAY[]::text[]`).
-fn unschedule_stale_sql(keep_job_names: &[String]) -> String {
-    let array = if keep_job_names.is_empty() {
-        "ARRAY[]::text[]".to_string()
-    } else {
-        let items = keep_job_names
-            .iter()
-            .map(|n| format!("'{}'", n.replace('\'', "''")))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("ARRAY[{items}]")
-    };
+/// Build the statement that unschedules `owner`'s refresh jobs NOT in
+/// `keep_job_names`, and the legacy untagged jobs named in `legacy_job_names`
+/// — those of the matviews `owner` declares. Another owner's jobs, tagged or
+/// legacy, are never matched. The owner's prefix is compared with `left`, not
+/// `LIKE`, whose `_` and `%` an owner's name may hold. Empty lists still yield
+/// valid SQL via a typed empty array (`ARRAY[]::text[]`).
+fn unschedule_stale_sql(owner: &str, keep_job_names: &[String], legacy_job_names: &[String]) -> String {
+    let prefix = refresh_job_prefix(owner);
     format!(
         "SELECT cron.unschedule(jobid) FROM cron.job \
-         WHERE jobname LIKE 'dbd:refresh:%' AND jobname <> ALL({array});"
+         WHERE (left(jobname, {}) = '{}' AND jobname <> ALL({})) OR jobname = ANY({});",
+        prefix.chars().count(),
+        prefix.replace('\'', "''"),
+        text_array(keep_job_names),
+        text_array(legacy_job_names),
     )
 }
 
-/// Decide the cron-sync plan for a set of `(qualified_name, ResolvedMatview)`.
+/// Decide `owner`'s cron-sync plan for a set of `(qualified_name, ResolvedMatview)`
+/// — every matview `owner` declares.
 ///
 /// - No scheduled matviews and no pg_cron → `Ok(vec![])` (safe no-op for DBs
 ///   without the extension).
@@ -138,8 +170,9 @@ fn unschedule_stale_sql(keep_job_names: &[String]) -> String {
 /// - pg_cron present → one `refresh_job_sql` per scheduled matview (sorted by
 ///   name for determinism) followed by ONE `unschedule_stale_sql` keeping exactly
 ///   the scheduled jobs (so a matview whose schedule was removed gets its stale
-///   dbd-owned job dropped).
-fn plan_cron_sync(jobs: &[(String, ResolvedMatview)], pg_cron_present: bool) -> Result<Vec<String>> {
+///   job dropped), and dropping the legacy untagged job of every matview in
+///   `jobs`, which a tagged one replaces.
+fn plan_cron_sync(owner: &str, jobs: &[(String, ResolvedMatview)], pg_cron_present: bool) -> Result<Vec<String>> {
     let mut scheduled: Vec<&(String, ResolvedMatview)> = jobs.iter().filter(|(_, mv)| mv.refresh.is_some()).collect();
 
     if scheduled.is_empty() && !pg_cron_present {
@@ -160,10 +193,11 @@ fn plan_cron_sync(jobs: &[(String, ResolvedMatview)], pg_cron_present: bool) -> 
     let mut keep = Vec::with_capacity(scheduled.len());
     for (name, mv) in &scheduled {
         let schedule = mv.refresh.as_deref().expect("filtered to Some above");
-        stmts.push(refresh_job_sql(name, schedule, mv.concurrently));
-        keep.push(format!("dbd:refresh:{name}"));
+        stmts.push(refresh_job_sql(owner, name, schedule, mv.concurrently));
+        keep.push(refresh_job_name(owner, name));
     }
-    stmts.push(unschedule_stale_sql(&keep));
+    let legacy: Vec<String> = jobs.iter().map(|(name, _)| legacy_refresh_job_name(name)).collect();
+    stmts.push(unschedule_stale_sql(owner, &keep, &legacy));
     Ok(stmts)
 }
 
@@ -2648,7 +2682,7 @@ ORDER BY 1, 2, 4, 5"#;
         // error). `plan_cron_sync` returns a no-op plan when nothing is scheduled
         // and pg_cron is absent, or errors when scheduling is requested without it.
         let present = self.pg_cron_present().await?;
-        let stmts = plan_cron_sync(jobs, present)?;
+        let stmts = plan_cron_sync(self.bookkeeping.project(), jobs, present)?;
         for s in stmts {
             self.execute_script(&s).await?;
         }
@@ -2769,8 +2803,11 @@ mod tests {
 
     #[test]
     fn refresh_job_sql_concurrent_contains_expected_parts() {
-        let sql = refresh_job_sql("analytics.daily_sales", "0 2 * * *", true);
-        assert!(sql.contains("dbd:refresh:analytics.daily_sales"), "job name: {sql}");
+        let sql = refresh_job_sql("proj", "analytics.daily_sales", "0 2 * * *", true);
+        assert!(
+            sql.contains("dbd:refresh:proj:analytics.daily_sales"),
+            "job name: {sql}"
+        );
         assert!(
             sql.contains("REFRESH MATERIALIZED VIEW CONCURRENTLY \"analytics\".\"daily_sales\""),
             "concurrent refresh command: {sql}"
@@ -2780,7 +2817,7 @@ mod tests {
 
     #[test]
     fn refresh_job_sql_non_concurrent_omits_concurrently() {
-        let sql = refresh_job_sql("analytics.x", "0 3 * * *", false);
+        let sql = refresh_job_sql("proj", "analytics.x", "0 3 * * *", false);
         assert!(
             sql.contains("REFRESH MATERIALIZED VIEW \"analytics\".\"x\""),
             "non-concurrent refresh command: {sql}"
@@ -2791,9 +2828,9 @@ mod tests {
     #[test]
     fn refresh_job_sql_escapes_single_quotes() {
         // Contrived name/schedule carrying single quotes — all literals escaped.
-        let sql = refresh_job_sql("analytics.o'brien", "0 2 * * *'; DROP", true);
+        let sql = refresh_job_sql("o'proj", "analytics.o'brien", "0 2 * * *'; DROP", true);
         assert!(
-            sql.contains("dbd:refresh:analytics.o''brien"),
+            sql.contains("dbd:refresh:o''proj:analytics.o''brien"),
             "job name escaped: {sql}"
         );
         assert!(
@@ -2805,7 +2842,7 @@ mod tests {
 
     #[test]
     fn refresh_job_sql_unqualified_falls_back_to_public() {
-        let sql = refresh_job_sql("solo", "0 0 * * *", false);
+        let sql = refresh_job_sql("proj", "solo", "0 0 * * *", false);
         assert!(
             sql.contains("\"public\".\"solo\""),
             "unqualified name uses public: {sql}"
@@ -2814,18 +2851,22 @@ mod tests {
 
     #[test]
     fn unschedule_stale_sql_with_keep_list_is_valid() {
-        let keep = vec!["dbd:refresh:a.one".to_string(), "dbd:refresh:b.two".to_string()];
-        let sql = unschedule_stale_sql(&keep);
-        assert!(sql.contains("LIKE 'dbd:refresh:%'"), "prefix filter: {sql}");
-        assert!(sql.contains("'dbd:refresh:a.one'"), "keeps a.one: {sql}");
-        assert!(sql.contains("'dbd:refresh:b.two'"), "keeps b.two: {sql}");
+        let keep = vec!["dbd:refresh:p:a.one".to_string(), "dbd:refresh:p:b.two".to_string()];
+        let sql = unschedule_stale_sql("p", &keep, &["dbd:refresh:a.one".to_string()]);
+        assert!(
+            sql.contains("left(jobname, 14) = 'dbd:refresh:p:'"),
+            "owner prefix filter: {sql}"
+        );
+        assert!(sql.contains("'dbd:refresh:p:a.one'"), "keeps a.one: {sql}");
+        assert!(sql.contains("'dbd:refresh:p:b.two'"), "keeps b.two: {sql}");
         assert!(sql.contains("<> ALL(ARRAY["), "uses <> ALL(ARRAY[...]): {sql}");
+        assert!(sql.contains("= ANY(ARRAY['dbd:refresh:a.one']"), "legacy job: {sql}");
     }
 
     #[test]
     fn unschedule_stale_sql_empty_keep_list_is_valid() {
-        let sql = unschedule_stale_sql(&[]);
-        assert!(sql.contains("LIKE 'dbd:refresh:%'"), "prefix filter: {sql}");
+        let sql = unschedule_stale_sql("p", &[], &[]);
+        assert!(sql.contains("= 'dbd:refresh:p:'"), "owner prefix filter: {sql}");
         // Empty list must still produce valid SQL via a typed empty array.
         assert!(sql.contains("ARRAY[]::text[]"), "typed empty array: {sql}");
     }
@@ -2834,14 +2875,14 @@ mod tests {
     fn plan_cron_sync_empty_scheduled_no_pg_cron_is_noop() {
         // No matviews scheduled and no pg_cron → nothing to do (safe on non-cron DBs).
         let jobs = vec![("analytics.x".to_string(), mv(None, false))];
-        let plan = plan_cron_sync(&jobs, false).unwrap();
+        let plan = plan_cron_sync("proj", &jobs, false).unwrap();
         assert!(plan.is_empty(), "expected empty plan, got: {plan:?}");
     }
 
     #[test]
     fn plan_cron_sync_scheduled_without_pg_cron_errors() {
         let jobs = vec![("analytics.x".to_string(), mv(Some("0 2 * * *"), false))];
-        let err = plan_cron_sync(&jobs, false).unwrap_err();
+        let err = plan_cron_sync("proj", &jobs, false).unwrap_err();
         assert!(
             err.to_string().contains("pg_cron"),
             "error should mention pg_cron: {err}"
@@ -2857,20 +2898,20 @@ mod tests {
             ("analytics.unscheduled".to_string(), mv(None, false)),
             ("analytics.abc".to_string(), mv(Some("*/5 * * * *"), false)),
         ];
-        let plan = plan_cron_sync(&jobs, true).unwrap();
+        let plan = plan_cron_sync("proj", &jobs, true).unwrap();
 
         // 2 schedule statements + 1 unschedule statement.
         assert_eq!(plan.len(), 3, "expected 2 schedules + 1 unschedule: {plan:?}");
 
         // Sorted by name: "analytics.abc" before "analytics.daily_sales".
         assert!(
-            plan[0].contains("dbd:refresh:analytics.abc"),
+            plan[0].contains("dbd:refresh:proj:analytics.abc"),
             "first (sorted): {}",
             plan[0]
         );
         assert!(!plan[0].contains("CONCURRENTLY"), "abc is non-concurrent: {}", plan[0]);
         assert!(
-            plan[1].contains("dbd:refresh:analytics.daily_sales"),
+            plan[1].contains("dbd:refresh:proj:analytics.daily_sales"),
             "second (sorted): {}",
             plan[1]
         );
@@ -2888,16 +2929,20 @@ mod tests {
             "last is unschedule: {unschedule}"
         );
         assert!(
-            unschedule.contains("'dbd:refresh:analytics.abc'"),
+            unschedule.contains("'dbd:refresh:proj:analytics.abc'"),
             "keeps abc: {unschedule}"
         );
         assert!(
-            unschedule.contains("'dbd:refresh:analytics.daily_sales'"),
+            unschedule.contains("'dbd:refresh:proj:analytics.daily_sales'"),
             "keeps daily_sales: {unschedule}"
         );
         assert!(
-            !unschedule.contains("analytics.unscheduled"),
+            !unschedule.contains("'dbd:refresh:proj:analytics.unscheduled'"),
             "must NOT keep the unscheduled matview: {unschedule}"
+        );
+        assert!(
+            unschedule.contains("'dbd:refresh:analytics.unscheduled'"),
+            "drops the legacy job of every declared matview: {unschedule}"
         );
     }
 
@@ -2906,7 +2951,7 @@ mod tests {
         // pg_cron present, nothing scheduled → still emit the cleanup unschedule so
         // previously-scheduled dbd jobs get dropped.
         let jobs = vec![("analytics.x".to_string(), mv(None, false))];
-        let plan = plan_cron_sync(&jobs, true).unwrap();
+        let plan = plan_cron_sync("proj", &jobs, true).unwrap();
         assert_eq!(plan.len(), 1, "expected only the unschedule statement: {plan:?}");
         assert!(
             plan[0].contains("cron.unschedule"),
