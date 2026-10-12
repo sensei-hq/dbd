@@ -12784,3 +12784,111 @@ async fn a_constraint_another_projects_foreign_key_relies_on_is_not_dropped() {
         "{err}"
     );
 }
+
+/// A released project's migration drops what its design dropped — `DROP TABLE
+/// … CASCADE`, which took another project's view over it. The run is refused
+/// before anything runs, dry run included, naming the use (#7).
+#[tokio::test]
+async fn a_migration_dropping_a_table_another_project_reads_is_refused() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let dir = sd.path();
+    let yaml = "project:\n  name: shop\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+    let old = "ddl/table/app/old.ddl";
+    cut_version(
+        dir,
+        yaml,
+        &[
+            ORDERS_OWNER_FILES[0],
+            (
+                old,
+                "set search_path to app;\ncreate table if not exists old (id integer primary key);\n",
+            ),
+        ],
+        &[],
+        "v1",
+    );
+    released(dir)
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    billing_reading(
+        bd.path(),
+        &[(
+            "ddl/view/billing/v_old.ddl",
+            "create or replace view billing.v_old as select id from app.old;\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    cut_version(dir, yaml, &[], &[old], "v2 drops old");
+    for dry_run in [true, false] {
+        let err = released(dir)
+            .apply(&*shop, None, dry_run, None, Progress::none())
+            .await
+            .expect_err("billing's view reads app.old")
+            .to_string();
+        assert!(
+            err.contains("app.old is used by \"billing\" (view billing.v_old); remove that use first"),
+            "{err}"
+        );
+    }
+    assert_table_exists(&*shop, "app", "old").await;
+    assert_eq!(shop.get_db_version().await.unwrap(), 1, "v2 did not run");
+}
+
+/// A migration dropping a column another project's function body reads
+/// broke that function silently: the catalog does not see into it. The
+/// project's recorded use refuses the run (#7).
+#[tokio::test]
+async fn a_migration_dropping_a_column_another_projects_function_reads_is_refused() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let dir = sd.path();
+    let yaml = "project:\n  name: shop\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+    let orders = |columns: &str| {
+        format!("set search_path to app;\ncreate table if not exists orders (id integer primary key{columns});\n")
+    };
+    let v1 = orders(", total integer");
+    cut_version(dir, yaml, &[("ddl/table/app/orders.ddl", &v1)], &[], "v1");
+    released(dir)
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    billing_reading(
+        bd.path(),
+        &[(
+            "ddl/function/billing/sum_totals.ddl",
+            "create or replace function billing.sum_totals() returns bigint language sql \
+             as $$ select sum(total) from app.orders $$;\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    let v2 = orders("");
+    cut_version(dir, yaml, &[("ddl/table/app/orders.ddl", &v2)], &[], "v2 drops total");
+    let err = released(dir)
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect_err("billing's function reads app.orders")
+        .to_string();
+    assert!(
+        err.contains("\"billing\"") && err.contains("function billing.sum_totals"),
+        "{err}"
+    );
+    assert_catalog(
+        &*shop,
+        true,
+        "SELECT 1 FROM information_schema.columns WHERE table_schema = 'app' AND table_name = 'orders' AND column_name = 'total'",
+        "app.orders.total",
+    )
+    .await;
+}
