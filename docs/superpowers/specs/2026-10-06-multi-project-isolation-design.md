@@ -368,7 +368,14 @@ These are carried over from rev 1. Each is wrong today even with one project:
   (T2 runs against a pg_cron stand-in, T4 records the staging tables an event
   trigger sees). 1c also layers the bookkeeping reads — a project's record is
   its `dbd.meta` row, else its legacy row — since a heal that leaves another
-  project's rows behind must not hide them from that project's guards.*
+  project's rows behind must not hide them from that project's guards. Review
+  moved 1b's names to `dbd-refresh:<owner>:<schema>.<name>`: inside
+  `dbd:refresh:`, a co-tenant not yet upgraded — whose sweep takes every
+  `dbd:refresh:%` job it was not given — would still take them, the hazard
+  the heal tolerates for bookkeeping. Names fit 63 bytes (pg_cron 1.3/1.4
+  keep `name`); a legacy job whose view is gone is unscheduled. The heal locks
+  each legacy table before reading it and passes over one its role cannot
+  reach.*
 - **1d. Import staging moves into `dbd`, one table per owner** (H7).
   `dbd.import_jsonb_to_table` and `dbd."import_tmp:<owner>"` are used, with a
   hashed name past 63 bytes. Imports run through the pool, so `TEMP` tables

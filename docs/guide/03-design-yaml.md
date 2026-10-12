@@ -507,7 +507,7 @@ Files are written to `export/<schema>/<name>.<format>` in the project, or, with
 
 ### `materialized_views`
 
-Refresh scheduling for materialized views (entities under `ddl/materialized_view/`). A shared `options` block applies to every matview; `overrides` tweaks individual ones by qualified name. dbd compiles this into **pg_cron** jobs (named `dbd:refresh:<project>:<schema>.<name>`, so projects sharing a database each keep their own) synced on `apply`/`deploy`.
+Refresh scheduling for materialized views (entities under `ddl/materialized_view/`). A shared `options` block applies to every matview; `overrides` tweaks individual ones by qualified name. dbd compiles this into **pg_cron** jobs (named `dbd-refresh:<project>:<schema>.<name>`, so projects sharing a database each keep their own) synced on `apply`/`deploy`.
 
 ```yaml
 materialized_views:

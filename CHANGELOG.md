@@ -21,15 +21,22 @@ project too.
   an older dbd lost its record and read the database as fresh. A heal now
   moves the project's own rows; another project's stay, and so does a legacy
   table while it holds any, unaltered. A project not yet healed reads its own
-  record there, so its guards still see a database it marked prod. An emptied
-  legacy table is dropped.
+  record there, so its guards still see a database it marked prod. The heal
+  locks a legacy table before reading it, so a row an older dbd commits
+  meanwhile is seen, not dropped with the table; an emptied table is dropped,
+  or kept if Postgres refuses (a view over it); and a table the project's
+  role cannot read — another project's — is passed over, by reads too.
 - **A pg_cron refresh job is named for its project** —
-  `dbd:refresh:<project>:<schema>.<name>` — and a sync unschedules only its own
+  `dbd-refresh:<project>:<schema>.<name>` — and a sync unschedules only its own
   project's. It unscheduled every `dbd:refresh:` job it was not given, so each
-  project's apply took the other's jobs. A job an older dbd named
-  `dbd:refresh:<schema>.<name>` is replaced for a matview the project declares,
-  and left for one it does not. A `:` or `%` in a project's name is encoded,
-  so one project's name cannot reach another's jobs.
+  project's apply took the other's jobs; the new namespace is out of reach of
+  a project sharing the database that has not upgraded, whose sweep still
+  takes `dbd:refresh:%`. A name fits the 63 bytes pg_cron 1.3 and 1.4 keep (a
+  hash ends a longer one), and a `:` or `%` in a project's name is encoded, so
+  one project's name cannot reach another's jobs. A job an older dbd named
+  `dbd:refresh:<schema>.<name>` is replaced for a matview the project
+  declares, and unscheduled, by any project, once the view it refreshes no
+  longer exists.
 - **Each project stages its JSON imports in its own table**,
   `dbd."import_tmp:<project>"`. Every load dropped and recreated one
   `dbd.import_tmp`, so two projects importing at once emptied each other's
