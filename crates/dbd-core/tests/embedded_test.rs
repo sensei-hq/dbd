@@ -3846,9 +3846,10 @@ async fn assert_dbd_meta_version(adapter: &dyn dbd_core::DatabaseAdapter, projec
 /// A scoped apply can leave `_dbd_meta` in a non-`public` schema (pooled
 /// connections don't share `search_path`). The read-only detection path must
 /// still recognise the DB as managed BEFORE heal runs (both-names awareness),
-/// and `heal_bookkeeping` must fold every row into `dbd.meta` — preserving
-/// unrelated rows — then drop the stray copy, so later access can't miss it
-/// (which surfaced as `relation "_dbd_meta" does not exist` during reconcile).
+/// and `heal_bookkeeping` must fold this project's row into `dbd.meta`, so
+/// later access can't miss it (which surfaced as `relation "_dbd_meta" does not
+/// exist` during reconcile). Another project's row is that project's to fold:
+/// it stays, and so does the copy holding it (#7, H5).
 #[tokio::test]
 async fn heal_relocates_stray_meta_and_preserves_rows() {
     let (_pg, url) = start_pg().await;
@@ -3878,14 +3879,24 @@ async fn heal_relocates_stray_meta_and_preserves_rows() {
 
     adapter.heal_bookkeeping().await.unwrap();
 
-    // `_dbd_meta` now lives in `dbd.meta`; the stray `dojo` copy is gone.
+    // This project's row now lives in `dbd.meta` (v7) — moved, not dropped.
     assert_table_exists(&*adapter, "dbd", "meta").await;
-    assert_table_absent(&*adapter, "dojo", "_dbd_meta").await;
-
-    // This project's row rode along (v7), and the unrelated row too (v99) —
-    // proving data was moved, not dropped.
     assert_dbd_meta_version(&*adapter, "meta_heal_test", 7).await;
-    assert_dbd_meta_version(&*adapter, "other_project", 99).await;
+    // The unrelated row stays in the stray copy, which stays with it.
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM dojo._dbd_meta WHERE project = 'other_project' AND version = 99",
+        "other_project v99 in dojo._dbd_meta",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        false,
+        "SELECT 1 FROM dojo._dbd_meta WHERE project = 'meta_heal_test'",
+        "meta_heal_test left in dojo._dbd_meta",
+    )
+    .await;
 
     // Post-heal writes target `dbd.meta` and reads resolve against it.
     adapter.set_project_meta("prod", 8, None).await.unwrap();
@@ -3926,6 +3937,108 @@ async fn get_meta_reads_legacy_scopeless_meta_before_heal() {
     assert_eq!(m.env, "prod");
     assert_eq!(m.version, 4);
     assert_eq!(m.scope, None);
+}
+
+/// Two projects share a database whose bookkeeping is still the legacy
+/// `public._dbd_*` layout (#7, H5). When `a` upgrades and heals, it folds its
+/// own rows into `dbd.*` — and only those. `b`'s rows stay in the legacy
+/// tables, which stay as long as they hold any, unaltered: a `b` still on an
+/// older dbd keeps reading and writing them. `b`'s reads find its record
+/// there, so its guards still see a prod database, and `a` still sees `b` as
+/// another project. When `b` heals, its rows move too and the emptied legacy
+/// tables go.
+#[tokio::test]
+async fn a_heal_folds_only_its_own_legacy_rows() {
+    let (_pg, url) = start_pg().await;
+    let a = connect(&url, "a").await.unwrap();
+    let b = connect(&url, "b").await.unwrap();
+    a.execute_script(
+        "CREATE TABLE public._dbd_meta ( \
+            project varchar NOT NULL PRIMARY KEY, env varchar NOT NULL DEFAULT 'dev', \
+            version integer NOT NULL DEFAULT 0, \
+            created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now() ); \
+         CREATE TABLE public._dbd_migrations ( \
+            project varchar NOT NULL, version integer NOT NULL, applied_at timestamptz NOT NULL DEFAULT now(), \
+            description text, checksum text, PRIMARY KEY (project, version) ); \
+         INSERT INTO public._dbd_meta (project, env, version) VALUES ('a', 'prod', 4), ('b', 'prod', 9); \
+         INSERT INTO public._dbd_migrations (project, version) VALUES ('a', 1), ('b', 1), ('b', 2);",
+    )
+    .await
+    .unwrap();
+    let count = |table: &str, project: &str, n: i64| {
+        format!("SELECT 1 WHERE (SELECT count(*) FROM {table} WHERE project = '{project}') = {n}")
+    };
+
+    a.heal_bookkeeping().await.unwrap();
+
+    assert_dbd_meta_version(&*a, "a", 4).await;
+    assert_catalog(&*a, true, &count("dbd.meta", "b", 0), "no b row in dbd.meta").await;
+    assert_catalog(
+        &*a,
+        true,
+        &count("dbd.migrations", "a", 1),
+        "a's migration in dbd.migrations",
+    )
+    .await;
+    assert_catalog(
+        &*a,
+        true,
+        &count("dbd.migrations", "b", 0),
+        "no b migration in dbd.migrations",
+    )
+    .await;
+    assert_catalog(
+        &*a,
+        true,
+        &count("public._dbd_meta", "a", 0),
+        "a gone from public._dbd_meta",
+    )
+    .await;
+    assert_catalog(
+        &*a,
+        true,
+        &count("public._dbd_meta", "b", 1),
+        "b kept in public._dbd_meta",
+    )
+    .await;
+    assert_catalog(
+        &*a,
+        true,
+        &count("public._dbd_migrations", "a", 0),
+        "a gone from public._dbd_migrations",
+    )
+    .await;
+    assert_catalog(
+        &*a,
+        true,
+        &count("public._dbd_migrations", "b", 2),
+        "b kept in public._dbd_migrations",
+    )
+    .await;
+    assert_column_absent(&*a, "public", "_dbd_meta", "scope").await;
+
+    // `b`, not yet healed, still reads its own record.
+    let meta = b.get_project_meta().await.unwrap().expect("b's record");
+    assert_eq!((meta.env.as_str(), meta.version), ("prod", 9));
+    assert_eq!(b.get_db_version().await.unwrap(), 9);
+    assert_eq!(b.reverse_managed_version().await.unwrap(), Some(9));
+    let others = a.other_projects_meta().await.unwrap();
+    assert!(
+        others.iter().any(|m| m.project == "b" && m.version == 9),
+        "a sees b: {others:?}"
+    );
+
+    b.heal_bookkeeping().await.unwrap();
+    assert_dbd_meta_version(&*b, "b", 9).await;
+    assert_catalog(
+        &*b,
+        true,
+        &count("dbd.migrations", "b", 2),
+        "b's migrations in dbd.migrations",
+    )
+    .await;
+    assert_table_absent(&*b, "public", "_dbd_meta").await;
+    assert_table_absent(&*b, "public", "_dbd_migrations").await;
 }
 
 // ── heal_bookkeeping: move to `dbd` schema + fold legacy `public._dbd_*` ───────
