@@ -68,12 +68,16 @@ impl Bookkeeping {
     /// first, then strays by schema — which hold the rows of projects not yet
     /// healed. Empty = no bookkeeping anywhere (foreign/fresh DB). Only matches
     /// `dbd.meta` or `_dbd_meta` — never an unrelated user table named `meta`.
+    /// One this role cannot read is left out: projects sharing a database may
+    /// run as different roles, and another's legacy table holds nothing of this
+    /// project's.
     async fn meta_relations(&self) -> Result<Vec<(String, String)>> {
         let rows = sqlx::query(
             "SELECT n.nspname, c.relname FROM pg_class c \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
              WHERE c.relkind = 'r' \
                AND ((c.relname = 'meta' AND n.nspname = 'dbd') OR c.relname = '_dbd_meta') \
+               AND has_table_privilege(c.oid, 'SELECT') \
              ORDER BY (n.nspname = 'dbd') DESC, (n.nspname = 'public') DESC, n.nspname",
         )
         .fetch_all(&self.pool)
@@ -98,8 +102,10 @@ impl Bookkeeping {
     /// `fetch`), then all DDL/DML runs inside the transaction via
     /// `Executor::execute(&str)` — not `raw_sql`, whose future is not `Send`
     /// against `&mut PgConnection` under `#[async_trait]` (see
-    /// `PostgresAdapter::exec_raw`). dbd runs are serial per DB, so the catalog
-    /// cannot shift between the discovery read and the fold.
+    /// `PostgresAdapter::exec_raw`). Projects sharing a database run at once,
+    /// so each copy is locked before it is read — see [`Self::lock_legacy`] —
+    /// and one gone since the discovery, or out of this role's reach, is
+    /// passed over.
     pub(super) async fn heal(&self) -> Result<()> {
         use sqlx::Executor as _;
 
@@ -139,6 +145,9 @@ impl Bookkeeping {
         // on conflict). A copy that predates the `scope` column is read as it
         // is, not given one: an older dbd may still write it.
         for s in meta_schemas {
+            if !self.lock_legacy(&mut tx, &s, "_dbd_meta").await? {
+                continue;
+            }
             let q = s.replace('"', "\"\"");
             let has_scope: bool = sqlx::query_scalar(
                 "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute \
@@ -165,6 +174,9 @@ impl Bookkeeping {
         // Fold this project's `_dbd_migrations` rows → `dbd.migrations`
         // (composite PK unions copies).
         for s in migration_schemas {
+            if !self.lock_legacy(&mut tx, &s, "_dbd_migrations").await? {
+                continue;
+            }
             let q = s.replace('"', "\"\"");
             sqlx::query(&format!(
                 "INSERT INTO dbd.migrations (project, version, applied_at, description, checksum) \
@@ -184,9 +196,71 @@ impl Bookkeeping {
         Ok(())
     }
 
+    /// Lock the legacy `schema.relname` for the heal, so a project on an older
+    /// dbd writing it at the same moment is waited for and what it commits is
+    /// seen: a row it inserts unseen would otherwise go with a table the heal
+    /// found empty and dropped. `SHARE ROW EXCLUSIVE` lets readers through and
+    /// holds writers until the heal commits.
+    ///
+    /// `false`, with the transaction as it was, for a table this role cannot
+    /// lock, read or delete from — another project's role owns it, so it holds
+    /// nothing of this project's — or one dropped since it was found, by
+    /// another project's heal.
+    async fn lock_legacy(&self, tx: &mut Transaction<'static, Postgres>, schema: &str, relname: &str) -> Result<bool> {
+        use sqlx::Executor as _;
+        let table = quoted_table(schema, relname);
+        (&mut **tx)
+            .execute("SAVEPOINT dbd_heal_lock")
+            .await
+            .map_err(|e| DbdError::Config(format!("heal: savepoint failed: {e}")))?;
+        let locked = async {
+            (&mut **tx)
+                .execute(format!("LOCK TABLE {table} IN SHARE ROW EXCLUSIVE MODE").as_str())
+                .await?;
+            sqlx::query_scalar::<_, bool>(&format!(
+                "SELECT has_table_privilege('{0}', 'SELECT') AND has_table_privilege('{0}', 'DELETE')",
+                table.replace('\'', "''")
+            ))
+            .fetch_one(&mut **tx)
+            .await
+        }
+        .await;
+        match locked {
+            Ok(true) => {
+                (&mut **tx)
+                    .execute("RELEASE SAVEPOINT dbd_heal_lock")
+                    .await
+                    .map_err(|e| DbdError::Config(format!("heal: release savepoint failed: {e}")))?;
+                Ok(true)
+            }
+            Ok(false) => {
+                self.undo_to(tx, "dbd_heal_lock").await?;
+                Ok(false)
+            }
+            Err(e) if matches!(sqlstate(&e).as_deref(), Some("42P01" | "42501")) => {
+                self.undo_to(tx, "dbd_heal_lock").await?;
+                Ok(false)
+            }
+            Err(e) => Err(DbdError::Config(format!("heal: lock {schema}.{relname} failed: {e}"))),
+        }
+    }
+
+    /// Roll the heal back to `savepoint` and release it.
+    async fn undo_to(&self, tx: &mut Transaction<'static, Postgres>, savepoint: &str) -> Result<()> {
+        use sqlx::Executor as _;
+        (&mut **tx)
+            .execute(format!("ROLLBACK TO SAVEPOINT {savepoint}; RELEASE SAVEPOINT {savepoint}").as_str())
+            .await
+            .map_err(|e| DbdError::Config(format!("heal: rollback to savepoint failed: {e}")))?;
+        Ok(())
+    }
+
     /// Delete this project's rows from the legacy `schema.relname`, folded
     /// already, and drop the table if that leaves it empty — no other project's
-    /// rows, so no older dbd still using it.
+    /// rows, so no older dbd still using it. The drop is housekeeping — a reader
+    /// finds no rows in an empty table either — so one Postgres refuses (a view
+    /// over the table, a role that does not own it) leaves the table, empty,
+    /// rather than failing the heal and every one after it.
     async fn release_legacy_rows(
         &self,
         tx: &mut Transaction<'static, Postgres>,
@@ -194,11 +268,7 @@ impl Bookkeeping {
         relname: &str,
     ) -> Result<()> {
         use sqlx::Executor as _;
-        let table = format!(
-            "\"{}\".\"{}\"",
-            schema.replace('"', "\"\""),
-            relname.replace('"', "\"\"")
-        );
+        let table = quoted_table(schema, relname);
         sqlx::query(&format!("DELETE FROM {table} WHERE project = $1"))
             .bind(&self.project)
             .execute(&mut **tx)
@@ -210,9 +280,18 @@ impl Bookkeeping {
             .map_err(|e| DbdError::Config(format!("heal: read {schema}.{relname} failed: {e}")))?;
         if emptied {
             (&mut **tx)
-                .execute(format!("DROP TABLE {table}").as_str())
+                .execute("SAVEPOINT dbd_heal_drop")
                 .await
-                .map_err(|e| DbdError::Config(format!("heal: drop {schema}.{relname} failed: {e}")))?;
+                .map_err(|e| DbdError::Config(format!("heal: savepoint failed: {e}")))?;
+            match (&mut **tx).execute(format!("DROP TABLE {table}").as_str()).await {
+                Ok(_) => {
+                    (&mut **tx)
+                        .execute("RELEASE SAVEPOINT dbd_heal_drop")
+                        .await
+                        .map_err(|e| DbdError::Config(format!("heal: release savepoint failed: {e}")))?;
+                }
+                Err(_) => self.undo_to(tx, "dbd_heal_drop").await?,
+            }
         }
         Ok(())
     }
@@ -251,7 +330,17 @@ impl Bookkeeping {
     /// work on a project not yet healed (the guards read before the core op
     /// heals) — on a legacy DB, or beside a project that healed first.
     pub(super) async fn get_meta(&self) -> Result<Option<ProjectMeta>> {
-        Ok(self.read_meta("project = $1").await?.into_iter().next())
+        for (schema, rel) in self.meta_relations().await? {
+            if let Some(row) = self
+                .read_meta_in(&schema, &rel, "project = $1")
+                .await?
+                .into_iter()
+                .next()
+            {
+                return Ok(Some(row));
+            }
+        }
+        Ok(None)
     }
 
     /// Every other project's meta row, by project — what the guards read when
@@ -278,7 +367,8 @@ impl Bookkeeping {
         Ok(found)
     }
 
-    /// The rows `filter` selects in one meta relation, `schema.rel`.
+    /// The rows `filter` selects in one meta relation, `schema.rel` — none if
+    /// another project's heal dropped it since it was listed.
     async fn read_meta_in(&self, schema: &str, rel: &str, filter: &str) -> Result<Vec<ProjectMeta>> {
         let (sq, rq) = (schema.replace('"', "\"\""), rel.replace('"', "\"\""));
         // Preferred read includes `scope`. On a legacy `_dbd_meta` that predates
@@ -306,8 +396,9 @@ impl Bookkeeping {
             // OTHER error is real (transient failure, permission, etc.) and must
             // surface — swallowing it to `None` would silently disable the scope
             // AND prod guards.
+            Err(e) if sqlstate(&e).as_deref() == Some("42P01") => Ok(Vec::new()),
             Err(e) => {
-                let undefined_column = e.as_database_error().and_then(|db| db.code()).as_deref() == Some("42703");
+                let undefined_column = sqlstate(&e).as_deref() == Some("42703");
                 if !undefined_column {
                     return Err(DbdError::Config(format!("read meta failed: {e}")));
                 }
@@ -491,15 +582,33 @@ impl Bookkeeping {
         }
         for (schema, rel) in relations {
             let (sq, rq) = (schema.replace('"', "\"\""), rel.replace('"', "\"\""));
-            let vrow = sqlx::query(&format!("SELECT version FROM \"{sq}\".\"{rq}\" WHERE project = $1"))
+            let vrow = match sqlx::query(&format!("SELECT version FROM \"{sq}\".\"{rq}\" WHERE project = $1"))
                 .bind(&self.project)
                 .fetch_optional(&self.pool)
                 .await
-                .map_err(|e| DbdError::Config(format!("detect managed version read failed: {e}")))?;
+            {
+                // Dropped since it was listed, by another project's heal.
+                Err(e) if sqlstate(&e).as_deref() == Some("42P01") => continue,
+                read => read.map_err(|e| DbdError::Config(format!("detect managed version read failed: {e}")))?,
+            };
             if let Some(row) = vrow {
                 return Ok(Some(row.get::<i32, _>("version") as u32));
             }
         }
         Ok(Some(0))
     }
+}
+
+/// `"schema"."relname"`, each part quoted.
+fn quoted_table(schema: &str, relname: &str) -> String {
+    format!(
+        "\"{}\".\"{}\"",
+        schema.replace('"', "\"\""),
+        relname.replace('"', "\"\"")
+    )
+}
+
+/// The SQLSTATE of a database error, if `e` is one.
+fn sqlstate(e: &sqlx::Error) -> Option<String> {
+    e.as_database_error().and_then(|db| db.code()).map(|c| c.into_owned())
 }
