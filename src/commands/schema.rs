@@ -1064,6 +1064,7 @@ pub async fn cmd_refresh(
         "Refreshing another scope's materialized views would read tables this database was not built with.",
     )
     .await?;
+    design.check_ownership(&*adapter).await?;
 
     for entity in selected {
         let resolved = design.config().materialized_views.resolve(&entity.name);
@@ -1137,6 +1138,7 @@ pub async fn cmd_policies(
     // The scope guard every other writing command runs. Policies do not re-pin
     // the database, so there is no `--allow-scope-change` to offer.
     super::check_pinned_scope(&*adapter, &design, &resolved, POLICY_CONSEQUENCE).await?;
+    design.check_ownership(&*adapter).await?;
     let report = dbd_core::design::apply_policies(
         &*adapter,
         project_dir,

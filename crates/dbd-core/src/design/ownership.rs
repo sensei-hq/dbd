@@ -59,6 +59,14 @@ impl Design {
             .collect()
     }
 
+    /// Refuse, naming each, a design declaring an entity another owner holds
+    /// in this database — the check every command that claims nothing runs
+    /// before it touches the database: `refresh`, `policies`, `import`, a dry
+    /// run, `diff`. Reads the ownership registry and writes nothing (#7).
+    pub async fn check_ownership(&self, adapter: &dyn DatabaseAdapter) -> Result<()> {
+        self.preflight(adapter, Preflight::Check).await
+    }
+
     /// Claim the design's entities before a run writes anything — or, for one
     /// that only reads, check them — and refuse, naming each, when another
     /// owner holds any: owners sharing a database must not declare the same
