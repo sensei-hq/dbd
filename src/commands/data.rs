@@ -566,13 +566,21 @@ fn refuse_shared_files(tables: &[&dbd_core::Entity], root: &Path) -> Result<()> 
     if shared.is_empty() {
         return Ok(());
     }
+    // The folder above is no way out: exporting there gives each table a
+    // folder of its own schema, `import/core/…`, which an import refuses unless
+    // that schema is a staging one — and the next import failed on it.
+    let schema = root
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_default();
     bail!(
         "nothing exported: {} is a schema folder of the import tree, where a table is written as \
          <table>.<format> — and these tables would be one file there:\n{}\n\
-         Export them one at a time with -n, or to -o {} to keep each under its schema",
+         An import loads each file here into {schema}.<table>: export into this folder, with -n, \
+         the one table whose rows that should be (a second export here overwrites the first). \
+         Outside import/ — the default export/ — each table keeps its own schema folder.",
         root.display(),
         shared.join("\n"),
-        root.parent().map(|p| p.display().to_string()).unwrap_or_default()
     )
 }
 

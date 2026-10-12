@@ -93,12 +93,16 @@ impl Design {
                 _ => None,
             })
         };
+        let mut kinds: Vec<&str> = Vec::new();
         let not_tables: Vec<String> = self
             .import_tables
             .iter()
             .filter(|t| name.is_none_or(|n| t.name == n))
             .filter_map(|t| {
                 let kind = kind_of(&t.name)?;
+                if !kinds.contains(&kind) {
+                    kinds.push(kind);
+                }
                 let file = t
                     .file
                     .as_deref()
@@ -110,11 +114,22 @@ impl Design {
         if not_tables.is_empty() {
             return Ok(());
         }
+        // Why, for each kind refused and no other: "a view has no rows of its
+        // own" was the reason given for a sequence too.
+        let why: Vec<&str> = kinds
+            .iter()
+            .map(|kind| match *kind {
+                "a view" => "a view has no rows of its own, only its tables'",
+                "a materialized view" => "a materialized view's rows are its query's, refreshed rather than loaded",
+                _ => "a sequence holds a counter, not rows",
+            })
+            .collect();
         Err(DbdError::Config(format!(
             "import refused: these data files load something that is not a table:\n{}\n\
-             An import truncates and loads tables; a view has no rows of its own to load. Move each \
-             file to import/<schema>/<table>.<ext> for the table it holds rows of.",
-            not_tables.join("\n")
+             An import truncates and loads tables; {}. Move each file to \
+             import/<schema>/<table>.<ext> for the table it holds rows of.",
+            not_tables.join("\n"),
+            why.join("; ")
         )))
     }
 

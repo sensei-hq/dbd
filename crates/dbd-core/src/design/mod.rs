@@ -3774,7 +3774,8 @@ import:
             applied_at: None,
         };
         let marks = crate::design::DatabaseMarks::of_own("p", Some(meta));
-        let err = Design::check_reset_guard(&marks).unwrap_err().to_string();
+        let design = Design::from_config(&fixture_dir().join("design.yaml"), "dev").unwrap();
+        let err = design.check_reset_guard(&marks).unwrap_err().to_string();
         assert!(err.contains("versioned at v4"), "{err}");
         assert!(!err.contains("applied migrations"), "{err}");
     }
