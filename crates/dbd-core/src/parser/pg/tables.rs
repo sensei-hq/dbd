@@ -208,38 +208,50 @@ pub(crate) fn trigger_names(sql: &str) -> Vec<String> {
 /// The statements of a table or view file that are about its triggers, as the
 /// file wrote them — `CREATE [CONSTRAINT] TRIGGER`, the `DROP TRIGGER IF
 /// EXISTS` that keeps a constraint trigger re-runnable, and `COMMENT ON
-/// TRIGGER` — each with the comment lines written above it, in file order.
-/// `None` when the file does not parse.
+/// TRIGGER` — each with the comment lines written above it, in file order,
+/// and each preceded by the `SET search_path` it ran on when that changed
+/// since the last one kept. `None` when the file does not parse.
 ///
 /// For a rewrite of the file from a source that cannot hold a trigger — a
 /// DBML document — which would otherwise drop them (see
-/// [`crate::reverse::keep_authored_triggers`]).
+/// [`crate::reverse::keep_authored_triggers`]). The path comes with them
+/// because a trigger names its table and function as the file's path
+/// resolves them, and the rewritten file's own statements are qualified and
+/// set none.
 pub(crate) fn trigger_statements(sql: &str) -> Option<Vec<String>> {
     use protobuf::ObjectType;
     let parsed = pg_query::parse(sql).ok()?;
-    Some(
-        parsed
-            .protobuf
-            .stmts
-            .iter()
-            .filter(|raw| match raw.stmt.as_ref().and_then(|s| s.node.as_ref()) {
-                Some(NodeEnum::CreateTrigStmt(_)) => true,
-                Some(NodeEnum::DropStmt(d)) => d.remove_type() == ObjectType::ObjectTrigger,
-                Some(NodeEnum::CommentStmt(c)) => c.objtype() == ObjectType::ObjectTrigger,
-                _ => false,
-            })
-            .filter_map(|raw| {
-                let start = usize::try_from(raw.stmt_location).ok()?.min(sql.len());
-                // `stmt_len` 0 means "to the end of the script".
-                let end = match usize::try_from(raw.stmt_len).unwrap_or(0) {
-                    0 => sql.len(),
-                    len => (start + len).min(sql.len()),
-                };
-                let text = sql.get(start..end)?.trim();
-                (!text.is_empty()).then(|| text.to_string())
-            })
-            .collect(),
-    )
+    let text_of = |raw: &protobuf::RawStmt| -> Option<String> {
+        let start = usize::try_from(raw.stmt_location).ok()?.min(sql.len());
+        // `stmt_len` 0 means "to the end of the script".
+        let end = match usize::try_from(raw.stmt_len).unwrap_or(0) {
+            0 => sql.len(),
+            len => (start + len).min(sql.len()),
+        };
+        let text = sql.get(start..end)?.trim();
+        (!text.is_empty()).then(|| text.to_string())
+    };
+    let mut kept = Vec::new();
+    // The last `SET search_path` (or `RESET`) not yet written ahead of a kept
+    // statement.
+    let mut path: Option<String> = None;
+    for raw in &parsed.protobuf.stmts {
+        let about_a_trigger = match raw.stmt.as_ref().and_then(|s| s.node.as_ref()) {
+            Some(NodeEnum::VariableSetStmt(set)) if set.name.eq_ignore_ascii_case("search_path") => {
+                path = text_of(raw);
+                continue;
+            }
+            Some(NodeEnum::CreateTrigStmt(_)) => true,
+            Some(NodeEnum::DropStmt(d)) => d.remove_type() == ObjectType::ObjectTrigger,
+            Some(NodeEnum::CommentStmt(c)) => c.objtype() == ObjectType::ObjectTrigger,
+            _ => false,
+        };
+        if about_a_trigger && let Some(text) = text_of(raw) {
+            kept.extend(path.take());
+            kept.push(text);
+        }
+    }
+    Some(kept)
 }
 
 /// A `RangeVar` as a qualified name, defaulting the schema like Postgres does.
