@@ -40,7 +40,17 @@ impl Bookkeeping {
             description text, checksum text, PRIMARY KEY (project, version) ); \
          CREATE TABLE IF NOT EXISTS dbd.matview_stamps ( \
             project varchar NOT NULL, matview varchar NOT NULL, stamp text NOT NULL, \
-            stamped_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (project, matview) );";
+            stamped_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (project, matview) ); \
+         CREATE TABLE IF NOT EXISTS dbd.objects ( \
+            namespace varchar NOT NULL CHECK (namespace IN ('relation', 'type', 'routine')), \
+            schema varchar NOT NULL, name varchar NOT NULL, kind varchar NOT NULL, \
+            owner varchar NOT NULL, claimed_at timestamptz NOT NULL DEFAULT now(), \
+            PRIMARY KEY (namespace, schema, name) ); \
+         CREATE TABLE IF NOT EXISTS dbd.uses ( \
+            owner varchar NOT NULL, \
+            kind varchar NOT NULL CHECK (kind IN ('schema', 'extension', 'role', 'entity')), \
+            target varchar NOT NULL, via varchar NOT NULL DEFAULT '', \
+            PRIMARY KEY (owner, kind, target, via) );";
 
     pub(super) fn new(pool: PgPool, project: String) -> Self {
         Self { pool, project }
@@ -405,6 +415,229 @@ impl Bookkeeping {
         Ok(rows.into_iter().map(|r| r.get::<String, _>("nspname")).collect())
     }
 
+    /// Claim `objects` for `owner` in `dbd.objects`, or with `write` false only
+    /// read who holds them; the ones another owner holds come back, and when
+    /// there are any the caller fails the run. In `tx` — the run's open batch —
+    /// when there is one, so the claim commits with the run's work or rolls
+    /// back with it; else in a transaction of its own, rolled back when any is
+    /// held. Either waits at most [`HEAL_LOCK_TIMEOUT`] for another session's
+    /// write to the registry. The primary key settles two runs at once: the
+    /// second waits on the first's uncommitted rows, then finds them held.
+    ///
+    /// A read with no registry yet finds nothing held, and writes nothing.
+    pub(super) async fn claim_objects(
+        &self,
+        tx: Option<&mut Transaction<'static, Postgres>>,
+        owner: &str,
+        objects: &[crate::adapter::OwnedObject],
+        write: bool,
+    ) -> Result<Vec<crate::adapter::HeldObject>> {
+        if !write {
+            let exists: Option<String> = sqlx::query_scalar("SELECT to_regclass('dbd.objects')::text")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| DbdError::Config(format!("ownership lookup failed: {e}")))?;
+            if exists.is_none() {
+                return Ok(Vec::new());
+            }
+            let mut conn = self
+                .pool
+                .acquire()
+                .await
+                .map_err(|e| DbdError::Config(format!("ownership read failed: {e}")))?;
+            return held_objects(&mut conn, owner, objects).await;
+        }
+        match tx {
+            Some(tx) => self.claim_in(tx, owner, objects).await,
+            None => {
+                let mut own = self.registry_tx("claim").await?;
+                let held = self.claim_in(&mut own, owner, objects).await?;
+                if held.is_empty() {
+                    own.commit()
+                        .await
+                        .map_err(|e| DbdError::Config(format!("claim: commit failed: {e}")))?;
+                } else {
+                    own.rollback()
+                        .await
+                        .map_err(|e| DbdError::Config(format!("claim: rollback failed: {e}")))?;
+                }
+                Ok(held)
+            }
+        }
+    }
+
+    /// A transaction of the registry's own, for a write outside any batch:
+    /// `READ COMMITTED`, so a wait ends in a read of what the other session
+    /// committed.
+    async fn registry_tx(&self, what: &str) -> Result<Transaction<'static, Postgres>> {
+        use sqlx::Executor as _;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| DbdError::Config(format!("{what}: begin failed: {e}")))?;
+        (&mut *tx)
+            .execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            .await
+            .map_err(|e| DbdError::Config(format!("{what}: begin failed: {e}")))?;
+        Ok(tx)
+    }
+
+    /// The claim's statements, in `tx`, waiting at most [`HEAL_LOCK_TIMEOUT`]
+    /// for the registry and then leaving the batch's own lock timeout as it
+    /// was.
+    async fn claim_in(
+        &self,
+        tx: &mut Transaction<'static, Postgres>,
+        owner: &str,
+        objects: &[crate::adapter::OwnedObject],
+    ) -> Result<Vec<crate::adapter::HeldObject>> {
+        let column = |f: fn(&crate::adapter::OwnedObject) -> &str| -> Vec<String> {
+            objects.iter().map(|o| f(o).to_string()).collect()
+        };
+        bounded_wait(tx, "dbd.objects", true).await?;
+        sqlx::query(
+            "INSERT INTO dbd.objects (namespace, schema, name, kind, owner) \
+               SELECT d.namespace, d.schema, d.name, d.kind, $5 \
+               FROM unnest($1::text[], $2::text[], $3::text[], $4::text[]) AS d(namespace, schema, name, kind) \
+             ON CONFLICT (namespace, schema, name) DO UPDATE SET kind = EXCLUDED.kind \
+               WHERE dbd.objects.owner = EXCLUDED.owner",
+        )
+        .bind(column(|o| &o.namespace))
+        .bind(column(|o| &o.schema))
+        .bind(column(|o| &o.name))
+        .bind(column(|o| &o.kind))
+        .bind(owner)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| registry_error(&e, "dbd.objects", "claim"))?;
+        let held = held_objects(tx, owner, objects).await?;
+        bounded_wait(tx, "dbd.objects", false).await?;
+        Ok(held)
+    }
+
+    /// Replace `owner`'s rows in `dbd.uses` with `uses` — in `tx`, the run's
+    /// open batch, when there is one, else in a transaction of its own; either
+    /// waits at most [`HEAL_LOCK_TIMEOUT`] for the registry. A shared use —
+    /// schema, extension, role — is recorded as given. An entity use names its
+    /// target `namespace:schema.name`, the name split at its first dot as dbd
+    /// splits one, and is recorded where another owner holds it — and not at
+    /// all when nobody else does. One named bare is looked up along its search
+    /// path as Postgres looks it up: a read is of the first relation on the
+    /// path, owned or not; a call, of any routine on it that could be the one
+    /// its arguments reach.
+    pub(super) async fn record_uses(
+        &self,
+        tx: Option<&mut Transaction<'static, Postgres>>,
+        owner: &str,
+        uses: &[crate::adapter::Use],
+    ) -> Result<()> {
+        match tx {
+            Some(tx) => self.record_uses_in(tx, owner, uses).await,
+            None => {
+                let mut own = self.registry_tx("record uses").await?;
+                self.record_uses_in(&mut own, owner, uses).await?;
+                own.commit()
+                    .await
+                    .map_err(|e| DbdError::Config(format!("record uses: commit failed: {e}")))
+            }
+        }
+    }
+
+    async fn record_uses_in(
+        &self,
+        tx: &mut Transaction<'static, Postgres>,
+        owner: &str,
+        uses: &[crate::adapter::Use],
+    ) -> Result<()> {
+        let (shared, entities): (Vec<&crate::adapter::Use>, Vec<&crate::adapter::Use>) =
+            uses.iter().partition(|u| u.kind != "entity");
+        let column = |list: &[&crate::adapter::Use], f: fn(&crate::adapter::Use) -> &str| -> Vec<String> {
+            list.iter().map(|u| f(u).to_string()).collect()
+        };
+        // Each entity use's candidates, in the order Postgres tries them: the
+        // target's own schema, or each schema on its search path.
+        let mut candidates = Candidates::default();
+        for (i, u) in entities.iter().enumerate() {
+            let (namespace, qualified) = u.target.split_once(':').unwrap_or_default();
+            let (schema, name) = crate::entity::split_qualified_name(qualified);
+            let bare = !u.search_path.is_empty();
+            let schemas = if bare {
+                u.search_path.clone()
+            } else {
+                vec![schema.unwrap_or_default()]
+            };
+            for (rank, schema) in schemas.into_iter().enumerate() {
+                candidates.bare.push(bare);
+                candidates.used.push(i as i32);
+                candidates.rank.push(rank as i32);
+                candidates.namespace.push(namespace.to_string());
+                candidates.schema.push(schema);
+                candidates.name.push(name.clone());
+                candidates.via.push(u.via.clone());
+            }
+        }
+        bounded_wait(tx, "dbd.uses", true).await?;
+        sqlx::query("DELETE FROM dbd.uses WHERE owner = $1")
+            .bind(owner)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| registry_error(&e, "dbd.uses", "record uses"))?;
+        sqlx::query(
+            "INSERT INTO dbd.uses (owner, kind, target, via) \
+               SELECT $1, d.kind, d.target, d.via \
+               FROM unnest($2::text[], $3::text[], $4::text[]) AS d(kind, target, via) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(owner)
+        .bind(column(&shared, |u| &u.kind))
+        .bind(column(&shared, |u| &u.target))
+        .bind(column(&shared, |u| &u.via))
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| registry_error(&e, "dbd.uses", "record uses"))?;
+        // A bare name's candidates are those that exist, as Postgres finds
+        // them. A read is of the first relation on the path; a call is
+        // resolved by its arguments too, which dbd does not weigh, so it is a
+        // use of every routine on the path it could reach. Recorded where
+        // another owner holds it.
+        sqlx::query(
+            "WITH d AS ( \
+               SELECT * FROM unnest($2::int4[], $3::int4[], $4::text[], $5::text[], $6::text[], $7::text[], $8::bool[]) \
+                 AS d(used, rank, namespace, schema, name, via, bare) \
+             ), relations AS ( \
+               SELECT DISTINCT ON (d.used) d.via, d.namespace, d.schema, d.name FROM d \
+               WHERE d.namespace <> 'routine' AND (NOT d.bare OR EXISTS ( \
+                 SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = d.schema AND c.relname = d.name AND c.relkind IN ('r', 'v', 'm', 'f', 'p', 'S'))) \
+               ORDER BY d.used, d.rank \
+             ), routines AS ( \
+               SELECT d.via, d.namespace, d.schema, d.name FROM d \
+               WHERE d.namespace = 'routine' AND (NOT d.bare OR EXISTS ( \
+                 SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+                 WHERE n.nspname = d.schema AND p.proname = d.name)) \
+             ) \
+             INSERT INTO dbd.uses (owner, kind, target, via) \
+               SELECT $1, 'entity', o.namespace || ':' || o.schema || '.' || o.name, f.via \
+               FROM (SELECT * FROM relations UNION ALL SELECT * FROM routines) f \
+               JOIN dbd.objects o ON o.namespace = f.namespace AND o.schema = f.schema AND o.name = f.name \
+                 AND o.owner <> $1 \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(owner)
+        .bind(&candidates.used)
+        .bind(&candidates.rank)
+        .bind(&candidates.namespace)
+        .bind(&candidates.schema)
+        .bind(&candidates.name)
+        .bind(&candidates.via)
+        .bind(&candidates.bare)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| registry_error(&e, "dbd.uses", "record uses"))?;
+        bounded_wait(tx, "dbd.uses", false).await
+    }
+
     /// Read the recorded version for this project (authoritative version source).
     /// Catalog-resolved (both-names aware) so a not-yet-healed legacy DB is read
     /// correctly instead of silently missed as version 0. `0` when there is no
@@ -708,4 +941,84 @@ fn quoted_table(schema: &str, relname: &str) -> String {
 /// The SQLSTATE of a database error, if `e` is one.
 fn sqlstate(e: &sqlx::Error) -> Option<String> {
     e.as_database_error().and_then(|db| db.code()).map(|c| c.into_owned())
+}
+
+/// The ones of `objects` another owner than `owner` holds in `dbd.objects`.
+async fn held_objects(
+    conn: &mut sqlx::PgConnection,
+    owner: &str,
+    objects: &[crate::adapter::OwnedObject],
+) -> Result<Vec<crate::adapter::HeldObject>> {
+    let column = |f: fn(&crate::adapter::OwnedObject) -> &str| -> Vec<String> {
+        objects.iter().map(|o| f(o).to_string()).collect()
+    };
+    let rows = sqlx::query(
+        "SELECT o.namespace, o.schema, o.name, o.kind, o.owner FROM dbd.objects o \
+         JOIN unnest($1::text[], $2::text[], $3::text[]) AS d(namespace, schema, name) \
+           ON o.namespace = d.namespace AND o.schema = d.schema AND o.name = d.name \
+         WHERE o.owner <> $4 ORDER BY o.namespace, o.schema, o.name",
+    )
+    .bind(column(|o| &o.namespace))
+    .bind(column(|o| &o.schema))
+    .bind(column(|o| &o.name))
+    .bind(owner)
+    .fetch_all(conn)
+    .await
+    .map_err(|e| registry_error(&e, "dbd.objects", "ownership read"))?;
+    Ok(rows
+        .iter()
+        .map(|r| crate::adapter::HeldObject {
+            object: crate::adapter::OwnedObject {
+                namespace: r.get("namespace"),
+                schema: r.get("schema"),
+                name: r.get("name"),
+                kind: r.get("kind"),
+            },
+            owner: r.get("owner"),
+        })
+        .collect())
+}
+
+/// The rows an entity use is looked up by: one per schema it may be in, `rank`
+/// its place on the search path, `used` the use it stands for, `bare` whether
+/// it was named without a schema.
+#[derive(Default)]
+struct Candidates {
+    used: Vec<i32>,
+    rank: Vec<i32>,
+    namespace: Vec<String>,
+    schema: Vec<String>,
+    name: Vec<String>,
+    via: Vec<String>,
+    bare: Vec<bool>,
+}
+
+/// Bound how long `tx` waits for a lock on `table` — [`HEAL_LOCK_TIMEOUT`]
+/// while `on`, and back to the transaction's own setting after: a batch's DDL
+/// keeps whatever wait it had.
+async fn bounded_wait(tx: &mut Transaction<'static, Postgres>, table: &str, on: bool) -> Result<()> {
+    use sqlx::Executor as _;
+    let sql = if on {
+        format!("SET LOCAL lock_timeout = '{HEAL_LOCK_TIMEOUT}'")
+    } else {
+        "SET LOCAL lock_timeout TO DEFAULT".to_string()
+    };
+    (&mut **tx)
+        .execute(sql.as_str())
+        .await
+        .map_err(|e| registry_error(&e, table, "registry wait"))?;
+    Ok(())
+}
+
+/// A registry statement's failure: a lock held past [`HEAL_LOCK_TIMEOUT`],
+/// and a write another run made after this transaction's snapshot, say so.
+fn registry_error(e: &sqlx::Error, table: &str, what: &str) -> DbdError {
+    DbdError::Config(match sqlstate(e).as_deref() {
+        Some("55P03") => format!(
+            "{what}: {table} is held by another session's open write, which did not finish \
+             within {HEAL_LOCK_TIMEOUT} — let it finish, or end it, and run again"
+        ),
+        Some("40001") => format!("{what}: another run wrote {table} at the same time; run again"),
+        _ => format!("{what} failed: {e}"),
+    })
 }

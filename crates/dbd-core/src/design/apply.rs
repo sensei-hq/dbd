@@ -289,12 +289,39 @@ impl Design {
         if !adapter.prefers_batch_apply() {
             ensure_no_pending_todos(&pending)?;
         }
+        // The last gate, before the first hook: refuse a design declaring an
+        // entity another owner holds (#7). A real run heals the bookkeeping
+        // first. In one transaction it claims with its work, below; outside
+        // one nothing it writes rolls back — its hooks included — so it claims
+        // now, before the first of them: see `Design::claim_first`.
+        self.preflight(
+            adapter,
+            if dry_run {
+                ownership::Preflight::Read
+            } else {
+                ownership::Preflight::Write
+            },
+        )
+        .await?;
 
         // A hook is filtered against the same working set the entities were.
         // `None` — unscoped or the all-scope — runs every hook, and skips the
         // derivation cost entirely on that common path.
         let hook_scope = self.hook_scope(scope, working_set.as_ref());
         let hook_scope = hook_scope.as_ref().map(|(name, outside)| (*name, outside));
+
+        let outside_txn = !adapter.supports_transactional_apply() || std::env::var_os("DBD_NO_TX").is_some();
+        if !dry_run && outside_txn {
+            // The before-hooks' own refusals — a file missing, a path outside
+            // the project — come first: a refused run claims nothing.
+            hooks::plan_hooks(
+                self.hook_source(),
+                &self.config.apply.before,
+                hooks::HookKind::Before,
+                hook_scope,
+            )?;
+            self.claim(adapter).await?;
+        }
 
         // `apply.before` runs here: after the scope and parse gates, so a bad
         // design still refuses before any hook fires, and before the first
@@ -327,11 +354,6 @@ impl Design {
             .await?;
             return Ok(());
         }
-
-        // Heal-first: ensure bookkeeping storage exists (and is at the current
-        // layout, healing any legacy layout in place) before anything else reads
-        // or writes it — every ownership operation calls this up front.
-        adapter.heal_bookkeeping().await?;
 
         // Batch adapters (e.g. Convex) short-circuit — no execution plan needed
         if adapter.prefers_batch_apply() {
@@ -433,6 +455,9 @@ impl Design {
 
         if use_txn {
             adapter.begin_batch().await?;
+        } else if !outside_txn {
+            // A plan with nothing to build opens no transaction: claim here.
+            self.claim(adapter).await?;
         }
 
         // Execute plan steps inside an async block so a mid-plan error routes
@@ -451,13 +476,21 @@ impl Design {
                 )
                 .await?;
                 // A version's new enum values commit before the rest of it
-                // uses them (see `ExecutionStep::AddEnumValues`).
+                // uses them (see `ExecutionStep::AddEnumValues`) — claimed
+                // first, so nothing commits unclaimed (#7).
                 if use_txn && matches!(step, ExecutionStep::AddEnumValues { .. }) {
+                    self.claim_built(adapter).await?;
                     adapter.commit_batch().await?;
                     adapter.begin_batch().await?;
                 }
             }
-            Ok(())
+            // Built: claim it, in the batch, so the claim commits with the
+            // work and rolls back with it (#7). Claimed already outside one.
+            if use_txn {
+                self.claim_built(adapter).await
+            } else {
+                self.record_declared_uses(adapter).await
+            }
         }
         .await;
 

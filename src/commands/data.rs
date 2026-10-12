@@ -89,6 +89,7 @@ async fn check_import_guards(
 ) -> Result<()> {
     super::check_pinned_scope(adapter, design, resolved, PINNED).await?;
     design.guard_env(adapter).await?;
+    design.check_ownership(adapter).await?;
     Ok(())
 }
 

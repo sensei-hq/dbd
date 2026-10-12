@@ -450,6 +450,9 @@ pub async fn cmd_deploy(
             let marks = design.database_marks(&**adapter).await?;
             Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
             design.check_apply_guards(&marks)?;
+            // The real run claims the design's entities; its preview refuses
+            // what that claim would (#7).
+            design.check_ownership(&**adapter).await?;
         }
         // The migrations its apply phase executes first, built before anything
         // is printed: it refuses where the run does — an unresolved `-- TODO`

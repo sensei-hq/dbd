@@ -857,6 +857,9 @@ pub async fn cmd_apply(
             let marks = design.database_marks(&**adapter).await?;
             Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
             design.check_apply_guards(&marks)?;
+            // The real run claims the design's entities; its preview refuses
+            // what that claim would (#7).
+            design.check_ownership(&**adapter).await?;
         }
 
         // Built before anything is printed: it refuses where the run does — a
@@ -1064,6 +1067,7 @@ pub async fn cmd_refresh(
         "Refreshing another scope's materialized views would read tables this database was not built with.",
     )
     .await?;
+    design.check_ownership(&*adapter).await?;
 
     for entity in selected {
         let resolved = design.config().materialized_views.resolve(&entity.name);
@@ -1106,6 +1110,7 @@ pub async fn cmd_policies(
         // of policies the run refuses to apply promised something it won't do.
         if let Some(adapter) = super::dry_run_adapter(config, database_url).await? {
             super::check_pinned_scope(&*adapter, &design, &resolved, POLICY_CONSEQUENCE).await?;
+            design.check_ownership(&*adapter).await?;
         }
         // The real run's filter, so the preview never lists a policy the scope
         // skips — and says which ones it skips, as the real run does.
@@ -1137,6 +1142,7 @@ pub async fn cmd_policies(
     // The scope guard every other writing command runs. Policies do not re-pin
     // the database, so there is no `--allow-scope-change` to offer.
     super::check_pinned_scope(&*adapter, &design, &resolved, POLICY_CONSEQUENCE).await?;
+    design.check_ownership(&*adapter).await?;
     let report = dbd_core::design::apply_policies(
         &*adapter,
         project_dir,

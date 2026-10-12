@@ -341,8 +341,12 @@ pub enum RefKind {
     ///
     /// Hard once it resolves — the enum or sequence must exist before the
     /// table. But most column types are built-ins (`text`, `uuid`) that name
-    /// nothing in the project, so an unresolved one is **dropped**, not kept:
-    /// one dangling edge per built-in column would bury the dependency graph.
+    /// nothing in the project, so an unresolved one written bare is
+    /// **dropped**, not kept: one dangling edge per built-in column would bury
+    /// the dependency graph. One the source qualified — `app.status`,
+    /// `nextval('app.order_no')` — names another project's or an extension's,
+    /// and is kept, marked [`Ref::unresolved`], unwarned: a project's uses
+    /// name it (#7).
     Uses,
 }
 

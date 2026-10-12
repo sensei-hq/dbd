@@ -1,40 +1,39 @@
 # Checkpoint
 
-**Slice:** #7 Phase 1 merged to `develop` (PR #49, `2cd4b683`); unreleased.
-Next: Phase 2, entity ownership.
+**Slice:** #7 Phase 2, slices 1–2 (registry + claim, uses) on `feat/ownership-uses`
+= PR #50 (into the `feat/ownership` integration branch). Phase 1 is on `develop`,
+unreleased.
 
 ## Done
 
-- Phase 1 of #7 (spec `docs/superpowers/specs/2026-10-06-multi-project-isolation-design.md`):
-  - 1c heal: folds only its own legacy rows; layered reads; locks legacy tables
-    (READ COMMITTED, migrations before meta, 5s timeout, one heal at a time);
-    passes over tables the role cannot reach; refuses one holding its own row
-    it cannot take; keeps an emptied table it cannot drop.
-  - 1b cron: `dbd-refresh:<owner>:<schema>.<name>` (out of an older dbd's
-    `dbd:refresh:%` sweep), ≤63 bytes, prefix measured by Postgres, legacy
-    jobs replaced for declared views and unscheduled once their view is gone
-    (catalog lookup, names as Postgres cuts them), syncs serialized and
-    reading committed on the pool.
-  - 1d import: `dbd."import_tmp:<project>"`, hashed past 63 bytes.
-- Three review rounds, every finding fixed test-first; embedded 153/153,
-  `cli_live` 41/41; `quinn-proto` 0.11.19 for RUSTSEC-2026-0338/0340/0343.
-- Decisions settled (spec "Decisions"): per-module versions, `<project>/<module>`,
-  one root manifest, no `provides:`; unowned entities in a shared schema prune
-  only with `--prune-unowned`.
+- Slices 1–2: `dbd.objects`/`dbd.uses`; keys from every `CREATE` (DO blocks,
+  types and multiranges too) as Postgres makes them; uses namespaced, bare
+  reads the first relation on the path, bare calls every reachable routine.
+- Claim timing: an apply in one transaction claims last, in it, and before a
+  part-way commit; reconcile, reset and a DBD_NO_TX apply claim past their
+  last refusal (before-hooks planned first) and before the first write.
+- Rounds 3–5 fixed test-first; latest red `fba2b27e`, fixes `20515ad4`,
+  `871ad944`; its regression (built-in types bound to a `"Text"` table) red
+  `f383fb12`, fix `b042039d`. CI runs `cli_live` (libossp-uuid for `uuid-ossp`).
+- Embedded 198/198, `cli_live` 47/47, workspace 2002/0, clippy and fmt clean.
 
 ## Next
 
-    # Phase 2, slice 1: dbd.objects/dbd.uses in LAYOUT_DDL; claim the whole
-    # design's entities at apply/deploy/reconcile/reset, refusing one another
-    # owner holds before any DDL; backfill existing unowned declared entities.
+    git push origin feat/ownership-uses:feat/ownership-registry   # PR #50
+    # update its body; CI green; merge #50 locally into feat/ownership;
+    # then slice 3: prune rules (a)/(b), --prune-unowned, release.
 
 ## Open
 
+- Slice 3: an empty design's meta has no uses — the not-upgraded marker.
+- Pre-existing, outside #7: reconcile re-emits a mixed-case or quoted
+  `nextval('App.Seq')` default every run (`canonical_default`) — needs an
+  issue and a pg_get_expr probe first.
+- Declined: best-effort batch rollback error; dropping the old `dbd.import_tmp`.
+- A bare type of another project's is no use (dropped as a built-in).
+- An apply in one transaction runs `apply.before` hooks before its claim
+  (documented in the spec). `dbd.objects` still allows namespace `type`, unused.
 - Phase 1 is releasable as 0.25.2 when asked.
-- Not covered by a test: a legacy table dropped between listing and reading
-  (handled by construction: lock-or-skip under a savepoint, 42P01 = no rows).
-- Declined: dropping the old shared `dbd.import_tmp` (an older co-tenant may be
-  mid-import in it).
 
 ## Known limits
 

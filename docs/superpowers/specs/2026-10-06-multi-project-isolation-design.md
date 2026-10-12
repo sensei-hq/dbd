@@ -91,9 +91,12 @@ CREATE TABLE IF NOT EXISTS dbd.uses (
 
 The `relation` namespace covers tables, views, materialized views, sequences
 and foreign tables, which all share `pg_class`. A table and a view of the same
-name cannot both exist, so they cannot have two owners. `type` covers enums,
-domains and composites. `routine` is per name: dbd already drops every overload
-of a name together. Indexes, constraints, triggers, policies and comments
+name cannot both exist, so they cannot have two owners. Every type a design
+creates is keyed in `relation` too — an enum, and a composite, domain or range
+(with the multirange a range makes) a file creates beside its entity: Postgres gives every table, view and
+materialized view a row type of its own name, so none of them can share a
+name with a type. `type` is left unused. `routine` is per name: dbd already
+drops every overload of a name together. Indexes, constraints, triggers, policies and comments
 belong to their table.
 
 **Schemas, extensions and roles are shared containers**, recorded in
@@ -102,15 +105,40 @@ other schema; it owns the entities it puts there.
 
 ### Rules
 
-**Claim (apply, deploy, reconcile, reset).** Before any DDL, the owner claims
-every entity its whole design declares. "Whole design" means the full design,
-never the scope (#40). A claim on an entity held by another owner fails with no
-DDL executed:
+**Claim (apply, deploy, reconcile, reset).** Before any hook or DDL, the owner
+checks every entity its whole design declares. "Whole design" means the full
+design, never the scope (#40). A design declaring an entity held by another
+owner is refused with no DDL executed:
 
 `relation app.orders is owned by "shop/billing"; owners sharing a database must not declare the same entity`
 
-The primary key makes this atomic: of two concurrent first runs, exactly one
-wins.
+When the owner claims those entities depends on whether its work can roll
+back:
+
+- `apply` in one transaction claims as its last step, in that transaction, so
+  the claim commits with the work or not at all. A run that fails, or is
+  killed, claims nothing. A version that adds enum values commits part-way;
+  the run claims before that commit too, so nothing commits unclaimed.
+- `reconcile`, `reset`, and an `apply` outside one transaction (`DBD_NO_TX`)
+  commit as they go. They claim, committed, after their last refusal and
+  before their first write — `apply.before` hooks included — and keep the
+  claim if they then fail: what the design declares is the owner's, built
+  yet or not. Claimed after its writes, such a run could find an entity
+  unowned while another owner was building it, wait on that owner's lock,
+  then write over — or drop — what that owner had just claimed.
+
+`apply.before` hooks are the project's own scripts, and an `apply` in one
+transaction runs them, as it always has, outside it: after the check, before
+its claim. A hook that writes an entity another owner claims in that window is
+not stopped by ownership. Claiming first would close it, at the cost of a
+failed or killed apply keeping its claims — the wrong database, noticed in
+time, would be left claimed.
+
+Uses are recorded once the work is built.
+
+The primary key makes this atomic: of two concurrent first claims, exactly
+one wins. The other finds the entity held, and is refused before it writes —
+or, in an `apply` in one transaction, its DDL rolls back with the claim.
 
 **Prune.** `reconcile --prune` drops a live entity only when one of these holds:
 
@@ -151,10 +179,18 @@ depends on it, dbd refuses:
 
 `identity.users.email is used by "billing" (view billing.v_invoices); remove that use first`
 
+A call is a use of a routine; anything else — a read, a write, a column's type,
+a default's sequence — is a use of a relation. A name written bare is looked
+up along the referring entity's search path, as Postgres looks it up: a read
+is of the first relation on the path that exists, owned or not. A call is
+resolved by its arguments as well, which dbd does not weigh, so it is a use of
+every routine on the path it could reach.
+
 This is the contract between owners. It plays the role an API plays between
 services.
 
-**Reset.** Reset drops only entities this owner owns. On top of that:
+**Reset.** Reset drops only entities this owner owns; it claims its design's
+entities before it drops any (see Claim). On top of that:
 
 - `--schemas` drops a schema only when it holds no entity owned by anyone else
   and no unowned entity.
@@ -188,9 +224,14 @@ is unchanged.
 There is one core function, so library embedders are protected too:
 
 ```rust
-pub(crate) async fn preflight(&self, adapter: &dyn Adapter, mode: Preflight) -> Result<()>
-// Claim — apply, deploy, reconcile, reset: heal → claim → record uses
-// Check — import, policies, refresh, --dry-run, diff: read-only, same refusals, no writes
+pub(crate) async fn preflight(&self, adapter: &dyn DatabaseAdapter, mode: Preflight) -> Result<()>
+// Write — apply, deploy: heal → check, before any hook
+// Read — import, policies, refresh, --dry-run, diff, reconcile before it plans: check only, no writes
+pub(crate) async fn claim_built(&self, adapter: &dyn DatabaseAdapter) -> Result<()>
+// apply in one transaction: claim → record uses, in it, last — and before a part-way commit
+pub(crate) async fn claim_first(&self, adapter: &dyn DatabaseAdapter) -> Result<()>
+// reconcile, reset: heal → claim, committed, before the first write; an apply outside
+// one transaction claims there too, and each records its uses once built
 ```
 
 ---

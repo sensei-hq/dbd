@@ -124,6 +124,8 @@ pub async fn cmd_reset(
         let mut kept = Vec::new();
         if let Some(adapter) = super::dry_run_adapter(config, database_url).await? {
             check_reset_guards(&*adapter, &design, &resolved, force, allow_scope_change).await?;
+            // The real reset claims the design's entities first (#7).
+            design.check_ownership(&*adapter).await?;
             kept = design.roles_kept_by_reset(&*adapter, target, Some(&resolved)).await?;
         }
         let keep: Vec<String> = kept.iter().map(|k| k.role.clone()).collect();

@@ -7250,7 +7250,8 @@ fn named_design(dir: &std::path::Path, name: &str, version: u32, schema: &str, e
 /// database still holds the design's objects and the old name's record of
 /// them, so those marks are the guards' marks — refused, naming the project
 /// the database does record and the likely rename — and `--force` still
-/// overrides the reset guard, as it does for the project's own mark.
+/// overrides the reset guard, as it does for the project's own mark, though
+/// not the objects' ownership, which stays with the old name (#7).
 #[tokio::test]
 async fn a_renamed_project_is_held_to_the_record_its_old_name_left() {
     let (pg, _url) = start_pg().await;
@@ -7312,10 +7313,18 @@ async fn a_renamed_project_is_held_to_the_record_its_old_name_left() {
             failures.push(format!("{run} recorded the renamed project"));
         }
 
+        // `--force` overrides the reset guard, as it does on the project's own
+        // mark — but not ownership: the database's objects are `alpha`'s, and
+        // a renamed project takes them over only by adopting them (#7).
         if run == "reset" {
-            prod.reset(&*renamed, "postgres", true, false, false, None)
+            let err = prod
+                .reset(&*renamed, "postgres", true, false, false, None)
                 .await
-                .expect("--force overrides the reset guard, as it does on the project's own mark");
+                .expect_err("the objects are alpha's")
+                .to_string();
+            if !err.contains("is owned by \"alpha\"") {
+                failures.push(format!("a forced reset was not refused for alpha's objects: {err}"));
+            }
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");
@@ -9801,4 +9810,2080 @@ async fn sql_null_json_null_and_an_omitted_key_each_survive_a_jsonl_round_trip()
         "id 12: {\"$json\": null} is the JSON value null",
     )
     .await;
+}
+
+// ── #7 Phase 2: each entity in a shared database has one owner ────────────────
+
+const SHOP_YAML: &str = "project:\n  name: shop\nsource:\n  dialect: postgresql\nschemas:\n  - app\n\
+    scopes:\n  orders_only:\n    includes: [app.orders, app.status]\n";
+
+const SHOP_FILES: &[(&str, &str)] = &[
+    (
+        "ddl/enum/app/status.ddl",
+        "do $$ begin create type app.status as enum ('open', 'paid'); \
+         exception when duplicate_object then null; end $$;\n",
+    ),
+    (
+        "ddl/table/app/orders.ddl",
+        "set search_path to app;\ncreate table if not exists orders (id int primary key, status app.status);\n",
+    ),
+    (
+        "ddl/view/app/order_ids.ddl",
+        "set search_path to app;\ncreate or replace view order_ids as select id from orders;\n",
+    ),
+    (
+        "ddl/function/app/total.ddl",
+        "set search_path to app;\ncreate or replace function total() returns bigint language sql as $$ select count(*) from app.orders $$;\n",
+    ),
+];
+
+/// `billing` declares `app.orders` too, and a table of its own, behind a hook.
+const BILLING_YAML: &str = "project:\n  name: billing\nsource:\n  dialect: postgresql\nschemas:\n  - app\n\
+    apply:\n  before:\n    - sql/mark.sql\n";
+
+const BILLING_FILES: &[(&str, &str)] = &[
+    (
+        "sql/mark.sql",
+        "create table if not exists public.billing_hook_ran (id integer);\n",
+    ),
+    (
+        "ddl/table/app/orders.ddl",
+        "set search_path to app;\ncreate table if not exists orders (id int primary key);\n",
+    ),
+    (
+        "ddl/table/app/invoices.ddl",
+        "set search_path to app;\ncreate table if not exists invoices (id int primary key);\n",
+    ),
+];
+
+fn owned_by(namespace: &str, schema: &str, name: &str, kind: &str, owner: &str) -> String {
+    format!(
+        "SELECT 1 FROM dbd.objects WHERE namespace = '{namespace}' AND schema = '{schema}' \
+         AND name = '{name}' AND kind = '{kind}' AND owner = '{owner}'"
+    )
+}
+
+/// A project's run claims every entity its whole design declares — the whole
+/// design, not the scope it ran under (#40): a scope narrows what is applied,
+/// never what the project owns. Tables, views, materialized views and
+/// sequences share Postgres's relation namespace with enums — a table's row
+/// type is a type — and functions and procedures are routines, by name (#7).
+#[tokio::test]
+async fn a_project_claims_every_entity_its_whole_design_declares() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "shop").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let shop = write_project(tmp.path(), SHOP_YAML, SHOP_FILES);
+
+    let orders_only = shop.resolve_scope(Some("orders_only"), None).unwrap();
+    shop.apply(&*adapter, None, false, Some(&orders_only), Progress::none())
+        .await
+        .expect("a scoped apply");
+
+    for (namespace, name, kind) in [
+        ("relation", "orders", "table"),
+        ("relation", "order_ids", "view"),
+        ("relation", "status", "enum"),
+        ("routine", "total", "function"),
+    ] {
+        assert_catalog(
+            &*adapter,
+            true,
+            &owned_by(namespace, "app", name, kind, "shop"),
+            &format!("{namespace} app.{name} owned by shop"),
+        )
+        .await;
+    }
+}
+
+/// A second project declaring an entity the first owns is refused before
+/// anything runs — no hook, no DDL, no claim of its own — naming the entity
+/// and its owner. So are its reconcile and reset; and its dry run, its diff and
+/// its import, which claim nothing, refuse the same way (#7).
+#[tokio::test]
+async fn a_project_declaring_an_entity_another_owns_is_refused_before_anything_runs() {
+    let (_pg, url) = start_pg().await;
+    let shop_adapter = connect(&url, "shop").await.unwrap();
+    let billing_adapter = connect(&url, "billing").await.unwrap();
+    let shop_dir = tempfile::tempdir().unwrap();
+    let billing_dir = tempfile::tempdir().unwrap();
+    let shop = write_project(shop_dir.path(), SHOP_YAML, SHOP_FILES);
+    let billing = write_project(billing_dir.path(), BILLING_YAML, BILLING_FILES);
+    shop.apply(&*shop_adapter, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+
+    let refusal = |err: dbd_core::DbdError| {
+        let err = err.to_string();
+        assert!(
+            err.contains("relation app.orders is owned by \"shop\""),
+            "the refusal names the entity and its owner: {err}"
+        );
+    };
+    refusal(
+        billing
+            .apply(&*billing_adapter, None, false, None, Progress::none())
+            .await
+            .expect_err("billing's apply"),
+    );
+    refusal(
+        billing
+            .reconcile(&*billing_adapter, false, false, false, None, Progress::none())
+            .await
+            .expect_err("billing's reconcile"),
+    );
+    refusal(
+        billing
+            .reset(&*billing_adapter, "postgres", true, false, false, None)
+            .await
+            .expect_err("billing's reset"),
+    );
+    refusal(
+        billing
+            .apply(&*billing_adapter, None, true, None, Progress::none())
+            .await
+            .expect_err("billing's dry run"),
+    );
+    refusal(
+        billing
+            .diff_live(&*billing_adapter, None)
+            .await
+            .expect_err("billing's diff"),
+    );
+    refusal(
+        billing
+            .import_data(&*billing_adapter, None, false, None, Progress::none())
+            .await
+            .expect_err("billing's import"),
+    );
+
+    assert_table_absent(&*billing_adapter, "public", "billing_hook_ran").await;
+    assert_table_absent(&*billing_adapter, "app", "invoices").await;
+    assert_table_exists(&*billing_adapter, "app", "orders").await;
+    assert_catalog(
+        &*billing_adapter,
+        false,
+        "SELECT 1 FROM dbd.objects WHERE owner = 'billing'",
+        "a claim of billing",
+    )
+    .await;
+}
+
+/// What no design declares — a table made by hand — is nobody's.
+#[tokio::test]
+async fn an_entity_no_design_declares_stays_unowned() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "shop").await.unwrap();
+    adapter
+        .execute_script("CREATE SCHEMA app; CREATE TABLE app.manual (id int);")
+        .await
+        .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let shop = write_project(tmp.path(), SHOP_YAML, SHOP_FILES);
+    shop.apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+
+    assert_catalog(
+        &*adapter,
+        false,
+        "SELECT 1 FROM dbd.objects WHERE schema = 'app' AND name = 'manual'",
+        "an owner of app.manual",
+    )
+    .await;
+}
+
+fn used_by(owner: &str, kind: &str, target: &str, via: &str) -> String {
+    format!(
+        "SELECT 1 FROM dbd.uses WHERE owner = '{owner}' AND kind = '{kind}' \
+         AND target = '{target}' AND via = '{via}'"
+    )
+}
+
+/// What a project shares with others rather than owns — the schemas its
+/// entities live in, its extensions, its roles — it records as uses: a schema
+/// another project also uses is one neither may prune or drop alone (#7).
+#[tokio::test]
+async fn a_project_records_the_schemas_extensions_and_roles_it_uses() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "uses_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let design = write_project(
+        tmp.path(),
+        "project:\n  name: uses_test\nsource:\n  dialect: postgresql\nschemas:\n  - app\n\
+         target:\n  postgres:\n    url: $DATABASE_URL\n    roles:\n      - name: uses_role\n    \
+         extensions:\n      - plpgsql\n",
+        &[(
+            "ddl/table/app/items.ddl",
+            "set search_path to app;\ncreate table if not exists items (id int primary key);\n",
+        )],
+    );
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply");
+
+    for (kind, target) in [("schema", "app"), ("extension", "plpgsql"), ("role", "uses_role")] {
+        assert_catalog(
+            &*adapter,
+            true,
+            &used_by("uses_test", kind, target, ""),
+            &format!("{kind} {target} used by uses_test"),
+        )
+        .await;
+    }
+}
+
+const BILLING_USES_YAML: &str = "project:\n  name: billing\nsource:\n  dialect: postgresql\nschemas:\n  - billing\n\
+    external:\n  - name: app.orders\n  - name: app.status\n  - name: public.loose\n";
+
+/// A reference from one project's entity to another project's is recorded as
+/// a use — the target in the registry's own namespace, and the entity that
+/// makes it — so the owner cannot drop what another project depends on (#7).
+/// A reference to something nobody owns is no use of anyone's. A run records
+/// its design's uses afresh: one its design no longer makes is gone.
+#[tokio::test]
+async fn a_reference_to_another_projects_entity_is_recorded_as_a_use() {
+    let (_pg, url) = start_pg().await;
+    let shop_adapter = connect(&url, "shop").await.unwrap();
+    let billing_adapter = connect(&url, "billing").await.unwrap();
+    let shop_dir = tempfile::tempdir().unwrap();
+    let billing_dir = tempfile::tempdir().unwrap();
+    write_project(shop_dir.path(), SHOP_YAML, SHOP_FILES)
+        .apply(&*shop_adapter, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    shop_adapter
+        .execute_script("CREATE TABLE public.loose (id int);")
+        .await
+        .unwrap();
+
+    let view = (
+        "ddl/view/billing/v_orders.ddl",
+        "create or replace view billing.v_orders as \
+         select o.id from app.orders o join public.loose l on l.id = o.id;\n",
+    );
+    let invoices = (
+        "ddl/table/billing/invoices.ddl",
+        "create table if not exists billing.invoices (id int primary key, status app.status);\n",
+    );
+    write_project(billing_dir.path(), BILLING_USES_YAML, &[view, invoices])
+        .apply(&*billing_adapter, None, false, None, Progress::none())
+        .await
+        .expect("billing's apply");
+
+    let orders_use = used_by("billing", "entity", "relation:app.orders", "view billing.v_orders");
+    assert_catalog(&*billing_adapter, true, &orders_use, "billing's use of app.orders").await;
+    assert_catalog(
+        &*billing_adapter,
+        true,
+        &used_by("billing", "entity", "relation:app.status", "table billing.invoices"),
+        "billing's use of app.status",
+    )
+    .await;
+    assert_catalog(
+        &*billing_adapter,
+        false,
+        "SELECT 1 FROM dbd.uses WHERE target LIKE '%loose%'",
+        "a use of the unowned public.loose",
+    )
+    .await;
+
+    // The view goes from the design: its use goes from the record.
+    std::fs::remove_file(billing_dir.path().join(view.0)).unwrap();
+    billing_adapter
+        .execute_script("DROP VIEW billing.v_orders;")
+        .await
+        .unwrap();
+    Design::from_config_with_dir(&billing_dir.path().join("design.yaml"), "dev", Some(billing_dir.path()))
+        .unwrap()
+        .apply(&*billing_adapter, None, false, None, Progress::none())
+        .await
+        .expect("billing's second apply");
+    assert_catalog(
+        &*billing_adapter,
+        false,
+        &orders_use,
+        "billing's dropped use of app.orders",
+    )
+    .await;
+}
+
+/// `billing` owns `app.orders` and `app.invoices`.
+const ORDERS_OWNER_FILES: &[(&str, &str)] = &[
+    (
+        "ddl/table/app/orders.ddl",
+        "set search_path to app;\ncreate table if not exists orders (id int primary key);\n",
+    ),
+    (
+        "ddl/table/app/invoices.ddl",
+        "set search_path to app;\ncreate table if not exists invoices (id int primary key);\n",
+    ),
+];
+
+fn named_project(dir: &std::path::Path, name: &str, extra_yaml: &str, files: &[(&str, &str)]) -> Design {
+    write_project(
+        dir,
+        &format!("project:\n  name: {name}\nsource:\n  dialect: postgresql\n{extra_yaml}schemas:\n  - app\n"),
+        files,
+    )
+}
+
+/// A file dbd cannot read still declares its entity — its path does — and a
+/// reset drops it. The claim skipped such entities, so a design with one broken
+/// file reset another project's table and reported success. Every entity a
+/// design declares is claimed, read or not (#7).
+#[tokio::test]
+async fn a_design_with_a_broken_file_cannot_reset_another_projects_table() {
+    let (_pg, url) = start_pg().await;
+    let billing = connect(&url, "billing").await.unwrap();
+    let ra = connect(&url, "ra").await.unwrap();
+    let (bd, rd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    named_project(bd.path(), "billing", "", ORDERS_OWNER_FILES)
+        .apply(&*billing, None, false, None, Progress::none())
+        .await
+        .expect("billing's apply");
+    let broken = named_project(
+        rd.path(),
+        "ra",
+        "",
+        &[
+            (
+                "ddl/table/app/items.ddl",
+                "set search_path to app;\ncreate table if not exists items (id int primary key);\n",
+            ),
+            (
+                "ddl/table/app/orders.ddl",
+                "set search_path to app;\ncreate table if not exists orders (id int primary key,,);\n",
+            ),
+        ],
+    );
+
+    let err = broken
+        .reset(&*ra, "postgres", true, false, false, None)
+        .await
+        .expect_err("app.orders is billing's")
+        .to_string();
+    assert!(err.contains("relation app.orders is owned by \"billing\""), "{err}");
+    assert_table_exists(&*ra, "app", "orders").await;
+}
+
+/// A run claims before it builds, and a run can fail after its claim — refused
+/// by a later gate, or rolled back. Its claims of entities it never built
+/// outlived it, and barred the entities' real author for good. A failed run
+/// gives back the claims it made for what does not exist (#7).
+#[tokio::test]
+async fn a_failed_apply_gives_back_the_claims_it_made() {
+    let (_pg, url) = start_pg().await;
+    let viewer = connect(&url, "viewer").await.unwrap();
+    viewer
+        .execute_script("CREATE SCHEMA app; CREATE TABLE app.orders (id int primary key);")
+        .await
+        .unwrap();
+    let (vd, ad) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    named_project(
+        vd.path(),
+        "viewer",
+        "",
+        &[
+            (
+                "ddl/view/app/orders.ddl",
+                "set search_path to app;\ncreate or replace view orders as select 1 as id;\n",
+            ),
+            (
+                "ddl/table/app/ledger.ddl",
+                "set search_path to app;\ncreate table if not exists ledger (id int primary key);\n",
+            ),
+        ],
+    )
+    .apply(&*viewer, None, false, None, Progress::none())
+    .await
+    .expect_err("app.orders is a table, not a view");
+
+    assert_catalog(
+        &*viewer,
+        false,
+        "SELECT 1 FROM dbd.objects WHERE owner = 'viewer'",
+        "a claim of viewer",
+    )
+    .await;
+    let alpha = connect(&url, "alpha").await.unwrap();
+    named_project(ad.path(), "alpha", "", &ORDERS_OWNER_FILES[..1])
+        .apply(&*alpha, None, false, None, Progress::none())
+        .await
+        .expect("the table's real author applies");
+}
+
+/// A reconcile refused by its own gate — a destructive change without
+/// `--allow-destructive` — claims nothing: it checks before it plans, and
+/// claims after its last refusal (#7).
+#[tokio::test]
+async fn a_refused_reconcile_claims_nothing() {
+    let (_pg, url) = start_pg().await;
+    let billing = connect(&url, "billing").await.unwrap();
+    billing
+        .execute_script("CREATE SCHEMA app; CREATE TABLE app.orders (id int primary key, total int);")
+        .await
+        .unwrap();
+    let bd = tempfile::tempdir().unwrap();
+    named_project(bd.path(), "billing", "", ORDERS_OWNER_FILES)
+        .reconcile(&*billing, false, false, false, None, Progress::none())
+        .await
+        .expect_err("dropping app.orders.total is destructive");
+
+    // No registry at all is the plainest "nothing claimed": the refused run
+    // never reached its claim, nor the heal that would make one.
+    if catalog_holds(&*billing, "SELECT 1 WHERE to_regclass('dbd.objects') IS NOT NULL").await {
+        assert_catalog(
+            &*billing,
+            false,
+            "SELECT 1 FROM dbd.objects WHERE owner = 'billing'",
+            "a claim of billing",
+        )
+        .await;
+    }
+}
+
+/// Postgres gives every table a row type, so a table and an enum of one name
+/// cannot both exist: `CREATE TYPE` fails, and the `DO … duplicate_object`
+/// idiom swallows it, leaving the enum's columns typed with the table's row.
+/// The two are one entity, held by one owner (#7).
+#[tokio::test]
+async fn a_table_and_an_enum_of_one_name_are_one_entity() {
+    let (_pg, url) = start_pg().await;
+    let ta = connect(&url, "ta").await.unwrap();
+    let tb = connect(&url, "tb").await.unwrap();
+    let (ad, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    named_project(
+        ad.path(),
+        "ta",
+        "",
+        &[(
+            "ddl/table/app/status.ddl",
+            "set search_path to app;\ncreate table if not exists status (id int primary key);\n",
+        )],
+    )
+    .apply(&*ta, None, false, None, Progress::none())
+    .await
+    .expect("ta's apply");
+    let err = named_project(
+        bd.path(),
+        "tb",
+        "",
+        &[(
+            "ddl/enum/app/status.ddl",
+            "do $$ begin create type app.status as enum ('a'); \
+             exception when duplicate_object then null; end $$;\n",
+        )],
+    )
+    .apply(&*tb, None, false, None, Progress::none())
+    .await
+    .expect_err("app.status is ta's")
+    .to_string();
+    assert!(err.contains("app.status is owned by \"ta\""), "{err}");
+}
+
+/// An unqualified name lands where the search path points — a file's own
+/// `set search_path`, or the project's `source.search_path` — and is owned
+/// there, not in `public` (#7).
+#[tokio::test]
+async fn an_unqualified_entity_is_owned_where_its_search_path_puts_it() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let flat = connect(&url, "flat").await.unwrap();
+    let (sd, fd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1])
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    let err = named_project(
+        fd.path(),
+        "flat",
+        "  search_path: [app]\n",
+        &[(
+            "ddl/table/orders.ddl",
+            "create table if not exists orders (id int primary key);\n",
+        )],
+    )
+    .apply(&*flat, None, false, None, Progress::none())
+    .await
+    .expect_err("app.orders is shop's")
+    .to_string();
+    assert!(err.contains("relation app.orders is owned by \"shop\""), "{err}");
+}
+
+/// Postgres folds an unquoted name to lower case: `ddl/table/app/Orders.ddl`
+/// creating `Orders` makes `app.orders`. It is owned as Postgres names it (#7).
+#[tokio::test]
+async fn a_name_is_owned_as_postgres_folds_it() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let casey = connect(&url, "casey").await.unwrap();
+    let (sd, cd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1])
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    let err = named_project(
+        cd.path(),
+        "casey",
+        "",
+        &[(
+            "ddl/table/app/Orders.ddl",
+            "set search_path to app;\ncreate table if not exists Orders (id int primary key);\n",
+        )],
+    )
+    .apply(&*casey, None, false, None, Progress::none())
+    .await
+    .expect_err("app.orders is shop's")
+    .to_string();
+    assert!(err.contains("relation app.orders is owned by \"shop\""), "{err}");
+}
+
+/// A claim waits for another session writing the registry — and with nothing
+/// to stop it, waited as long as that session stayed open. It gives up after a
+/// few seconds instead, saying what held it (#7).
+#[tokio::test]
+async fn a_claim_held_up_by_an_open_registry_write_fails_naming_it() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let holder = connect(&url, "holder").await.unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    let design = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1]);
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's first apply");
+    holder.begin_batch().await.unwrap();
+    holder
+        .execute_script("UPDATE dbd.objects SET owner = owner WHERE name = 'orders';")
+        .await
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let applied = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        design.apply(&*shop, None, false, None, Progress::none()),
+    )
+    .await;
+    let waited = started.elapsed();
+    holder.rollback_batch().await.unwrap();
+    assert!(waited < std::time::Duration::from_secs(15), "waited {waited:?}");
+    let err = applied
+        .expect("the claim must give up, not wait for as long as the write stays open")
+        .expect_err("an open write holds the registry")
+        .to_string();
+    assert!(err.contains("dbd.objects"), "{err}");
+}
+
+/// A file may create more than the entity its path names — `orders.ddl`
+/// creating `order_status` then `orders`. Keyed by its first `CREATE`, the
+/// path's table went unclaimed, another project took it, and this project's
+/// reset then dropped that project's table. Every entity a file creates is
+/// claimed (#7).
+#[tokio::test]
+async fn a_file_creating_two_tables_owns_both() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let intruder = connect(&url, "intruder").await.unwrap();
+    let (sd, id) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    named_project(
+        sd.path(),
+        "shop",
+        "",
+        &[(
+            "ddl/table/app/orders.ddl",
+            "set search_path to app;\n\
+             create table if not exists order_status (id int primary key);\n\
+             create table if not exists orders (id int primary key, status int references order_status (id));\n",
+        )],
+    )
+    .apply(&*shop, None, false, None, Progress::none())
+    .await
+    .expect("shop's apply");
+    for table in ["order_status", "orders"] {
+        assert_catalog(
+            &*shop,
+            true,
+            &owned_by("relation", "app", table, "table", "shop"),
+            &format!("shop's app.{table}"),
+        )
+        .await;
+    }
+
+    let err = named_project(id.path(), "intruder", "", &ORDERS_OWNER_FILES[..1])
+        .apply(&*intruder, None, false, None, Progress::none())
+        .await
+        .expect_err("app.orders is shop's")
+        .to_string();
+    assert!(err.contains("relation app.orders is owned by \"shop\""), "{err}");
+}
+
+/// Two runs of one project at once, one failing: its failure must not take
+/// from the other what the other built. A run claims what it built, when it
+/// has built it — so the failed one claimed nothing to give back (#7).
+#[tokio::test]
+async fn a_failed_run_beside_a_succeeding_one_leaves_the_project_its_claims() {
+    let (_pg, url) = start_pg().await;
+    let (fd, sd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let failing = named_project(
+        fd.path(),
+        "shop",
+        "apply:\n  before:\n    - sql/slow_fail.sql\n",
+        &[
+            ("sql/slow_fail.sql", "select pg_sleep(2); select 1 / 0;\n"),
+            ORDERS_OWNER_FILES[0],
+        ],
+    );
+    let succeeding = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1]);
+    let (a, b) = (
+        connect(&url, "shop").await.unwrap(),
+        connect(&url, "shop").await.unwrap(),
+    );
+
+    let (failed, succeeded) = tokio::join!(failing.apply(&*a, None, false, None, Progress::none()), async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        succeeding.apply(&*b, None, false, None, Progress::none()).await
+    });
+    failed.expect_err("the hook divides by zero");
+    succeeded.expect("the other run");
+    assert_catalog(
+        &*b,
+        true,
+        &owned_by("relation", "app", "orders", "table", "shop"),
+        "shop's app.orders",
+    )
+    .await;
+}
+
+/// The uses are written with the claim, and wait as it does: an open write on
+/// `dbd.uses` gives the run up after a few seconds, naming it (#7).
+#[tokio::test]
+async fn a_run_held_up_by_an_open_uses_write_fails_naming_it() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let holder = connect(&url, "holder").await.unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    let design = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1]);
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's first apply");
+    holder.begin_batch().await.unwrap();
+    holder
+        .execute_script("UPDATE dbd.uses SET via = via WHERE owner = 'shop';")
+        .await
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let applied = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        design.apply(&*shop, None, false, None, Progress::none()),
+    )
+    .await;
+    let waited = started.elapsed();
+    holder.rollback_batch().await.unwrap();
+    assert!(waited < std::time::Duration::from_secs(15), "waited {waited:?}");
+    let err = applied
+        .expect("the run must give up, not wait for as long as the write stays open")
+        .expect_err("an open write holds the uses")
+        .to_string();
+    assert!(err.contains("dbd.uses"), "{err}");
+}
+
+/// A run that fails keeps the record of what the project uses as it was: the
+/// uses describe what is built, and a failed run built nothing (#7).
+#[tokio::test]
+async fn a_failed_run_keeps_the_uses_it_had() {
+    let (_pg, url) = start_pg().await;
+    let shop_adapter = connect(&url, "shop").await.unwrap();
+    let billing_adapter = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    write_project(sd.path(), SHOP_YAML, SHOP_FILES)
+        .apply(&*shop_adapter, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    shop_adapter
+        .execute_script("CREATE TABLE public.loose (id int);")
+        .await
+        .unwrap();
+    let view = (
+        "ddl/view/billing/v_orders.ddl",
+        "create or replace view billing.v_orders as select o.id from app.orders o;\n",
+    );
+    write_project(bd.path(), BILLING_USES_YAML, &[view])
+        .apply(&*billing_adapter, None, false, None, Progress::none())
+        .await
+        .expect("billing's apply");
+    let orders_use = used_by("billing", "entity", "relation:app.orders", "view billing.v_orders");
+    assert_catalog(&*billing_adapter, true, &orders_use, "billing's use of app.orders").await;
+
+    // The view stops reading app.orders, and a new table fails to build.
+    std::fs::write(
+        bd.path().join(view.0),
+        "create or replace view billing.v_orders as select 1 as id;\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(bd.path().join("ddl/table/billing")).unwrap();
+    std::fs::write(
+        bd.path().join("ddl/table/billing/broken.ddl"),
+        "create table if not exists billing.broken (id int references billing.nowhere (id));\n",
+    )
+    .unwrap();
+    Design::from_config_with_dir(&bd.path().join("design.yaml"), "dev", Some(bd.path()))
+        .unwrap()
+        .apply(&*billing_adapter, None, false, None, Progress::none())
+        .await
+        .expect_err("billing.nowhere does not exist");
+    assert_catalog(
+        &*billing_adapter,
+        true,
+        &orders_use,
+        "billing's use of app.orders, kept",
+    )
+    .await;
+}
+
+/// Overloads of one routine are one entity, in as many files as the author
+/// likes — and each file's references are the routine's uses (#7).
+#[tokio::test]
+async fn every_overload_records_its_references() {
+    let (_pg, url) = start_pg().await;
+    let billing = connect(&url, "billing").await.unwrap();
+    let shop = connect(&url, "shop").await.unwrap();
+    let (bd, sd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    write_project(
+        bd.path(),
+        "project:\n  name: billing\nsource:\n  dialect: postgresql\nschemas:\n  - bill\n",
+        &[
+            (
+                "ddl/table/bill/invoices.ddl",
+                "create table if not exists bill.invoices (id int primary key);\n",
+            ),
+            (
+                "ddl/table/bill/payments.ddl",
+                "create table if not exists bill.payments (id int primary key);\n",
+            ),
+        ],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+    write_project(
+        sd.path(),
+        "project:\n  name: shop\nsource:\n  dialect: postgresql\nschemas:\n  - app\n\
+         external:\n  - name: bill.invoices\n  - name: bill.payments\n",
+        &[
+            (
+                "ddl/function/app/total.ddl",
+                "create or replace function app.total(n int) returns bigint language sql \
+                 as $$ select count(*) from bill.invoices $$;\n",
+            ),
+            (
+                "ddl/function/app/total_text.ddl",
+                "create or replace function app.total(n text) returns bigint language sql \
+                 as $$ select count(*) from bill.payments $$;\n",
+            ),
+        ],
+    )
+    .apply(&*shop, None, false, None, Progress::none())
+    .await
+    .expect("shop's apply");
+
+    for table in ["invoices", "payments"] {
+        assert_catalog(
+            &*shop,
+            true,
+            &format!("SELECT 1 FROM dbd.uses WHERE owner = 'shop' AND target = 'relation:bill.{table}'"),
+            &format!("shop's use of bill.{table}"),
+        )
+        .await;
+    }
+}
+
+/// A reference to `a.b.c` names, as dbd splits a name at its first dot,
+/// `"a"."b.c"` — not a `"a.b"."c"` another project holds (#7).
+#[tokio::test]
+async fn a_dotted_reference_is_matched_as_dbd_splits_it() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    shop.heal_bookkeeping().await.unwrap();
+    let record = |schema: &'static str, name: &'static str| {
+        format!(
+            "DELETE FROM dbd.objects; INSERT INTO dbd.objects (namespace, schema, name, kind, owner) \
+             VALUES ('relation', '{schema}', '{name}', 'table', 'crm');"
+        )
+    };
+    let dotted = dbd_core::adapter::Use {
+        kind: "entity".to_string(),
+        target: "relation:a.b.c".to_string(),
+        via: "view app.v".to_string(),
+        search_path: Vec::new(),
+    };
+
+    shop.execute_script(&record("a.b", "c")).await.unwrap();
+    shop.record_uses("shop", std::slice::from_ref(&dotted)).await.unwrap();
+    assert_catalog(
+        &*shop,
+        false,
+        "SELECT 1 FROM dbd.uses WHERE owner = 'shop' AND kind = 'entity'",
+        "a use of crm's \"a.b\".\"c\"",
+    )
+    .await;
+
+    shop.execute_script(&record("a", "b.c")).await.unwrap();
+    shop.record_uses("shop", std::slice::from_ref(&dotted)).await.unwrap();
+    assert_catalog(
+        &*shop,
+        true,
+        &used_by("shop", "entity", "relation:a.b.c", "view app.v"),
+        "a use of crm's \"a\".\"b.c\"",
+    )
+    .await;
+}
+
+/// A `supabase` project is Postgres to its reader, and its files are read as
+/// Postgres: keyed by their paths alone, the second table a file creates went
+/// unclaimed, and another project took it (#7).
+#[tokio::test]
+async fn a_supabase_project_owns_every_table_its_file_creates() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let intruder = connect(&url, "intruder").await.unwrap();
+    let (sd, id) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    write_project(
+        sd.path(),
+        "project:\n  name: shop\nsource:\n  dialect: supabase\nschemas:\n  - app\n",
+        &[(
+            "ddl/table/app/orders.ddl",
+            "set search_path to app;\n\
+             create table if not exists order_status (id int primary key);\n\
+             create table if not exists orders (id int primary key, status int references order_status (id));\n",
+        )],
+    )
+    .apply(&*shop, None, false, None, Progress::none())
+    .await
+    .expect("shop's apply");
+
+    let err = named_project(
+        id.path(),
+        "intruder",
+        "",
+        &[(
+            "ddl/table/app/order_status.ddl",
+            "set search_path to app;\ncreate table if not exists order_status (id int primary key);\n",
+        )],
+    )
+    .apply(&*intruder, None, false, None, Progress::none())
+    .await
+    .expect_err("app.order_status is shop's")
+    .to_string();
+    assert!(err.contains("relation app.order_status is owned by \"shop\""), "{err}");
+}
+
+/// A column of another project's enum, a default drawing on its sequence: each
+/// is a use, declared `external` or not. A schema-qualified type or sequence
+/// that was none of the design's own was dropped as a built-in, so neither use
+/// was recorded (#7).
+#[tokio::test]
+async fn another_projects_enum_and_sequence_are_uses_without_declaring_them_external() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let shop_files: Vec<(&str, &str)> = SHOP_FILES
+        .iter()
+        .copied()
+        .chain([(
+            "ddl/sequence/app/order_no.ddl",
+            "create sequence if not exists app.order_no;\n",
+        )])
+        .collect();
+    write_project(sd.path(), SHOP_YAML, &shop_files)
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    write_project(
+        bd.path(),
+        "project:\n  name: billing\nsource:\n  dialect: postgresql\nschemas:\n  - billing\n",
+        &[(
+            "ddl/table/billing/invoices.ddl",
+            "create table if not exists billing.invoices \
+             (id int primary key default nextval('app.order_no'), status app.status);\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    for target in ["relation:app.status", "relation:app.order_no"] {
+        assert_catalog(
+            &*billing,
+            true,
+            &used_by("billing", "entity", target, "table billing.invoices"),
+            &format!("billing's use of {target}"),
+        )
+        .await;
+    }
+}
+
+/// A use names what it uses in the registry's own namespace: a read of a table
+/// is no use of a routine that shares its name, and a call of a routine is a
+/// use of it even where the caller owns a table of that name (#7).
+#[tokio::test]
+async fn a_read_of_a_table_is_no_use_of_a_routine_of_its_name() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let fnowner = connect(&url, "fnowner").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, fd, bd) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1])
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    write_project(
+        fd.path(),
+        "project:\n  name: fnowner\nsource:\n  dialect: postgresql\nschemas:\n  - app\n  - billing\n",
+        &[
+            (
+                "ddl/function/app/orders.ddl",
+                "create or replace function app.orders() returns int language sql as $$ select 1 $$;\n",
+            ),
+            (
+                "ddl/function/billing/tally.ddl",
+                "create or replace function billing.tally() returns int language sql as $$ select 1 $$;\n",
+            ),
+        ],
+    )
+    .apply(&*fnowner, None, false, None, Progress::none())
+    .await
+    .expect("fnowner's apply");
+    write_project(
+        bd.path(),
+        "project:\n  name: billing\nsource:\n  dialect: postgresql\nschemas:\n  - billing\n\
+         external:\n  - name: app.orders\n",
+        &[
+            (
+                "ddl/table/billing/tally.ddl",
+                "create table if not exists billing.tally (id int);\n",
+            ),
+            (
+                "ddl/view/billing/v.ddl",
+                "create or replace view billing.v as select o.id, billing.tally() as n from app.orders o;\n",
+            ),
+        ],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    assert_catalog(
+        &*billing,
+        true,
+        &used_by("billing", "entity", "relation:app.orders", "view billing.v"),
+        "billing's use of the table app.orders",
+    )
+    .await;
+    assert_catalog(
+        &*billing,
+        false,
+        "SELECT 1 FROM dbd.uses WHERE owner = 'billing' AND target = 'routine:app.orders'",
+        "a use of the routine app.orders, which billing never calls",
+    )
+    .await;
+    assert_catalog(
+        &*billing,
+        true,
+        &used_by("billing", "entity", "routine:billing.tally", "view billing.v"),
+        "billing's call of fnowner's billing.tally()",
+    )
+    .await;
+}
+
+/// A bare name is looked up along the search path, as Postgres looks it up:
+/// `orders` read under `billing, app` is `app.orders` when billing has none —
+/// a use of its owner's table. Keyed to the path's first schema, the use
+/// matched nothing (#7).
+#[tokio::test]
+async fn a_bare_name_found_on_the_search_path_is_a_use_of_its_owner() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1])
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    write_project(
+        bd.path(),
+        "project:\n  name: billing\nsource:\n  dialect: postgresql\nschemas:\n  - billing\n",
+        &[(
+            "ddl/view/billing/v.ddl",
+            "set search_path to billing, app;\ncreate or replace view billing.v as select id from orders;\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    assert_catalog(
+        &*billing,
+        true,
+        &used_by("billing", "entity", "relation:app.orders", "view billing.v"),
+        "billing's use of app.orders, read as orders",
+    )
+    .await;
+}
+
+/// An enum declared inside a `DO` block is named by its path — as Postgres
+/// names it, folded: `OrderStatus.ddl` makes `app.orderstatus`. Unfolded, a
+/// project declaring `orderstatus.ddl` claimed the same type beside it (#7).
+#[tokio::test]
+async fn an_enum_dbd_cannot_read_is_owned_by_its_folded_name() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let rival = connect(&url, "rival").await.unwrap();
+    let (sd, rd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let do_block = "do $$ begin create type app.orderstatus as enum ('a'); \
+                    exception when duplicate_object then null; end $$;\n";
+    named_project(sd.path(), "shop", "", &[("ddl/enum/app/OrderStatus.ddl", do_block)])
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+
+    let err = named_project(rd.path(), "rival", "", &[("ddl/enum/app/orderstatus.ddl", do_block)])
+        .apply(&*rival, None, false, None, Progress::none())
+        .await
+        .expect_err("app.orderstatus is shop's")
+        .to_string();
+    assert!(err.contains("relation app.orderstatus is owned by \"shop\""), "{err}");
+}
+
+/// A function's file may create the types it takes or returns — a composite,
+/// a domain, a range. Each takes a name a table could have, so each is claimed
+/// with the function (#7).
+#[tokio::test]
+async fn the_types_a_function_file_creates_are_owned_with_it() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let rival = connect(&url, "rival").await.unwrap();
+    let (sd, rd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    named_project(
+        sd.path(),
+        "shop",
+        "",
+        &[(
+            "ddl/function/app/summary.ddl",
+            "create type app.order_summary as (n int);\n\
+             create domain app.positive as int check (value > 0);\n\
+             create type app.span as range (subtype = int4);\n\
+             create type app.floatrange as range (subtype = float8);\n\
+             create or replace function app.summary(p app.positive, s app.span, o app.order_summary) \
+             returns int language sql as $$ select 1 $$;\n",
+        )],
+    )
+    .apply(&*shop, None, false, None, Progress::none())
+    .await
+    .expect("shop's apply");
+
+    let table = |name: &str| {
+        (
+            format!("ddl/table/app/{name}.ddl"),
+            format!("set search_path to app;\ncreate table if not exists {name} (id int primary key);\n"),
+        )
+    };
+    // A range makes a multirange beside it: `span_multirange`, and for a name
+    // holding "range", that word made "multirange".
+    let names = [
+        "order_summary",
+        "positive",
+        "span",
+        "span_multirange",
+        "floatmultirange",
+    ];
+    let tables: Vec<(String, String)> = names.iter().map(|n| table(n)).collect();
+    let files: Vec<(&str, &str)> = tables.iter().map(|(p, s)| (p.as_str(), s.as_str())).collect();
+    let err = named_project(rd.path(), "rival", "", &files)
+        .apply(&*rival, None, false, None, Progress::none())
+        .await
+        .expect_err("each name is shop's")
+        .to_string();
+    for name in names {
+        assert!(
+            err.contains(&format!("relation app.{name} is owned by \"shop\"")),
+            "{err}"
+        );
+    }
+}
+
+/// A use is made through the entity its file is for: the function `status`,
+/// not an enum of its name the file creates first (#7).
+#[tokio::test]
+async fn a_use_is_made_through_the_entity_its_file_is_for() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    write_project(sd.path(), SHOP_YAML, SHOP_FILES)
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    write_project(
+        bd.path(),
+        BILLING_USES_YAML,
+        &[(
+            "ddl/function/billing/status.ddl",
+            "create type billing.status as enum ('a');\n\
+             create or replace function billing.status(x int) returns bigint language sql \
+             as $$ select count(*) from app.orders $$;\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    assert_catalog(
+        &*billing,
+        true,
+        &used_by("billing", "entity", "relation:app.orders", "function billing.status"),
+        "billing's use of app.orders, through its function",
+    )
+    .await;
+}
+
+/// `billing`, declaring the `app.orders` that `shop` declares too, applies
+/// slowly: a third session's lock on `app.blocker` holds its run open after it
+/// has read `app.orders` and before it claims.
+const SLOW_BILLING_YAML: &str = "project:\n  name: billing\nsource:\n  dialect: postgresql\nschemas:\n  - app\n\
+    external:\n  - name: app.blocker\n";
+
+fn slow_billing_files(orders_columns: &str) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "ddl/table/app/orders.ddl",
+            format!(
+                "set search_path to app;\ncreate table if not exists orders (id int primary key{orders_columns});\n"
+            ),
+        ),
+        (
+            "ddl/view/app/order_ids.ddl",
+            "set search_path to app;\ncreate or replace view order_ids as select id from orders;\n".to_string(),
+        ),
+        (
+            "ddl/view/app/z_wait.ddl",
+            "set search_path to app;\n\
+             create or replace view z_wait as select o.id from order_ids o join blocker b on b.id = o.id;\n"
+                .to_string(),
+        ),
+    ]
+}
+
+/// Wait — at most 30s — until some session waits for a lock on `app.<table>`:
+/// the race tests order their runs by what each is blocked on, not by sleeps.
+async fn await_lock_wait(adapter: &dyn dbd_core::DatabaseAdapter, table: &str) {
+    let probe = format!(
+        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_class c ON c.oid = l.relation \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = 'app' AND c.relname = '{table}' AND NOT l.granted) \
+         THEN RAISE EXCEPTION 'no wait'; END IF; END $$"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while adapter.execute_script(&probe).await.is_err() {
+        assert!(std::time::Instant::now() < deadline, "nothing waited on app.{table}");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Lock `app.blocker` in a session of its own, holding a slow billing open
+/// until the returned adapter rolls back.
+async fn hold_blocker(url: &str) -> Box<dyn dbd_core::DatabaseAdapter> {
+    let holder = connect(url, "holder").await.unwrap();
+    holder.begin_batch().await.unwrap();
+    holder
+        .execute_script("LOCK TABLE app.blocker IN ACCESS EXCLUSIVE MODE")
+        .await
+        .unwrap();
+    holder
+}
+
+/// Two projects declare one table nobody owns yet, and one is mid-apply. The
+/// other's reset found it unowned, waited on the apply's lock, and dropped it
+/// once the apply had claimed it — another project's table, gone, and the
+/// reset reporting success. A run that writes as it goes claims before its
+/// first write: the first to claim owns the table, and the other is refused
+/// (#7).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reset_cannot_drop_what_another_project_claims_while_it_runs() {
+    let (_pg, url) = start_pg().await;
+    let setup = connect(&url, "setup").await.unwrap();
+    setup
+        .execute_script(
+            "CREATE SCHEMA app; CREATE TABLE app.orders (id int primary key); \
+             INSERT INTO app.orders VALUES (1), (2), (3); CREATE TABLE app.blocker (id int);",
+        )
+        .await
+        .unwrap();
+    let (bd, sd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let files = slow_billing_files("");
+    let files: Vec<(&str, &str)> = files.iter().map(|(p, s)| (*p, s.as_str())).collect();
+    let billing = write_project(bd.path(), SLOW_BILLING_YAML, &files);
+    let shop = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1]);
+    let holder = hold_blocker(&url).await;
+    let (b, s) = (
+        connect(&url, "billing").await.unwrap(),
+        connect(&url, "shop").await.unwrap(),
+    );
+
+    // shop starts once billing is held mid-run, and billing goes on once
+    // shop's drop is waiting on it.
+    let (applied, reset, ()) = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        tokio::join!(
+            billing.apply(&*b, None, false, None, Progress::none()),
+            async {
+                await_lock_wait(&*setup, "blocker").await;
+                shop.reset(&*s, "postgres", false, false, false, None).await
+            },
+            async {
+                await_lock_wait(&*setup, "blocker").await;
+                await_lock_wait(&*setup, "orders").await;
+                holder.rollback_batch().await.unwrap();
+            }
+        )
+    })
+    .await
+    .expect("neither run may hang");
+
+    // shop claimed while billing was still building: billing is refused, and
+    // what shop's reset dropped was its own.
+    let err = applied
+        .expect_err("app.orders is shop's by the time billing claims")
+        .to_string();
+    assert!(err.contains("relation app.orders is owned by \"shop\""), "{err}");
+    reset.expect("shop's reset");
+    assert_catalog(
+        &*setup,
+        true,
+        &owned_by("relation", "app", "orders", "table", "shop"),
+        "shop's app.orders",
+    )
+    .await;
+}
+
+/// The same race through reconcile: its destructive write waited on the
+/// apply's lock, ran once the apply had claimed the table — dropping another
+/// project's column — and only then was reconcile refused. It claims before
+/// its first write instead (#7).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reconcile_cannot_alter_what_another_project_claims_while_it_runs() {
+    let (_pg, url) = start_pg().await;
+    let setup = connect(&url, "setup").await.unwrap();
+    setup
+        .execute_script(
+            "CREATE SCHEMA app; CREATE TABLE app.orders (id int primary key, total int); \
+             INSERT INTO app.orders VALUES (1, 10), (2, 20); CREATE TABLE app.blocker (id int);",
+        )
+        .await
+        .unwrap();
+    let (bd, sd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let files = slow_billing_files(", total int");
+    let files: Vec<(&str, &str)> = files.iter().map(|(p, s)| (*p, s.as_str())).collect();
+    let billing = write_project(bd.path(), SLOW_BILLING_YAML, &files);
+    let shop = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1]);
+    let holder = hold_blocker(&url).await;
+    let (b, s) = (
+        connect(&url, "billing").await.unwrap(),
+        connect(&url, "shop").await.unwrap(),
+    );
+
+    // shop starts once billing is held mid-run, and billing goes on once
+    // shop's write is waiting on it.
+    let (applied, reconciled, ()) = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        tokio::join!(
+            billing.apply(&*b, None, false, None, Progress::none()),
+            async {
+                await_lock_wait(&*setup, "blocker").await;
+                shop.reconcile(&*s, false, true, false, None, Progress::none()).await
+            },
+            async {
+                await_lock_wait(&*setup, "blocker").await;
+                await_lock_wait(&*setup, "orders").await;
+                holder.rollback_batch().await.unwrap();
+            }
+        )
+    })
+    .await
+    .expect("neither run may hang");
+
+    let err = applied
+        .expect_err("app.orders is shop's by the time billing claims")
+        .to_string();
+    assert!(err.contains("relation app.orders is owned by \"shop\""), "{err}");
+    reconciled.expect("shop's reconcile");
+    assert_catalog(
+        &*setup,
+        true,
+        &owned_by("relation", "app", "orders", "table", "shop"),
+        "shop's app.orders",
+    )
+    .await;
+}
+
+/// A run that adds enum values commits part-way, so a later version can use
+/// them — and what it committed there stayed unclaimed when the rest of the
+/// run failed: another project could take a table this one built. The run
+/// claims before each such commit (#7).
+#[tokio::test]
+async fn a_run_committing_part_way_for_enum_values_claims_what_it_committed() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "enum_add_test").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    cut_mood_version(dir, "'ok', 'bad'", ", mood mood not null default 'ok'", "v1");
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    cut_version(
+        dir,
+        MOOD_YAML,
+        &[(
+            "ddl/table/app/ledger.ddl",
+            "set search_path to app;\ncreate table if not exists ledger (id integer primary key);\n",
+        )],
+        &[],
+        "v2 adds the ledger",
+    );
+    cut_mood_version(
+        dir,
+        "'ok', 'bad', 'archived'",
+        ", mood mood not null default 'archived'",
+        "v3 archives by default",
+    );
+    let people_sql = dir.join("migrations/003/app/people.sql");
+    let generated = std::fs::read_to_string(&people_sql).unwrap();
+    std::fs::write(&people_sql, format!("{generated}\nSELECT 1 / 0;\n")).unwrap();
+
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect_err("v3's broken script fails the run");
+    assert_eq!(
+        adapter.get_db_version().await.unwrap(),
+        2,
+        "v2 committed with v3's enum values"
+    );
+    assert_table_exists(&*adapter, "app", "ledger").await;
+    assert_catalog(
+        &*adapter,
+        true,
+        &owned_by("relation", "app", "ledger", "table", "enum_add_test"),
+        "the committed app.ledger, claimed",
+    )
+    .await;
+}
+
+/// An apply claims in its own transaction, as its last step: a claim refused
+/// there — another project took the entity while this run built it — takes
+/// everything the run built with it (#7).
+#[tokio::test]
+async fn an_apply_refused_its_claim_after_building_keeps_nothing_it_built() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    let err = named_project(
+        sd.path(),
+        "shop",
+        "apply:\n  before:\n    - sql/rival.sql\n",
+        &[
+            (
+                "sql/rival.sql",
+                "INSERT INTO dbd.objects (namespace, schema, name, kind, owner) \
+                 VALUES ('relation', 'app', 'orders', 'table', 'rival');\n",
+            ),
+            ORDERS_OWNER_FILES[0],
+        ],
+    )
+    .apply(&*shop, None, false, None, Progress::none())
+    .await
+    .expect_err("rival holds app.orders by the time shop claims")
+    .to_string();
+    assert!(err.contains("relation app.orders is owned by \"rival\""), "{err}");
+    assert_table_absent(&*shop, "app", "orders").await;
+}
+
+/// The uses are written in the transaction that holds the claim and the work:
+/// a run that cannot write them keeps neither (#7).
+#[tokio::test]
+async fn an_apply_that_cannot_record_its_uses_keeps_neither_its_claim_nor_its_work() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let holder = connect(&url, "holder").await.unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    holder.heal_bookkeeping().await.unwrap();
+    holder.begin_batch().await.unwrap();
+    holder
+        .execute_script("LOCK TABLE dbd.uses IN SHARE MODE")
+        .await
+        .unwrap();
+
+    let applied = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1]).apply(
+            &*shop,
+            None,
+            false,
+            None,
+            Progress::none(),
+        ),
+    )
+    .await;
+    holder.rollback_batch().await.unwrap();
+    let err = applied
+        .expect("the run must give up, not wait for as long as the lock stays")
+        .expect_err("the lock holds the uses")
+        .to_string();
+    assert!(err.contains("dbd.uses"), "{err}");
+    assert_catalog(
+        &*shop,
+        false,
+        "SELECT 1 FROM dbd.objects WHERE owner = 'shop'",
+        "a claim of shop's",
+    )
+    .await;
+    assert_table_absent(&*shop, "app", "orders").await;
+}
+
+/// A reconcile claims what its design declares (#7).
+#[tokio::test]
+async fn a_reconcile_claims_what_its_design_declares() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1])
+        .reconcile(&*shop, false, false, false, None, Progress::none())
+        .await
+        .expect("shop's reconcile");
+    assert_catalog(
+        &*shop,
+        true,
+        &owned_by("relation", "app", "orders", "table", "shop"),
+        "shop's app.orders",
+    )
+    .await;
+}
+
+/// A reconcile's writes commit as they run, so it claims before the first of
+/// them, and one that fails part-way keeps its claims: what its design
+/// declares is its own, built yet or not (#7).
+#[tokio::test]
+async fn a_reconcile_that_fails_part_way_keeps_what_it_claimed() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    let err = named_project(
+        sd.path(),
+        "shop",
+        "",
+        &[
+            ORDERS_OWNER_FILES[0],
+            (
+                "ddl/table/app/broken.ddl",
+                "create table if not exists app.broken (id int references app.nowhere (id));\n",
+            ),
+        ],
+    )
+    .reconcile(&*shop, false, false, false, None, Progress::none())
+    .await
+    .expect_err("app.nowhere does not exist")
+    .to_string();
+    assert!(err.contains("nowhere"), "{err}");
+    for table in ["orders", "broken"] {
+        assert_catalog(
+            &*shop,
+            true,
+            &owned_by("relation", "app", table, "table", "shop"),
+            &format!("shop's app.{table}"),
+        )
+        .await;
+    }
+}
+
+/// A reset drops what its design declares, so it claims it first, as every run
+/// that writes outside one transaction does: another project declaring one of
+/// those entities is refused, not handed what this one dropped (#7).
+#[tokio::test]
+async fn a_reset_claims_what_its_design_declares_before_dropping_it() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let rival = connect(&url, "rival").await.unwrap();
+    let (sd, rd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1])
+        .reset(&*shop, "postgres", true, false, false, None)
+        .await
+        .expect("shop's reset");
+    assert_catalog(
+        &*shop,
+        true,
+        &owned_by("relation", "app", "orders", "table", "shop"),
+        "shop's app.orders",
+    )
+    .await;
+
+    let err = named_project(rd.path(), "rival", "", &ORDERS_OWNER_FILES[..1])
+        .apply(&*rival, None, false, None, Progress::none())
+        .await
+        .expect_err("app.orders is shop's")
+        .to_string();
+    assert!(err.contains("relation app.orders is owned by \"shop\""), "{err}");
+}
+
+/// dbd writes an enum inside a `DO` block, quoted, so it can run twice — and
+/// keyed by its path, folded, `"public"."Role"` was owned as `public.role`, a
+/// name Postgres never made: a rival declaring `"Role"` took it beside, and a
+/// project declaring the distinct `role` was refused. A `DO` block's own
+/// statements name what it creates (#7).
+#[tokio::test]
+async fn an_enum_written_inside_a_do_block_is_owned_by_the_name_it_creates() {
+    let (_pg, url) = start_pg().await;
+    let (shop, rival, other) = (
+        connect(&url, "shop").await.unwrap(),
+        connect(&url, "rival").await.unwrap(),
+        connect(&url, "other").await.unwrap(),
+    );
+    let (sd, rd, od) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let yaml = |name: &str| format!("project:\n  name: {name}\nsource:\n  dialect: postgresql\nschemas:\n  - public\n");
+    // As `emit_enum` writes it.
+    let role = (
+        "ddl/enum/public/Role.ddl",
+        "DO $$ BEGIN\n  CREATE TYPE \"public\".\"Role\" AS ENUM ('USER', 'ADMIN');\n\
+         EXCEPTION WHEN duplicate_object THEN NULL;\nEND $$;\n",
+    );
+    write_project(sd.path(), &yaml("shop"), &[role])
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    assert_catalog(
+        &*shop,
+        true,
+        &owned_by("relation", "public", "Role", "enum", "shop"),
+        "shop's public.\"Role\"",
+    )
+    .await;
+
+    let err = write_project(rd.path(), &yaml("rival"), &[role])
+        .apply(&*rival, None, false, None, Progress::none())
+        .await
+        .expect_err("public.\"Role\" is shop's")
+        .to_string();
+    assert!(err.contains("relation public.Role is owned by \"shop\""), "{err}");
+
+    write_project(
+        od.path(),
+        &yaml("other"),
+        &[("ddl/enum/public/role.ddl", "create type public.role as enum ('x');\n")],
+    )
+    .apply(&*other, None, false, None, Progress::none())
+    .await
+    .expect("public.role is no one's");
+}
+
+/// An enum declared inside a `DO` block, in a file that also creates a type
+/// of its own — the pair the enum makes — was keyed by that type alone, and
+/// the enum went to whoever claimed it next (#7).
+#[tokio::test]
+async fn a_do_block_enum_beside_a_type_is_owned_too() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let rival = connect(&url, "rival").await.unwrap();
+    let (sd, rd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let do_block = "do $$ begin create type app.status as enum ('a'); \
+                    exception when duplicate_object then null; end $$;\n";
+    let with_pair = format!("{do_block}create type app.status_pair as (a app.status, b app.status);\n");
+    named_project(sd.path(), "shop", "", &[("ddl/enum/app/status.ddl", &with_pair)])
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+
+    let err = named_project(rd.path(), "rival", "", &[("ddl/enum/app/status.ddl", do_block)])
+        .apply(&*rival, None, false, None, Progress::none())
+        .await
+        .expect_err("app.status is shop's")
+        .to_string();
+    assert!(err.contains("relation app.status is owned by \"shop\""), "{err}");
+}
+
+/// Of two projects' tables a bare name could mean, it means the one first on
+/// the search path — `app.orders`, not `public.orders` (#7).
+#[tokio::test]
+async fn a_bare_name_is_a_use_of_the_first_table_on_the_path() {
+    let (_pg, url) = start_pg().await;
+    let (shop, crm, billing) = (
+        connect(&url, "shop").await.unwrap(),
+        connect(&url, "crm").await.unwrap(),
+        connect(&url, "billing").await.unwrap(),
+    );
+    let (sd, cd, bd) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1])
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    write_project(
+        cd.path(),
+        "project:\n  name: crm\nsource:\n  dialect: postgresql\nschemas:\n  - public\n",
+        &[(
+            "ddl/table/public/orders.ddl",
+            "create table if not exists public.orders (id int primary key);\n",
+        )],
+    )
+    .apply(&*crm, None, false, None, Progress::none())
+    .await
+    .expect("crm's apply");
+    write_project(
+        bd.path(),
+        "project:\n  name: billing\nsource:\n  dialect: postgresql\nschemas:\n  - billing\n",
+        &[(
+            "ddl/view/billing/v.ddl",
+            "set search_path to billing, app;\ncreate or replace view billing.v as select id from orders;\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    assert_catalog(
+        &*billing,
+        true,
+        &used_by("billing", "entity", "relation:app.orders", "view billing.v"),
+        "billing's use of app.orders",
+    )
+    .await;
+    assert_catalog(
+        &*billing,
+        false,
+        "SELECT 1 FROM dbd.uses WHERE owner = 'billing' AND target = 'relation:public.orders'",
+        "a use of public.orders, which the path reaches after app.orders",
+    )
+    .await;
+}
+
+/// A bare name means the first table on the path that exists, owned or not:
+/// with an unowned `billing.orders` ahead of `app.orders`, a view reading
+/// `orders` reads billing's and uses no one's. Looked up in the registry, it
+/// was recorded as a use of `app.orders` (#7).
+#[tokio::test]
+async fn a_bare_name_reads_an_unowned_table_first_on_the_path() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1])
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    shop.execute_script("CREATE SCHEMA billing; CREATE TABLE billing.orders (id int);")
+        .await
+        .unwrap();
+    write_project(
+        bd.path(),
+        "project:\n  name: billing\nsource:\n  dialect: postgresql\nschemas:\n  - billing\n",
+        &[(
+            "ddl/view/billing/v.ddl",
+            "set search_path to billing, app;\ncreate or replace view billing.v as select id from orders;\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    assert_catalog(
+        &*billing,
+        false,
+        "SELECT 1 FROM dbd.uses WHERE owner = 'billing' AND kind = 'entity'",
+        "a use, of a table billing's view does not read",
+    )
+    .await;
+}
+
+/// A claim of a table never built is not what a bare name reads: Postgres
+/// passes over `billing.orders`, which does not exist, to `app.orders` (#7).
+#[tokio::test]
+async fn a_bare_name_passes_over_a_claim_never_built() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1])
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    shop.execute_script(
+        "INSERT INTO dbd.objects (namespace, schema, name, kind, owner) \
+         VALUES ('relation', 'billing', 'orders', 'table', 'ghost');",
+    )
+    .await
+    .unwrap();
+    write_project(
+        bd.path(),
+        "project:\n  name: billing\nsource:\n  dialect: postgresql\nschemas:\n  - billing\n",
+        &[(
+            "ddl/function/billing/n.ddl",
+            "set search_path to billing, app;\n\
+             create or replace function billing.n() returns bigint language sql as $$ select count(*) from orders $$;\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    assert_catalog(
+        &*billing,
+        true,
+        &used_by("billing", "entity", "relation:app.orders", "function billing.n"),
+        "billing's use of app.orders, read as orders",
+    )
+    .await;
+}
+
+/// `nextval('App.Order_No')` and `nextval('"app"."order_no"')` both draw on
+/// `app.order_no`, as Postgres reads the string — a use of its owner's
+/// sequence. Split as raw text, neither matched it (#7).
+#[tokio::test]
+async fn a_sequence_named_in_any_spelling_is_a_use_of_its_owners() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    named_project(
+        sd.path(),
+        "shop",
+        "",
+        &[(
+            "ddl/sequence/app/order_no.ddl",
+            "create sequence if not exists app.order_no;\n",
+        )],
+    )
+    .apply(&*shop, None, false, None, Progress::none())
+    .await
+    .expect("shop's apply");
+    write_project(
+        bd.path(),
+        "project:\n  name: billing\nsource:\n  dialect: postgresql\nschemas:\n  - billing\n",
+        &[
+            (
+                "ddl/table/billing/invoices.ddl",
+                "create table if not exists billing.invoices (id int primary key default nextval('App.Order_No'));\n",
+            ),
+            (
+                "ddl/table/billing/receipts.ddl",
+                "create table if not exists billing.receipts \
+                 (id int primary key default nextval('\"app\".\"order_no\"'));\n",
+            ),
+        ],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    for table in ["invoices", "receipts"] {
+        assert_catalog(
+            &*billing,
+            true,
+            &used_by(
+                "billing",
+                "entity",
+                "relation:app.order_no",
+                &format!("table billing.{table}"),
+            ),
+            &format!("billing.{table}'s use of app.order_no"),
+        )
+        .await;
+    }
+}
+
+/// A bare name read as a table means a table: Postgres passes over an enum
+/// of that name earlier on the path to the table after it. Counted as found
+/// by its type, the enum's owner was recorded as used (#7).
+#[tokio::test]
+async fn a_bare_table_read_is_no_use_of_an_enum_of_its_name() {
+    let (_pg, url) = start_pg().await;
+    let (types, tables, reader) = (
+        connect(&url, "types").await.unwrap(),
+        connect(&url, "tables").await.unwrap(),
+        connect(&url, "reader").await.unwrap(),
+    );
+    let (td, bd, rd) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    named_project(
+        td.path(),
+        "types",
+        "",
+        &[("ddl/enum/app/status.ddl", "create type app.status as enum ('a');\n")],
+    )
+    .apply(&*types, None, false, None, Progress::none())
+    .await
+    .expect("types' apply");
+    let in_public =
+        |name: &str| format!("project:\n  name: {name}\nsource:\n  dialect: postgresql\nschemas:\n  - public\n");
+    write_project(
+        bd.path(),
+        &in_public("tables"),
+        &[(
+            "ddl/table/public/status.ddl",
+            "create table if not exists public.status (id int);\n",
+        )],
+    )
+    .apply(&*tables, None, false, None, Progress::none())
+    .await
+    .expect("tables' apply");
+    write_project(
+        rd.path(),
+        &in_public("reader"),
+        &[(
+            "ddl/view/public/v.ddl",
+            "set search_path to app, public;\ncreate or replace view public.v as select * from status;\n",
+        )],
+    )
+    .apply(&*reader, None, false, None, Progress::none())
+    .await
+    .expect("reader's apply");
+
+    assert_catalog(
+        &*reader,
+        true,
+        &used_by("reader", "entity", "relation:public.status", "view public.v"),
+        "reader's use of the table public.status",
+    )
+    .await;
+    assert_catalog(
+        &*reader,
+        false,
+        "SELECT 1 FROM dbd.uses WHERE owner = 'reader' AND target = 'relation:app.status'",
+        "a use of the enum app.status",
+    )
+    .await;
+}
+
+/// A bare call is resolved by its arguments as well as the path: `f(1)` under
+/// `app, public` calls `public.f(int)`, not `app.f(text)`. dbd does not
+/// resolve overloads, so it records each routine the call could reach — the
+/// one it does reach among them (#7).
+#[tokio::test]
+async fn a_bare_call_is_a_use_of_every_routine_it_could_reach() {
+    let (_pg, url) = start_pg().await;
+    let (fa, fb, reader) = (
+        connect(&url, "fa").await.unwrap(),
+        connect(&url, "fb").await.unwrap(),
+        connect(&url, "reader").await.unwrap(),
+    );
+    let (ad, bd, rd) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    named_project(
+        ad.path(),
+        "fa",
+        "",
+        &[(
+            "ddl/function/app/f.ddl",
+            "create or replace function app.f(x text) returns int language sql as $$ select 1 $$;\n",
+        )],
+    )
+    .apply(&*fa, None, false, None, Progress::none())
+    .await
+    .expect("fa's apply");
+    let in_public =
+        |name: &str| format!("project:\n  name: {name}\nsource:\n  dialect: postgresql\nschemas:\n  - public\n");
+    write_project(
+        bd.path(),
+        &in_public("fb"),
+        &[(
+            "ddl/function/public/f.ddl",
+            "create or replace function public.f(x int) returns int language sql as $$ select 2 $$;\n",
+        )],
+    )
+    .apply(&*fb, None, false, None, Progress::none())
+    .await
+    .expect("fb's apply");
+    write_project(
+        rd.path(),
+        &in_public("reader"),
+        &[(
+            "ddl/view/public/w.ddl",
+            "set search_path to app, public;\ncreate or replace view public.w as select f(1) as n;\n",
+        )],
+    )
+    .apply(&*reader, None, false, None, Progress::none())
+    .await
+    .expect("reader's apply");
+
+    assert_catalog(
+        &*reader,
+        true,
+        &used_by("reader", "entity", "routine:public.f", "view public.w"),
+        "reader's use of public.f(int), the routine its view calls",
+    )
+    .await;
+}
+
+/// A sequence file keeps its stem's case — `Order_No.ddl` declares
+/// `app.Order_No` — and a default reading `nextval('app.Order_No')` names it,
+/// as Postgres folds the string. Folded and matched exactly, the table lost
+/// its dependency on its own sequence (#7).
+#[test]
+fn a_table_depends_on_its_own_sequence_however_nextval_spells_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let design = named_project(
+        tmp.path(),
+        "shop",
+        "",
+        &[
+            (
+                "ddl/sequence/app/Order_No.ddl",
+                "create sequence if not exists app.Order_No;\n",
+            ),
+            (
+                "ddl/table/app/orders.ddl",
+                "create table if not exists app.orders (id int primary key default nextval('app.Order_No'));\n",
+            ),
+        ],
+    );
+    let orders = design
+        .entities()
+        .iter()
+        .find(|e| e.name == "app.orders")
+        .expect("app.orders");
+    let refers: Vec<&str> = orders.refers().collect();
+    assert!(refers.contains(&"app.Order_No"), "{refers:?}");
+}
+
+/// A before-hook that cannot run — its file missing — refuses a reconcile,
+/// which claims only past its last refusal (#7).
+#[tokio::test]
+async fn a_reconcile_refused_its_hook_claims_nothing() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    shop.heal_bookkeeping().await.unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    let err = named_project(
+        sd.path(),
+        "shop",
+        "apply:\n  before:\n    - sql/missing.sql\n",
+        &ORDERS_OWNER_FILES[..1],
+    )
+    .reconcile(&*shop, false, false, false, None, Progress::none())
+    .await
+    .expect_err("the hook file is missing")
+    .to_string();
+    assert!(err.contains("missing.sql"), "{err}");
+    assert_catalog(
+        &*shop,
+        false,
+        "SELECT 1 FROM dbd.objects WHERE owner = 'shop'",
+        "a claim of shop's",
+    )
+    .await;
+}
+
+/// A bare built-in column type — `text`, `date` — is Postgres's own, found in
+/// `pg_catalog` first, whatever the project names a table: matched to a
+/// quoted `"Text"` table, every `text` column made a dependency on it, and two
+/// tables referring to each other read as a cycle (#7).
+#[test]
+fn a_built_in_column_type_is_no_dependency_on_a_table_of_its_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let design = write_project(
+        tmp.path(),
+        "project:\n  name: shop\nsource:\n  dialect: postgresql\nschemas:\n  - public\n",
+        &[
+            (
+                "ddl/table/public/User.ddl",
+                "create table if not exists \"User\" (id int primary key, name text);\n",
+            ),
+            (
+                "ddl/table/public/Text.ddl",
+                "create table if not exists \"Text\" (id int primary key, user_id int references \"User\" (id), body text);\n",
+            ),
+            (
+                "ddl/table/public/Date.ddl",
+                "create table if not exists \"Date\" (d date primary key);\n",
+            ),
+            (
+                "ddl/table/public/orders.ddl",
+                "create table if not exists orders (id int primary key, placed date);\n",
+            ),
+        ],
+    );
+    let errors: Vec<&String> = design.entities().iter().flat_map(|e| e.errors.iter()).collect();
+    assert!(errors.is_empty(), "{errors:?}");
+    let refers = |name: &str| -> Vec<String> {
+        design
+            .entities()
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("{name}"))
+            .refers()
+            .map(str::to_string)
+            .collect()
+    };
+    assert!(
+        !refers("public.User").contains(&"public.Text".to_string()),
+        "{:?}",
+        refers("public.User")
+    );
+    assert!(
+        !refers("public.orders").contains(&"public.Date".to_string()),
+        "{:?}",
+        refers("public.orders")
+    );
+    assert!(
+        !refers("public.Date").contains(&"public.Date".to_string()),
+        "{:?}",
+        refers("public.Date")
+    );
+}
+
+/// The same holds for a sequence named bare: `nextval('Order_No')` under
+/// `search_path app` draws on the `app.Order_No` its unquoted file creates
+/// (#7).
+#[test]
+fn a_table_depends_on_its_own_sequence_named_bare() {
+    let tmp = tempfile::tempdir().unwrap();
+    let design = named_project(
+        tmp.path(),
+        "shop",
+        "",
+        &[
+            (
+                "ddl/sequence/app/Order_No.ddl",
+                "create sequence if not exists app.Order_No;\n",
+            ),
+            (
+                "ddl/table/app/orders.ddl",
+                "set search_path to app;\ncreate table if not exists orders (id int primary key default nextval('Order_No'));\n",
+            ),
+        ],
+    );
+    let orders = design
+        .entities()
+        .iter()
+        .find(|e| e.name == "app.orders")
+        .expect("app.orders");
+    let refers: Vec<&str> = orders.refers().collect();
+    assert!(refers.contains(&"app.Order_No"), "{refers:?}");
 }

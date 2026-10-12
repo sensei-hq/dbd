@@ -69,6 +69,51 @@ pub struct CatalogData {
     pub extension_schemas: HashSet<String>,
 }
 
+/// An entity in a database's ownership registry, `dbd.objects` (#7): each has
+/// one owner. The key — `namespace`, `schema`, `name` — mirrors Postgres's own
+/// namespaces, so two owners can never hold things that could collide.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct OwnedObject {
+    /// `relation` (tables, views, materialized views, sequences), `type`
+    /// (enums) or `routine` (functions and procedures, by name).
+    pub namespace: String,
+    pub schema: String,
+    pub name: String,
+    /// `table`, `view`, `materialized view`, `sequence`, `enum`, `function`
+    /// or `procedure`.
+    pub kind: String,
+}
+
+/// What an owner uses without owning it, in `dbd.uses` (#7): a `schema`, an
+/// `extension` or a `role` it shares with other owners, or an `entity` another
+/// owner holds, through one of its own.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Use {
+    /// `schema`, `extension`, `role` or `entity`.
+    pub kind: String,
+    /// The schema, extension or role's name; for an `entity`,
+    /// `namespace:schema.name` — `relation:app.orders` — with the name split
+    /// at its first dot as dbd splits one. An entity use is recorded only
+    /// where another owner holds the target, and not at all when nobody else
+    /// does.
+    pub target: String,
+    /// For an `entity`, the owner's own entity that makes the reference —
+    /// `view billing.v_invoices`; empty otherwise.
+    pub via: String,
+    /// For an `entity` named bare, the schemas Postgres looks the name up in,
+    /// in order: the use is of the first that holds it, the target's own
+    /// schema standing in for none. Empty when the source wrote the schema,
+    /// or dbd found the target.
+    pub search_path: Vec<String>,
+}
+
+/// An entity another owner holds, and that owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldObject {
+    pub object: OwnedObject,
+    pub owner: String,
+}
+
 /// The database adapter trait — each target implements this.
 ///
 /// Adapters handle:
@@ -408,6 +453,27 @@ pub trait DatabaseAdapter: Send + Sync {
     /// of every ownership operation (apply/deploy/reconcile/reset/migrate). Runs
     /// before any version/guard read so those reads see consistent state.
     async fn heal_bookkeeping(&self) -> Result<()>;
+
+    /// Claim `objects` for `owner` — every entity its whole design declares —
+    /// in the database's ownership registry, or, with `write` false, only look.
+    /// Returns those another owner holds; when there are any, a claim takes
+    /// none of them (#7). A claim runs in the open batch transaction when there
+    /// is one, so it commits with the run's own work and rolls back with it.
+    /// Adapters without a registry claim nothing and find nothing held.
+    async fn claim_objects(&self, owner: &str, objects: &[OwnedObject], write: bool) -> Result<Vec<HeldObject>> {
+        let _ = (owner, objects, write);
+        Ok(Vec::new())
+    }
+
+    /// Record `uses` as everything `owner` uses, replacing what it used before.
+    /// An `entity` use is recorded only where another owner holds the target,
+    /// in that owner's namespace (#7). Like a claim, in the open batch
+    /// transaction when there is one. Adapters without a registry record
+    /// nothing.
+    async fn record_uses(&self, owner: &str, uses: &[Use]) -> Result<()> {
+        let _ = (owner, uses);
+        Ok(())
+    }
     async fn get_db_version(&self) -> Result<u32>;
     async fn apply_migration(&self, version: u32, sql: &str, description: &str, checksum: &str) -> Result<()>;
     async fn clear_project_migrations(&self) -> Result<()>;

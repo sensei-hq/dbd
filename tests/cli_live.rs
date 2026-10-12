@@ -1616,7 +1616,8 @@ async fn a_dry_run_checks_every_guard_its_real_run_checks() {
 /// guard, and an unscoped apply passed the scope pin. Each — and the dry runs
 /// that check the same guards — must be refused, naming the project the
 /// database records and the likely rename. `--force` and
-/// `--allow-scope-change` are honoured as they are on the project's own mark.
+/// `--allow-scope-change` lift their guards as they do on the project's own
+/// mark, but not the old name's ownership of the objects.
 #[tokio::test]
 async fn a_renamed_project_is_refused_where_its_old_name_would_be() {
     let (pg, url) = start_pg().await;
@@ -1650,10 +1651,21 @@ async fn a_renamed_project_is_refused_where_its_old_name_would_be() {
     }
     assert_eq!(schemas_of(&pg, &url, "nodes"), "hub", "the reset dropped nothing");
 
-    let o = dbd(dir, &url, &["reset", "--scope", "hub", "--dry-run", "--force"]);
-    assert!(o.status.success(), "--force is honoured: {}", combined(&o));
-    let o = dbd(dir, &url, &["apply", "--dry-run", "--allow-scope-change"]);
-    assert!(o.status.success(), "--allow-scope-change is honoured: {}", combined(&o));
+    // `--force` and `--allow-scope-change` lift the guards they name — and no
+    // further: the database's objects are still owned by `scoped`, which a
+    // renamed project takes over only by adopting them (#7).
+    for args in [
+        &["reset", "--scope", "hub", "--dry-run", "--force"][..],
+        &["apply", "--dry-run", "--allow-scope-change"],
+    ] {
+        let o = dbd(dir, &url, args);
+        assert!(!o.status.success(), "{args:?}: {}", combined(&o));
+        assert!(
+            combined(&o).contains("is owned by \"scoped\""),
+            "{args:?} is refused for the objects scoped owns: {}",
+            combined(&o)
+        );
+    }
 }
 
 // ── init --from-db writes a project that applies ────────────────────────────
@@ -2146,4 +2158,292 @@ async fn awkward_names_survive_dbml_init_from_dbml_and_a_real_apply() {
     assert!(o.status.success(), "apply: {}\n{dbml}", combined(&o));
     let o = dbd(dir, &url, &["diff", "--exit-code"]);
     assert!(o.status.success(), "diff: {}\n{dbml}", combined(&o));
+}
+
+/// A project declaring an entity another owns is refused by the commands that
+/// claim nothing, too — `refresh` and `policies` — naming the entity and its
+/// owner, before either touches the database (#7).
+#[tokio::test]
+async fn refresh_and_policies_refuse_a_design_declaring_another_owners_entity() {
+    let (pg, url) = start_pg().await;
+    let owner = tempfile::tempdir().unwrap();
+    project(owner.path());
+    let applied = dbd(owner.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+
+    let intruder = tempfile::tempdir().unwrap();
+    let dir = intruder.path();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: intruder\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    for (rel, sql) in [
+        (
+            "ddl/table/app/widgets.ddl",
+            "set search_path to app;\ncreate table if not exists widgets (id integer primary key);\n",
+        ),
+        (
+            "ddl/materialized_view/app/counts.ddl",
+            "create materialized view if not exists app.counts as select count(*) as n from app.widgets with data;\n",
+        ),
+        (
+            "policies/app/widgets.sql",
+            "alter table app.widgets enable row level security;\n",
+        ),
+    ] {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, sql).unwrap();
+    }
+
+    for command in ["refresh", "policies"] {
+        let out = dbd(dir, &url, &[command]);
+        assert!(!out.status.success(), "{command} succeeded: {}", combined(&out));
+        assert!(
+            combined(&out).contains("relation app.widgets is owned by \"clilive\""),
+            "{command} did not name the entity and its owner: {}",
+            combined(&out)
+        );
+    }
+    // Refused before it touched anything: the owner's table is as it was.
+    let rls = psql(
+        &pg,
+        &url,
+        &[
+            "-tA",
+            "-c",
+            "select relrowsecurity from pg_class where oid = 'app.widgets'::regclass",
+        ],
+    );
+    assert!(rls.status.success(), "{}", combined(&rls));
+    assert_eq!(
+        stdout(&rls).trim(),
+        "f",
+        "row level security on the owner's app.widgets"
+    );
+}
+
+/// The CLI's previews — `apply`, `deploy`, `reset`, `import` and `policies`
+/// with `--dry-run` — said "no issues" for a run the real command refuses, a
+/// design declaring another owner's entity. A preview refuses it too (#7).
+#[tokio::test]
+async fn dry_runs_refuse_a_design_declaring_another_owners_entity() {
+    let (_pg, url) = start_pg().await;
+    let owner = tempfile::tempdir().unwrap();
+    project(owner.path());
+    let applied = dbd(owner.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+
+    let intruder = tempfile::tempdir().unwrap();
+    let dir = intruder.path();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: intruder\n  version: 1\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    for (rel, body) in [
+        (
+            "ddl/table/app/widgets.ddl",
+            "set search_path to app;\ncreate table if not exists widgets (id integer primary key);\n",
+        ),
+        (
+            "policies/app/widgets.sql",
+            "alter table app.widgets enable row level security;\n",
+        ),
+        ("import/app/widgets.csv", "id\n1\n"),
+    ] {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    for args in [
+        &["apply", "--dry-run"][..],
+        &["deploy", "--dry-run"],
+        // `--force` past the reset guard the owner's prod mark raises, as the
+        // real reset would need: ownership is what this preview must refuse on.
+        &["reset", "--dry-run", "--force"],
+        &["import", "--dry-run"],
+        &["policies", "--dry-run"],
+    ] {
+        let out = dbd(dir, &url, args);
+        assert!(!out.status.success(), "{args:?} succeeded: {}", combined(&out));
+        assert!(
+            combined(&out).contains("relation app.widgets is owned by \"clilive\""),
+            "{args:?} did not name the entity and its owner: {}",
+            combined(&out)
+        );
+    }
+}
+
+/// A run killed part-way — the wrong database, noticed in time — leaves no
+/// claim behind: it claims what it built, once built (#7).
+#[tokio::test]
+async fn an_interrupted_apply_holds_no_claims() {
+    let (pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir);
+    let yaml = std::fs::read_to_string(dir.join("design.yaml")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        format!("{yaml}apply:\n  before:\n    - sql/slow.sql\n"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("sql")).unwrap();
+    std::fs::write(dir.join("sql/slow.sql"), "select pg_sleep(20);\n").unwrap();
+
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("dbd"))
+        .args(["apply", "-c", dir.join("design.yaml").to_str().unwrap(), "-d", &url])
+        .current_dir(dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn dbd");
+    // Killed inside its hook — past the check, before any work — not after a
+    // guess at how long getting there takes.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let in_hook = psql(
+            &pg,
+            &url,
+            &[
+                "-tA",
+                "-c",
+                "select count(*) from pg_stat_activity \
+                 where state = 'active' and query like '%pg_sleep(20)%' and pid <> pg_backend_pid()",
+            ],
+        );
+        assert!(in_hook.status.success(), "{}", combined(&in_hook));
+        if stdout(&in_hook).trim() != "0" {
+            break;
+        }
+        assert!(
+            child.try_wait().expect("poll dbd").is_none(),
+            "dbd exited before its hook"
+        );
+        assert!(std::time::Instant::now() < deadline, "dbd never reached its hook");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert!(
+        child.try_wait().expect("poll dbd").is_none(),
+        "dbd finished before the kill"
+    );
+    child.kill().expect("kill dbd");
+    let _ = child.wait();
+
+    // The registry exists — the run healed before its hook — and holds nothing.
+    let held = psql(&pg, &url, &["-tA", "-c", "select count(*) from dbd.objects"]);
+    assert!(held.status.success(), "{}", combined(&held));
+    assert_eq!(stdout(&held).trim(), "0", "the killed run's claims");
+}
+
+/// Outside one transaction the claim comes before the first write, and an
+/// `apply.before` hook writes: it ran ahead of the claim, so a hook could
+/// write over an entity another project claimed while it waited. The run
+/// claims before its hooks (#7).
+#[tokio::test]
+async fn an_apply_outside_a_transaction_claims_before_its_hooks() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir);
+    let yaml = std::fs::read_to_string(dir.join("design.yaml")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        format!("{yaml}apply:\n  before:\n    - sql/claimed.sql\n"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("sql")).unwrap();
+    std::fs::write(
+        dir.join("sql/claimed.sql"),
+        "do $$ begin if not exists (select 1 from dbd.objects where owner = 'clilive' and name = 'widgets') \
+         then raise exception 'the hook ran before the claim'; end if; end $$;\n",
+    )
+    .unwrap();
+
+    let out = std::process::Command::new(assert_cmd::cargo::cargo_bin("dbd"))
+        .args(["apply", "-c", dir.join("design.yaml").to_str().unwrap(), "-d", &url])
+        .env("DBD_NO_TX", "1")
+        .current_dir(dir)
+        .output()
+        .expect("run dbd");
+    assert!(out.status.success(), "{}", combined(&out));
+}
+
+/// A before-hook that cannot run — its file missing — refuses the run, and
+/// an apply outside one transaction claims only past its last refusal: the
+/// CLI's own run claims nothing (#7).
+#[tokio::test]
+async fn an_apply_outside_a_transaction_refused_its_hook_claims_nothing() {
+    let (pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir);
+    let yaml = std::fs::read_to_string(dir.join("design.yaml")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        format!("{yaml}apply:\n  before:\n    - sql/missing.sql\n"),
+    )
+    .unwrap();
+
+    let out = std::process::Command::new(assert_cmd::cargo::cargo_bin("dbd"))
+        .args(["apply", "-c", dir.join("design.yaml").to_str().unwrap(), "-d", &url])
+        .env("DBD_NO_TX", "1")
+        .current_dir(dir)
+        .output()
+        .expect("run dbd");
+    assert!(!out.status.success(), "the hook file is missing: {}", combined(&out));
+    assert!(combined(&out).contains("missing.sql"), "{}", combined(&out));
+
+    // The CLI refuses before it heals, so there may be no registry at all.
+    let unclaimed = psql(
+        &pg,
+        &url,
+        &[
+            "-c",
+            "do $$ begin if to_regclass('dbd.objects') is not null then \
+             if exists (select 1 from dbd.objects where owner = 'clilive') then \
+             raise exception 'clilive holds claims'; end if; end if; end $$;",
+        ],
+    );
+    assert!(unclaimed.status.success(), "{}", combined(&unclaimed));
+}
+
+/// `DBD_NO_TX` runs each statement on its own — what `CREATE INDEX
+/// CONCURRENTLY` needs — so nothing it builds rolls back: it claims before it
+/// builds, and a run that fails part-way keeps its claims (#7).
+#[tokio::test]
+async fn an_apply_outside_a_transaction_claims_before_it_builds() {
+    let (pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir);
+    std::fs::write(
+        dir.join("ddl/view/app/broken.ddl"),
+        "create or replace view app.broken as select * from app.nowhere;\n",
+    )
+    .unwrap();
+
+    let out = std::process::Command::new(assert_cmd::cargo::cargo_bin("dbd"))
+        .args(["apply", "-c", dir.join("design.yaml").to_str().unwrap(), "-d", &url])
+        .env("DBD_NO_TX", "1")
+        .current_dir(dir)
+        .output()
+        .expect("run dbd");
+    assert!(!out.status.success(), "app.nowhere does not exist: {}", combined(&out));
+    assert!(combined(&out).contains("nowhere"), "{}", combined(&out));
+
+    let held = psql(
+        &pg,
+        &url,
+        &[
+            "-tA",
+            "-c",
+            "select string_agg(name, ',' order by name) from dbd.objects where owner = 'clilive'",
+        ],
+    );
+    assert!(held.status.success(), "{}", combined(&held));
+    assert_eq!(stdout(&held).trim(), "broken,named,widgets", "clilive's claims");
 }

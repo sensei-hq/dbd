@@ -266,6 +266,110 @@ fn owns(decl: &Declaration, target: &str) -> bool {
     decl.name == target || (decl.schema.is_none() && target.rsplit('.').next() == Some(decl.name.as_str()))
 }
 
+/// The types the statements of `parsed` create that no entity is declared for
+/// — a composite, a domain, a range — as `(kind, schema, schema.name)`, named
+/// as [`declarations`] names an entity. A file may create one beside the
+/// entity it is for: the type a function returns.
+pub(in crate::parser) fn created_types(
+    parsed: &pg_query::ParseResult,
+    default_schema: &str,
+) -> Vec<(&'static str, Option<String>, String)> {
+    let mut types = Vec::new();
+    for node in parsed
+        .protobuf
+        .stmts
+        .iter()
+        .filter_map(|raw| raw.stmt.as_ref().and_then(|s| s.node.as_ref()))
+    {
+        match node {
+            NodeEnum::CompositeTypeStmt(c) => {
+                if let Some(rv) = c.typevar.as_ref() {
+                    let (schema, name) = from_range_var(rv, default_schema);
+                    types.push(("composite type", schema, name));
+                }
+            }
+            NodeEnum::CreateDomainStmt(c) => {
+                if let Some((schema, name)) = from_parts(&name_parts(&c.domainname), default_schema) {
+                    types.push(("domain", schema, name));
+                }
+            }
+            NodeEnum::CreateRangeStmt(c) => {
+                let parts = name_parts(&c.type_name);
+                if let Some((schema, name)) = from_parts(&parts, default_schema) {
+                    types.push(("range type", schema, name));
+                }
+                if let Some((schema, name)) = from_parts(&multirange_parts(c, &parts), default_schema) {
+                    types.push(("multirange type", schema, name));
+                }
+            }
+            _ => {}
+        }
+    }
+    types
+}
+
+/// The name of the multirange Postgres makes beside a range, as
+/// `makeMultirangeTypeName` makes it: its `multirange_type_name` — an
+/// unqualified one on the search path, as any unqualified name — else the
+/// range's name with `multi` before its first `range`, else its first 52
+/// bytes and `_multirange`; cut to the 63 bytes a name keeps.
+fn multirange_parts(stmt: &protobuf::CreateRangeStmt, range_parts: &[String]) -> Vec<String> {
+    let given = stmt.params.iter().find_map(|p| match p.node.as_ref()? {
+        NodeEnum::DefElem(d) if d.defname.eq_ignore_ascii_case("multirange_type_name") => {
+            match d.arg.as_ref()?.node.as_ref()? {
+                NodeEnum::TypeName(t) => Some(name_parts(&t.names)),
+                _ => None,
+            }
+        }
+        _ => None,
+    });
+    if let Some(given) = given {
+        return given;
+    }
+    let Some(range) = range_parts.last() else {
+        return Vec::new();
+    };
+    let multirange = match range.find("range") {
+        Some(at) => format!("{}multi{}", &range[..at], &range[at..]),
+        None => format!("{}_multirange", clip_name(range, NAME_BYTES - 11)),
+    };
+    let schema_parts = &range_parts[..range_parts.len() - 1];
+    [schema_parts, &[clip_name(&multirange, NAME_BYTES)]].concat()
+}
+
+/// The bytes Postgres keeps of a name: `NAMEDATALEN - 1`.
+const NAME_BYTES: usize = 63;
+
+/// `name` cut to at most `bytes`, on a character's edge.
+fn clip_name(name: &str, bytes: usize) -> String {
+    let mut end = bytes.min(name.len());
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    name[..end].to_string()
+}
+
+/// The names of the relations the statements of `parsed` create temporary —
+/// the session's own, which nobody owns.
+pub(in crate::parser) fn temporary_relations(parsed: &pg_query::ParseResult) -> std::collections::HashSet<String> {
+    let temporary = |rv: &protobuf::RangeVar| rv.relpersistence == "t" || rv.schemaname.starts_with("pg_temp");
+    parsed
+        .protobuf
+        .stmts
+        .iter()
+        .filter_map(|raw| raw.stmt.as_ref().and_then(|s| s.node.as_ref()))
+        .filter_map(|node| match node {
+            NodeEnum::CreateStmt(c) => c.relation.as_ref(),
+            NodeEnum::CreateTableAsStmt(c) => c.into.as_ref().and_then(|i| i.rel.as_ref()),
+            NodeEnum::ViewStmt(v) => v.view.as_ref(),
+            NodeEnum::CreateSeqStmt(c) => c.sequence.as_ref(),
+            _ => None,
+        })
+        .filter(|rv| temporary(rv))
+        .map(|rv| rv.relname.clone())
+        .collect()
+}
+
 fn from_range_var(rv: &protobuf::RangeVar, default_schema: &str) -> (Option<String>, String) {
     qualify(&rv.schemaname, &rv.relname, default_schema)
 }

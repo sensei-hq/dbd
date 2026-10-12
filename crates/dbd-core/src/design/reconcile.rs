@@ -362,6 +362,9 @@ impl Design {
         // Refuse before planning, `dry_run` included: a plan computed from a
         // partial design reports drift that isn't there and misses drift that is.
         self.ensure_fully_parsed(scope, working_set.as_ref(), None)?;
+        // Before planning: a design declaring an entity another owner holds is
+        // refused before anything runs (#7). It claims below, before it writes.
+        self.preflight(adapter, ownership::Preflight::Read).await?;
         let desired_entities = self.entities_in_scope(scope, working_set.as_ref(), None);
 
         // A reconciled database is the one an apply builds, so reconcile runs
@@ -481,13 +484,19 @@ impl Design {
             return Ok(plan);
         }
 
-        // Heal-first: ensure bookkeeping storage exists (and is at the current
-        // layout, healing any legacy layout in place) before any meta read/write
-        // below — every ownership operation calls this up front. Runs after the
-        // dry-run return above so `--dry-run` stays read-only.
-        adapter.heal_bookkeeping().await?;
-
         ensure_reconcile_not_destructive(&plan, allow_destructive)?;
+        // The before-hooks' own refusals — a file missing, a path outside the
+        // project — are the last.
+        hooks::plan_hooks(
+            self.hook_source(),
+            &self.config.apply.before,
+            hooks::HookKind::Before,
+            hook_scope,
+        )?;
+        // Past the last refusal, before the first write: heal the bookkeeping
+        // and claim. Reconcile's writes commit as they run, so it claims first
+        // — see `Design::claim_first` (#7).
+        self.claim_first(adapter).await?;
 
         // `apply.before` where apply runs it: after every gate, so a refused
         // reconcile fires no hook, and before the first write, so a hook can
@@ -517,6 +526,8 @@ impl Design {
                 &mut progress.on_done,
             )
             .await?;
+        // Built: record what it uses (#7).
+        self.record_declared_uses(adapter).await?;
 
         // Sync pg_cron refresh jobs, mirroring the apply path. This MUST cover the
         // whole design, not the scoped `desired_entities`: `sync_refresh_jobs`
@@ -637,6 +648,9 @@ impl Design {
         // Read-only, but the same refusal applies: "in sync with the design" is a
         // false statement when part of the design was never read.
         self.ensure_fully_parsed(scope, working_set.as_ref(), None)?;
+        // Read-only, and refused as a run would be: a design declaring another
+        // owner's entity diffs against something it does not own (#7).
+        self.preflight(adapter, ownership::Preflight::Read).await?;
         let desired_entities = self.entities_in_scope(scope, working_set.as_ref(), None);
 
         // Desired snapshot (tables + enums, schema-normalized). Raw (un-canonicalized)
