@@ -9,6 +9,49 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+### Fixed
+
+Projects sharing one database no longer undo each other's bookkeeping, refresh
+jobs or imports — the first phase of [#7], fixes that were wrong with a single
+project too.
+
+- **A heal folds only its own project's legacy bookkeeping.** Upgrading one
+  project folded every project's rows out of a legacy `_dbd_meta` and
+  `_dbd_migrations` into `dbd.*` and dropped the tables — so a project still on
+  an older dbd lost its record and read the database as fresh. A heal now
+  moves the project's own rows; another project's stay, and so does a legacy
+  table while it holds any, unaltered. A project not yet healed reads its own
+  record there, so its guards still see a database it marked prod. The heal
+  locks a legacy table before reading it, reading committed whatever the
+  database's isolation default, so a row an older dbd commits meanwhile is
+  seen, not dropped with the table; it locks them in the order an older
+  dbd's batch writes them, so the two never deadlock; it waits at most 5
+  seconds for another session's write, then fails naming the table; and one
+  heal runs at a time, so two projects' first runs no longer collide creating
+  the `dbd` schema. An emptied table is dropped, or kept if Postgres refuses
+  (a view over it). A table the project's role cannot read — another
+  project's — is passed over, by reads too; one it can read but not take that
+  holds its own row is refused, naming the table.
+- **A pg_cron refresh job is named for its project** —
+  `dbd-refresh:<project>:<schema>.<name>` — and a sync unschedules only its own
+  project's. It unscheduled every `dbd:refresh:` job it was not given, so each
+  project's apply took the other's jobs; the new namespace is out of reach of
+  a project sharing the database that has not upgraded, whose sweep still
+  takes `dbd:refresh:%`. A name fits the 63 bytes pg_cron 1.3 and 1.4 keep (a
+  hash ends a longer one), and a `:` or `%` in a project's name is encoded, so
+  one project's name cannot reach another's jobs. A job an older dbd named
+  `dbd:refresh:<schema>.<name>` is replaced for a matview the project
+  declares, and unscheduled, by any project, once the view it refreshes no
+  longer exists — read from the catalog, so a schema the role cannot use
+  fails nothing; concurrent syncs take turns.
+- **Each project stages its JSON imports in its own table**,
+  `dbd."import_tmp:<project>"`. Every load dropped and recreated one
+  `dbd.import_tmp`, so two projects importing at once emptied each other's
+  staged rows. A name past Postgres's 63-byte limit, which it would cut short
+  and so merge with another, ends in a hash of the whole name.
+
+[#7]: https://github.com/sensei-hq/dbd/issues/7
+
 ## [0.25.1] — 2026-10-12
 
 **Two fixes for refusals that left no way through.** `reconcile` failed on every

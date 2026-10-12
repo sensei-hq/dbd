@@ -1,7 +1,8 @@
 # Multi-Project Isolation in One Database (#7)
 
 **Date:** 2026-10-06 (rev 3, 2026-10-07)
-**Status:** Proposed
+**Status:** Proposed — Phase 1 done on `develop` (1a in 0.25.0; 1b, 1c, 1d
+after 0.25.1); Phases 2–4 next; the decisions below are settled.
 **Scope:** Let several owners share one database safely: independent projects
 from different repositories, and modules of one workspace kept under
 `database/<module>/`. Ownership is per **entity**, recorded in the shared `dbd`
@@ -117,10 +118,11 @@ wins.
 - (b) nobody owns it, and its schema is used by no other owner.
 
 Rule (b) keeps today's drift clean-up for a database with one owner. In a
-schema that another owner also uses, unowned entities are reported and never
-dropped:
+schema that another owner also uses, unowned entities are reported, and
+dropped only when the run confirms it with `--prune-unowned` (decision 4), each
+named as it goes:
 
-`unowned: public.tmp_report — not dropped because public is shared with "billing"`
+`unowned: public.tmp_report — not dropped because public is shared with "billing" (--prune-unowned drops it)`
 
 Entities owned by someone else are never candidates. This replaces
 `managed_schemas` as the prune boundary. `restrict_snapshot_to_schemas` stays
@@ -362,6 +364,19 @@ These are carried over from rev 1. Each is wrong today even with one project:
   owner declares.
 - **1c. Heal folds only this owner's legacy rows** (H5). It drops a legacy table
   only once it is empty.
+- *Done: 1a in 0.25.0 (`managed_schemas` skips roles and extensions); 1b, 1c
+  and 1d on `develop` after 0.25.1, each with the test the table below names
+  (T2 runs against a pg_cron stand-in, T4 records the staging tables an event
+  trigger sees). 1c also layers the bookkeeping reads — a project's record is
+  its `dbd.meta` row, else its legacy row — since a heal that leaves another
+  project's rows behind must not hide them from that project's guards. Review
+  moved 1b's names to `dbd-refresh:<owner>:<schema>.<name>`: inside
+  `dbd:refresh:`, a co-tenant not yet upgraded — whose sweep takes every
+  `dbd:refresh:%` job it was not given — would still take them, the hazard
+  the heal tolerates for bookkeeping. Names fit 63 bytes (pg_cron 1.3/1.4
+  keep `name`); a legacy job whose view is gone is unscheduled. The heal locks
+  each legacy table before reading it and passes over one its role cannot
+  reach.*
 - **1d. Import staging moves into `dbd`, one table per owner** (H7).
   `dbd.import_jsonb_to_table` and `dbd."import_tmp:<owner>"` are used, with a
   hashed name past 63 bytes. Imports run through the pool, so `TEMP` tables
@@ -422,7 +437,10 @@ failing.
 
 ---
 
-## Decisions to confirm
+## Decisions
+
+Settled 2026-10-12: 1, 2, 3 and 5 as recommended; 4 changed — unowned entities
+in a shared schema are pruned after confirming.
 
 1. **No list of what a module offers to others.** What a module protects is
    derived from what other owners actually use. If a restriction is ever
@@ -433,8 +451,10 @@ failing.
    version.
 3. **Owner identity `<project>/<module>`.** Recommended, because two workspaces
    may both have a `shared` module. The alternative is bare module names.
-4. **Unowned entities in a shared schema are reported, never pruned.** An
-   explicit `dbd adopt <entity>` can come later if reports pile up.
+4. **Unowned entities in a shared schema are reported, and pruned only with
+   `--prune-unowned`**, which names each one it drops. (Proposed: reported,
+   never pruned; changed so a shared schema can be cleaned without dropping to
+   SQL.) An explicit `dbd adopt <entity>` can still come later.
 5. **One root manifest**, with module folders holding no configuration.
    Recommended (see section 2). The alternative is a `module.yaml` per module.
 

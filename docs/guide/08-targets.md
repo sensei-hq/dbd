@@ -140,8 +140,11 @@ The reference target: every feature works here.
   dropped.
 - **Legacy bookkeeping heals itself.** Databases written by older dbd versions
   kept `_dbd_meta`/`_dbd_migrations` in `public` (or, after a scoped apply, in
-  other schemas). The next `apply`, `deploy`, `reconcile` or `reset` folds them
-  into `dbd.meta`/`dbd.migrations` in one transaction and drops the originals.
+  other schemas). The next `apply`, `deploy`, `reconcile` or `reset` folds the
+  project's own rows into `dbd.meta`/`dbd.migrations` in one transaction.
+  Another project's rows stay, and so does a legacy table while it holds any:
+  that project may still be on an older dbd, and reads its own record there
+  until its own upgrade folds it. A legacy table left empty is dropped.
   The same heal copies a drift stamp that dbd before 0.25 kept as a
   materialized view's comment into `dbd.matview_stamps` — before anything
   re-runs the view's file, whose own `COMMENT ON` would erase it — and leaves
@@ -149,8 +152,9 @@ The reference target: every feature works here.
 - **Import** streams CSV and TSV through `COPY`, into the columns the file's
   header names — `COPY t (cols…) FROM STDIN WITH (FORMAT csv)`, with the header
   row taken off first — so the file's column order need not be the table's. JSON
-  and JSON Lines records are staged as bound `json` values in `dbd.import_tmp`
-  and moved into the table by `dbd.import_jsonb_to_table`, a procedure the load
+  and JSON Lines records are staged as bound `json` values in the project's own
+  `dbd."import_tmp:<project>"` — so projects sharing a database never share one
+  — and moved into the table by `dbd.import_jsonb_to_table`, a procedure the load
   installs itself in dbd's own `dbd` schema; no other schema is created. (Before
   0.25 it lived in a schema called `staging`, created whatever your staging
   schemas were called; a database an earlier dbd imported JSON into keeps its
