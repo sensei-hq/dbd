@@ -355,8 +355,38 @@ impl Design {
         name: Option<&str>,
         scope: Option<&ResolvedScope>,
     ) -> Result<(Vec<ImportPlanEntry>, Vec<String>)> {
+        self.scoped_import_plan_keyed(name, scope, &[])
+    }
+
+    /// [`Self::scoped_import_plan`], ordered also by the foreign keys
+    /// `adapter`'s database reports (see [`DatabaseAdapter::foreign_keys`]).
+    ///
+    /// What the import itself runs, and what its preview lists when it has a
+    /// database to ask. A SQLite project's DDL is read verbatim, with no
+    /// references, so ordered by the design alone its staging tables came out
+    /// alphabetical: a table loaded before the one it references, and the
+    /// referenced one emptied first, and SQLite refused both on the key.
+    pub async fn live_import_plan(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        name: Option<&str>,
+        scope: Option<&ResolvedScope>,
+    ) -> Result<(Vec<ImportPlanEntry>, Vec<String>)> {
+        let keys = adapter.foreign_keys().await?;
+        self.scoped_import_plan_keyed(name, scope, &keys)
+    }
+
+    /// [`Self::scoped_import_plan`], with `keys` — the live database's
+    /// foreign keys, as [`DatabaseAdapter::foreign_keys`] names them — joining
+    /// the design's references in ordering it.
+    fn scoped_import_plan_keyed(
+        &self,
+        name: Option<&str>,
+        scope: Option<&ResolvedScope>,
+        keys: &[(String, String)],
+    ) -> Result<(Vec<ImportPlanEntry>, Vec<String>)> {
         self.check_import_plan(name)?;
-        let plan = self.import_plan(name);
+        let plan = self.import_plan_keyed(name, keys);
         let Some(scope) = scope.filter(|s| !s.is_all) else {
             return Ok((plan, Vec::new()));
         };
@@ -428,6 +458,12 @@ impl Design {
     /// that failed to parse are excluded here; they are reported separately
     /// via [`Design::import_invalid_tables`].
     pub fn import_plan(&self, name: Option<&str>) -> Vec<ImportPlanEntry> {
+        self.import_plan_keyed(name, &[])
+    }
+
+    /// [`Self::import_plan`], ordered by the live database's foreign keys
+    /// `keys` as well as by the design's references.
+    fn import_plan_keyed(&self, name: Option<&str>, keys: &[(String, String)]) -> Vec<ImportPlanEntry> {
         let loaders = self.import_loaders();
         let mut entries: Vec<ImportPlanEntry> = self
             .loadable_tables(name)
@@ -446,7 +482,7 @@ impl Design {
         // Sort by write dependencies:
         // If entry A writes to a table that entry B's target table references (via FK),
         // A must come before B.
-        self.sort_import_plan(&mut entries);
+        self.sort_import_plan(&mut entries, keys);
 
         // A table with two data files is two entries and one load: both files
         // load, then its loader runs once over the rows of both. Every entry
@@ -623,16 +659,45 @@ impl Design {
 
     /// Sort import entries so that procedures writing to tables referenced by other
     /// procedures' targets come first.
-    fn sort_import_plan(&self, entries: &mut Vec<ImportPlanEntry>) {
+    ///
+    /// `keys` are the live database's foreign keys (see
+    /// [`DatabaseAdapter::foreign_keys`]), each joining the references of the
+    /// design table it names. The database names a table as it knows it — a
+    /// SQLite table has no schema — so a key matches a design table by its
+    /// name, or by its bare name when the key names no schema.
+    fn sort_import_plan(&self, entries: &mut Vec<ImportPlanEntry>, keys: &[(String, String)]) {
         // Build dependency: entry depends on another if its writes target has a FK
         // to a table written by another entry.
         // For now, use the DDL entity's refers to check FK deps between write targets.
-        let entity_refs: std::collections::HashMap<String, Vec<String>> = self
+        let tables: Vec<&str> = self
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == EntityType::Table)
+            .map(|e| e.name.as_str())
+            .collect();
+        let named = |live: &str| -> Vec<&str> {
+            tables
+                .iter()
+                .copied()
+                .filter(|t| *t == live || (!live.contains('.') && bare_name(t) == live))
+                .collect()
+        };
+        let mut entity_refs: std::collections::HashMap<String, Vec<String>> = self
             .entities
             .iter()
             .filter(|e| e.entity_type == EntityType::Table)
             .map(|e| (e.name.clone(), e.refers().map(str::to_string).collect::<Vec<_>>()))
             .collect();
+        for (referencing, referenced) in keys {
+            for table in named(referencing) {
+                let refs = entity_refs.entry(table.to_string()).or_default();
+                for target in named(referenced) {
+                    if !refs.iter().any(|r| r == target) {
+                        refs.push(target.to_string());
+                    }
+                }
+            }
+        }
 
         // Simple topological sort on entries
         let n = entries.len();
@@ -713,7 +778,7 @@ impl Design {
         // half-loaded data.
         let working_set = self.scope_working_set(scope)?;
 
-        let (plan, skips) = self.scoped_import_plan(name, scope)?;
+        let (plan, skips) = self.live_import_plan(adapter, name, scope).await?;
         warnings.extend(skips);
 
         // Run the import phases in order, tallying each for the summary.

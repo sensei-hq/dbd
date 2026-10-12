@@ -391,6 +391,28 @@ impl DatabaseAdapter for SqliteAdapter {
         .await
     }
 
+    async fn foreign_keys(&self) -> Result<Vec<(String, String)>> {
+        // A key names its table as its DDL wrote it, and SQLite matches table
+        // names without regard to case — so the referenced table is looked up
+        // the same way, and reported by its own name. A key to a table that
+        // does not exist orders nothing, and drops out of the join.
+        let rows = sqlx::query(
+            "SELECT DISTINCT m.name AS referencing, p.name AS referenced \
+             FROM sqlite_master m \
+             JOIN pragma_foreign_key_list(m.name) f \
+             JOIN sqlite_master p ON p.type = 'table' AND p.name = f.\"table\" COLLATE NOCASE \
+             WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%' \
+             ORDER BY 1, 2",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbdError::Config(format!("reading the foreign keys failed: {e}")))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<String, _>("referencing"), r.get::<String, _>("referenced")))
+            .collect())
+    }
+
     async fn export_data(&self, entity: &Entity, out_dir: Option<&Path>) -> Result<()> {
         let table = Self::bare_name(&entity.name);
         let format = entity.format.as_deref().unwrap_or("csv");
