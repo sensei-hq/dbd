@@ -1406,6 +1406,77 @@ fn reset_accepts_the_targets_its_help_names_and_resets_a_sqlite_database() {
     );
 }
 
+// ── a SQLite import follows the foreign keys ────────────────────────────────
+
+/// SQLite enforces foreign keys on dbd's connections, and a SQLite project's
+/// DDL is read verbatim, with no references — so an import ordered `kid`
+/// before `parent` alphabetically and failed on `kid`'s key, both tables
+/// left empty, and a re-import emptied `parent` first and failed the same
+/// way. The import loads a referenced table first and empties it last, by the
+/// foreign keys the database itself reports; its preview lists that order.
+#[test]
+fn a_sqlite_import_of_tables_linked_by_a_foreign_key_loads_and_reloads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write(
+        dir,
+        "design.yaml",
+        &format!(
+            "project:\n  name: lite\nsource:\n  dialect: sqlite\ntarget:\n  sqlite:\n    url: sqlite://{}\nschemas: []\n",
+            dir.join("app.db").display()
+        ),
+    );
+    write(
+        dir,
+        "ddl/table/parent.ddl",
+        "CREATE TABLE IF NOT EXISTS parent (id INTEGER PRIMARY KEY, name TEXT);\n",
+    );
+    write(
+        dir,
+        "ddl/table/kid.ddl",
+        "CREATE TABLE IF NOT EXISTS kid (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent (id));\n",
+    );
+    write(dir, "import/parent.csv", "id,name\n1,a\n2,b\n");
+    write(dir, "import/kid.csv", "id,pid\n1,1\n2,2\n");
+
+    let o = dbd(dir, &["apply"]);
+    assert!(o.status.success(), "apply: {}{}", stdout(&o), stderr(&o));
+
+    let o = dbd(dir, &["import", "--dry-run"]);
+    assert!(o.status.success(), "import --dry-run: {}{}", stdout(&o), stderr(&o));
+    let preview = stdout(&o);
+    let at = |table: &str| preview.find(&format!("import {table} ")).unwrap_or(usize::MAX);
+    assert!(
+        at("parent") < at("kid"),
+        "the preview loads parent before the table referencing it: {preview}"
+    );
+
+    // Loaded into an empty pair, then reloaded over a populated one — which
+    // empties both first, `kid` before the `parent` its rows point at.
+    for run in ["first import", "re-import"] {
+        let o = dbd(dir, &["import"]);
+        assert!(o.status.success(), "{run}: {}{}", stdout(&o), stderr(&o));
+        let out = dir.join("out");
+        let o = dbd(dir, &["export", "-o", out.to_str().unwrap()]);
+        assert!(
+            o.status.success(),
+            "export after the {run}: {}{}",
+            stdout(&o),
+            stderr(&o)
+        );
+        assert_eq!(
+            fs::read_to_string(out.join("parent.csv")).unwrap(),
+            "id,name\n1,a\n2,b\n",
+            "parent after the {run}"
+        );
+        assert_eq!(
+            fs::read_to_string(out.join("kid.csv")).unwrap(),
+            "id,pid\n1,1\n2,2\n",
+            "kid after the {run}"
+        );
+    }
+}
+
 // ── a dry run creates nothing ───────────────────────────────────────────────
 
 /// A dry run asks the configured database for its guards — and the SQLite
