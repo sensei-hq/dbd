@@ -6859,6 +6859,108 @@ async fn a_scoped_reset_drops_its_tables_and_views_triggers_before_their_functio
     assert_table_exists(&*adapter, "other", "logs").await;
 }
 
+/// A row trigger on a partitioned table is cloned onto each partition, and the
+/// clone is the parent's: Postgres refuses to drop it on its own ("trigger … on
+/// table … requires it"), and drops it with the parent's. dbd refuses `PARTITION
+/// OF`, but a plain table entity becomes a partition by `ATTACH PARTITION`, so
+/// its clone was among the triggers a scoped reset drops first — refusing every
+/// reset of a scope holding the partition. Only a trigger no parent made is
+/// dropped there.
+async fn attached_partition_project(
+    parent_schema: &str,
+) -> (
+    PostgreSQL,
+    Box<dyn dbd_core::DatabaseAdapter>,
+    Design,
+    tempfile::TempDir,
+) {
+    let (pg, url) = start_pg().await;
+    let adapter = connect(&url, "scoped_reset_partitions").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let design = write_project(
+        tmp.path(),
+        &format!(
+            "project:\n  name: scoped_reset_partitions\nsource:\n  dialect: postgresql\n\
+             schemas:\n  - app\n  - {parent_schema}\nscopes:\n  app_only:\n    includes: [app]\n"
+        ),
+        &[
+            (
+                &format!("ddl/table/{parent_schema}/events.ddl"),
+                &format!(
+                    "set search_path to {parent_schema};\n\
+                     create table if not exists events (id int, at date not null, seq int) partition by range (at);\n"
+                ),
+            ),
+            (
+                &format!("ddl/function/{parent_schema}/bump.ddl"),
+                &format!(
+                    "set search_path to {parent_schema};\n\
+                     create or replace function bump() returns trigger language plpgsql as $$\n\
+                     begin new.seq := coalesce(new.seq, 0) + 1; return new; end $$;\n\
+                     drop trigger if exists events_bump on {parent_schema}.events;\n\
+                     create trigger events_bump before update on {parent_schema}.events\n\
+                       for each row execute function {parent_schema}.bump();\n"
+                ),
+            ),
+            (
+                "ddl/table/app/events_2026.ddl",
+                "set search_path to app;\ncreate table if not exists events_2026 (id int, at date not null, seq int);\n",
+            ),
+        ],
+    );
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply");
+    adapter
+        .execute_script(&format!(
+            "ALTER TABLE {parent_schema}.events ATTACH PARTITION app.events_2026 \
+               FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');"
+        ))
+        .await
+        .unwrap();
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_trigger WHERE tgrelid = 'app.events_2026'::regclass AND tgname = 'events_bump' \
+           AND NOT tgisinternal",
+        "the clone of events_bump on the partition",
+    )
+    .await;
+    (pg, adapter, design, tmp)
+}
+
+#[tokio::test]
+async fn a_scoped_reset_leaves_a_partitions_cloned_trigger_to_its_parent() {
+    let (_pg, adapter, design, _tmp) = attached_partition_project("app").await;
+    let app_only = design.resolve_scope(Some("app_only"), None).unwrap();
+    design
+        .reset(&*adapter, "postgres", false, false, false, Some(&app_only))
+        .await
+        .expect("a partition's cloned trigger must not refuse the scoped reset");
+    assert_table_absent(&*adapter, "app", "events").await;
+    assert_table_absent(&*adapter, "app", "events_2026").await;
+}
+
+#[tokio::test]
+async fn a_scoped_reset_of_a_partition_keeps_the_trigger_of_a_parent_outside_it() {
+    let (_pg, adapter, design, _tmp) = attached_partition_project("base").await;
+    let app_only = design.resolve_scope(Some("app_only"), None).unwrap();
+    design
+        .reset(&*adapter, "postgres", false, false, false, Some(&app_only))
+        .await
+        .expect("the clone of a trigger outside the scope must not refuse the scoped reset");
+    assert_table_absent(&*adapter, "app", "events_2026").await;
+    assert_table_exists(&*adapter, "base", "events").await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_trigger WHERE tgrelid = 'base.events'::regclass AND tgname = 'events_bump'",
+        "trigger events_bump on base.events",
+    )
+    .await;
+}
+
 // ── Roles are server-wide: a reset keeps one another database holds ───────────
 
 /// Two databases on one server built from the same design share its roles,
