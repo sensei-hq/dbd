@@ -2525,6 +2525,125 @@ async fn reconcile_creates_alters_and_drops_in_place() {
     assert_table_absent(&*adapter, "app", "notes").await;
 }
 
+/// A type an extension installs outside the session `search_path` is the same
+/// type however the DDL spells it (#41). Introspection reads it through
+/// `format_type`, which qualifies what the path does not reach —
+/// `extensions.citext`, `extensions.citext[]`, `extensions.cube` — while the
+/// DDL reaches it through its own `set search_path` and writes it bare.
+/// Compared as text the two differed, so every reconcile after the first
+/// planned an `ALTER … TYPE` that changed nothing, and Postgres refused it for
+/// a column a view reads, failing the reconcile. `dbd diff` reported the same
+/// false drift. A real change to such a type still applies, and lands on the
+/// extension's type wherever the session path points.
+#[tokio::test]
+async fn an_extension_type_outside_the_search_path_is_not_drift() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "ext_types_test").await.unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::create_dir_all(dir.join("ddl/view/app")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: ext_types_test\n  version: 1\n\
+         source:\n  dialect: postgresql\n\
+         target:\n  postgres:\n    url: $DATABASE_URL\n    extensions:\n\
+         \x20     - name: citext\n        schema: extensions\n\
+         \x20     - name: cube\n        schema: extensions\n\
+         schemas:\n  - app\n  - extensions\n",
+    )
+    .unwrap();
+    let write_items = |note_type: &str| {
+        std::fs::write(
+            dir.join("ddl/table/app/items.ddl"),
+            format!(
+                "set search_path to app, extensions;\n\
+                 create table if not exists items (\n\
+                   id    integer primary key\n\
+                 , email citext not null\n\
+                 , tags  citext[]\n\
+                 , box   cube\n\
+                 , code  extensions.citext\n\
+                 , note  {note_type}\n\
+                 );\n"
+            ),
+        )
+        .unwrap();
+    };
+    std::fs::write(
+        dir.join("ddl/view/app/item_emails.ddl"),
+        "set search_path to app, extensions;\n\
+         create or replace view item_emails as select id, email, tags, box, code from items;\n",
+    )
+    .unwrap();
+    let load = || Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design");
+    let type_changes = |plan: &dbd_core::reconcile::ReconcilePlan| -> Vec<String> {
+        plan.warnings
+            .iter()
+            .filter(|w| w.contains("type change"))
+            .cloned()
+            .collect()
+    };
+
+    write_items("text");
+    load()
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("the first reconcile creates the table and the view");
+    assert_table_exists(&*adapter, "app", "items").await;
+
+    // Nothing changed, so nothing is planned — and nothing is refused.
+    let plan = load()
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("reconciling an unchanged design must not fail");
+    assert!(
+        plan.altered.is_empty(),
+        "an unchanged design altered: {:?}",
+        plan.altered
+    );
+    assert!(type_changes(&plan).is_empty(), "{:?}", type_changes(&plan));
+
+    let diff = load().diff_live(&*adapter, None).await.expect("diff_live");
+    assert!(
+        diff.changes.is_empty(),
+        "an unchanged design reported drift: {:?}",
+        diff.changes
+    );
+
+    // A real change to an extension type applies, and the column ends up with
+    // the extension's own type, which the session path does not reach.
+    write_items("citext");
+    let plan = load()
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("a column changed to an extension type reconciles");
+    assert_eq!(
+        plan.altered.iter().map(|s| s.entity_name.as_str()).collect::<Vec<_>>(),
+        ["app.items"],
+        "{:?}",
+        plan.altered
+    );
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_attribute WHERE attrelid = 'app.items'::regclass \
+           AND attname = 'note' AND atttypid = 'extensions.citext'::regtype",
+        "app.items.note typed extensions.citext",
+    )
+    .await;
+    let plan = load()
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("reconciling the changed design again must not fail");
+    assert!(
+        plan.altered.is_empty(),
+        "a converged design altered: {:?}",
+        plan.altered
+    );
+}
+
 /// Source-hash drift handling for materialized views, end to end:
 /// 1. First reconcile CREATEs the matview and stamps a `dbd:hash=` comment.
 /// 2. Reconciling the SAME design SKIPs (no warning; oid unchanged).
