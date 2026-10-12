@@ -225,19 +225,32 @@ const REFRESH_COMMAND: &str = r#"^REFRESH MATERIALIZED VIEW (CONCURRENTLY )?"([^
 ///
 /// The owner's prefix is compared with `left`, not `LIKE`, whose `_` and `%`
 /// an owner's name may hold, and Postgres measures it as it measures the job's
-/// name: in bytes in a `SQL_ASCII` database, in characters elsewhere. The view
-/// is looked up only for a command in dbd's form — `CASE` keeps `to_regclass`
-/// from reading anything else. Empty lists still yield valid SQL via a typed
+/// name: in bytes in a `SQL_ASCII` database, in characters elsewhere. Whether
+/// a view exists is read from `pg_class`, which any role may read —
+/// `to_regclass` raises for a schema the role cannot use, and one such job
+/// failed every sync. Only a named job whose command is in dbd's form is looked
+/// at, `CASE` keeping the lookup from anything else.
+///
+/// Every project's sync goes for the same gone jobs, and pg_cron raises when
+/// asked to unschedule one already gone, so the statement first takes a lock
+/// held to the end of its transaction: syncs take turns, and the next one's
+/// read finds the job gone. Empty lists still yield valid SQL via a typed
 /// empty array (`ARRAY[]::text[]`).
 fn unschedule_stale_sql(owner: &str, keep_job_names: &[String], legacy_job_names: &[String]) -> String {
     let prefix = refresh_job_prefix(owner).replace('\'', "''");
     format!(
-        "SELECT cron.unschedule(jobid) FROM cron.job \
+        "SELECT pg_advisory_xact_lock(hashtext('dbd:cron')); \
+         SELECT cron.unschedule(jobid) FROM cron.job \
          WHERE (left(jobname, length('{prefix}')) = '{prefix}' AND jobname <> ALL({})) \
             OR jobname = ANY({}) \
-            OR (left(jobname, 12) = 'dbd:refresh:' AND CASE WHEN command ~ '{REFRESH_COMMAND}' \
-                  THEN to_regclass(substring(command from '^REFRESH MATERIALIZED VIEW (?:CONCURRENTLY )?(.*)$')) IS NULL \
-                  ELSE false END);",
+            OR (jobname IS NOT NULL AND left(jobname, 12) = 'dbd:refresh:' \
+                AND CASE WHEN command ~ '{REFRESH_COMMAND}' THEN NOT EXISTS ( \
+                      SELECT 1 FROM pg_catalog.pg_class c \
+                      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                      WHERE '\"' || replace(n.nspname, '\"', '\"\"') || '\".\"' \
+                            || replace(c.relname, '\"', '\"\"') || '\"' \
+                          = substring(command from '^REFRESH MATERIALIZED VIEW (?:CONCURRENTLY )?(.*)$')) \
+                    ELSE false END);",
         text_array(keep_job_names),
         text_array(legacy_job_names),
     )
