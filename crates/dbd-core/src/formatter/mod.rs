@@ -768,6 +768,56 @@ mod tests {
         assert!(out.trim_end().ends_with("); -- c"), "{out}");
     }
 
+    /// A table is laid out whatever its literals, names and clauses — as
+    /// long as the layout means the same. Each of these was recased and left
+    /// as written: the layout re-spelled `U&'d\0061t'` as `U&'dat'`, skipped
+    /// any statement with a `$$` string, lowercased a quoted name or dropped
+    /// its quotes, wrote a column's CHECK as `check (check (…))`, dropped a
+    /// column constraint's name, and wrote nothing after the column list.
+    #[test]
+    fn a_table_is_laid_out_whatever_its_literals_names_and_clauses() {
+        for input in [
+            "create table t (id int, note text default U&'d\\0061t');",
+            "create table t (id int, note text default $$x$$);",
+            "create table t (id int, note text default $tag$x$tag$);",
+            "create table t (id int, \"Note\" text, \"a b\" int, \"x\"\"y\" int, \"note\" text);",
+            "create table t (id int, note text check (note <> 'x'), n int check (n > 0));",
+            "create table \"T\" (id int);",
+            "create table app.\"T\" (id int);",
+            "create table t (id int constraint nn not null, n int constraint n_pk primary key);",
+            "create table t (id int) with (fillfactor = 70);",
+            "create table t (id int) partition by range (id);",
+            "create table t (id int) inherits (u);",
+            "create table t (id int) tablespace pg_default;",
+            "create temp table t (id int);",
+            "create unlogged table if not exists t (id int);",
+            "-- header\ncreate table t (id int);",
+        ] {
+            for config in [
+                in_case(KeywordCase::Lower),
+                in_case(KeywordCase::Upper),
+                in_case(KeywordCase::Preserve),
+            ] {
+                let out = format_ddl(input, &config);
+                let first = out
+                    .lines()
+                    .find(|l| l.trim_start().starts_with("id"))
+                    .unwrap_or_default();
+                assert!(
+                    first.starts_with("  id                       "),
+                    "{:?} lays out:\n{input}\n--- into ---\n{out}",
+                    config.keyword_case
+                );
+                assert_eq!(meaning(&out), meaning(input), "{input}\n--- into ---\n{out}");
+                assert_eq!(
+                    opaque_tokens(&out),
+                    opaque_tokens(input),
+                    "{input}\n--- into ---\n{out}"
+                );
+            }
+        }
+    }
+
     // ── River formatter tests ─────────────────────────────
 
     fn river_config() -> FormatConfig {
