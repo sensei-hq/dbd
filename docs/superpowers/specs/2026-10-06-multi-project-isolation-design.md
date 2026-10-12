@@ -156,10 +156,12 @@ With `--prune-unowned` the run reports instead `unowned: public.tmp_report —
 dropped by --prune-unowned (public is shared with "billing")`.
 
 Entities owned by someone else are never candidates: `reconcile` and `diff`
-hide them, so they are neither drift nor orphans. A prune claims each table it
-is about to drop with the run's other claims, before any write: one another
-owner has claimed since the run read the registry is kept, naming that owner,
-and what is claimed is released once dropped. Removing an enum value rewrites
+hide them, so they are neither drift nor orphans. A table the design creates —
+whatever its file's path calls it — is never an orphan. A prune claims each
+table it is about to drop in the transaction that drops it, after the run's
+other writes: one another owner has claimed since the run read the registry is
+kept, naming that owner; a run that fails or is killed mid-prune keeps neither
+its drops nor those claims; and what is claimed is released once dropped. Removing an enum value rewrites
 every column of that type, so a column in another owner's table refuses it,
 before any write and under a dry run, naming the column and its owner. Ownership decides which
 orphans go; `managed_schemas`, through `restrict_snapshot_to_schemas`, stays as
