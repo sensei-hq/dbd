@@ -78,17 +78,23 @@ Taken in slice 2:
 - A run over more than one module checks every module's run as its dry run
   checks it — scope pin, guards, claims, migrations, hook files, imports —
   before the first module writes, so a refusal any module would meet comes
-  first. A reset previews every module (`Design::resetting_beside`: the
-  run's other modules' uses and holdings do not hold it back, their prod
-  marks still do) and is refused whole or run whole; its `--dry-run` passes
+  first. A reset previews every module, each beside the modules reset
+  before it (`Design::resetting_beside`: their uses and holdings do not hold
+  it back, their prod marks still do; the modules after it still hold what
+  they hold), and is refused whole or run whole; its `--dry-run` passes
   where it passes. An error past those checks — a statement the database
   refuses — still stops the run with the modules before it applied, as one
   project's run stops with its earlier statements committed.
 - A workspace's import reloads as one project's does: its first module
-  empties, together, every table the run reloads that exists by then
-  (`Design::emptying_for_import`), the others none — so `shared`'s reference
-  data reloads with the tables that hold keys to it, and `--module shared`
-  alone is refused naming them.
+  empties, together, every table the run reloads that exists by then, in
+  load order by the database's keys (`Design::emptying_for_import`), the
+  others none — so `shared`'s reference data reloads with the tables that
+  hold keys to it, and `--module shared` alone is refused naming them. An
+  import that fails names what it emptied and did not reload.
+- A workspace's deploy goes over the modules twice: every module's schema
+  (`Design::deploy_schema`: apply, grants), then every module's data
+  (`Design::deploy_data`: import, policies). No module migrates after the
+  import has emptied the tables it reloads.
 - Each `export:` entry is the module's that declares its entity; one no
   module declares stays with the first module, which warns about it once.
 - Each module's run is headed `module <name> (<owner>)`. `inspect --shared`

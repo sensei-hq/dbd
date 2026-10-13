@@ -12,10 +12,11 @@
 
 ## Next
 
-Slice 2 PR #62 (`feat/workspaces-run` → `feat/workspaces`): three reviews'
-findings fixed (fc497ff4) — preflight before any module writes, whole-or-nothing
-reset, -n/hooks, import together, export per module; plan/spec updated
-(3299354b). Full suites + focused re-review running; then CI, merge, slice 3.
+Slice 2 PR #62 (`feat/workspaces-run` → `feat/workspaces`): second re-review's
+findings fixed (2adf8a1d) — two-pass workspace deploy, failed import names what
+it emptied, keys/case-blind emptying, reconcile destructive preflight, reset
+beside earlier modules. Next: full suites, a last focused review, CI, merge;
+then slice 3 (scopes over modules, walking up from a module folder).
 
     gh pr checks 62
 
