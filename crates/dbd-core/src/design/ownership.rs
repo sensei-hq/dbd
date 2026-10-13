@@ -354,16 +354,26 @@ impl Design {
                 None => {}
             }
         }
-        owned.not_recording = adapter
+        owned.not_recording = self.not_recording(adapter, &found.recording).await?;
+        Ok(owned)
+    }
+
+    /// The other projects the database records that do not record their uses
+    /// — not in `recording` — sorted.
+    async fn not_recording(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        recording: &std::collections::BTreeSet<String>,
+    ) -> Result<Vec<String>> {
+        Ok(adapter
             .other_projects_meta()
             .await?
             .into_iter()
             .map(|m| m.project)
-            .filter(|p| p != self.owner() && !found.recording.contains(p))
+            .filter(|p| p != self.owner() && !recording.contains(p))
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
-            .collect();
-        Ok(owned)
+            .collect())
     }
 
     /// Claim what a prune is about to drop, in the transaction that drops it:
@@ -753,13 +763,28 @@ impl Design {
         }
         let objects: Vec<crate::adapter::Guarded> = guarded.iter().map(|(g, _)| g.clone()).collect();
         let found = adapter.dependents(self.owner(), &objects).await?;
+        // What nobody owns is guarded where a project might own it, by the
+        // rule `--prune` keeps such a table by: in a schema another owner
+        // uses, or anywhere while a project the database records does not
+        // record its uses.
+        let mut could_own = None;
+        if found.iter().any(|d| d.owner.is_none()) {
+            let known = adapter.ownership(self.owner(), &[]).await?;
+            could_own = Some((known.schema_users, self.not_recording(adapter, &known.recording).await?));
+        }
+        let phrase = |d: &crate::adapter::Dependence| match &d.owner {
+            Some(owner) => Some(format!("\"{owner}\" ({})", d.via)),
+            None => {
+                let (schema_users, not_recording) = could_own.as_ref()?;
+                let mut could: std::collections::BTreeSet<String> = not_recording.iter().cloned().collect();
+                could.extend(schema_users.get(&d.schema).into_iter().flatten().cloned());
+                let could: Vec<String> = could.into_iter().collect();
+                (!could.is_empty()).then(|| format!("{} (owned by nobody; maybe by {})", d.via, quoted(&could)))
+            }
+        };
         Ok((0..guarded.len())
             .map(|i| {
-                let uses: Vec<String> = found
-                    .iter()
-                    .filter(|d| d.guarded == i)
-                    .map(|d| format!("\"{}\" ({})", d.owner, d.via))
-                    .collect();
+                let uses: Vec<String> = found.iter().filter(|d| d.guarded == i).filter_map(phrase).collect();
                 (!uses.is_empty()).then(|| uses.join(", "))
             })
             .collect())

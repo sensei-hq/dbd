@@ -807,7 +807,8 @@ impl Bookkeeping {
                 GuardedPart::Index(n) => ("index", n.as_str()),
                 GuardedPart::Truncate => ("truncate", ""),
             };
-            let mut seen: std::collections::BTreeSet<(String, String)> = sqlx::query_as(DEPENDENTS_SQL)
+            // Each dependent once, by owner and name, with its schema.
+            let rows: Vec<(Option<String>, String, String)> = sqlx::query_as(DEPENDENTS_SQL)
                 .bind(&g.object.namespace)
                 .bind(&g.object.schema)
                 .bind(&g.object.name)
@@ -816,11 +817,13 @@ impl Bookkeeping {
                 .bind(owner)
                 .fetch_all(&self.pool)
                 .await
-                .map_err(read)?
+                .map_err(read)?;
+            let mut seen: std::collections::BTreeMap<(Option<String>, String), String> = rows
                 .into_iter()
+                .map(|(owner, via, schema)| ((owner, via), schema))
                 .collect();
             // A schema's uses are its entities' uses.
-            let uses: Vec<(String, String)> = sqlx::query_as(
+            let uses: Vec<(Option<String>, String)> = sqlx::query_as(
                 "SELECT owner, via FROM dbd.uses WHERE kind = 'entity' AND owner <> $2 \
                    AND (target = $1 OR ($4 AND (starts_with(target, 'relation:' || $5 || '.') \
                                                 OR starts_with(target, 'routine:' || $5 || '.')))) \
@@ -836,11 +839,18 @@ impl Bookkeeping {
             .map_err(read)?;
             // A truncate drops nothing a use could name.
             if part != "truncate" {
-                seen.extend(uses);
+                for key in uses {
+                    seen.entry(key).or_default();
+                }
             }
             found.extend(
                 seen.into_iter()
-                    .map(|(owner, via)| crate::adapter::Dependence { guarded: i, owner, via }),
+                    .map(|((owner, via), schema)| crate::adapter::Dependence {
+                        guarded: i,
+                        owner,
+                        via,
+                        schema,
+                    }),
             );
         }
         Ok(found)
@@ -889,11 +899,13 @@ impl Bookkeeping {
             "NULL::varchar"
         };
         // An extension's members — `deptype = 'e'` — are listed as the
-        // extension, once, whatever it is called.
+        // extension, once, whatever it is called; and what is part of another
+        // object — `deptype = 'i'`, a range type's constructors — as that
+        // object.
         let member = |class: &str, oid: &str| {
             format!(
                 "NOT EXISTS (SELECT 1 FROM pg_depend e WHERE e.classid = '{class}'::regclass \
-                 AND e.objid = {oid} AND e.deptype = 'e')"
+                 AND e.objid = {oid} AND e.objsubid = 0 AND e.deptype IN ('e', 'i'))"
             )
         };
         let sql = format!(
@@ -1386,8 +1398,12 @@ async fn release_in(
 /// further, dropping nothing: the table, every table inheriting from or a
 /// partition of one it empties, and every table whose foreign key points at
 /// one it empties. Each dependent is named by its owning
-/// relation, type or routine. Rows: the other owner, and the dependent as
-/// `kind schema.name`.
+/// relation, type or routine. A schema starts from all it holds: its
+/// relations, types and routines, and its collations, text search objects,
+/// operators, operator classes and families, and conversions — a column
+/// collated by one goes with it. Rows: the other owner — none for an entity
+/// nobody owns that stands on its own and is not the one dropped — the
+/// dependent as `kind schema.name`, and its schema.
 const DEPENDENTS_SQL: &str = "\
 WITH RECURSIVE \
 rel AS (SELECT c.oid, c.reltype FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -1435,6 +1451,17 @@ start(classid, objid, objsubid) AS ( \
             WHERE $1 = 'schema' AND n.nspname = $2 AND t.typrelid = 0 AND t.typelem = 0 \
   UNION ALL SELECT 'pg_proc'::regclass::oid, p.oid, 0 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
             WHERE $1 = 'schema' AND n.nspname = $2 \
+  UNION ALL SELECT x.classid, x.objid, 0 FROM pg_namespace n CROSS JOIN LATERAL ( \
+              SELECT 'pg_collation'::regclass::oid, oid FROM pg_collation WHERE collnamespace = n.oid \
+              UNION ALL SELECT 'pg_ts_config'::regclass::oid, oid FROM pg_ts_config WHERE cfgnamespace = n.oid \
+              UNION ALL SELECT 'pg_ts_dict'::regclass::oid, oid FROM pg_ts_dict WHERE dictnamespace = n.oid \
+              UNION ALL SELECT 'pg_ts_parser'::regclass::oid, oid FROM pg_ts_parser WHERE prsnamespace = n.oid \
+              UNION ALL SELECT 'pg_ts_template'::regclass::oid, oid FROM pg_ts_template WHERE tmplnamespace = n.oid \
+              UNION ALL SELECT 'pg_operator'::regclass::oid, oid FROM pg_operator WHERE oprnamespace = n.oid \
+              UNION ALL SELECT 'pg_opclass'::regclass::oid, oid FROM pg_opclass WHERE opcnamespace = n.oid \
+              UNION ALL SELECT 'pg_opfamily'::regclass::oid, oid FROM pg_opfamily WHERE opfnamespace = n.oid \
+              UNION ALL SELECT 'pg_conversion'::regclass::oid, oid FROM pg_conversion WHERE connamespace = n.oid \
+            ) x(classid, objid) WHERE $1 = 'schema' AND n.nspname = $2 \
   UNION ALL SELECT d.classid, d.objid, d.objsubid FROM pg_extension e \
             JOIN pg_depend d ON d.refclassid = 'pg_extension'::regclass AND d.refobjid = e.oid AND d.deptype = 'e' \
             WHERE $1 = 'extension' AND e.extname = $3 \
@@ -1472,10 +1499,11 @@ owning(classid, objid) AS ( \
   SELECT 'pg_type'::regclass::oid, k.contypid FROM walk w JOIN pg_constraint k \
          ON w.classid = 'pg_constraint'::regclass AND k.oid = w.objid AND k.conrelid = 0 AND k.contypid <> 0 \
 ), \
-found(namespace, schema, name, kind) AS ( \
+found(namespace, schema, name, kind, classid, objid) AS ( \
   SELECT 'relation', n.nspname, c.relname, \
          CASE c.relkind WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' WHEN 'S' THEN 'sequence' \
-                        WHEN 'f' THEN 'foreign table' WHEN 'c' THEN 'type' ELSE 'table' END \
+                        WHEN 'f' THEN 'foreign table' WHEN 'c' THEN 'type' ELSE 'table' END, \
+         'pg_class'::regclass::oid, c.oid \
   FROM owning w JOIN pg_class c0 ON w.classid = 'pg_class'::regclass AND c0.oid = w.objid \
   JOIN pg_class c ON c.oid = CASE WHEN c0.relkind IN ('i', 'I') \
                                   THEN (SELECT x.indrelid FROM pg_index x WHERE x.indexrelid = c0.oid) \
@@ -1484,15 +1512,22 @@ found(namespace, schema, name, kind) AS ( \
   UNION \
   SELECT 'relation', n.nspname, COALESCE(c.relname, t.typname), \
          CASE WHEN c.oid IS NULL THEN 'type' WHEN c.relkind = 'v' THEN 'view' \
-              WHEN c.relkind = 'm' THEN 'materialized view' ELSE 'table' END \
+              WHEN c.relkind = 'm' THEN 'materialized view' ELSE 'table' END, \
+         CASE WHEN c.oid IS NULL THEN 'pg_type'::regclass::oid ELSE 'pg_class'::regclass::oid END, \
+         COALESCE(c.oid, t.oid) \
   FROM owning w JOIN pg_type t ON w.classid = 'pg_type'::regclass AND t.oid = w.objid \
   LEFT JOIN pg_class c ON c.oid = t.typrelid \
   JOIN pg_namespace n ON n.oid = COALESCE(c.relnamespace, t.typnamespace) \
   UNION \
-  SELECT 'routine', n.nspname, p.proname, CASE p.prokind WHEN 'p' THEN 'procedure' ELSE 'function' END \
+  SELECT 'routine', n.nspname, p.proname, CASE p.prokind WHEN 'p' THEN 'procedure' ELSE 'function' END, \
+         'pg_proc'::regclass::oid, p.oid \
   FROM owning w JOIN pg_proc p ON w.classid = 'pg_proc'::regclass AND p.oid = w.objid \
   JOIN pg_namespace n ON n.oid = p.pronamespace \
 ) \
-SELECT DISTINCT o.owner, f.kind || ' ' || f.schema || '.' || f.name \
-FROM found f JOIN dbd.objects o ON o.namespace = f.namespace AND o.schema = f.schema AND o.name = f.name \
-WHERE o.owner <> $6";
+SELECT DISTINCT o.owner, f.kind || ' ' || f.schema || '.' || f.name, f.schema \
+FROM found f LEFT JOIN dbd.objects o ON o.namespace = f.namespace AND o.schema = f.schema AND o.name = f.name \
+WHERE o.owner IS DISTINCT FROM $6 \
+  AND (o.owner IS NOT NULL OR ( \
+    NOT (f.namespace = $1 AND f.schema = $2 AND f.name = $3) AND NOT ($1 = 'schema' AND f.schema = $2) \
+    AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = f.classid AND d.objid = f.objid \
+                    AND d.objsubid = 0 AND d.deptype IN ('i', 'a', 'e'))))";
