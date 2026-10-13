@@ -609,8 +609,9 @@ pub trait DatabaseAdapter: Send + Sync {
     }
     /// Hold the database's dbd write lock until [`Self::unlock_writes`] (#7):
     /// shared by a run that builds, exclusive for one that drops `CASCADE` by
-    /// what it read of other projects — a reset — so no other project's run
-    /// writes between its reads and its drops. A nested call shares the lock
+    /// what it read of other projects — a reset, a reconcile, an apply running
+    /// migrations — so no other project's run writes between its reads and its
+    /// drops. A nested call shares the lock
     /// already held. Waits a bounded time, then fails. Adapters without other
     /// projects to wait for need none.
     async fn lock_writes(&self, exclusive: bool) -> Result<()> {

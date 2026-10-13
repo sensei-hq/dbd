@@ -11081,8 +11081,9 @@ async fn a_reset_cannot_drop_what_another_project_claims_while_it_runs() {
 
 /// The same race through reconcile: its destructive write waited on the
 /// apply's lock, ran once the apply had claimed the table — dropping another
-/// project's column — and only then was reconcile refused. It claims before
-/// its first write instead (#7).
+/// project's column — and only then was reconcile refused. A reconcile waits
+/// for the runs writing to the database before it reads anything: the apply
+/// finishes, owning the table, and the reconcile is refused (#7).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reconcile_cannot_alter_what_another_project_claims_while_it_runs() {
     let (_pg, url) = start_pg().await;
@@ -11106,7 +11107,7 @@ async fn a_reconcile_cannot_alter_what_another_project_claims_while_it_runs() {
     );
 
     // shop starts once billing is held mid-run, and billing goes on once
-    // shop's write is waiting on it.
+    // shop's reconcile is waiting for it.
     let (applied, reconciled, ()) = tokio::time::timeout(std::time::Duration::from_secs(60), async {
         tokio::join!(
             billing.apply(&*b, None, false, None, Progress::none()),
@@ -11116,7 +11117,7 @@ async fn a_reconcile_cannot_alter_what_another_project_claims_while_it_runs() {
             },
             async {
                 await_lock_wait(&*setup, "blocker").await;
-                await_lock_wait(&*setup, "orders").await;
+                await_write_lock_wait(&*setup).await;
                 holder.rollback_batch().await.unwrap();
             }
         )
@@ -11124,16 +11125,24 @@ async fn a_reconcile_cannot_alter_what_another_project_claims_while_it_runs() {
     .await
     .expect("neither run may hang");
 
-    let err = applied
-        .expect_err("app.orders is shop's by the time billing claims")
+    applied.expect("billing's apply");
+    let err = reconciled
+        .expect_err("app.orders is billing's by the time shop's reconcile claims")
         .to_string();
-    assert!(err.contains("relation app.orders is owned by \"shop\""), "{err}");
-    reconciled.expect("shop's reconcile");
+    assert!(err.contains("relation app.orders is owned by \"billing\""), "{err}");
     assert_catalog(
         &*setup,
         true,
-        &owned_by("relation", "app", "orders", "table", "shop"),
-        "shop's app.orders",
+        "SELECT 1 FROM information_schema.columns WHERE table_schema = 'app' \
+         AND table_name = 'orders' AND column_name = 'total'",
+        "billing's app.orders.total",
+    )
+    .await;
+    assert_catalog(
+        &*setup,
+        true,
+        &owned_by("relation", "app", "orders", "table", "billing"),
+        "billing's app.orders",
     )
     .await;
 }

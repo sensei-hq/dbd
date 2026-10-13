@@ -391,13 +391,15 @@ impl Design {
         D: FnMut(&str, Option<&str>),
         C: FnMut(crate::reconcile::ReconcileComplete),
     {
-        // A real run holds the database's dbd write lock, shared, as an apply
-        // does (#7).
+        // A real run holds the database's dbd write lock, exclusive, from its
+        // first read to its last write (#7): its drops `CASCADE` by what the
+        // guard read of other projects, so no other project's run writes
+        // between the two.
         let run = self.reconcile_run(adapter, dry_run, allow_destructive, prune.into(), scope, progress);
         if dry_run {
             return run.await;
         }
-        ownership::with_write_lock(adapter, false, run).await
+        ownership::with_write_lock(adapter, true, run).await
     }
 
     /// [`Design::reconcile`]'s run, under the write lock when it writes.

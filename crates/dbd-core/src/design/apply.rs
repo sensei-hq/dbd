@@ -268,14 +268,18 @@ impl Design {
         D: FnMut(&str, Option<&str>),
         C: FnMut(ApplyComplete),
     {
-        // A real run holds the database's dbd write lock, shared, from its
-        // first read to its last write: another project's reset waits for it
-        // and reads what it built, and it waits for one (#7).
+        // A real run holds the database's dbd write lock from its first read
+        // to its last write (#7): shared to build, so another project's reset
+        // waits for it and reads what it built; exclusive to run migrations,
+        // whose drops `CASCADE` by what the guard read of other projects, so
+        // no other project's run writes between the two.
         let run = self.apply_run(adapter, name, dry_run, scope, progress);
         if dry_run {
             return run.await;
         }
-        ownership::with_write_lock(adapter, false, run).await
+        let migrates = !adapter.prefers_batch_apply()
+            && !snapshot::pending_migrations(adapter.get_db_version().await?, &self.project_dir).is_empty();
+        ownership::with_write_lock(adapter, migrates, run).await
     }
 
     /// [`Design::apply`]'s run, under the write lock when it writes.
