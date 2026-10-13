@@ -61,6 +61,28 @@ Taken in slice 1:
 - `Workspace::config` is the manifest as written — its `apply:` hooks, which
   run around the whole workspace, and its `scopes:`.
 
+Taken in slice 2:
+
+- `Workspace::select(module)` is what a run that builds or reads goes over:
+  every module, or the module and every module it depends on, in load order;
+  the manifest's `apply.before` runs ahead of the first module's own, its
+  `apply.after` behind the last's, read from the project folder, in that
+  module's run. `Workspace::selected_to_reset(module)` is every module in
+  reverse, or the module alone — never its dependencies, which are other
+  owners. Each module connects as its owner (`Design::owner`, now public).
+- `--module` is a global flag; on a design without `modules:` it is refused.
+  `-n` in a workspace runs in the module declaring the entity.
+- Each module's run is headed `module <name> (<owner>)`. `inspect --shared`
+  lists what shares the database once, then each module's conflicts; `diff`
+  answers for every module — `--exit-code` over all, `--json` one document,
+  `{"modules": [{"module", "owner", "diff"}]}` (a project's is its diff, as
+  before); a policy failing in one module is reported, the modules after it
+  still run, and the run fails at the end.
+- Still refusing a workspace: `format` and `doctor` (slice 4, with
+  `snapshot` and `release`), `combine`, `emit`, `graph`, `dbml` and `diagram`
+  (slice 5, with the viewer), `init` and `merge` (onboarding a workspace is
+  `dbd split`, slice 6).
+
 ## Slices
 
 Each is red tests first, then the implementation, a focused review, CI, and a

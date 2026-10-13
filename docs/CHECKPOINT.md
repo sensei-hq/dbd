@@ -12,12 +12,13 @@
 
 ## Next
 
-Slice 2 on `feat/workspaces-run`: red tests committed (05e41ea7). Implement
-`Workspace::select`/`selected_to_reset`, the manifest's hooks as a hook phase
-of the first/last module's design, a global `--module`, and the per-module CLI
-loop connecting as each module's owner.
+Slice 2 on `feat/workspaces-run`: implemented (eb024a24, 0daf688a) — modules
+run in order as their owners, `--module`, the manifest's hooks around the run,
+T21 green; plan records the decisions. Next: full suites, PR into
+`feat/workspaces`, adversarial review, CI, merge; then slice 3 (scopes over
+modules, walking up from a module folder).
 
-    cargo test -p dbd-core --test workspace_select && cargo test --test workspace_inspect
+    cargo test --features embedded-tests --test cli_live
 
 ## Open
 
