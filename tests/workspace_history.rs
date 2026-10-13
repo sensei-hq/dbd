@@ -214,6 +214,7 @@ fn a_whole_workspace_release_skips_what_is_released() {
 fn format_and_doctor_take_a_module() {
     let tmp = tempfile::tempdir().unwrap();
     shop(tmp.path());
+    assert!(dbd(tmp.path(), &["format"]).status.success());
     write(
         tmp.path(),
         "shared/ddl/table/app/rates.ddl",

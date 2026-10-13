@@ -134,7 +134,7 @@ pub async fn cmd_reset(
                     .await?;
                 anyhow::Ok(())
             };
-            check.await.with_context(|| reset.label().unwrap_or_default())?;
+            reset.labelled(check.await)?;
         }
     }
     for (i, reset) in targets.into_iter().enumerate() {
@@ -459,21 +459,13 @@ pub(crate) async fn migrate_status_with_adapter(
 
 #[allow(clippy::too_many_arguments)]
 pub fn cmd_snapshot_list(config: &Path, project_dir: &Path, module: Option<&str>, verbosity: Verbosity) -> Result<()> {
-    let folders = super::file_folders(config, project_dir)?;
+    let folders = super::file_folders(config, project_dir, module)?;
     let in_workspace = folders.iter().any(|(m, _)| m.is_some());
     let project = in_workspace
         .then(|| dbd_core::config::read(config).map(|c| c.project.name))
         .transpose()?;
-    if let Some(wanted) = module
-        && !folders.iter().any(|(m, _)| m.as_deref() == Some(wanted))
-    {
-        anyhow::bail!("no module \"{wanted}\" in {}", config.display());
-    }
     let mut first = true;
     for (name, dir) in folders {
-        if module.is_some() && name.as_deref() != module {
-            continue;
-        }
         if let (Some(name), Some(project)) = (&name, &project) {
             let label = format!("module {name} ({project}/{name})");
             output::always(&if first { label } else { format!("\n{label}") });

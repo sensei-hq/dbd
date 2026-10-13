@@ -754,52 +754,46 @@ pub fn set_released(config_path: &Path, released: bool) -> Result<()> {
 /// `None`, of the project, `project.version` (#7): a workspace's modules each
 /// have their own.
 pub fn update_version_of(config_path: &Path, module: Option<&str>, version: u32) -> Result<()> {
-    let took = |c: &DesignConfig| match module {
-        None => c.project.version == Some(version),
-        Some(m) => c.modules.get(m).is_some_and(|m| m.version == Some(version)),
-    };
-    set_key(config_path, module, "version", &version.to_string(), took)
+    set_key(config_path, module, "version", &version.to_string())
 }
 
 /// Set the release flag of `module` — `modules.<module>.released` — or, with
 /// `None`, of the project (#7).
 pub fn set_released_of(config_path: &Path, module: Option<&str>, released: bool) -> Result<()> {
-    let took = |c: &DesignConfig| match module {
-        None => c.project.released == released,
-        Some(m) => c.modules.get(m).is_some_and(|m| m.released == released),
-    };
-    set_key(config_path, module, "released", &released.to_string(), took)
+    set_key(config_path, module, "released", &released.to_string())
 }
 
-/// Set one scalar `key` in the project's block, or in `module`'s under
-/// `modules:` — see [`set_project_key`].
-fn set_key(
-    config_path: &Path,
-    module: Option<&str>,
-    key: &str,
-    value: &str,
-    took: impl Fn(&DesignConfig) -> bool,
-) -> Result<()> {
-    let Some(module) = module else {
-        return set_project_key(config_path, key, value, took);
-    };
+/// Set one scalar `key` under `project:`, or under `modules.<module>`,
+/// editing that line in place.
+///
+/// design.yaml is hand-written: re-serialising it through serde dropped every
+/// comment, blank line and flow-style list each time `dbd snapshot` bumped the
+/// version. The edit touches one line (or adds one at the end of the block);
+/// the result must read as the file did with that one key set — every other
+/// value as it was — and a layout the line edit gets wrong, or cannot handle,
+/// falls back to the whole-file rewrite rather than guessing.
+fn set_key(config_path: &Path, module: Option<&str>, key: &str, value: &str) -> Result<()> {
     // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     let content = std::fs::read_to_string(config_path)
         .map_err(|e| DbdError::Config(format!("Cannot read {}: {}", config_path.display(), e)))?;
-    let edited = edit_module_key(&content, module, key, value)
-        .filter(|out| serde_yaml::from_str::<DesignConfig>(out).is_ok_and(|c| took(&c)));
+    let mut expected: serde_yaml::Value = serde_yaml::from_str(&content)?;
+    let parsed: serde_yaml::Value = serde_yaml::from_str(value)?;
+    let block = match module {
+        None => &mut expected["project"],
+        Some(module) => &mut expected["modules"][module],
+    };
+    if block.is_null() {
+        *block = serde_yaml::Value::Mapping(Default::default());
+    }
+    block[key] = parsed;
+    let edited = match module {
+        None => edit_project_key(&content, key, value),
+        Some(module) => edit_module_key(&content, module, key, value),
+    }
+    .filter(|out| serde_yaml::from_str::<serde_yaml::Value>(out).is_ok_and(|v| v == expected));
     let output = match edited {
         Some(out) => out,
-        None => {
-            let mut doc: serde_yaml::Value = serde_yaml::from_str(&content)?;
-            let parsed: serde_yaml::Value = serde_yaml::from_str(value)?;
-            let entry = &mut doc["modules"][module];
-            if entry.is_null() {
-                *entry = serde_yaml::Value::Mapping(Default::default());
-            }
-            entry[key] = parsed;
-            serde_yaml::to_string(&doc)?
-        }
+        None => serde_yaml::to_string(&expected)?,
     };
     // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     std::fs::write(config_path, output)?;
@@ -861,34 +855,6 @@ fn edit_module_key(content: &str, module: &str, key: &str, value: &str) -> Optio
         out.insert(last + 1, format!("{key_prefix} {value}\n"));
     }
     Some(out.concat())
-}
-
-/// Set one scalar `key` under `project:`, editing that line in place.
-///
-/// design.yaml is hand-written: re-serialising it through serde dropped every
-/// comment, blank line and flow-style list each time `dbd snapshot` bumped the
-/// version. The edit touches one line (or adds one at the end of the
-/// `project:` block); the result is re-parsed and must say what was asked, and
-/// a layout the line edit cannot handle — a flow-style `project: {…}` — falls
-/// back to the old whole-file rewrite rather than guessing.
-fn set_project_key(config_path: &Path, key: &str, value: &str, took: impl Fn(&DesignConfig) -> bool) -> Result<()> {
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    let content = std::fs::read_to_string(config_path)
-        .map_err(|e| DbdError::Config(format!("Cannot read {}: {}", config_path.display(), e)))?;
-    let edited = edit_project_key(&content, key, value)
-        .filter(|out| serde_yaml::from_str::<DesignConfig>(out).is_ok_and(|c| took(&c)));
-    let output = match edited {
-        Some(out) => out,
-        None => {
-            let mut doc: serde_yaml::Value = serde_yaml::from_str(&content)?;
-            let parsed: serde_yaml::Value = serde_yaml::from_str(value)?;
-            doc["project"][key] = parsed;
-            serde_yaml::to_string(&doc)?
-        }
-    };
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    std::fs::write(config_path, output)?;
-    Ok(())
 }
 
 /// `content` with `key: value` set inside the block-style `project:` mapping,

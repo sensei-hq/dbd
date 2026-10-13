@@ -281,13 +281,22 @@ impl Workspace {
     /// `project_dir` — read without loading any module's design, for the
     /// commands that go over the files of a workspace (`format`, `doctor`,
     /// `snapshot --list`). Empty for a design without `modules:`. Refuses a
-    /// folder outside the project.
+    /// folder outside the project, or one that is not there.
     pub fn folders(config_path: &Path, project_dir: &Path) -> Result<Vec<(String, PathBuf)>> {
         let manifest = crate::config::read(config_path)?;
         manifest
             .modules
             .iter()
-            .map(|(name, module)| Ok((name.clone(), project_dir.join(module_folder(name, module)?))))
+            .map(|(name, module)| {
+                let dir = project_dir.join(module_folder(name, module)?);
+                if !dir.is_dir() {
+                    return Err(DbdError::Config(format!(
+                        "module \"{name}\": its folder {} does not exist",
+                        dir.display()
+                    )));
+                }
+                Ok((name.clone(), dir))
+            })
             .collect()
     }
 

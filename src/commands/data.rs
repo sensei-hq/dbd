@@ -274,7 +274,7 @@ async fn preflight_import(
                 .await?;
             anyhow::Ok(())
         };
-        check.await.with_context(|| target.label().unwrap_or_default())?;
+        target.labelled(check.await)?;
     }
     Ok(())
 }
