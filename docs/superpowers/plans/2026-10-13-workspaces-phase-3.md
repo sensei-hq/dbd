@@ -151,13 +151,19 @@ Taken in slice 4:
   `config::update_version_of` / `set_released_of`. Its snapshots and
   migrations are in its folder: `snapshot::create_snapshot_of` /
   `create_baseline_snapshot_of`, which name the module (`Design::module`).
+- An edit in place must read as the file did with that one key set — every
+  other value as it was — or the file is rewritten whole.
 - `snapshot` and `release` go over every module, or `--module` alone, never
-  a scope (a snapshot records the design); a whole-workspace `release` skips
-  the modules already released and refuses only when none is left.
-  `snapshot --list`, `format` and `doctor` go over each module's folder
-  (`Workspace::folders`, without loading designs).
-- `reconcile` refuses a run holding a released module before anything
-  connects, naming it; the other modules reconcile with `--module`.
+  a scope (a snapshot records the design). A `release` checks every module
+  it releases before writing any; a whole-workspace `release` skips the
+  modules already released and refuses only when none is left.
+  `snapshot --list`, `format` and `doctor` go over each module's folder —
+  or `--module`'s, or the folder dbd runs in — without loading designs
+  (`Workspace::folders`, which refuses a folder that is not there); `doctor`
+  audits a design.yaml it cannot parse as a project's, as before.
+- A released module changes by snapshot and `dbd apply`: `reconcile` refuses
+  the module asked for if it is released, and leaves out — saying so — a
+  released module the run takes in otherwise, a dependency included.
 
 ## Slices
 

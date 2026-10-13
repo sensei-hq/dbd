@@ -16,10 +16,11 @@
 
 ## Next
 
-Slice 4 on `feat/workspaces-history`: implemented (fee3ce4d) — per-module
-versions and releases written in place, snapshots and migrations per module
-folder, snapshot/release/format/doctor over modules. Next: full suites, PR into
-`feat/workspaces`, review, CI, merge; then slice 5 (viewer and outputs).
+Slice 4 PR #64 (`feat/workspaces-history` → `feat/workspaces`): review findings
+fixed (c5625677) and the plan updated. Next: full suites, CI, merge; then slice
+5 (viewer grouping and outputs: dbml, diagram, graph, combine, emit).
+
+    gh pr checks 64
 
 ## Open
 
