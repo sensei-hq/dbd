@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use dbd_core::design::{ApplyComplete, Progress};
-use dbd_core::{Design, Entity, EntityType};
+use dbd_core::{Design, Entity, EntityType, Workspace};
 
 use super::{format_apply_summary, format_in_place, get_adapter, safe_canonicalize_within};
 use crate::output::{self, Verbosity};
@@ -121,10 +121,93 @@ pub async fn cmd_inspect(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let mut design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
-    warn_if_no_authored_ddl(&design, project_dir);
+    let workspace = Workspace::load(config, env, Some(project_dir)).context("Failed to load design")?;
+    let inspect = Inspect {
+        config,
+        database_url,
+        name,
+        fix,
+        use_database,
+        scope,
+        deps,
+        verbosity,
+    };
+    let blocking = if workspace.has_modules() {
+        inspect_modules(workspace, &inspect).await?
+    } else {
+        let mut design = workspace.into_modules().remove(0).into_design();
+        warn_if_no_authored_ddl(&design, project_dir);
+        inspect_design(&mut design, project_dir, &inspect).await?
+    };
 
-    resolve_inspect_refs(&mut design, config, database_url, use_database, verbosity).await?;
+    // Report first, then fail. The findings are the useful output; an early
+    // return would print an "Error:" line instead of them.
+    let code = inspect_exit_code(blocking);
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
+}
+
+/// What `dbd inspect` was asked, for each design it inspects.
+struct Inspect<'a> {
+    config: &'a Path,
+    database_url: Option<&'a str>,
+    name: Option<&'a str>,
+    fix: bool,
+    use_database: bool,
+    scope: Option<&'a str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
+    verbosity: Verbosity,
+}
+
+/// Inspect each module of a workspace in `depends_on` order — or, with `-n`,
+/// the module declaring that entity — and return the blocking findings of
+/// all of them. The workspace's own checks (T19, T20) ran as it loaded.
+async fn inspect_modules(workspace: Workspace, inspect: &Inspect<'_>) -> Result<usize> {
+    // Scopes select modules in a workspace. Until they do, a scope resolved
+    // within each module would select as if that module were the design.
+    if inspect.scope.is_some() || inspect.deps.is_some() {
+        anyhow::bail!("--scope and --deps do not select over a design with modules: yet — inspect without them");
+    }
+    let mut modules = workspace.into_modules();
+    if let Some(n) = inspect.name {
+        modules.retain(|m| {
+            m.design()
+                .resolve_name(n, None)
+                .is_ok_and(|e| e.entity_type != EntityType::External)
+        });
+        if modules.is_empty() {
+            anyhow::bail!("no module declares {n}");
+        }
+    }
+    let mut blocking = 0;
+    for (i, module) in modules.iter_mut().enumerate() {
+        let label = format!("module {} ({})", module.name().unwrap_or_default(), module.owner());
+        output::always(&if i == 0 { label } else { format!("\n{label}") });
+        let dir = module.design().project_dir().to_path_buf();
+        if module.design().authored_entity_count() == 0 {
+            output::warn(&format!("no authored DDL found under '{}/ddl'", dir.display()));
+        }
+        blocking += inspect_design(module.design_mut(), &dir, inspect).await?;
+    }
+    Ok(blocking)
+}
+
+/// Inspect one design — a project, or one module of a workspace — printing
+/// its findings and summary, and return how many of them block.
+async fn inspect_design(design: &mut Design, project_dir: &Path, inspect: &Inspect<'_>) -> Result<usize> {
+    let &Inspect {
+        config,
+        database_url,
+        name,
+        fix,
+        use_database,
+        scope,
+        deps,
+        verbosity,
+    } = inspect;
+    resolve_inspect_refs(design, config, database_url, use_database, verbosity).await?;
 
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
     // Resolve the working set the way every run does, before reporting on it.
@@ -260,13 +343,7 @@ pub async fn cmd_inspect(
         ));
     }
 
-    // Report first, then fail. The findings above are the useful output; an
-    // early return would print an "Error:" line instead of them.
-    let code = inspect_exit_code(blocking);
-    if code != 0 {
-        std::process::exit(code);
-    }
-    Ok(())
+    Ok(blocking)
 }
 
 /// Resolve unknown references against the live DB (persisting a refcache) or,

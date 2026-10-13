@@ -29,11 +29,18 @@ fn shop(root: &Path) {
         "project:\n  name: shop\n\nschemas:\n  - app\n\n\
          modules:\n  core:\n    depends_on: [shared]\n  shared:\n    note: Reference data\n",
     );
-    write(root, "shared/ddl/table/app/currencies.ddl", &table("currencies", "code text primary key"));
+    write(
+        root,
+        "shared/ddl/table/app/currencies.ddl",
+        &table("currencies", "code text primary key"),
+    );
     write(
         root,
         "core/ddl/table/app/orders.ddl",
-        &table("orders", "id integer primary key\n, currency text references currencies (code)"),
+        &table(
+            "orders",
+            "id integer primary key\n, currency text references currencies (code)",
+        ),
     );
 }
 
@@ -57,7 +64,11 @@ fn a_design_without_modules_is_a_workspace_of_one_owned_by_its_project() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     write(root, "design.yaml", "project:\n  name: shop\n\nschemas:\n  - app\n");
-    write(root, "ddl/table/app/orders.ddl", &table("orders", "id integer primary key"));
+    write(
+        root,
+        "ddl/table/app/orders.ddl",
+        &table("orders", "id integer primary key"),
+    );
 
     let workspace = load(root).expect("load");
     assert!(!workspace.has_modules());
@@ -80,7 +91,11 @@ fn each_module_is_a_design_of_its_own_rooted_at_its_folder() {
     let workspace = load(root).expect("load");
     assert!(workspace.has_modules());
     let owners: Vec<&str> = workspace.modules().iter().map(|m| m.owner()).collect();
-    assert_eq!(owners, ["shop/shared", "shop/core"], "a dependency loads before its dependents");
+    assert_eq!(
+        owners,
+        ["shop/shared", "shop/core"],
+        "a dependency loads before its dependents"
+    );
 
     let shared = &workspace.modules()[0];
     let core = &workspace.modules()[1];
@@ -92,7 +107,11 @@ fn each_module_is_a_design_of_its_own_rooted_at_its_folder() {
     assert_eq!(core.design().config().project.name, "shop/core");
 
     assert_eq!(kind_of(shared.design(), "app.currencies"), Some(EntityType::Table));
-    assert_eq!(kind_of(shared.design(), "app.orders"), None, "a module knows nothing of its dependents");
+    assert_eq!(
+        kind_of(shared.design(), "app.orders"),
+        None,
+        "a module knows nothing of its dependents"
+    );
     assert_eq!(kind_of(core.design(), "app.orders"), Some(EntityType::Table));
     assert_eq!(
         kind_of(core.design(), "app.currencies"),
@@ -171,7 +190,11 @@ fn a_module_may_be_rooted_at_the_project_folder() {
         "design.yaml",
         "project:\n  name: p\n\nschemas:\n  - app\n\nmodules:\n  core:\n    path: .\n  extra: {}\n",
     );
-    write(root, "ddl/table/app/orders.ddl", &table("orders", "id integer primary key"));
+    write(
+        root,
+        "ddl/table/app/orders.ddl",
+        &table("orders", "id integer primary key"),
+    );
     std::fs::create_dir_all(root.join("extra")).unwrap();
 
     let workspace = load(root).expect("load");
@@ -198,7 +221,9 @@ fn a_modules_version_release_and_hooks_are_its_own() {
     std::fs::create_dir_all(root.join("core")).unwrap();
 
     let workspace = load(root).expect("load");
-    let [shared, core] = workspace.modules() else { panic!("two modules") };
+    let [shared, core] = workspace.modules() else {
+        panic!("two modules")
+    };
 
     let core = core.design().config();
     assert_eq!(core.project.version, Some(3));
@@ -210,7 +235,10 @@ fn a_modules_version_release_and_hooks_are_its_own() {
     let shared = shared.design().config();
     assert_eq!(shared.project.version, None);
     assert!(!shared.project.released);
-    assert!(shared.apply.before.is_empty(), "the manifest's hooks are not a module's");
+    assert!(
+        shared.apply.before.is_empty(),
+        "the manifest's hooks are not a module's"
+    );
 }
 
 #[test]
@@ -230,7 +258,11 @@ fn design_from_config_refuses_a_design_with_modules() {
 
 /// `design.yaml` with `modules` as its block, and a folder for each module.
 fn workspace_with(root: &Path, modules: &str, folders: &[&str]) {
-    write(root, "design.yaml", &format!("project:\n  name: p\n\nmodules:\n{modules}"));
+    write(
+        root,
+        "design.yaml",
+        &format!("project:\n  name: p\n\nmodules:\n{modules}"),
+    );
     for folder in folders {
         std::fs::create_dir_all(root.join(folder)).unwrap();
     }
@@ -285,13 +317,12 @@ fn a_module_without_its_folder_is_refused() {
 #[test]
 fn two_modules_sharing_a_folder_are_refused() {
     let tmp = tempfile::tempdir().unwrap();
-    workspace_with(
-        tmp.path(),
-        "  a:\n    path: db\n  b:\n    path: ./db\n",
-        &["db"],
-    );
+    workspace_with(tmp.path(), "  a:\n    path: db\n  b:\n    path: ./db\n", &["db"]);
     let err = load_err(tmp.path());
-    assert!(err.contains("\"a\"") && err.contains("\"b\"") && err.contains("folder"), "{err}");
+    assert!(
+        err.contains("\"a\"") && err.contains("\"b\"") && err.contains("folder"),
+        "{err}"
+    );
 }
 
 /// A module's name is half its owner's, `<project>/<module>`, and its default
@@ -311,7 +342,11 @@ fn a_module_name_that_cannot_name_an_owner_is_refused() {
 #[test]
 fn an_unknown_key_in_a_module_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
-    workspace_with(tmp.path(), "  core:\n    dependson: [shared]\n  shared: {}\n", &["core", "shared"]);
+    workspace_with(
+        tmp.path(),
+        "  core:\n    dependson: [shared]\n  shared: {}\n",
+        &["core", "shared"],
+    );
     let err = load_err(tmp.path());
     assert!(err.contains("dependson"), "{err}");
 }
@@ -323,7 +358,11 @@ fn a_project_version_or_release_in_a_workspace_is_refused() {
     for key in ["version: 2", "released: true"] {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        write(root, "design.yaml", &format!("project:\n  name: p\n  {key}\n\nmodules:\n  core: {{}}\n"));
+        write(
+            root,
+            "design.yaml",
+            &format!("project:\n  name: p\n  {key}\n\nmodules:\n  core: {{}}\n"),
+        );
         std::fs::create_dir_all(root.join("core")).unwrap();
         let err = load_err(root);
         let field = key.split(':').next().unwrap();
@@ -345,7 +384,10 @@ fn a_root_folder_no_module_holds_is_refused() {
         write(root, &format!("{folder}/file.sql"), "select 1;\n");
         let err = load_err(root);
         let top = folder.split('/').next().unwrap();
-        assert!(err.contains(&format!("{top}/")) && err.contains("no module"), "{folder}: {err}");
+        assert!(
+            err.contains(&format!("{top}/")) && err.contains("no module"),
+            "{folder}: {err}"
+        );
     }
 }
 
@@ -364,7 +406,11 @@ fn two_modules_declaring_the_same_entity_are_refused() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     shop(root);
-    write(root, "core/ddl/table/app/currencies.ddl", &table("currencies", "code text primary key"));
+    write(
+        root,
+        "core/ddl/table/app/currencies.ddl",
+        &table("currencies", "code text primary key"),
+    );
 
     let err = load_err(root);
     assert!(
@@ -408,7 +454,10 @@ fn a_reference_into_a_module_that_is_not_a_dependency_is_a_gap() {
     let err = load_err(root);
     assert!(err.contains("dependency gap"), "{err}");
     assert!(err.contains("app.orders") && err.contains("app.currencies"), "{err}");
-    assert!(err.contains("modules.core.depends_on") && err.contains("shared"), "{err}");
+    assert!(
+        err.contains("modules.core.depends_on") && err.contains("shared"),
+        "{err}"
+    );
 }
 
 /// What a dependency depends on is deployed before the module too.
@@ -422,12 +471,19 @@ fn a_reference_into_a_transitive_dependency_is_not_a_gap() {
         "project:\n  name: p\n\nschemas:\n  - app\n\n\
          modules:\n  base: {}\n  mid:\n    depends_on: [base]\n  top:\n    depends_on: [mid]\n",
     );
-    write(root, "base/ddl/table/app/currencies.ddl", &table("currencies", "code text primary key"));
+    write(
+        root,
+        "base/ddl/table/app/currencies.ddl",
+        &table("currencies", "code text primary key"),
+    );
     std::fs::create_dir_all(root.join("mid")).unwrap();
     write(
         root,
         "top/ddl/table/app/orders.ddl",
-        &table("orders", "id integer primary key\n, currency text references currencies (code)"),
+        &table(
+            "orders",
+            "id integer primary key\n, currency text references currencies (code)",
+        ),
     );
 
     load(root).expect("a dependency of a dependency is reachable");
@@ -443,7 +499,10 @@ fn a_reference_no_module_declares_stays_a_warning() {
     write(
         root,
         "core/ddl/table/app/orders.ddl",
-        &table("orders", "id integer primary key\n, ghost_id integer references ghosts (id)"),
+        &table(
+            "orders",
+            "id integer primary key\n, ghost_id integer references ghosts (id)",
+        ),
     );
 
     let workspace = load(root).expect("load");
@@ -455,7 +514,10 @@ fn a_reference_no_module_declares_stays_a_warning() {
         .find(|e| e.name == "app.orders")
         .unwrap();
     assert!(
-        orders.warnings.iter().any(|w| w.contains("Unresolved reference: app.ghosts")),
+        orders
+            .warnings
+            .iter()
+            .any(|w| w.contains("Unresolved reference: app.ghosts")),
         "{:?}",
         orders.warnings
     );

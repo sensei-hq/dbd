@@ -48,11 +48,18 @@ fn shop(dir: &Path) {
         "project:\n  name: shop\n\nschemas:\n  - app\n\n\
          modules:\n  shared: {}\n  core:\n    depends_on: [shared]\n",
     );
-    write(dir, "shared/ddl/table/app/currencies.ddl", &table("currencies", "code text primary key"));
+    write(
+        dir,
+        "shared/ddl/table/app/currencies.ddl",
+        &table("currencies", "code text primary key"),
+    );
     write(
         dir,
         "core/ddl/table/app/orders.ddl",
-        &table("orders", "id integer primary key\n, currency text references currencies (code)"),
+        &table(
+            "orders",
+            "id integer primary key\n, currency text references currencies (code)",
+        ),
     );
 }
 
@@ -92,7 +99,11 @@ fn inspect_fails_on_an_error_in_any_module() {
 fn inspect_refuses_two_modules_declaring_the_same_entity() {
     let tmp = tempfile::tempdir().unwrap();
     shop(tmp.path());
-    write(tmp.path(), "core/ddl/table/app/currencies.ddl", &table("currencies", "code text primary key"));
+    write(
+        tmp.path(),
+        "core/ddl/table/app/currencies.ddl",
+        &table("currencies", "code text primary key"),
+    );
 
     let out = dbd(tmp.path(), &["inspect"]);
     let text = text(&out);

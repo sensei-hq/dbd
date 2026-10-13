@@ -35,6 +35,11 @@ pub struct DesignConfig {
     pub ignore: Vec<String>,
     #[serde(default)]
     pub format: FormatConfig,
+    /// The modules of a workspace (#7), in the order written. Empty for a
+    /// project without them: a workspace of one, the project itself. See
+    /// [`crate::design::Workspace`].
+    #[serde(default)]
+    pub modules: IndexMap<String, ModuleConfig>,
 }
 
 impl DesignConfig {
@@ -176,6 +181,35 @@ impl ProjectConfig {
     pub fn version(&self) -> u32 {
         self.version.unwrap_or(DEFAULT_PROJECT_VERSION)
     }
+}
+
+// ── Modules ─────────────────────────────────────────────
+
+/// One module of a workspace: `modules.<name>` (#7).
+///
+/// A module is a design of its own, owned by `<project>/<module>` and rooted at
+/// its folder. What it shares with the other modules — targets, schemas,
+/// `source`, `import` options, format — is the manifest's; what is its own is
+/// here. Unknown keys are refused: a misspelt `depends_on` would quietly leave
+/// a module without its dependencies.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleConfig {
+    pub note: Option<String>,
+    /// The modules this one references, deployed before it.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    /// Its folder, relative to the project directory; `<name>` when absent.
+    pub path: Option<String>,
+    /// As [`ProjectConfig::version`], for this module.
+    pub version: Option<u32>,
+    /// As [`ProjectConfig::released`], for this module.
+    #[serde(default)]
+    pub released: bool,
+    /// This module's hooks; the manifest's own `apply:` runs once around the
+    /// whole workspace.
+    #[serde(default)]
+    pub apply: ApplyConfig,
 }
 
 // ── Source ───────────────────────────────────────────────

@@ -24,11 +24,13 @@ mod plan;
 mod reconcile;
 mod reset;
 mod scope;
+mod workspace;
 
 pub use marks::DatabaseMarks;
 pub use ownership::{Prune, SharedDatabase, SharedProject, SharedUse, leave_out_other_owners};
 pub use plan::{ApplyStrategy, ExecutionPlan, ExecutionStep, build_execution_plan};
 pub use reset::{KeptRole, ResetComplete};
+pub use workspace::{Module, Workspace};
 
 /// Summary passed to the `on_complete` callback of `apply()`.
 #[derive(Debug, Clone, Default)]
@@ -812,12 +814,29 @@ impl Design {
 
     /// Create a Design with an explicit project directory.
     /// If `project_dir` is None, uses the config file's parent directory.
+    ///
+    /// Refuses a `design.yaml` with a `modules:` block: that is a workspace,
+    /// a design per module — see [`Workspace::load`].
     pub fn from_config_with_dir(config_path: &Path, env: &str, project_dir: Option<&Path>) -> Result<Self> {
         let project_dir = project_dir
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| config_path.parent().unwrap_or(Path::new(".")).to_path_buf());
 
         let design_config = config::read(config_path)?;
+        if !design_config.modules.is_empty() {
+            return Err(DbdError::Config(format!(
+                "{} declares modules:, so it is a workspace — a design per module, each owned by \
+                 <project>/<module>; load it with Workspace::load",
+                config_path.display()
+            )));
+        }
+        Ok(Self::scan(design_config, env, project_dir)?.resolved(&[]))
+    }
+
+    /// Read the project `design_config` describes in `project_dir`: its DDL,
+    /// the entities its config declares, and its import files — not yet
+    /// resolved against each other (see [`Self::resolved`]).
+    pub(crate) fn scan(design_config: DesignConfig, env: &str, project_dir: PathBuf) -> Result<Self> {
         // Taken before the config is moved into the Design, and kept as the
         // user wrote it — a refusal must name `sqlite`, not the `Verbatim`
         // reader that label selects.
@@ -936,39 +955,6 @@ impl Design {
             });
         }
 
-        // Add external entities for reference resolution
-        let external_names: Vec<String> = design_config.external.iter().map(|e| e.name.clone()).collect();
-        for ext in &design_config.external {
-            entities.push(Entity::external(&ext.name));
-        }
-
-        // Resolve references
-        references::resolve_references(&mut entities, &external_names, &design_config.ignore);
-
-        // Order for apply in one pass over the whole graph. Dependencies decide,
-        // with the type sequence (schemas → extensions → roles → sequences →
-        // enums → tables → views → matviews → functions/procedures, via
-        // `EntityType::apply_rank`) acting as a floor rather than a partition —
-        // see `dependency::sort_by_dependencies` for why that distinction is the
-        // whole design.
-        //
-        // A single sort is required because two type pairs depend on each other
-        // in BOTH directions, so no fixed sequence can order them: a view can
-        // call a function and a function body can read a view (issue #9); a
-        // table's `DEFAULT`/`CHECK` can call a function and a function body can
-        // read that table (issue #10).
-        //
-        // External entities are held out of the graph and appended. They are
-        // never applied (`entities_in_scope` drops them), they exist only so
-        // `resolve_references` can resolve references to objects dbd does not
-        // manage — and being the highest rank, leaving them in would drag every
-        // entity that references one to the very end of the order.
-        let (externals, managed): (Vec<Entity>, Vec<Entity>) = entities
-            .into_iter()
-            .partition(|e| e.entity_type == EntityType::External);
-
-        let entities = [dependency::sort_by_dependencies(&managed), externals].concat();
-
         // Scan import tables (data files, not DDL)
         // Pass env so that import/{env}/ subdirectories are filtered appropriately.
         let mut import_scan = scanner::scan_import(&project_dir, Some(env))?;
@@ -1002,6 +988,57 @@ impl Design {
             adopt_from: None,
             allow_ownership_change: false,
         })
+    }
+
+    /// The scanned design with its references resolved and its entities in
+    /// apply order. `known` names entities this design may reference without
+    /// declaring them: in a workspace, what the other modules declare. Each
+    /// is added as an external — never this design's to build or own — as is
+    /// each `external:` entry.
+    pub(crate) fn resolved(mut self, known: &[String]) -> Self {
+        let mut entities = std::mem::take(&mut self.entities);
+        let design_config = &self.config;
+
+        // Add external entities for reference resolution
+        let mut external_names: Vec<String> = design_config.external.iter().map(|e| e.name.clone()).collect();
+        for ext in &design_config.external {
+            entities.push(Entity::external(&ext.name));
+        }
+        let mut seen: std::collections::HashSet<String> = external_names.iter().cloned().collect();
+        for name in known {
+            if seen.insert(name.clone()) {
+                external_names.push(name.clone());
+                entities.push(Entity::external(name));
+            }
+        }
+
+        // Resolve references
+        references::resolve_references(&mut entities, &external_names, &design_config.ignore);
+
+        // Order for apply in one pass over the whole graph. Dependencies decide,
+        // with the type sequence (schemas → extensions → roles → sequences →
+        // enums → tables → views → matviews → functions/procedures, via
+        // `EntityType::apply_rank`) acting as a floor rather than a partition —
+        // see `dependency::sort_by_dependencies` for why that distinction is the
+        // whole design.
+        //
+        // A single sort is required because two type pairs depend on each other
+        // in BOTH directions, so no fixed sequence can order them: a view can
+        // call a function and a function body can read a view (issue #9); a
+        // table's `DEFAULT`/`CHECK` can call a function and a function body can
+        // read that table (issue #10).
+        //
+        // External entities are held out of the graph and appended. They are
+        // never applied (`entities_in_scope` drops them), they exist only so
+        // `resolve_references` can resolve references to objects dbd does not
+        // manage — and being the highest rank, leaving them in would drag every
+        // entity that references one to the very end of the order.
+        let (externals, managed): (Vec<Entity>, Vec<Entity>) = entities
+            .into_iter()
+            .partition(|e| e.entity_type == EntityType::External);
+
+        self.entities = [dependency::sort_by_dependencies(&managed), externals].concat();
+        self
     }
 
     /// `source.search_path`, resolved — `None` when the project sets none.
