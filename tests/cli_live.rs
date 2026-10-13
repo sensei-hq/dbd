@@ -2606,3 +2606,73 @@ async fn apply_under_a_reused_owner_name_needs_allow_ownership_change() {
     let allowed = dbd(second.path(), &url, &["apply", "--allow-ownership-change"]);
     assert!(allowed.status.success(), "{}", combined(&allowed));
 }
+
+/// A deploy adopting says what it takes, as an apply does (#7).
+#[tokio::test]
+async fn deploy_adopting_from_an_owner_says_what_it_takes() {
+    let (_pg, url) = start_pg().await;
+    let giver = tempfile::tempdir().unwrap();
+    project(giver.path());
+    let applied = dbd(giver.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+    let taker = taker_of_widgets(giver.path());
+
+    let deployed = dbd(taker.path(), &url, &["deploy", "--adopt-from", "clilive"]);
+    let out = combined(&deployed);
+    assert!(deployed.status.success(), "{out}");
+    assert!(out.contains("adopting relation app.widgets from \"clilive\""), "{out}");
+}
+
+/// A run refused — a third project holds an entity the design declares —
+/// adopts nothing, and says nothing of adopting (#7).
+#[tokio::test]
+async fn a_refused_apply_says_nothing_of_adopting() {
+    let (_pg, url) = start_pg().await;
+    let giver = tempfile::tempdir().unwrap();
+    project(giver.path());
+    let applied = dbd(giver.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+    let other = tempfile::tempdir().unwrap();
+    std::fs::write(
+        other.path().join("design.yaml"),
+        "project:\n  name: other\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(other.path().join("ddl/table/app")).unwrap();
+    std::fs::write(
+        other.path().join("ddl/table/app/gadgets.ddl"),
+        "create table if not exists app.gadgets (id integer primary key);\n",
+    )
+    .unwrap();
+    let applied = dbd(other.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+
+    let taker = taker_of_widgets(giver.path());
+    std::fs::copy(
+        other.path().join("ddl/table/app/gadgets.ddl"),
+        taker.path().join("ddl/table/app/gadgets.ddl"),
+    )
+    .unwrap();
+    let refused = dbd(taker.path(), &url, &["apply", "--adopt-from", "clilive"]);
+    let out = combined(&refused);
+    assert!(!refused.status.success(), "{out}");
+    assert!(out.contains("owned by \"other\""), "{out}");
+    assert!(!out.contains("adopting"), "{out}");
+}
+
+/// A project `taker` declaring the `clilive` fixture's `app.widgets`.
+fn taker_of_widgets(giver: &Path) -> tempfile::TempDir {
+    let taker = tempfile::tempdir().unwrap();
+    std::fs::write(
+        taker.path().join("design.yaml"),
+        "project:\n  name: taker\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(taker.path().join("ddl/table/app")).unwrap();
+    std::fs::copy(
+        giver.join("ddl/table/app/widgets.ddl"),
+        taker.path().join("ddl/table/app/widgets.ddl"),
+    )
+    .unwrap();
+    taker
+}

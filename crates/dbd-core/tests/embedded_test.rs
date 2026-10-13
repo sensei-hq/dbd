@@ -15435,3 +15435,120 @@ async fn a_dry_run_adopting_claims_nothing() {
     )
     .await;
 }
+
+/// A reconcile adopting planned against a snapshot that still hid the
+/// adopted table as another project's: it "created" a table that was there,
+/// and skipped its declared change. What it adopts it plans as its own (#7).
+#[tokio::test]
+async fn reconciling_while_adopting_plans_the_adopted_table_as_its_own() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    named_project(bd.path(), "billing", "", &ORDERS_OWNER_FILES[..1])
+        .apply(&*billing, None, false, None, Progress::none())
+        .await
+        .expect("billing's apply");
+
+    let plan = named_project(
+        sd.path(),
+        "shop",
+        "",
+        &[(
+            "ddl/table/app/orders.ddl",
+            "set search_path to app;\ncreate table if not exists orders (id int primary key, note text);\n",
+        )],
+    )
+    .adopting_from("billing")
+    .reconcile(&*shop, false, false, false, None, Progress::none())
+    .await
+    .expect("shop's reconcile");
+    assert!(!plan.added.iter().any(|t| t.contains("orders")), "{:?}", plan.added);
+    assert_catalog(
+        &*shop,
+        true,
+        "SELECT 1 FROM information_schema.columns WHERE table_schema = 'app' AND table_name = 'orders' \
+         AND column_name = 'note'",
+        "app.orders.note",
+    )
+    .await;
+}
+
+/// A run that adopted and then failed has claims and no record: those claims
+/// are its own, no sign it was renamed from the giver — whose record the
+/// guards read as its, refusing every later run (#7).
+#[tokio::test]
+async fn a_failed_run_that_adopted_is_no_rename_on_the_next() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    write_project(
+        bd.path(),
+        "project:\n  name: billing\n  version: 1\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+        &ORDERS_OWNER_FILES[..1],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+    named_project(
+        sd.path(),
+        "shop",
+        "apply:\n  before:\n    - sql/fail.sql\n",
+        &[ORDERS_OWNER_FILES[0], ("sql/fail.sql", "select 1 / 0;\n")],
+    )
+    .adopting_from("billing")
+    .reconcile(&*shop, false, false, false, None, Progress::none())
+    .await
+    .expect_err("the hook divides by zero");
+    assert_catalog(
+        &*shop,
+        true,
+        &owned_by("relation", "app", "orders", "table", "shop"),
+        "shop's adopted app.orders",
+    )
+    .await;
+
+    named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1])
+        .apply(&*shop, None, true, None, Progress::none())
+        .await
+        .expect("shop's claims are its own, not a renamed billing's");
+}
+
+/// The usual reuse — a new design with no version under an owner at v1 — met
+/// the version guard first, which sent the user after a newer revision; and
+/// `--allow-ownership-change` could not pass it, the old record being the
+/// previous design's history. The reuse is named first, and the override
+/// passes the version guard (#7).
+#[tokio::test]
+async fn a_reused_name_is_named_before_the_version_guard_and_its_override_passes_it() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let (sd, nd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    write_project(
+        sd.path(),
+        "project:\n  name: shop\n  version: 1\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+        &ORDERS_OWNER_FILES[..1],
+    )
+    .apply(&*shop, None, false, None, Progress::none())
+    .await
+    .expect("shop's apply");
+    let newcomer = named_project(nd.path(), "shop", "", &ORDERS_OWNER_FILES[1..]);
+
+    let err = newcomer
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect_err("another project under the name shop")
+        .to_string();
+    assert!(err.contains("this design declares none of them"), "{err}");
+    assert!(
+        err.contains("apply, deploy, reconcile or reset with --allow-ownership-change"),
+        "{err}"
+    );
+    newcomer
+        .allowing_ownership_change()
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("the override");
+    assert_table_exists(&*shop, "app", "invoices").await;
+}
