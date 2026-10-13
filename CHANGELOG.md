@@ -119,7 +119,7 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   migration's `DROP TABLE … CASCADE`, took a view committed over the table
   the same way. Every writing `apply`, `reconcile`, `reset`, `import`,
   `policies` and grant — a `deploy`'s phases each — now holds the database's
-  dbd write lock (an advisory lock on `dbd:write`, in a session of its own):
+  dbd write lock (an advisory lock on `hashtext('dbd:write')`, in a session of its own):
   shared to build, so those of different projects still run side by side;
   exclusive for a reset, a reconcile and an apply running migrations. A run
   waits for the lock at most 5 minutes, asking again every 100ms, its session
@@ -220,7 +220,8 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   `Dependence::owner` is an `Option` — `None` for a dependent nobody owns —
   and `Dependence::schema` names the dependent's schema.
 - `Design::adopting_from`, `allowing_ownership_change`, `adoptions` and
-  `check_run_guards` — the guards `apply` checks, name reuse first;
+  `check_run_guards` — the guards `apply` checks, name reuse first — and
+  `check_reset_run_guards`, a reset's;
   `Design::shared_database` (`SharedDatabase`, `SharedProject`, `SharedUse`)
   and `design::leave_out_other_owners`; `DatabaseAdapter::registry`
   (`adapter::Registry`, `RecordedUse`; default empty), `keeps_registry`

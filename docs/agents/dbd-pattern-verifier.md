@@ -87,9 +87,11 @@ file evidence).
    - A **renamed `project.name`** on a project that already has databases (check `git log -p
      design.yaml`) → violation. dbd keys its record of a database on the name. From 0.25 the
      guards hold the renamed project to the old record while the database holds its objects, and
-     refuse naming it; but a run that trips no guard records a second row, and a design ahead of
-     the old record's version is planned as a fresh install, so its pending migrations never run.
-     Fix: set `project.name` back.
+     refuse naming it, and where the old name holds its entities in the ownership registry the
+     renamed design is refused for them; in a database from before the registry, a run that trips
+     no guard records a second row, and a design ahead of the old record's version is planned as a
+     fresh install, so its pending migrations never run. Fix: set `project.name` back (or, to move
+     on for good, take the entities over once with `--adopt-from <old name>`).
    - A **`migrations/NNN/…/<table>.data.sql` for a table that version's `graph.json` neither adds
      nor alters** (`added`/`altered`) → violation: it never runs, and no preview lists it. A
      version runs the data scripts of the tables it alters or adds (before 0.25, of those it

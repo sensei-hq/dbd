@@ -842,7 +842,8 @@ with none configured the dry run is offline and says pending migrations cannot b
 **Refused before anything runs** (the run and, given a database, its dry run): a project
 older than the database — `version guard: the database is at v3, but this project is at v2`
 (`… records no version` for an unversioned design) — since applying it would re-apply older
-DDL over a newer schema; no override, check out a newer revision. Before 0.25 it said
+DDL over a newer schema; no override (but `--allow-ownership-change`, taking over a reused
+owner name, passes it — the version is the previous design's), check out a newer revision. Before 0.25 it said
 "Already up to date (v3)". And a `-e dev` run on a database marked prod (the environment
 guard — see Global options).
 
@@ -2047,9 +2048,11 @@ another project's entity:
 - **Reset** keeps a schema (`--schemas`) holding anything not this project's or another project
   uses, an extension (`--extensions`) another project uses or depends on, and a role another
   project uses, with its grants; each named. Any project's `prod` record refuses an unforced reset.
-- **Write lock.** Every writing run holds the database's dbd write lock (`pg_advisory_lock` on
-  `dbd:write`): exclusive for a reset, a reconcile and an apply running migrations, shared for an
-  apply, import, `policies` or grant that only builds. A run waits at most 5 minutes
+- **Write lock.** Every `apply` (a `deploy`'s phases each), `reconcile`, `reset`, `import`,
+  `policies` run and grant holds the database's dbd write lock — an advisory lock on
+  `hashtext('dbd:write')`, taken with `pg_try_advisory_lock[_shared]`, polled every 100ms:
+  exclusive for a reset, a reconcile and an apply running migrations, shared for the rest.
+  `refresh` takes none. A run waits at most 5 minutes
   (`dbd: waiting for the write lock` in `pg_stat_activity`), then fails.
 - **Name reuse.** A design under an owner name holding live entities it declares none of is
   refused (`owner "shop" here owns 1 entity (relation app.orders); this design declares none of
@@ -2089,6 +2092,8 @@ schemas, so the prefix is the namespace). Convex keeps migrations + meta in a JS
 | dev, version 0 | allowed | allowed |
 | dev, version >= 1 (`versioned at vN`) | blocked | allowed |
 | prod (or a legacy `production` row), any version | blocked | allowed |
+| another project's row prod (or an env dbd does not know) | blocked | allowed |
+| another project depends on what it drops | blocked | blocked |
 | fresh (no table) | allowed | allowed |
 
 The environment is the one recorded by the last write, which can promote dev to
@@ -2113,16 +2118,21 @@ adopted — neither is a rename) — each refusal names the project that set the
 `project.name` back (`This database holds this design's objects but no record of project 'shop2'; it
 records project 'shop'. dbd keys its record on project.name, so a renamed project.name is
 the likely cause — if this design was 'shop', set project.name back to 'shop'.`). Two
-projects sharing a database each read their own row, and a project the database holds
-nothing of is held to no other's. Still a limit: a renamed project whose run trips no guard
-is recorded beside the old row, which stays; and a renamed design ahead of the old row's
-version is planned as a fresh install, so its pending migrations do not run — set
+projects sharing a database each read their own row — except that any project's prod mark
+refuses an unforced `reset` — and a project the database holds nothing of is held to no
+other's. Where the old name holds its entities in the registry, the renamed design is refused
+for them, the refusal naming the rename (set `project.name` back, or `--adopt-from <old
+name>`). Still a limit, in a database from before the registry: a renamed project whose run
+trips no guard is recorded beside the old row, which stays; and a renamed design ahead of the
+old row's version is planned as a fresh install, so its pending migrations do not run — set
 `project.name` back before upgrading.
 
 A project older than the database it is applied to — `project.version` behind the
 database's, or none against a versioned database — is refused by `apply`, `deploy` and
 their dry runs (`version guard: the database is at v3, but this project is at v2.`), since
-re-applying older DDL over a newer schema is never right; there is no override.
+re-applying older DDL over a newer schema is never right; there is no override, but for a
+design `--allow-ownership-change` lets take over a reused owner name (the version recorded is the
+previous design's).
 
 ---
 

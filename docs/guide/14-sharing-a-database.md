@@ -27,9 +27,10 @@ not the `--scope` a run is under: a scope narrows what is applied, not what the
 project owns. An entity is owned as Postgres names it — in the schema its file
 states, else on its search path, an unquoted name folded to lower case.
 
-**Claiming.** Every run that writes claims what its design declares. A project
-declaring an entity another project holds is refused before its first hook or
-statement, and so is its dry run, `diff`, `import`, `refresh` and `policies`:
+**Claiming.** `apply`, `deploy`, `reconcile` and `reset` claim what the design
+declares. A project declaring an entity another project holds is refused before
+its first hook or statement — and so are its dry runs, `diff`, `import`,
+`refresh` and `policies`, which check without claiming:
 
 ```
 relation app.orders is owned by "billing"; owners sharing a database must not declare the same entity
@@ -41,7 +42,8 @@ claims nothing. `reconcile`, `reset`, and an `apply` under `DBD_NO_TX` commit as
 they go, so they claim before their first write and keep the claim if they then
 fail: what the design declares is the project's, built yet or not.
 
-**Uses.** Every successful run records what its project uses: the schemas its
+**Uses.** Every successful `apply`, `deploy` and `reconcile` records what its
+project uses — and a full reset forgets it: the schemas its
 entities live in, its extensions and roles, and each reference one of its
 entities makes to another project's — a view over `app.orders`, a foreign key to
 it, a function body reading it. These are what protect a project from its
@@ -117,9 +119,10 @@ Elsewhere it goes with the drop, as it always did.
 A reset drops only what its design declares, behind the same guard: one another
 project depends on refuses the reset, `--force` or not. On top of that:
 
-- **A database any project marked prod is prod for every project in it.** An
-  unforced reset is refused while another project's record says `prod` — or an
-  env dbd does not know.
+- **Another project's prod mark blocks a reset.** An unforced reset is refused
+  while any project's record says `prod` — or an env dbd does not know. (The
+  `-e` [environment guard](04-commands.md#global-options) still reads each
+  project's own record.)
 - **`--schemas`** keeps a schema holding anything that is not this project's —
   another project's entity, one nobody owns, an extension another project needs
   — and one another project uses. It refuses to drop one holding something of
@@ -140,11 +143,14 @@ extension citext kept: "billing" uses it.
 ### Runs wait for each other
 
 A reset, a reconcile, or an apply running migrations reads what other projects
-have and then drops `CASCADE`. So that no other project writes in between, every
-writing run holds the database's dbd write lock: shared by an apply, import,
-`policies` run or grant that only builds — those of different projects still run
-side by side — and exclusive for a reset, a reconcile and an apply running
-migrations. A run waits for the lock at most five minutes, then fails:
+have and then drops `CASCADE`. So that no other project writes in between, those
+runs and every other `apply`, `deploy` phase, `import`, `policies` run and grant
+hold the database's dbd write lock — an advisory lock on
+`hashtext('dbd:write')`, taken with `pg_try_advisory_lock` and asked for again
+every 100 ms: shared by a run that only builds — those of different projects
+still run side by side — and exclusive for a reset, a reconcile and an apply
+running migrations. (`refresh` takes none: it creates nothing.) A run waits for
+the lock at most five minutes, then fails:
 
 ```
 waited 5 minutes for another dbd run writing to this database to finish; try again once it has
@@ -214,7 +220,8 @@ No conflicts for project 'shop'.
 ```
 
 It lists what would refuse this design there — an entity another project owns,
-a reused owner name — and exits non-zero over any:
+a reused owner name — and exits non-zero over any. It reports sharing only: it
+does not validate the design (run plain `dbd inspect` for that):
 
 ```
 Conflicts for project 'taker':
