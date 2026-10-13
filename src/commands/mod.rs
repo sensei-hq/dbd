@@ -155,6 +155,10 @@ pub(super) enum Order {
     Alone,
     /// A reset: in reverse, `--module` alone.
     Reset,
+    /// A reconcile: as [`Order::Build`], leaving out — and saying so — a
+    /// released module other than the one `--module` names, which changes
+    /// by snapshot and `dbd apply`.
+    Reconcile,
 }
 
 /// One design a command runs: the project's, or one module of a workspace.
@@ -387,10 +391,26 @@ pub(super) fn targets(
             modules
         }
         (Order::Reset, _) => workspace.selected_to_reset(module)?,
+        (Order::Reconcile, _) => {
+            let released = |m: &dbd_core::design::Module| {
+                m.design().config().project.released && m.name().is_some() && m.name() != module
+            };
+            let (kept, left_out) = workspace.select_except(module, released)?;
+            for name in left_out {
+                output::info(
+                    Verbosity::Normal,
+                    &format!(
+                        "module {name} is released — it changes by `dbd snapshot` and `dbd apply`; reconcile \
+                         leaves it out."
+                    ),
+                );
+            }
+            kept
+        }
     };
     // A run that builds or reads goes over its modules as one design goes over
     // its entities: what one requires of another is in the run's scope.
-    if matches!(order, Order::Build) {
+    if matches!(order, Order::Build | Order::Reconcile) {
         dbd_core::design::check_scope_gaps(&modules, scope, deps)?;
     }
     Ok(modules

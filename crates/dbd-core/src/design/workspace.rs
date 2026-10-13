@@ -469,6 +469,34 @@ impl Workspace {
         })
     }
 
+    /// [`Self::select`], leaving out the modules `except` names — and the
+    /// manifest's hooks around those it keeps, not on one it left out. A run
+    /// that may not touch some modules — `reconcile`, a released one — goes
+    /// over the rest. Returns the modules kept and the names of those left
+    /// out. A design without `modules:` keeps its one design.
+    pub fn select_except(
+        self,
+        module: Option<&str>,
+        except: impl Fn(&Module) -> bool,
+    ) -> Result<(Vec<Module>, Vec<String>)> {
+        let Some(manifest) = &self.manifest else {
+            return Ok((self.select(module)?, Vec::new()));
+        };
+        let wanted = selection(manifest, module)?;
+        if let Some(name) = module {
+            self.in_scope(name)?;
+        }
+        let in_run = |m: &Module| m.name.as_ref().is_some_and(|n| wanted.contains(n));
+        let left_out: Vec<String> = self
+            .modules
+            .iter()
+            .filter(|m| in_run(m) && except(m))
+            .filter_map(|m| m.name.clone())
+            .collect();
+        let kept = self.with_hooks_around(|m| in_run(m) && !except(m))?;
+        Ok((kept, left_out))
+    }
+
     /// The modules a run that only reads one module goes over — `export`: the
     /// module `module` alone, or every module in `depends_on` order. Its
     /// dependencies are not read with it, and no hooks run.
@@ -892,7 +920,7 @@ fn check_manifest(manifest: &DesignConfig, project_dir: &Path) -> Result<IndexMa
         if !is_module_name(name) {
             return Err(DbdError::Config(format!(
                 "module name \"{name}\" cannot name an owner (<project>/<module>) or a folder — use letters, \
-                 digits, '_' and '-'"
+                 digits, '_' and '-', in a name YAML reads as a string (not a number, `true`, `no` or `null`)"
             )));
         }
     }
@@ -971,13 +999,30 @@ fn check_manifest(manifest: &DesignConfig, project_dir: &Path) -> Result<IndexMa
         .collect())
 }
 
-/// `[A-Za-z0-9_][A-Za-z0-9_-]*`: what can follow `<project>/` in an owner and
-/// name a folder, unambiguously.
+/// `[A-Za-z0-9_][A-Za-z0-9_-]*`, and read by YAML as a string: what can
+/// follow `<project>/` in an owner, name a folder, and key its block,
+/// unambiguously.
 fn is_module_name(name: &str) -> bool {
     name.chars()
         .next()
         .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        // Written as a key, YAML reads `2024`, `true` or `null` as other than
+        // a string — and the module's block as another key's.
+        && matches!(serde_yaml::from_str::<serde_yaml::Value>(name), Ok(serde_yaml::Value::String(_)))
+        && !yaml_1_1_reads_otherwise(name)
+}
+
+/// YAML 1.1 readers — PyYAML among them — also read `NO`, `on`, `y`,
+/// `1_000` and `0b101` as other than a string.
+fn yaml_1_1_reads_otherwise(name: &str) -> bool {
+    const KEYWORDS: [&str; 8] = ["y", "yes", "n", "no", "on", "off", "true", "false"];
+    let keyword = KEYWORDS.contains(&name.to_ascii_lowercase().as_str());
+    let digits = |s: &str, radix: u32| !s.is_empty() && s.chars().all(|c| c == '_' || c.is_digit(radix));
+    let number = digits(name, 10)
+        || name.strip_prefix("0b").is_some_and(|s| digits(s, 2))
+        || name.strip_prefix("0x").is_some_and(|s| digits(s, 16));
+    keyword || number
 }
 
 /// The module's folder relative to the project, refusing one outside it and

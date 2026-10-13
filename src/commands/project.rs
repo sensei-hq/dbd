@@ -128,14 +128,31 @@ pub fn cmd_doctor(
     // every other command reads them (#7). A design.yaml this dbd cannot read
     // — one written for an older dbd, what doctor exists to migrate — is
     // audited as a project's.
-    let parsed_config = dbd_core::config::read(config).ok();
+    let parsed = dbd_core::config::read(config);
+    let unreadable = parsed.as_ref().err().map(|e| e.to_string());
+    let parsed_config = parsed.ok();
     let folders: Vec<std::path::PathBuf> = match &parsed_config {
         Some(_) => super::file_folders(config, source_dir, module)?
             .into_iter()
             .map(|(_, dir)| dir)
             .collect(),
+        None if module.is_some() => {
+            anyhow::bail!(
+                "--module: {} does not read as a design.yaml: {}",
+                config.display(),
+                unreadable.unwrap_or_default()
+            );
+        }
         None => vec![project_dir.to_path_buf()],
     };
+    // A design.yaml declaring `modules:` is not one an older dbd wrote — it
+    // had none — so what reads as old in it is fixed by hand: migrating it
+    // would rebuild it without its modules.
+    let workspace_manifest =
+        serde_yaml::from_str::<serde_yaml::Value>(&content).is_ok_and(|v| v.get("modules").is_some());
+    // What reads as neither today's design.yaml nor an older one is said, not
+    // audited clean.
+    let unreadable = unreadable.filter(|_| config_issues.is_empty());
     let (mut stale_files, mut plural_dirs, mut mismatches, mut declared_files) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for dir in &folders {
@@ -151,9 +168,16 @@ pub fn cmd_doctor(
         ));
     }
 
-    let auto_fixable = config_issues.len() + stale_files.len() + plural_dirs.len();
-    let by_hand = mismatches.len() + declared_files.len();
+    let config_fixable = if workspace_manifest { 0 } else { config_issues.len() };
+    let auto_fixable = config_fixable + stale_files.len() + plural_dirs.len();
+    let by_hand = mismatches.len()
+        + declared_files.len()
+        + (config_issues.len() - config_fixable)
+        + usize::from(unreadable.is_some());
     let total_issues = auto_fixable + by_hand;
+    if let Some(error) = &unreadable {
+        output::always(&format!("design.yaml does not read: {error}"));
+    }
 
     // doctor counts issues, not entities: the shared entity summary printed
     // "0 entities — no issues" here on a project full of tables.
@@ -180,7 +204,12 @@ pub fn cmd_doctor(
     }
 
     let mut fixed = 0;
-    if !config_issues.is_empty() {
+    if !config_issues.is_empty() && workspace_manifest {
+        output::always(
+            "\ndesign.yaml declares modules:, so its old entries (above) are fixed by hand — migrating it \
+             would rebuild it without its modules.",
+        );
+    } else if !config_issues.is_empty() {
         fix_config_migration(config, project_dir, &content, verbosity)?;
         fixed += config_issues.len();
     }
@@ -796,29 +825,24 @@ pub async fn cmd_reconcile(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let targets: Vec<super::Target> =
-        super::targets(config, env, project_dir, scope, deps, module, None, super::Order::Build)?
-            .into_iter()
-            .map(|target| target.map_design(|design| ownership.applied_to(design)))
-            .collect();
-    // A released module changes by snapshot and `dbd apply`: one asked for —
-    // the project, or the module `--module` names — is refused before anything
-    // connects; one the run takes in otherwise, a dependency or another module
-    // of the workspace, is left out, said so.
-    let (released, targets): (Vec<super::Target>, Vec<super::Target>) =
-        targets.into_iter().partition(|t| t.design.config().project.released);
-    for target in &released {
-        let asked_for = target.module.is_none() || target.module.as_deref() == module;
-        if asked_for {
-            refuse_a_released_reconcile(&target.design)?;
-        }
-        output::info(
-            verbosity,
-            &format!(
-                "module {} is released — it changes by `dbd snapshot` and `dbd apply`; reconcile leaves it out.",
-                target.module.as_deref().unwrap_or_default()
-            ),
-        );
+    let targets: Vec<super::Target> = super::targets(
+        config,
+        env,
+        project_dir,
+        scope,
+        deps,
+        module,
+        None,
+        super::Order::Reconcile,
+    )?
+    .into_iter()
+    .map(|target| target.map_design(|design| ownership.applied_to(design)))
+    .collect();
+    // A released module changes by snapshot and `dbd apply`: the one asked for
+    // — the project, or the module `--module` names — is refused before
+    // anything connects; others the run would take in are left out.
+    for target in &targets {
+        refuse_a_released_reconcile(&target.design)?;
     }
     if targets.is_empty() {
         anyhow::bail!("Every module this run selects is released — `reconcile` is disabled for them.");
