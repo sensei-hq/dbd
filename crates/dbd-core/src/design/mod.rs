@@ -863,6 +863,18 @@ impl Design {
     /// the entities its config declares, and its import files — not yet
     /// resolved against each other (see [`Self::resolved`]).
     pub(crate) fn scan(design_config: DesignConfig, env: &str, project_dir: PathBuf) -> Result<Self> {
+        // A scope's `modules:` selects the modules of a workspace; this design
+        // has none. (A module's own config carries only its projection of the
+        // manifest's scopes, which select nothing by module.)
+        for (name, entry) in &design_config.scopes {
+            if let config::ScopeEntry::Spec(spec) = entry
+                && !spec.modules.is_empty()
+            {
+                return Err(DbdError::Config(format!(
+                    "scope '{name}' selects modules (scopes.{name}.modules), but design.yaml declares no modules:"
+                )));
+            }
+        }
         // Taken before the config is moved into the Design, and kept as the
         // user wrote it — a refusal must name `sqlite`, not the `Verbatim`
         // reader that label selects.

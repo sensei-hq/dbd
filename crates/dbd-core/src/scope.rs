@@ -73,7 +73,7 @@ fn universe(all_entities: &[Entity]) -> HashSet<String> {
 /// - `schema` — a bare schema token: every scopable entity under the schema PLUS
 ///   the schema entity itself. A declared-but-empty schema resolves to just its
 ///   `CREATE SCHEMA` entity rather than an error (the schema is real, not a typo).
-fn match_item(item: &str, all_entities: &[Entity]) -> Result<HashSet<String>> {
+pub(crate) fn match_item(item: &str, all_entities: &[Entity]) -> Result<HashSet<String>> {
     if let Some(prefix) = item.strip_suffix(".*") {
         // `prefix.*` — every scopable entity whose name is `prefix.<something>`,
         // matched the same way the `ignore:` list matches `prefix.*` patterns.

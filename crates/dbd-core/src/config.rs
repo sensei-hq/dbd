@@ -122,6 +122,11 @@ pub enum ScopeEntry {
 /// Include/exclude selection plus dependency policy for one scope.
 #[derive(Debug, Default, Deserialize)]
 pub struct ScopeSpec {
+    /// In a workspace, the modules the scope selects — each with the modules
+    /// it depends on, whole (#7). A design without `modules:` has none to
+    /// select, and is refused one.
+    #[serde(default)]
+    pub modules: Vec<String>,
     #[serde(default)]
     pub includes: Vec<String>,
     #[serde(default)]

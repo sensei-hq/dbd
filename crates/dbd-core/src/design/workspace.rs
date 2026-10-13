@@ -34,6 +34,11 @@ pub struct Workspace {
     /// The project folder: the module folders' parent, and where the
     /// manifest's hook paths are read from.
     root: PathBuf,
+    /// The modules each manifest scope selects, by scope name — see
+    /// [`Workspace::under_scope`].
+    scope_modules: IndexMap<String, HashSet<String>>,
+    /// The scope [`Workspace::under_scope`] narrowed the workspace to.
+    scope: Option<String>,
 }
 
 /// One module of a [`Workspace`]: a design of its own.
@@ -108,6 +113,8 @@ impl Workspace {
                 }],
                 manifest: None,
                 root: project_dir,
+                scope_modules: IndexMap::new(),
+                scope: None,
             });
         }
 
@@ -204,11 +211,42 @@ impl Workspace {
             )));
         }
 
+        let scope_modules = project_scopes(&manifest, &mut modules)?;
         Ok(Self {
             modules,
             manifest: Some(manifest),
             root: project_dir,
+            scope_modules,
+            scope: None,
         })
+    }
+
+    /// Where a run started in `dir` finds its workspace (#7): the nearest folder
+    /// above `dir` holding `config_name` and declaring `modules:` — as Cargo finds
+    /// its workspace — with the module whose folder holds `dir`, if one does.
+    /// `None` when the nearest such file above declares no modules, or there is
+    /// none: a design without modules is not looked for above where it is run.
+    pub fn locate(dir: &Path, config_name: &Path) -> Option<(PathBuf, Option<String>)> {
+        let dir = dir.canonicalize().ok()?;
+        for root in dir.ancestors().skip(1) {
+            let config_path = root.join(config_name);
+            if !config_path.is_file() {
+                continue;
+            }
+            let Ok(manifest) = crate::config::read(&config_path) else {
+                // Its own load says what is wrong with it.
+                return Some((root.to_path_buf(), None));
+            };
+            if manifest.modules.is_empty() {
+                return None;
+            }
+            let module = manifest.modules.iter().find_map(|(name, module)| {
+                let folder = root.join(module_folder(name, module).ok()?).canonicalize().ok()?;
+                dir.starts_with(&folder).then(|| name.clone())
+            });
+            return Some((root.to_path_buf(), module));
+        }
+        None
     }
 
     /// Whether the manifest declares `modules:` — `false` for a project that
@@ -238,6 +276,57 @@ impl Workspace {
         self.modules
     }
 
+    /// The workspace a run under `scope` sees (#7): the modules the scope
+    /// selects — those it names with every module they depend on, whole, and
+    /// those it includes entities of — each resolving the scope as its own,
+    /// under the same name. `None` is the `default` scope if the manifest has
+    /// one, else every module; `all` is every module. A design without
+    /// `modules:` resolves its scopes itself, and is returned as it is.
+    pub fn under_scope(mut self, scope: Option<&str>) -> Result<Self> {
+        let Some(manifest) = &self.manifest else {
+            return Ok(self);
+        };
+        let name = match scope {
+            Some(name) => name,
+            None if manifest.scopes.contains_key("default") => "default",
+            None => return Ok(self),
+        };
+        if name == "all" {
+            return Ok(self);
+        }
+        let Some(selected) = self.scope_modules.get(name) else {
+            let available: Vec<&str> = std::iter::once("all")
+                .chain(self.scope_modules.keys().map(String::as_str))
+                .collect();
+            return Err(DbdError::Config(format!(
+                "unknown scope '{name}'. Available: {}",
+                available.join(", ")
+            )));
+        };
+        let selected = selected.clone();
+        self.modules
+            .retain(|m| m.name.as_ref().is_some_and(|n| selected.contains(n)));
+        self.scope = Some(name.to_string());
+        Ok(self)
+    }
+
+    /// Refuse a module `name` the scope this workspace runs under leaves out.
+    fn in_scope(&self, name: &str) -> Result<()> {
+        match &self.scope {
+            Some(scope) if !self.modules.iter().any(|m| m.name.as_deref() == Some(name)) => {
+                Err(DbdError::Config(format!(
+                    "module \"{name}\" is not in scope {scope}, which runs {}",
+                    self.module_names().join(", ")
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn module_names(&self) -> Vec<&str> {
+        self.modules.iter().filter_map(|m| m.name.as_deref()).collect()
+    }
+
     /// The modules a run that builds or reads goes over — `apply`, `deploy`,
     /// `reconcile`, an import, a diff — in `depends_on` order: every module,
     /// or the module `module` and every module it depends on, directly or
@@ -253,6 +342,9 @@ impl Workspace {
             };
         };
         let wanted = selection(manifest, module)?;
+        if let Some(name) = module {
+            self.in_scope(name)?;
+        }
         self.with_hooks_around(|m| wanted.contains(m.name.as_deref().unwrap_or_default()))
     }
 
@@ -265,6 +357,9 @@ impl Workspace {
             return self.select(module);
         };
         let wanted = selection(manifest, module)?;
+        if let Some(name) = module {
+            self.in_scope(name)?;
+        }
         let declaring: Vec<&str> = self
             .modules
             .iter()
@@ -307,6 +402,7 @@ impl Workspace {
             None => Ok(self.modules),
             Some(name) => {
                 known_module(manifest, name)?;
+                self.in_scope(name)?;
                 Ok(self
                     .modules
                     .into_iter()
@@ -358,6 +454,116 @@ impl Workspace {
         }
         Ok(selected)
     }
+}
+
+/// Each manifest scope, projected onto each module it selects (#7): set in
+/// the module's config under the scope's name, so the module resolves it as
+/// its own. A module the scope names — or one a named module depends on, or
+/// one depending on which a module it includes entities of — runs whole, less
+/// what the scope excludes of it; a module the scope only includes entities
+/// of runs those. A scope naming no module and including nothing selects
+/// every module. Returns the modules each scope selects; refuses a scope
+/// naming a module `modules:` does not declare, or an item no module has.
+fn project_scopes(manifest: &DesignConfig, modules: &mut [Module]) -> Result<IndexMap<String, HashSet<String>>> {
+    use crate::config::{ScopeEntry, ScopeSpec};
+    let closure = dependency_closure(&manifest.modules);
+    let mut selected_by: IndexMap<String, HashSet<String>> = IndexMap::new();
+    for (scope, entry) in &manifest.scopes {
+        let spec = match entry {
+            ScopeEntry::All(keyword) => {
+                for module in modules.iter_mut() {
+                    module
+                        .design
+                        .config
+                        .scopes
+                        .insert(scope.clone(), ScopeEntry::All(keyword.clone()));
+                }
+                selected_by.insert(scope.clone(), modules.iter().filter_map(|m| m.name.clone()).collect());
+                continue;
+            }
+            ScopeEntry::Spec(spec) => spec,
+        };
+        // What of each module an item names, by module.
+        let matched = |item: &str| -> Result<IndexMap<String, ()>> {
+            let mut hits = IndexMap::new();
+            for module in modules.iter() {
+                let own: Vec<crate::entity::Entity> = module
+                    .design
+                    .entities
+                    .iter()
+                    .filter(|e| e.entity_type != EntityType::External)
+                    .cloned()
+                    .collect();
+                if crate::scope::match_item(item, &own).is_ok_and(|m| !m.is_empty())
+                    && let Some(name) = &module.name
+                {
+                    hits.insert(name.clone(), ());
+                }
+            }
+            if hits.is_empty() {
+                return Err(DbdError::Config(format!(
+                    "scope '{scope}': item '{item}' matches nothing any module declares"
+                )));
+            }
+            Ok(hits)
+        };
+
+        let mut whole: HashSet<String> = HashSet::new();
+        for name in &spec.modules {
+            if !manifest.modules.contains_key(name) {
+                return Err(DbdError::Config(format!(
+                    "scope '{scope}' selects module \"{name}\", which modules: does not declare"
+                )));
+            }
+            whole.insert(name.clone());
+            whole.extend(closure[name].iter().cloned());
+        }
+        let mut includes: IndexMap<String, Vec<String>> = IndexMap::new();
+        for item in &spec.includes {
+            for module in matched(item)?.into_keys() {
+                includes.entry(module).or_default().push(item.clone());
+            }
+        }
+        let mut excludes: IndexMap<String, Vec<String>> = IndexMap::new();
+        for item in &spec.excludes {
+            for module in matched(item)?.into_keys() {
+                excludes.entry(module).or_default().push(item.clone());
+            }
+        }
+        if spec.modules.is_empty() && spec.includes.is_empty() {
+            whole.extend(manifest.modules.keys().cloned());
+        }
+        // A module whose entities the scope includes runs on the modules it
+        // depends on, whole, as `--module` runs it.
+        for module in includes.keys() {
+            whole.extend(closure[module].iter().cloned());
+        }
+
+        let mut selected = HashSet::new();
+        for module in modules.iter_mut() {
+            let Some(name) = module.name.clone() else { continue };
+            let includes = if whole.contains(&name) {
+                Vec::new()
+            } else if let Some(items) = includes.get(&name) {
+                items.clone()
+            } else {
+                continue;
+            };
+            module.design.config.scopes.insert(
+                scope.clone(),
+                ScopeEntry::Spec(ScopeSpec {
+                    modules: Vec::new(),
+                    includes,
+                    excludes: excludes.get(&name).cloned().unwrap_or_default(),
+                    deps: spec.deps,
+                    extensions: spec.extensions.clone(),
+                }),
+            );
+            selected.insert(name);
+        }
+        selected_by.insert(scope.clone(), selected);
+    }
+    Ok(selected_by)
 }
 
 /// The modules `module` selects: itself and every module it depends on,
