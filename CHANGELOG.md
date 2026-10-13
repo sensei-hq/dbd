@@ -166,7 +166,11 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   `_dbd_objects` and `_dbd_uses`: a second project sharing a SQLite file is
   refused a table the first owns, a reset cannot drop another's table, name
   reuse and `--adopt-from` work as on Postgres, `inspect --shared` reads it, and
-  `init --from-db` and `merge` leave another project's tables out.
+  `init --from-db` and `merge` leave another project's tables out. A SQLite
+  object is its name, whatever schema its path names and whatever its case.
+  A SQLite reset is guarded by the uses owners record and the foreign keys
+  that reference a table: a table another project's view reads is not
+  dropped.
 - **The uses guard sees further** (#7, phase 2). A dependent nobody owns —
   a project's not yet recording its uses — is guarded where a project might
   own it, by `--prune`'s rule: in a schema another project uses, or anywhere
@@ -213,8 +217,9 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   `check_run_guards` — the guards `apply` checks, name reuse first;
   `Design::shared_database` (`SharedDatabase`, `SharedProject`, `SharedUse`)
   and `design::leave_out_other_owners`; `DatabaseAdapter::registry`
-  (`adapter::Registry`, `RecordedUse`; default empty) and `keeps_registry`
-  (default false; Postgres and SQLite keep one);
+  (`adapter::Registry`, `RecordedUse`; default empty), `keeps_registry`
+  (default false; Postgres and SQLite keep one) and `same_object` (whether two
+  keys name one object);
   `DatabaseAdapter::claim_objects` takes `adopt_from`, and the adapter gains
   `owned_objects` (default: nothing held).
 
