@@ -12,10 +12,10 @@
 
 ## Next
 
-Slice 1 PR #61 (`feat/workspaces-load` → `feat/workspaces`): review findings
-fixed (2534f002) and plan/spec updated (9ceacd0f). Full suites and a focused
-re-review running; then CI green and merge into `feat/workspaces`, then slice 2
-(running a workspace: per-module runs, `--module`, T21).
+Slice 1 PR #61 (`feat/workspaces-load` → `feat/workspaces`): two review rounds
+fixed (2534f002, a34dc1b3), plan/spec updated (9ceacd0f). Waiting on CI, then
+merge into `feat/workspaces` locally; then slice 2 (running a workspace:
+per-module runs and adapters, `--module`, manifest hooks around the run, T21).
 
     gh pr checks 61
 
