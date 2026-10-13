@@ -829,7 +829,7 @@ impl Design {
             Err(_) => format!("recorded env '{}', which dbd does not know and reads as prod", row.env),
         };
         Err(DbdError::SafetyGuard(format!(
-            "reset is blocked — project '{}' {marked}, and a database is prod for every project in it. \
+            "reset is blocked — project '{}' {marked}, and a prod mark blocks every project's reset. \
              Use --force to override.",
             row.project
         )))
