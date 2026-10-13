@@ -14,11 +14,10 @@
 
 ## Next
 
-Slice 3 PR #63 (`feat/workspaces-scopes` → `feat/workspaces`): review findings
-fixed (schema items, cross-module scope gaps, `under_scope_of`, -n outside a
-scope, logical-path walk-up) and the plan updated. Next: full suites, CI, merge;
-then slice 4 (per-module history: snapshot, release, migrations; format and
-doctor over modules).
+Slice 3 PR #63 (`feat/workspaces-scopes` → `feat/workspaces`): both review
+rounds fixed (f930d147, 08d366d8) and the plan updated. Next: full suites, CI,
+merge; then slice 4 (per-module history: snapshot, release, migrations; format
+and doctor over modules).
 
     gh pr checks 63
 
