@@ -8,18 +8,20 @@
 
 - Slices 1–3 merged into `feat/ownership` (PRs #50, #51): registry, claim,
   uses, prune by ownership.
-- Slice 4 (red `6476dc39`, `f1e8ad39`; impl `9c91df5b`, `968c1293`): the uses
-  guard — `dependents` walks pg_depend (as a CASCADE reaches) + dbd.uses
-  (routine bodies); reconcile refuses a dropped column/constraint/index/enum
-  value another owner depends on, a prune keeps such a table named; apply
-  refuses a pending migration's DROP / DROP COLUMN / DROP CONSTRAINT of it.
-- Embedded 222/222, `cli_live` 48/48, workspace 2002/0, clippy, fmt, doc clean.
+- Slice 4 = PR #52 (impl `9c91df5b`, `968c1293`; review red `c6183626`, fixes
+  `3612a8cf` walk, `6ebdf47d` migration reader, `8092df1a` uses recording):
+  the guard walks pg_depend as a CASCADE reaches, part by part (inherited
+  columns, arrays, domain checks) + dbd.uses (recorded whoever owns the
+  target; routine bodies in any file); reconcile refuses dropped parts, a
+  prune keeps used tables; apply refuses a migration's drops (DO blocks,
+  schemas, indexes, data scripts) and an unreadable one.
+- Embedded 232/232, `cli_live` 48/48, workspace 2003/0, clippy, fmt, doc clean.
 
 ## Next
 
-    # PR for feat/ownership-guard into feat/ownership; focused review; fix
-    # test-first; CI green; merge locally; then slice 5: reset rules (drops
-    # only own; --schemas/--extensions/roles skip what others use).
+    # PR #52: regression check + CI green → merge locally into feat/ownership;
+    # then slice 5: reset rules (drops only own; --schemas/--extensions/roles
+    # skip what others use; reset's CASCADE behind the same guard).
 
 ## Open
 
