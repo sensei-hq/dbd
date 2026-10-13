@@ -1,7 +1,7 @@
 # Checkpoint
 
-**Slice:** #7 Phase 2 complete in `feat/ownership` (PRs #50–#57, `5c852618`); its PR
-into `develop` is next. Phase 1 is on `develop`, unreleased.
+**Slice:** #7 Phases 1 and 2 merged into `develop` (Phase 2: PR #58, `1ec0e311`),
+unreleased. Phase 3 (workspaces) not started.
 
 ## Done
 
@@ -14,9 +14,8 @@ into `develop` is next. Phase 1 is on `develop`, unreleased.
 
 ## Next
 
-    gh pr create --base develop --head feat/ownership   # Phase 2 → develop
-    # CI green → local --no-ff merge into develop; then Phase 3 (workspaces)
-    # only when asked; a release (0.26.0, minor) only when asked
+    # waiting on the user: a release (Phases 1+2 → 0.26.0, minor), Phase 3
+    # (workspaces), or the nextval drift issue
 
 ## Open
 
@@ -30,7 +29,7 @@ into `develop` is next. Phase 1 is on `develop`, unreleased.
   (documented in the spec). `dbd.objects` still allows namespace `type`, unused.
 - Delete by hand: `/tmp/dbd-mut` (+ `git worktree prune`), `/tmp/dbd-mut-target`,
   `/tmp/dbd-idx.*`, `/tmp/dbd-review2*`, `/tmp/dbd-lockreview*`.
-- Phase 1 is releasable as 0.25.2 when asked.
+- Phases 1 and 2 are releasable together as 0.26.0 (minor: library API changes) when asked.
 
 ## Known limits
 
