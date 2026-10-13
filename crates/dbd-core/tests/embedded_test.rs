@@ -10040,8 +10040,10 @@ const BILLING_USES_YAML: &str = "project:\n  name: billing\nsource:\n  dialect: 
 /// A reference from one project's entity to another project's is recorded as
 /// a use — the target in the registry's own namespace, and the entity that
 /// makes it — so the owner cannot drop what another project depends on (#7).
-/// A reference to something nobody owns is no use of anyone's. A run records
-/// its design's uses afresh: one its design no longer makes is gone.
+/// A reference to something nobody owns yet is recorded too: its owner may
+/// claim it later, and the uses guard asks who owns a target when it runs. A
+/// run records its design's uses afresh: one its design no longer makes is
+/// gone.
 #[tokio::test]
 async fn a_reference_to_another_projects_entity_is_recorded_as_a_use() {
     let (_pg, url) = start_pg().await;
@@ -10083,9 +10085,9 @@ async fn a_reference_to_another_projects_entity_is_recorded_as_a_use() {
     .await;
     assert_catalog(
         &*billing_adapter,
-        false,
-        "SELECT 1 FROM dbd.uses WHERE target LIKE '%loose%'",
-        "a use of the unowned public.loose",
+        true,
+        &used_by("billing", "entity", "relation:public.loose", "view billing.v_orders"),
+        "billing's use of the unowned public.loose",
     )
     .await;
 
@@ -10601,43 +10603,26 @@ async fn every_overload_records_its_references() {
     }
 }
 
-/// A reference to `a.b.c` names, as dbd splits a name at its first dot,
-/// `"a"."b.c"` — not a `"a.b"."c"` another project holds (#7).
+/// A use is recorded as written, whoever owns its target when it is — the
+/// guard asks the registry who owns it when it runs — so a dotted reference
+/// is kept as its text: `relation:a.b.c` (#7).
 #[tokio::test]
-async fn a_dotted_reference_is_matched_as_dbd_splits_it() {
+async fn a_dotted_reference_is_recorded_as_written() {
     let (_pg, url) = start_pg().await;
     let shop = connect(&url, "shop").await.unwrap();
     shop.heal_bookkeeping().await.unwrap();
-    let record = |schema: &'static str, name: &'static str| {
-        format!(
-            "DELETE FROM dbd.objects; INSERT INTO dbd.objects (namespace, schema, name, kind, owner) \
-             VALUES ('relation', '{schema}', '{name}', 'table', 'crm');"
-        )
-    };
     let dotted = dbd_core::adapter::Use {
         kind: "entity".to_string(),
         target: "relation:a.b.c".to_string(),
         via: "view app.v".to_string(),
         search_path: Vec::new(),
     };
-
-    shop.execute_script(&record("a.b", "c")).await.unwrap();
-    shop.record_uses("shop", std::slice::from_ref(&dotted)).await.unwrap();
-    assert_catalog(
-        &*shop,
-        false,
-        "SELECT 1 FROM dbd.uses WHERE owner = 'shop' AND kind = 'entity'",
-        "a use of crm's \"a.b\".\"c\"",
-    )
-    .await;
-
-    shop.execute_script(&record("a", "b.c")).await.unwrap();
     shop.record_uses("shop", std::slice::from_ref(&dotted)).await.unwrap();
     assert_catalog(
         &*shop,
         true,
         &used_by("shop", "entity", "relation:a.b.c", "view app.v"),
-        "a use of crm's \"a\".\"b.c\"",
+        "shop's dotted use",
     )
     .await;
 }
@@ -11480,8 +11465,8 @@ async fn a_bare_name_is_a_use_of_the_first_table_on_the_path() {
 
 /// A bare name means the first table on the path that exists, owned or not:
 /// with an unowned `billing.orders` ahead of `app.orders`, a view reading
-/// `orders` reads billing's and uses no one's. Looked up in the registry, it
-/// was recorded as a use of `app.orders` (#7).
+/// `orders` reads billing's — that is its use, not `app.orders`. Looked up in
+/// the registry, it was recorded as a use of `app.orders` (#7).
 #[tokio::test]
 async fn a_bare_name_reads_an_unowned_table_first_on_the_path() {
     let (_pg, url) = start_pg().await;
@@ -11510,8 +11495,15 @@ async fn a_bare_name_reads_an_unowned_table_first_on_the_path() {
     assert_catalog(
         &*billing,
         false,
-        "SELECT 1 FROM dbd.uses WHERE owner = 'billing' AND kind = 'entity'",
-        "a use, of a table billing's view does not read",
+        "SELECT 1 FROM dbd.uses WHERE owner = 'billing' AND target = 'relation:app.orders'",
+        "a use of app.orders, which billing's view does not read",
+    )
+    .await;
+    assert_catalog(
+        &*billing,
+        true,
+        &used_by("billing", "entity", "relation:billing.orders", "view billing.v"),
+        "billing's use of the billing.orders its view reads",
     )
     .await;
 }

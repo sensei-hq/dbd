@@ -521,11 +521,12 @@ impl Bookkeeping {
     /// waits at most [`HEAL_LOCK_TIMEOUT`] for the registry. A shared use —
     /// schema, extension, role — is recorded as given. An entity use names its
     /// target `namespace:schema.name`, the name split at its first dot as dbd
-    /// splits one, and is recorded where another owner holds it — and not at
-    /// all when nobody else does. One named bare is looked up along its search
-    /// path as Postgres looks it up: a read is of the first relation on the
-    /// path, owned or not; a call, of any routine on it that could be the one
-    /// its arguments reach.
+    /// splits one, and is recorded whoever owns it — or nobody yet: the uses
+    /// guard asks the registry who owns a target when it runs, so a use of
+    /// an entity its owner claims later still guards it. One named bare is
+    /// looked up along its search path as Postgres looks it up: a read is of
+    /// the first relation on the path that exists; a call, of any routine on
+    /// it that could be the one its arguments reach.
     pub(super) async fn record_uses(
         &self,
         tx: Option<&mut Transaction<'static, Postgres>>,
@@ -599,8 +600,7 @@ impl Bookkeeping {
         // A bare name's candidates are those that exist, as Postgres finds
         // them. A read is of the first relation on the path; a call is
         // resolved by its arguments too, which dbd does not weigh, so it is a
-        // use of every routine on the path it could reach. Recorded where
-        // another owner holds it.
+        // use of every routine on the path it could reach.
         sqlx::query(
             "WITH d AS ( \
                SELECT * FROM unnest($2::int4[], $3::int4[], $4::text[], $5::text[], $6::text[], $7::text[], $8::bool[]) \
@@ -618,10 +618,8 @@ impl Bookkeeping {
                  WHERE n.nspname = d.schema AND p.proname = d.name)) \
              ) \
              INSERT INTO dbd.uses (owner, kind, target, via) \
-               SELECT $1, 'entity', o.namespace || ':' || o.schema || '.' || o.name, f.via \
+               SELECT $1, 'entity', f.namespace || ':' || f.schema || '.' || f.name, f.via \
                FROM (SELECT * FROM relations UNION ALL SELECT * FROM routines) f \
-               JOIN dbd.objects o ON o.namespace = f.namespace AND o.schema = f.schema AND o.name = f.name \
-                 AND o.owner <> $1 \
              ON CONFLICT DO NOTHING",
         )
         .bind(owner)

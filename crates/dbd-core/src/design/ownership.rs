@@ -184,17 +184,10 @@ impl Design {
                 _ => {}
             }
         }
-        for (e, keys) in &keyed {
-            let Some(via) = keys.first() else {
-                continue;
-            };
-            // As the resolver walks it: the named schemas, then `public`, which
-            // dbd keeps on every path it applies.
-            let mut search_path: Vec<String> = e.schema_path.schemas().map(str::to_string).collect();
-            if !search_path.iter().any(|s| s == crate::reconcile::DEFAULT_SCHEMA) {
-                search_path.push(crate::reconcile::DEFAULT_SCHEMA.to_string());
-            }
-            for r in e.refs.iter().filter(|r| {
+        // Each reference `refs` makes, through `via`: a guessed schema that
+        // resolved to nothing carries the path it is looked up along.
+        let mut add = |via: &OwnedObject, refs: &[crate::entity::Ref], search_path: &[String]| {
+            for r in refs.iter().filter(|r| {
                 matches!(
                     r.kind,
                     RefKind::Reads | RefKind::Writes | RefKind::Calls | RefKind::Uses
@@ -214,12 +207,45 @@ impl Design {
                         kind: "entity".to_string(),
                         target,
                         via: format!("{} {}.{}", via.kind, via.schema, via.name),
-                        search_path: if r.unresolved && r.schema_source.is_guess() {
-                            search_path.clone()
+                        search_path: if r.schema_source.is_guess() {
+                            search_path.to_vec()
                         } else {
                             Vec::new()
                         },
                     });
+                }
+            }
+        };
+        for (e, keys) in &keyed {
+            let Some(via) = keys.first() else {
+                continue;
+            };
+            // As the resolver walks it: the named schemas, then `public`, which
+            // dbd keeps on every path it applies.
+            let mut search_path: Vec<String> = e.schema_path.schemas().map(str::to_string).collect();
+            if !search_path.iter().any(|s| s == crate::reconcile::DEFAULT_SCHEMA) {
+                search_path.push(crate::reconcile::DEFAULT_SCHEMA.to_string());
+            }
+            // A reference dbd resolved is `Resolved`, no guess; one it could
+            // not still carries the path.
+            add(via, &e.refs, &search_path);
+            // A routine its file creates beside the entity it is for — a
+            // table's trigger function — uses what its own body refers to.
+            if matches!(e.entity_type, EntityType::Function | EntityType::Procedure)
+                || !keys.iter().any(|k| k.namespace == "routine")
+            {
+                continue;
+            }
+            let Some(sql) = e
+                .file
+                .as_ref()
+                .and_then(|file| crate::source_text::read_to_string(&self.project_dir.join(file)).ok())
+            else {
+                continue;
+            };
+            for (_, name, refs) in crate::parser::pg::procs::routine_body_refs(&sql, &e.schema_path) {
+                if let Some(routine) = keys.iter().find(|k| k.namespace == "routine" && k.name == name) {
+                    add(routine, &refs, &search_path);
                 }
             }
         }
