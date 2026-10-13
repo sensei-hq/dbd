@@ -2511,3 +2511,36 @@ async fn reconcile_prunes_an_unowned_table_in_a_shared_schema_only_when_told() {
     );
     assert_eq!(stdout(&gadgets).trim(), "t", "other's app.gadgets survives");
 }
+
+/// `reset --dry-run --schemas` previews what the run does: it keeps a schema
+/// another project has tables in, and says so, rather than listing a `DROP
+/// SCHEMA` the run will not perform (#7).
+#[tokio::test]
+async fn a_reset_preview_keeps_what_another_project_has() {
+    let (_pg, url) = start_pg().await;
+    let shop = tempfile::tempdir().unwrap();
+    project(shop.path());
+    let applied = dbd(shop.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+
+    let other = tempfile::tempdir().unwrap();
+    std::fs::write(
+        other.path().join("design.yaml"),
+        "project:\n  name: other\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(other.path().join("ddl/table/app")).unwrap();
+    std::fs::write(
+        other.path().join("ddl/table/app/gadgets.ddl"),
+        "create table if not exists app.gadgets (id integer primary key);\n",
+    )
+    .unwrap();
+    let applied = dbd(other.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+
+    let preview = dbd(shop.path(), &url, &["reset", "--dry-run", "--force", "--schemas"]);
+    assert!(preview.status.success(), "{}", combined(&preview));
+    let out = combined(&preview);
+    assert!(!out.contains("DROP SCHEMA IF EXISTS \"app\""), "{out}");
+    assert!(out.contains("schema app kept") && out.contains("\"other\""), "{out}");
+}
