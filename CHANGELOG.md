@@ -171,6 +171,12 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   A SQLite reset is guarded by the uses owners record and the foreign keys
   that reference a table: a table another project's view reads is not
   dropped.
+- **A guide to sharing a database** —
+  [docs/guide/14-sharing-a-database.md](docs/guide/14-sharing-a-database.md),
+  on the site at `/guide/sharing-a-database`: owners and the registry, what each
+  command does beside other projects, moving entities and names, `inspect
+  --shared`, onboarding and SQLite. The commands reference, `llms.txt`,
+  `llms-full.txt` and the skill cover the new flags and rules.
 - **The uses guard sees further** (#7, phase 2). A dependent nobody owns —
   a project's not yet recording its uses — is guarded where a project might
   own it, by `--prune`'s rule: in a schema another project uses, or anywhere

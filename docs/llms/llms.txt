@@ -175,6 +175,7 @@ Global flags: `-e dev|prod` (`development`/`production` accepted as aliases; any
 - [The schema viewer](https://dbd.sensei-hq.com/guide/schema-viewer) — tabs, privacy, /projects, the model
 - [Embedding dbd-core](https://dbd.sensei-hq.com/guide/embedding) — the library API, compiled examples
 - [Other dialects](https://dbd.sensei-hq.com/guide/other-dialects) — readers, encodings, `dbd emit`
+- [Sharing a database](https://dbd.sensei-hq.com/guide/sharing-a-database) — one owner per entity, pruning and reset beside other projects, `--adopt-from`, `inspect --shared`
 - [Changelog](https://dbd.sensei-hq.com/changelog) — the last five releases
 
 ## Documentation

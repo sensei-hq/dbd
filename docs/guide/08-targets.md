@@ -186,6 +186,10 @@ target:
   procedures and materialized views —
   `SQLite adapter does not support Enum entities (status)`.
 - **No transaction around the apply**, unlike PostgreSQL.
+- **Projects sharing a file** are kept apart as on PostgreSQL: each table has one
+  owner, recorded in `_dbd_objects` and `_dbd_uses`, and no run touches another
+  project's. A table is its name there — schema-less, and without regard to
+  case. See [sharing a database](14-sharing-a-database.md#sqlite).
 - **Grants are skipped** with `Skipping schema grants (target has no grant
   model).` **Policies** are PostgreSQL SQL, so each policy file fails.
 - **Import** writes multi-row `INSERT … VALUES (?,?),(?,?), …` batches of at most
