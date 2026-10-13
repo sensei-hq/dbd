@@ -1211,9 +1211,10 @@ async fn release_in(
 /// policy as itself — so a part reaches what depends on the part and not on
 /// its table; a view's rewrite rule stands for the whole view, which is what
 /// depends on the view, and a generated column's expression leads to the
-/// column it is part of. A `truncate` reaches only the tables whose foreign
-/// keys point at the entity, through each other, and walks no further: it
-/// empties them, and drops nothing. Each dependent is named by its owning
+/// column it is part of. A `truncate` reaches what it empties and walks no
+/// further, dropping nothing: the table, every table inheriting from or a
+/// partition of one it empties, and every table whose foreign key points at
+/// one it empties. Each dependent is named by its owning
 /// relation, type or routine. Rows: the other owner, and the dependent as
 /// `kind schema.name`.
 const DEPENDENTS_SQL: &str = "\
@@ -1226,10 +1227,14 @@ inh(child) AS ( \
   SELECT i.inhrelid FROM pg_inherits i JOIN rel ON i.inhparent = rel.oid WHERE $4 = 'column' \
   UNION SELECT i.inhrelid FROM pg_inherits i JOIN inh ON i.inhparent = inh.child \
 ), \
-fk(child) AS ( \
-  SELECT k.conrelid FROM pg_constraint k JOIN rel ON k.confrelid = rel.oid \
-  WHERE $4 = 'truncate' AND k.contype = 'f' AND k.conrelid <> rel.oid \
-  UNION SELECT k.conrelid FROM pg_constraint k JOIN fk ON k.confrelid = fk.child WHERE k.contype = 'f' \
+emptied(member) AS ( \
+  SELECT rel.oid FROM rel WHERE $4 = 'truncate' \
+  UNION \
+  SELECT x.member FROM emptied e CROSS JOIN LATERAL ( \
+    SELECT i.inhrelid FROM pg_inherits i WHERE i.inhparent = e.member \
+    UNION ALL \
+    SELECT k.conrelid FROM pg_constraint k WHERE k.confrelid = e.member AND k.contype = 'f' \
+  ) x(member) \
 ), \
 start(classid, objid, objsubid) AS ( \
   SELECT 'pg_class'::regclass::oid, rel.oid, 0 FROM rel WHERE $4 = 'whole' \
@@ -1262,7 +1267,7 @@ start(classid, objid, objsubid) AS ( \
   UNION ALL SELECT d.classid, d.objid, d.objsubid FROM pg_extension e \
             JOIN pg_depend d ON d.refclassid = 'pg_extension'::regclass AND d.refobjid = e.oid AND d.deptype = 'e' \
             WHERE $1 = 'extension' AND e.extname = $3 \
-  UNION ALL SELECT 'pg_class'::regclass::oid, fk.child, 0 FROM fk \
+  UNION ALL SELECT 'pg_class'::regclass::oid, emptied.member, 0 FROM emptied \
 ), \
 walk(classid, objid, objsubid) AS ( \
   SELECT classid, objid, objsubid FROM start \

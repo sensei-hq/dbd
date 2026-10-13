@@ -501,16 +501,14 @@ impl Design {
         plan: &super::ExecutionPlan,
     ) -> Result<()> {
         use crate::adapter::{Guarded, GuardedPart};
-        // A design not read as Postgres has migrations in its own dialect —
-        // SQLite's, say — which this guard, reading Postgres, cannot judge.
+        // A design not read as Postgres may keep migrations in its own dialect
+        // — SQLite's — which libpg_query cannot read: such a script is passed
+        // over, not refused. What it can read is guarded as any other's. An
+        // unreadable script is refused only where there is someone else to
+        // protect: another project recorded in the database.
         let postgres =
             crate::parser::ParserChoice::resolve(&self.config.source.dialect, self.config.source.parser.as_deref())
                 .is_ok_and(|parser| parser == crate::parser::ParserChoice::PgQuery);
-        if !postgres {
-            return Ok(());
-        }
-        // An unreadable script is refused only where there is someone else to
-        // protect: another project recorded in the database.
         let mut others: Option<bool> = None;
         let mut guarded: Vec<(Guarded, String)> = Vec::new();
         for step in &plan.steps {
@@ -536,6 +534,9 @@ impl Design {
                 continue;
             };
             if let Err(e) = pg_query::parse(&sql) {
+                if !postgres {
+                    continue;
+                }
                 let others = match others {
                     Some(others) => others,
                     None => *others.insert(!adapter.other_projects_meta().await?.is_empty()),
