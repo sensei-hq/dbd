@@ -10992,9 +10992,12 @@ async fn await_lock_wait(adapter: &dyn dbd_core::DatabaseAdapter, table: &str) {
     }
 }
 
-/// Wait — at most 30s — until some session waits for dbd's write lock.
+/// Wait — at most 30s — until some session waits for dbd's write lock: one
+/// blocked on it, or one that says it is waiting.
 async fn await_write_lock_wait(adapter: &dyn dbd_core::DatabaseAdapter) {
     let probe = "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND NOT granted) \
+                 AND NOT EXISTS (SELECT 1 FROM pg_stat_activity \
+                                 WHERE application_name = 'dbd: waiting for the write lock') \
                  THEN RAISE EXCEPTION 'no wait'; END IF; END $$";
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while adapter.execute_script(probe).await.is_err() {
@@ -14182,6 +14185,183 @@ async fn a_migration_waits_for_another_projects_apply_in_flight() {
         "{err}"
     );
     assert_table_exists(&*shop, "app", "old").await;
+}
+
+/// Whether dbd's write lock is held — in `mode` (`ExclusiveLock`,
+/// `ShareLock`), or in any mode for `None`.
+fn write_lock_held(mode: Option<&str>) -> String {
+    let mode = mode.map(|m| format!(" AND mode = '{m}'")).unwrap_or_default();
+    format!("SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND granted{mode}")
+}
+
+/// A deploy's policies run after its apply, and `dbd policies` on its own:
+/// unlocked, another project's reset read, the policy landed, and the reset's
+/// `CASCADE` dropped it. Policies wait for the write lock as an apply does
+/// (#7).
+#[tokio::test]
+async fn policies_wait_for_a_run_holding_the_write_lock() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let setup = connect(&url, "setup").await.unwrap();
+    let bd = tempfile::tempdir().unwrap();
+    let theirs = billing_reading(
+        bd.path(),
+        &[
+            (
+                "ddl/table/billing/ledger.ddl",
+                "create table if not exists billing.ledger (id int primary key);\n",
+            ),
+            (
+                "policies/billing/ledger.sql",
+                "alter table billing.ledger enable row level security;\n\
+                 create policy p_all on billing.ledger using (true);\n",
+            ),
+        ],
+    );
+    theirs
+        .apply(&*billing, None, false, None, Progress::none())
+        .await
+        .expect("billing's apply");
+
+    shop.lock_writes(true).await.expect("shop's lock");
+    let (report, ()) = tokio::join!(
+        dbd_core::design::apply_policies(&*billing, theirs.project_dir(), false, None),
+        async {
+            await_write_lock_wait(&*setup).await;
+            assert_catalog(
+                &*setup,
+                false,
+                "SELECT 1 FROM pg_policies WHERE policyname = 'p_all'",
+                "p_all",
+            )
+            .await;
+            shop.unlock_writes().await.expect("shop's unlock");
+        }
+    );
+    assert_eq!(report.expect("billing's policies").applied.len(), 1);
+    assert_catalog(
+        &*setup,
+        true,
+        "SELECT 1 FROM pg_policies WHERE policyname = 'p_all'",
+        "p_all",
+    )
+    .await;
+}
+
+/// The lock is held by a session that sits idle through the run: a server's
+/// `idle_session_timeout` ended it — and the lock with it — mid-run (#7).
+#[tokio::test]
+async fn the_write_lock_outlives_an_idle_session_timeout() {
+    let (_pg, url) = start_pg().await;
+    let setup = connect(&url, "setup").await.unwrap();
+    setup
+        .execute_script(
+            "DO $$ BEGIN EXECUTE format('ALTER DATABASE %I SET idle_session_timeout = %L', current_database(), '1s'); END $$",
+        )
+        .await
+        .unwrap();
+    let shop = connect(&url, "shop").await.unwrap();
+    shop.lock_writes(false).await.expect("shop's lock");
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    let probe = connect(&url, "probe").await.unwrap();
+    assert_catalog(&*probe, true, &write_lock_held(Some("ShareLock")), "shop's write lock").await;
+    shop.unlock_writes().await.expect("shop's unlock");
+}
+
+/// A run cancelled part-way — a library caller's timeout — left its lock held
+/// by its adapter for as long as the adapter lived, and every later run on it
+/// sharing that lock, an exclusive one included (#7).
+#[tokio::test]
+async fn a_cancelled_run_releases_the_write_lock() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let probe = connect(&url, "probe").await.unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    let slow = named_project(
+        sd.path(),
+        "shop",
+        "",
+        &[(
+            "ddl/table/app/orders.ddl",
+            "set search_path to app;\ncreate table if not exists orders (id int primary key);\n\
+             do $$ begin perform pg_sleep(3); end $$;\n",
+        )],
+    );
+    let cancelled = tokio::time::timeout(
+        std::time::Duration::from_millis(1500),
+        slow.apply(&*shop, None, false, None, Progress::none()),
+    )
+    .await;
+    assert!(cancelled.is_err(), "the apply was to be cancelled mid-run");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while probe
+        .execute_script(&format!(
+            "DO $$ BEGIN IF EXISTS ({}) THEN RAISE EXCEPTION 'held'; END IF; END $$",
+            write_lock_held(None)
+        ))
+        .await
+        .is_err()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the cancelled run's lock is still held"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    let fresh = connect(&url, "shop").await.unwrap();
+    fresh.lock_writes(true).await.expect("an exclusive lock");
+    assert_catalog(
+        &*probe,
+        true,
+        &write_lock_held(Some("ExclusiveLock")),
+        "the exclusive write lock",
+    )
+    .await;
+    fresh.unlock_writes().await.unwrap();
+}
+
+/// A run holding the lock shared asking for it exclusive got the shared one,
+/// silently: it is refused (#7).
+#[tokio::test]
+async fn an_exclusive_write_lock_is_refused_inside_a_shared_one() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    shop.lock_writes(false).await.expect("shared");
+    let err = shop
+        .lock_writes(true)
+        .await
+        .expect_err("exclusive inside shared")
+        .to_string();
+    assert!(err.contains("exclusive"), "{err}");
+    shop.unlock_writes().await.unwrap();
+}
+
+/// A run waiting for the lock sat in one long statement, its snapshot open,
+/// and `CREATE INDEX CONCURRENTLY` by the run holding the lock waited for that
+/// snapshot — each waiting on the other until the lock wait gave up (#7).
+#[tokio::test]
+async fn a_run_waiting_for_the_write_lock_holds_no_snapshot() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let setup = connect(&url, "setup").await.unwrap();
+    setup.execute_script("CREATE TABLE public.big (id int);").await.unwrap();
+    shop.lock_writes(false).await.expect("shop's lock");
+    let (waited, ()) = tokio::join!(billing.lock_writes(true), async {
+        await_write_lock_wait(&*setup).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            shop.execute_script("CREATE INDEX CONCURRENTLY big_id ON public.big (id);"),
+        )
+        .await
+        .expect("the index build waited on the lock's waiter")
+        .expect("the index build");
+        shop.unlock_writes().await.expect("shop's unlock");
+    });
+    waited.expect("billing's lock");
+    billing.unlock_writes().await.unwrap();
 }
 
 /// A project not yet on a dbd that records its uses claims nothing: its
