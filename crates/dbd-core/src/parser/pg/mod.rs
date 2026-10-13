@@ -63,6 +63,95 @@ impl PgQueryDdl {
     }
 }
 
+/// What a `CREATE` makes: an entity dbd declares, or a type it declares none
+/// for — a composite, a domain, a range — which a file may create beside one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Created {
+    Entity(EntityType),
+    /// The type's kind: `composite type`, `domain` or `range type`.
+    Type(&'static str),
+}
+
+/// Everything the `CREATE` statements in `sql` make — what it is, the schema
+/// the statement states (`None` where it leaves it to the search path), and
+/// its name as Postgres reads it, an unquoted one folded to lower case. A
+/// `DO` block's own statements count: they run as the file applies — how dbd
+/// writes an enum, so it can run twice. Empty when `sql` does not parse.
+pub(crate) fn created_identities(sql: &str) -> Vec<(Created, Option<String>, String)> {
+    let Ok(parsed) = pg_query::parse(sql) else {
+        return Vec::new();
+    };
+    let mut created = created_by(&parsed, sql);
+    for query in do_block_statements(&parsed, sql) {
+        if let Ok(inner) = pg_query::parse(&query) {
+            created.extend(created_by(&inner, &query));
+        }
+    }
+    created
+}
+
+/// The statements the top-level `DO` blocks of `parsed` — `sql`'s parse —
+/// run, as SQL text, in order: what they create, drop or alter is the
+/// script's as much as what it says outright.
+pub(crate) fn do_block_statements(parsed: &pg_query::ParseResult, sql: &str) -> Vec<String> {
+    let mut queries = Vec::new();
+    for raw in &parsed.protobuf.stmts {
+        if !matches!(
+            raw.stmt.as_ref().and_then(|s| s.node.as_ref()),
+            Some(pg_query::NodeEnum::DoStmt(_))
+        ) {
+            continue;
+        }
+        let start = (raw.stmt_location as usize).min(sql.len());
+        let end = if raw.stmt_len == 0 {
+            sql.len()
+        } else {
+            (start + raw.stmt_len as usize).min(sql.len())
+        };
+        if let Some(Ok(tree)) = sql.get(start..end).map(pg_query::parse_plpgsql) {
+            common::collect_plpgsql_queries(&tree, &mut queries);
+        }
+    }
+    queries
+}
+
+/// [`created_identities`] for one parsed script, its `DO` blocks unread.
+fn created_by(parsed: &pg_query::ParseResult, sql: &str) -> Vec<(Created, Option<String>, String)> {
+    // Passed as the default schema, so an unqualified name comes back with it.
+    const UNSTATED: &str = "\u{1}";
+    let (decls, _) = declarations::declarations(parsed, sql, UNSTATED);
+    let temporary = declarations::temporary_relations(parsed);
+    decls
+        .into_iter()
+        .map(|decl| (Created::Entity(decl.entity_type), decl.schema, decl.name))
+        .chain(
+            declarations::created_types(parsed, UNSTATED)
+                .into_iter()
+                .map(|(kind, schema, name)| (Created::Type(kind), schema, name)),
+        )
+        .map(|(created, schema, qualified)| {
+            let name = match &schema {
+                Some(schema) => qualified
+                    .strip_prefix(&format!("{schema}."))
+                    .unwrap_or(&qualified)
+                    .to_string(),
+                None => qualified.clone(),
+            };
+            (created, schema.filter(|s| s != UNSTATED), name)
+        })
+        // A temporary relation is the session's, and nobody's to own.
+        .filter(|(created, schema, name)| {
+            let relation = matches!(
+                created,
+                Created::Entity(
+                    EntityType::Table | EntityType::View | EntityType::MaterializedView | EntityType::Sequence
+                )
+            );
+            !(relation && schema.as_deref().is_none_or(|s| s.starts_with("pg_temp")) && temporary.contains(name))
+        })
+        .collect()
+}
+
 /// [`PgQueryDdl::parse`] with the project's fallback schema path.
 ///
 /// Seeded onto the entity before dispatch; `common::resolve_schema_path` keeps
@@ -222,5 +311,52 @@ mod tests {
                 "COVERED and dispatch disagree on {t:?}"
             );
         }
+    }
+
+    fn created(sql: &str) -> Vec<(Created, Option<String>, String)> {
+        created_identities(sql)
+    }
+
+    /// An unqualified `multirange_type_name` lands where any unqualified name
+    /// does — on the search path — not in the range's schema (#7).
+    #[test]
+    fn an_unqualified_multirange_name_is_left_to_the_search_path() {
+        let made = created("create type app.r1 as range (subtype = int4, multirange_type_name = r1_multi);");
+        assert!(
+            made.contains(&(Created::Type("multirange type"), None, "r1_multi".to_string())),
+            "{made:?}"
+        );
+    }
+
+    /// Postgres clips a multirange's name as it makes it: a name with no
+    /// `range` keeps 52 bytes before `_multirange`, and every name is cut to
+    /// 63 bytes (#7).
+    #[test]
+    fn a_multirange_name_is_clipped_as_postgres_clips_it() {
+        let a = "a".repeat(54);
+        let b = "b".repeat(60);
+        let made = created(&format!(
+            "create type app.{a}range as range (subtype = int4); create type app.{b} as range (subtype = int4);"
+        ));
+        let multiranges: Vec<&str> = made
+            .iter()
+            .filter(|(c, _, _)| *c == Created::Type("multirange type"))
+            .map(|(_, _, n)| n.as_str())
+            .collect();
+        assert_eq!(
+            multiranges,
+            vec![format!("{a}multirang"), format!("{}_multirange", "b".repeat(52))],
+        );
+    }
+
+    /// A temporary table is the session's, and nobody's to own — at the top
+    /// of a file or inside a `DO` block (#7).
+    #[test]
+    fn a_temporary_table_is_no_key() {
+        assert!(created("create temp table tmp_map as select 1 as id;").is_empty());
+        assert!(created("create temporary table tmp_ids (id int);").is_empty());
+        assert!(
+            created("do $$ begin create temp table tmp_map as select 1 as id; drop table tmp_map; end $$;").is_empty()
+        );
     }
 }

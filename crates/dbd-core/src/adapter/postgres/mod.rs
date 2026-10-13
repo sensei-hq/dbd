@@ -2555,8 +2555,81 @@ ORDER BY 1, 2, 4, 5"#;
         self.bookkeeping.heal().await
     }
 
+    async fn claim_objects(
+        &self,
+        owner: &str,
+        objects: &[super::OwnedObject],
+        write: bool,
+        adopt_from: Option<&str>,
+    ) -> Result<Vec<super::HeldObject>> {
+        let mut guard = self.batch.lock().await;
+        self.bookkeeping
+            .claim_objects(guard.as_mut(), owner, objects, write, adopt_from)
+            .await
+    }
+
+    async fn owned_objects(&self, owner: &str) -> Result<Vec<super::OwnedObject>> {
+        self.bookkeeping.owned_objects(owner).await
+    }
+
+    async fn registry(&self) -> Result<super::Registry> {
+        self.bookkeeping.registry().await
+    }
+
+    fn keeps_registry(&self) -> bool {
+        true
+    }
+
+    async fn record_uses(&self, owner: &str, uses: &[super::Use]) -> Result<()> {
+        let mut guard = self.batch.lock().await;
+        self.bookkeeping.record_uses(guard.as_mut(), owner, uses).await
+    }
+
+    async fn ownership(&self, owner: &str, objects: &[super::OwnedObject]) -> Result<super::Ownership> {
+        self.bookkeeping.ownership(owner, objects).await
+    }
+
+    async fn release_objects(&self, owner: &str, declared: &[super::OwnedObject]) -> Result<()> {
+        let mut guard = self.batch.lock().await;
+        self.bookkeeping.release_objects(guard.as_mut(), owner, declared).await
+    }
+
+    async fn dependents(
+        &self,
+        owner: &str,
+        guarded: &[super::Guarded],
+        mine: &[super::OwnedObject],
+    ) -> Result<Vec<super::Dependence>> {
+        self.bookkeeping.dependents(owner, guarded, mine).await
+    }
+
+    async fn users_of(&self, owner: &str, kind: &str, target: &str) -> Result<Vec<String>> {
+        self.bookkeeping.users_of(owner, kind, target).await
+    }
+
+    async fn not_owned_in_schema(
+        &self,
+        owner: &str,
+        schema: &str,
+        mine: &[super::OwnedObject],
+    ) -> Result<Vec<super::SchemaMember>> {
+        self.bookkeeping.not_owned_in_schema(owner, schema, mine).await
+    }
+
     async fn get_db_version(&self) -> Result<u32> {
         self.bookkeeping.version().await
+    }
+
+    async fn lock_writes(&self, exclusive: bool) -> Result<()> {
+        self.bookkeeping.lock_writes(exclusive).await
+    }
+
+    async fn unlock_writes(&self) -> Result<()> {
+        self.bookkeeping.unlock_writes().await
+    }
+
+    fn abandon_writes(&self) {
+        self.bookkeeping.abandon_writes()
     }
 
     async fn apply_migration(&self, version: u32, sql: &str, description: &str, checksum: &str) -> Result<()> {

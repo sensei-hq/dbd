@@ -261,6 +261,34 @@ impl Design {
         name: Option<&str>,
         dry_run: bool,
         scope: Option<&ResolvedScope>,
+        progress: Progress<S, D, C>,
+    ) -> Result<()>
+    where
+        S: FnMut(&str),
+        D: FnMut(&str, Option<&str>),
+        C: FnMut(ApplyComplete),
+    {
+        // A real run holds the database's dbd write lock from its first read
+        // to its last write (#7): shared to build, so another project's reset
+        // waits for it and reads what it built; exclusive to run migrations,
+        // whose drops `CASCADE` by what the guard read of other projects, so
+        // no other project's run writes between the two.
+        let run = self.apply_run(adapter, name, dry_run, scope, progress);
+        if dry_run {
+            return run.await;
+        }
+        let migrates = !adapter.prefers_batch_apply()
+            && !snapshot::pending_migrations(adapter.get_db_version().await?, &self.project_dir).is_empty();
+        ownership::with_write_lock(adapter, migrates, run).await
+    }
+
+    /// [`Design::apply`]'s run, under the write lock when it writes.
+    async fn apply_run<S, D, C>(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        name: Option<&str>,
+        dry_run: bool,
+        scope: Option<&ResolvedScope>,
         mut progress: Progress<S, D, C>,
     ) -> Result<()>
     where
@@ -276,7 +304,8 @@ impl Design {
         // `dry_run` too, since the database is there to ask. Both read the
         // database's marks without healing the bookkeeping, which is itself a
         // write.
-        self.check_apply_guards(&self.database_marks(adapter).await?)?;
+        self.check_run_guards(adapter, &self.database_marks(adapter).await?)
+            .await?;
         // Also before the first hook, and under `dry_run` (see the function).
         let db_version = adapter.get_db_version().await?;
         let latest_version = self.config.project.version.unwrap_or(0);
@@ -289,12 +318,47 @@ impl Design {
         if !adapter.prefers_batch_apply() {
             ensure_no_pending_todos(&pending)?;
         }
+        // The last gate, before the first hook: refuse a design declaring an
+        // entity another owner holds (#7). A real run heals the bookkeeping
+        // first. In one transaction it claims with its work, below; outside
+        // one nothing it writes rolls back — its hooks included — so it claims
+        // now, before the first of them: see `Design::claim_first`.
+        self.preflight(
+            adapter,
+            if dry_run {
+                ownership::Preflight::Read
+            } else {
+                ownership::Preflight::Write
+            },
+        )
+        .await?;
+        // What a pending migration drops that another owner depends on is
+        // refused before anything runs, dry run included (#7) — read from the
+        // run's own plan, built here without writing.
+        if !adapter.prefers_batch_apply() && !pending.is_empty() {
+            let owned: Vec<Entity> = valid_entities.iter().map(|e| (*e).clone()).collect();
+            let preview = build_execution_plan(&owned, db_version, latest_version, &pending, working_set.as_ref());
+            self.guard_migration_drops(adapter, &preview).await?;
+        }
 
         // A hook is filtered against the same working set the entities were.
         // `None` — unscoped or the all-scope — runs every hook, and skips the
         // derivation cost entirely on that common path.
         let hook_scope = self.hook_scope(scope, working_set.as_ref());
         let hook_scope = hook_scope.as_ref().map(|(name, outside)| (*name, outside));
+
+        let outside_txn = !adapter.supports_transactional_apply() || std::env::var_os("DBD_NO_TX").is_some();
+        if !dry_run && outside_txn {
+            // The before-hooks' own refusals — a file missing, a path outside
+            // the project — come first: a refused run claims nothing.
+            hooks::plan_hooks(
+                self.hook_source(),
+                &self.config.apply.before,
+                hooks::HookKind::Before,
+                hook_scope,
+            )?;
+            self.claim(adapter).await?;
+        }
 
         // `apply.before` runs here: after the scope and parse gates, so a bad
         // design still refuses before any hook fires, and before the first
@@ -327,11 +391,6 @@ impl Design {
             .await?;
             return Ok(());
         }
-
-        // Heal-first: ensure bookkeeping storage exists (and is at the current
-        // layout, healing any legacy layout in place) before anything else reads
-        // or writes it — every ownership operation calls this up front.
-        adapter.heal_bookkeeping().await?;
 
         // Batch adapters (e.g. Convex) short-circuit — no execution plan needed
         if adapter.prefers_batch_apply() {
@@ -433,6 +492,9 @@ impl Design {
 
         if use_txn {
             adapter.begin_batch().await?;
+        } else if !outside_txn {
+            // A plan with nothing to build opens no transaction: claim here.
+            self.claim(adapter).await?;
         }
 
         // Execute plan steps inside an async block so a mid-plan error routes
@@ -451,13 +513,21 @@ impl Design {
                 )
                 .await?;
                 // A version's new enum values commit before the rest of it
-                // uses them (see `ExecutionStep::AddEnumValues`).
+                // uses them (see `ExecutionStep::AddEnumValues`) — claimed
+                // first, so nothing commits unclaimed (#7).
                 if use_txn && matches!(step, ExecutionStep::AddEnumValues { .. }) {
+                    self.claim_built(adapter).await?;
                     adapter.commit_batch().await?;
                     adapter.begin_batch().await?;
                 }
             }
-            Ok(())
+            // Built: claim it, in the batch, so the claim commits with the
+            // work and rolls back with it (#7). Claimed already outside one.
+            if use_txn {
+                self.claim_built(adapter).await
+            } else {
+                self.settle(adapter).await
+            }
         }
         .await;
 
@@ -910,7 +980,8 @@ impl Design {
         }
         match crate::script::build_grants_script(&schema_grants, &supabase_schemas) {
             Some(sql) => {
-                adapter.execute_script(&sql).await?;
+                // Under the database's dbd write lock, shared, as an apply (#7).
+                ownership::with_write_lock(adapter, false, adapter.execute_script(&sql)).await?;
                 Ok(GrantsOutcome::Applied)
             }
             None => Ok(GrantsOutcome::None),

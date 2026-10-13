@@ -37,6 +37,9 @@ pub struct MockAdapter {
     /// Entities `introspect()` reports as the live database state. Empty by
     /// default, i.e. an empty live DB.
     pub introspected: Arc<Mutex<Vec<Entity>>>,
+    /// Ordered log of the claims a run writes, as `"<owner>: <n> entities"`
+    /// — a check that only looks is not recorded.
+    pub claims: Arc<Mutex<Vec<String>>>,
 }
 
 impl Default for MockAdapter {
@@ -61,6 +64,7 @@ impl MockAdapter {
             fail_on: Arc::new(Mutex::new(None)),
             fail_script_on: Arc::new(Mutex::new(None)),
             introspected: Arc::new(Mutex::new(Vec::new())),
+            claims: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -264,6 +268,22 @@ impl DatabaseAdapter for MockAdapter {
 
     async fn heal_bookkeeping(&self) -> Result<()> {
         Ok(())
+    }
+
+    async fn claim_objects(
+        &self,
+        owner: &str,
+        objects: &[super::OwnedObject],
+        write: bool,
+        _adopt_from: Option<&str>,
+    ) -> Result<Vec<super::HeldObject>> {
+        if write {
+            self.claims
+                .lock()
+                .unwrap()
+                .push(format!("{owner}: {} entities", objects.len()));
+        }
+        Ok(Vec::new())
     }
 
     async fn get_db_version(&self) -> Result<u32> {

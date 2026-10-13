@@ -276,6 +276,164 @@ fn first_token_at(piece: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// What script `sql` drops, statement by statement — for the uses guard (#7):
+/// a `DROP` of a table, view, materialized view, sequence, foreign table, type
+/// or domain (`relation`), of a function, procedure or routine (`routine`), of
+/// a schema (`schema`, everything in it) or of an extension (`extension`),
+/// whole; a `DROP INDEX`, an index; an `ALTER TABLE`'s `DROP COLUMN` or `DROP
+/// CONSTRAINT`, a part; and a `TRUNCATE … CASCADE`'s tables, as truncated —
+/// it empties every table that refers to them. The statements a `DO` block runs
+/// count. Each as `(namespace, schema, name, part)`; the schema is the one the
+/// statement states, else the script's own `SET search_path` before it, else
+/// `None`. Empty for a script that does not parse.
+pub(crate) fn drops_in(sql: &str) -> Vec<(&'static str, Option<String>, String, crate::adapter::GuardedPart)> {
+    let Ok(parsed) = pg_query::parse(sql) else {
+        return Vec::new();
+    };
+    let mut path: Option<String> = None;
+    let mut drops = Vec::new();
+    collect_drops(&parsed, &mut path, &mut drops);
+    for query in crate::parser::pg::do_block_statements(&parsed, sql) {
+        if let Ok(inner) = pg_query::parse(&query) {
+            collect_drops(&inner, &mut path, &mut drops);
+        }
+    }
+    drops
+}
+
+/// [`drops_in`]'s walk of one parsed script, `path` the search path's first
+/// schema as the script sets it.
+fn collect_drops(
+    parsed: &pg_query::ParseResult,
+    path: &mut Option<String>,
+    drops: &mut Vec<(&'static str, Option<String>, String, crate::adapter::GuardedPart)>,
+) {
+    use crate::adapter::GuardedPart;
+    use pg_query::NodeEnum;
+    use pg_query::protobuf::{AlterTableType, DropBehavior, ObjectType};
+    let strings = |nodes: &[pg_query::protobuf::Node]| -> Vec<String> {
+        nodes
+            .iter()
+            .filter_map(|n| match n.node.as_ref() {
+                Some(NodeEnum::String(s)) => Some(s.sval.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    for node in parsed
+        .protobuf
+        .stmts
+        .iter()
+        .filter_map(|raw| raw.stmt.as_ref().and_then(|s| s.node.as_ref()))
+    {
+        let named = |parts: Vec<String>| -> Option<(Option<String>, String)> {
+            match parts.as_slice() {
+                [name] => Some((path.clone(), name.clone())),
+                [.., schema, name] => Some((Some(schema.clone()), name.clone())),
+                [] => None,
+            }
+        };
+        match node {
+            // The first schema the path names: `"$user"` is the connecting
+            // role's, which no script names.
+            NodeEnum::VariableSetStmt(set) if set.name.eq_ignore_ascii_case("search_path") => {
+                *path = set
+                    .args
+                    .iter()
+                    .filter_map(|a| match a.node.as_ref() {
+                        Some(NodeEnum::AConst(c)) => match c.val.as_ref() {
+                            Some(pg_query::protobuf::a_const::Val::Sval(s)) => Some(s.sval.clone()),
+                            _ => None,
+                        },
+                        Some(NodeEnum::String(s)) => Some(s.sval.clone()),
+                        _ => None,
+                    })
+                    .find(|schema| schema != "$user");
+            }
+            NodeEnum::DropStmt(d) => {
+                let kind = d.remove_type();
+                for object in &d.objects {
+                    let parts = match object.node.as_ref() {
+                        Some(NodeEnum::List(list)) => strings(&list.items),
+                        Some(NodeEnum::TypeName(t)) => strings(&t.names),
+                        Some(NodeEnum::ObjectWithArgs(f)) => strings(&f.objname),
+                        Some(NodeEnum::String(s)) => vec![s.sval.clone()],
+                        _ => continue,
+                    };
+                    match kind {
+                        ObjectType::ObjectTable
+                        | ObjectType::ObjectView
+                        | ObjectType::ObjectMatview
+                        | ObjectType::ObjectSequence
+                        | ObjectType::ObjectForeignTable
+                        | ObjectType::ObjectType
+                        | ObjectType::ObjectDomain => {
+                            if let Some((schema, name)) = named(parts) {
+                                drops.push(("relation", schema, name, GuardedPart::Whole));
+                            }
+                        }
+                        ObjectType::ObjectFunction | ObjectType::ObjectProcedure | ObjectType::ObjectRoutine => {
+                            if let Some((schema, name)) = named(parts) {
+                                drops.push(("routine", schema, name, GuardedPart::Whole));
+                            }
+                        }
+                        ObjectType::ObjectIndex => {
+                            if let Some((schema, name)) = named(parts) {
+                                drops.push(("relation", schema, name.clone(), GuardedPart::Index(name)));
+                            }
+                        }
+                        ObjectType::ObjectSchema => {
+                            if let Some(name) = parts.last() {
+                                drops.push(("schema", Some(name.clone()), name.clone(), GuardedPart::Whole));
+                            }
+                        }
+                        ObjectType::ObjectExtension => {
+                            if let Some(name) = parts.last() {
+                                drops.push(("extension", None, name.clone(), GuardedPart::Whole));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            NodeEnum::TruncateStmt(t) if t.behavior() == DropBehavior::DropCascade => {
+                for rel in &t.relations {
+                    if let Some(NodeEnum::RangeVar(rv)) = rel.node.as_ref() {
+                        let schema = if rv.schemaname.is_empty() {
+                            path.clone()
+                        } else {
+                            Some(rv.schemaname.clone())
+                        };
+                        drops.push(("relation", schema, rv.relname.clone(), GuardedPart::Truncate));
+                    }
+                }
+            }
+            NodeEnum::AlterTableStmt(a) => {
+                let Some(rv) = a.relation.as_ref() else {
+                    continue;
+                };
+                let schema = if rv.schemaname.is_empty() {
+                    path.clone()
+                } else {
+                    Some(rv.schemaname.clone())
+                };
+                for cmd in &a.cmds {
+                    let Some(NodeEnum::AlterTableCmd(cmd)) = cmd.node.as_ref() else {
+                        continue;
+                    };
+                    let part = match cmd.subtype() {
+                        AlterTableType::AtDropColumn => GuardedPart::Column(cmd.name.clone()),
+                        AlterTableType::AtDropConstraint => GuardedPart::Constraint(cmd.name.clone()),
+                        _ => continue,
+                    };
+                    drops.push(("relation", schema.clone(), rv.relname.clone(), part));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Whether statement `piece` is an `ALTER TYPE … ADD VALUE`.
 pub(crate) fn is_enum_value_addition(piece: &str) -> bool {
     matches!(migration_statement(piece), MigrationStatement::AddValue { .. })
@@ -1664,5 +1822,37 @@ mod tests {
         assert!(script.contains("GRANT USAGE ON SCHEMA \"config\" TO \"app_user\""));
         assert!(script.contains("GRANT SELECT ON ALL TABLES IN SCHEMA \"config\" TO \"app_user\""));
         assert!(script.contains("GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA \"config\" TO \"app_admin\""));
+    }
+
+    /// What a migration drops is read from every statement it runs — a `DO`
+    /// block's included (#7).
+    #[test]
+    fn a_scripts_drops_are_read_inside_do_blocks() {
+        use crate::adapter::GuardedPart;
+        assert_eq!(
+            drops_in("DO $$ BEGIN ALTER TABLE app.orders DROP COLUMN total CASCADE; END $$;"),
+            vec![(
+                "relation",
+                Some("app".to_string()),
+                "orders".to_string(),
+                GuardedPart::Column("total".to_string())
+            )]
+        );
+    }
+
+    /// `"$user"` on a search path is the connecting role's schema, which no
+    /// script names: a bare name is in the first schema the path names (#7).
+    #[test]
+    fn a_bare_drop_after_user_on_the_path_is_in_the_first_named_schema() {
+        use crate::adapter::GuardedPart;
+        assert_eq!(
+            drops_in("SET search_path TO \"$user\", app; DROP TABLE old CASCADE;"),
+            vec![(
+                "relation",
+                Some("app".to_string()),
+                "old".to_string(),
+                GuardedPart::Whole
+            )]
+        );
     }
 }

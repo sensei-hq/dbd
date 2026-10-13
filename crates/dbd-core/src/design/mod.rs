@@ -19,12 +19,14 @@ mod env_guard;
 mod hooks;
 mod import;
 mod marks;
+mod ownership;
 mod plan;
 mod reconcile;
 mod reset;
 mod scope;
 
 pub use marks::DatabaseMarks;
+pub use ownership::{Prune, SharedDatabase, SharedProject, SharedUse, leave_out_other_owners};
 pub use plan::{ApplyStrategy, ExecutionPlan, ExecutionStep, build_execution_plan};
 pub use reset::{KeptRole, ResetComplete};
 
@@ -499,6 +501,14 @@ pub async fn apply_policies(
     if dry_run {
         return Ok(plan);
     }
+    // A policy depends on the tables it names: written under the database's
+    // dbd write lock, shared, so another project's reset or prune reads it
+    // before it drops `CASCADE` (#7).
+    ownership::with_write_lock(adapter, false, run_policies(adapter, project_dir, plan)).await
+}
+
+/// [`apply_policies`]'s run of `plan`, under the write lock.
+async fn run_policies(adapter: &dyn DatabaseAdapter, project_dir: &Path, plan: PolicyReport) -> Result<PolicyReport> {
     let mut report = PolicyReport {
         applied: Vec::new(),
         failed: Vec::new(),
@@ -608,6 +618,13 @@ pub struct Design {
     /// telling someone their "verbatim project" cannot be diffed names nothing
     /// they typed.
     dialect: String,
+    /// The owner whose entities this design takes over as it claims them —
+    /// `--adopt-from` (#7). See [`Design::adopting_from`].
+    adopt_from: Option<String>,
+    /// Whether this design may run as an owner that holds entities here it
+    /// declares none of — `--allow-ownership-change` (#7). See
+    /// [`Design::allowing_ownership_change`].
+    allow_ownership_change: bool,
 }
 
 /// The phrase [`warn_if_no_search_path`] reports with, so
@@ -982,6 +999,8 @@ impl Design {
             parser: parser_choice,
             search_path: project_search_path,
             dialect: dialect_label,
+            adopt_from: None,
+            allow_ownership_change: false,
         })
     }
 
@@ -1923,6 +1942,42 @@ import:
                 .await
                 .unwrap_or_else(|e| panic!("a v{db} database takes a v1 project: {e}"));
         }
+    }
+
+    /// A before-hook that cannot run — its file missing — is a refusal, and an
+    /// apply outside one transaction claims only past its last refusal: it
+    /// claimed first, and a misconfigured run left the database claimed for
+    /// entities it never wrote (#7).
+    #[tokio::test]
+    async fn an_apply_outside_a_transaction_refused_its_hook_claims_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+        std::fs::write(
+            dir.join("design.yaml"),
+            "project:\n  name: shop\nsource:\n  dialect: postgresql\nschemas:\n  - app\n\
+             apply:\n  before:\n    - sql/missing.sql\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/app/orders.ddl"),
+            "create table if not exists app.orders (id int primary key);\n",
+        )
+        .unwrap();
+        let design = load_project(dir, "dev");
+        let mock = MockAdapter::new();
+        assert!(!mock.supports_txn, "outside a transaction");
+
+        let err = design
+            .apply(&mock, None, false, None, Progress::none())
+            .await
+            .expect_err("the hook file is missing");
+        assert!(err.to_string().contains("missing.sql"), "{err}");
+        assert!(
+            mock.claims.lock().unwrap().is_empty(),
+            "{:?}",
+            mock.claims.lock().unwrap()
+        );
     }
 
     /// The gap this feature exists to close: `dbd apply` calls `Design::apply`

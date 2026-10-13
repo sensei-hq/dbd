@@ -151,6 +151,15 @@ Where `apply` can write. See the table above for what dbd can *read*.
   Whole-deployment export remains the Convex CLI's job (`npx convex export`)
   because the CLI doesn't expose per-table dumps.
 
+## Sharing a database
+
+Several projects can deploy into one database. Each entity has one owner — the
+project whose design declares it — and no run changes or drops another
+project's: declaring one is refused, `reconcile --prune` leaves it alone, and a
+drop another project depends on is refused, naming the use. Move an entity with
+`--adopt-from <owner>`, and see what shares a database with
+`dbd inspect --shared`. See [sharing a database](docs/guide/14-sharing-a-database.md).
+
 ## Offline reference cache
 
 After `dbd inspect --from-db`, dbd writes a snapshot of all user-defined
@@ -390,6 +399,7 @@ See [Embedding dbd-core](docs/guide/12-embedding.md) for the whole API.
 - [The schema viewer](docs/guide/11-schema-viewer.md)
 - [Embedding dbd-core](docs/guide/12-embedding.md)
 - [Other dialects](docs/guide/13-other-dialects.md)
+- [Sharing a database](docs/guide/14-sharing-a-database.md)
 - [Changelog](CHANGELOG.md)
 - [Design document](docs/design/architecture.md)
 
