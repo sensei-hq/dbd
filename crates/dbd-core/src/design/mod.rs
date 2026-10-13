@@ -992,10 +992,11 @@ impl Design {
 
     /// The scanned design with its references resolved and its entities in
     /// apply order. `known` names entities this design may reference without
-    /// declaring them: in a workspace, what the other modules declare. Each
-    /// is added as an external — never this design's to build or own — as is
-    /// each `external:` entry.
-    pub(crate) fn resolved(mut self, known: &[String]) -> Self {
+    /// declaring them, with their kinds: in a workspace, what the other
+    /// modules declare. Each is added as an external — never this design's to
+    /// build or own — as is each `external:` entry; a known sequence or enum
+    /// is reached folded as one of the design's own is.
+    pub(crate) fn resolved(mut self, known: &[(String, EntityType)]) -> Self {
         let mut entities = std::mem::take(&mut self.entities);
         let design_config = &self.config;
 
@@ -1005,15 +1006,20 @@ impl Design {
             entities.push(Entity::external(&ext.name));
         }
         let mut seen: std::collections::HashSet<String> = external_names.iter().cloned().collect();
-        for name in known {
+        for (name, _) in known {
             if seen.insert(name.clone()) {
                 external_names.push(name.clone());
                 entities.push(Entity::external(name));
             }
         }
+        let foldable: Vec<String> = known
+            .iter()
+            .filter(|(_, kind)| matches!(kind, EntityType::Sequence | EntityType::Enum))
+            .map(|(name, _)| name.clone())
+            .collect();
 
         // Resolve references
-        references::resolve_references(&mut entities, &external_names, &design_config.ignore);
+        references::resolve_references_with(&mut entities, &external_names, &foldable, &design_config.ignore);
 
         // Order for apply in one pass over the whole graph. Dependencies decide,
         // with the type sequence (schemas → extensions → roles → sequences →

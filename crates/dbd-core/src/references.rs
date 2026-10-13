@@ -21,6 +21,18 @@ use crate::entity::{Entity, EntityType, ForeignKey, Ref, SchemaSource, TableCons
 ///
 /// Also filters out references that match the ignore list (patterns from design.yaml).
 pub fn resolve_references(entities: &mut [Entity], external_names: &[String], ignore: &[String]) {
+    resolve_references_with(entities, external_names, &[], ignore)
+}
+
+/// As [`resolve_references`], where `foldable` names sequences and enums
+/// declared elsewhere — a workspace module's neighbours (#7) — that a folded
+/// reference reaches as it reaches the design's own.
+pub(crate) fn resolve_references_with(
+    entities: &mut [Entity],
+    external_names: &[String],
+    foldable: &[String],
+    ignore: &[String],
+) {
     // Keyed on `Entity::qualified_key`, not `name`: two databases can hold the
     // same `schema.name`, and keying on the bare name would merge them into one
     // node. For a catalog-less entity — every entity in every PostgreSQL
@@ -43,11 +55,12 @@ pub fn resolve_references(entities: &mut [Entity], external_names: &[String], ig
     // built-in `text` must not find a `"Text"` table. Two that fold alike
     // reach neither.
     let mut folded: HashMap<String, Option<String>> = HashMap::new();
-    for e in entities
+    let keys = entities
         .iter()
         .filter(|e| matches!(e.entity_type, EntityType::Sequence | EntityType::Enum))
-    {
-        let key = e.qualified_key();
+        .map(Entity::qualified_key)
+        .chain(foldable.iter().cloned());
+    for key in keys {
         let lower = key.to_ascii_lowercase();
         if lower != key {
             folded.entry(lower).and_modify(|name| *name = None).or_insert(Some(key));

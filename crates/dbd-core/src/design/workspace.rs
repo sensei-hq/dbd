@@ -15,18 +15,22 @@ use std::path::{Path, PathBuf};
 use indexmap::IndexMap;
 
 use super::Design;
+use crate::adapter::OwnedObject;
 use crate::config::{DesignConfig, ModuleConfig, ProjectConfig};
-use crate::entity::EntityType;
+use crate::entity::{EntityType, Ref};
 use crate::error::{DbdError, Result};
 
 /// The folders a module's design reads and writes, each under its own folder.
 const MODULE_FOLDERS: &[&str] = &["ddl", "import", "policies", "snapshots", "migrations"];
 
 /// A manifest and its modules, in `depends_on` order: each after the modules
-/// it depends on, ties in the order `modules:` lists them.
+/// it depends on — of those whose dependencies are in place, the one
+/// `modules:` lists first.
 pub struct Workspace {
+    /// The manifest as written, for a design with `modules:`. A design
+    /// without them is its one module's config.
+    manifest: Option<DesignConfig>,
     modules: Vec<Module>,
-    has_modules: bool,
 }
 
 /// One module of a [`Workspace`]: a design of its own.
@@ -72,15 +76,17 @@ impl Workspace {
     /// to `project_dir` (the config's own folder when `None`).
     ///
     /// Refuses a `modules:` block that does not describe a partition: an
-    /// unknown dependency or a cycle, a folder outside the project, missing or
-    /// shared, a module name that cannot name an owner, `project.version` or
-    /// `project.released` (each module has its own), files at the root no
-    /// module holds — and then two modules declaring the same entity (T19), or
-    /// a module referencing one it does not depend on, directly or through its
-    /// dependencies (T20). All before any database is involved.
+    /// unknown dependency or a cycle, a module name that cannot name an owner,
+    /// a folder that is outside the project, the project's own, inside another
+    /// module's, shared or missing, `project.version` or `project.released`
+    /// (each module has its own), files at the root no module holds — and then
+    /// two modules declaring the same entity (T19), or a module referencing
+    /// one it does not depend on, directly or through its dependencies (T20).
+    /// All before any database is involved.
     ///
     /// Each module knows what its dependencies declare without `external:`
-    /// entries: their entities resolve its references, and are never its own.
+    /// entries: their entities resolve its references as externals — never
+    /// its own to build, claim or own; their definitions stay in their module.
     pub fn load(config_path: &Path, env: &str, project_dir: Option<&Path>) -> Result<Self> {
         let project_dir = project_dir
             .map(Path::to_path_buf)
@@ -97,7 +103,7 @@ impl Workspace {
                     depends_on: Vec::new(),
                     design,
                 }],
-                has_modules: false,
+                manifest: None,
             });
         }
 
@@ -109,41 +115,40 @@ impl Workspace {
             let config = module_config(&text, &manifest.project.name, name)?;
             scanned.push((name.clone(), Design::scan(config, env, folders[name].clone())?));
         }
-        check_overlaps(&scanned)?;
+        let objects: Vec<Vec<OwnedObject>> = scanned.iter().map(|(_, d)| d.declared_objects()).collect();
+        check_overlaps(&scanned, &objects)?;
 
-        // What each module declares, by the name a reference reaches it by.
-        let declared_by: HashMap<String, String> = scanned
-            .iter()
-            .flat_map(|(name, design)| {
-                design
-                    .entities
-                    .iter()
-                    .filter(|e| super::ownership::owned_kind(e.entity_type).is_some())
-                    .map(move |e| (e.qualified_key(), name.clone()))
-            })
-            .collect();
+        let declared = Declared::of(&scanned, &objects);
         let reach = dependency_closure(&manifest.modules);
+        let manifest_externals: HashSet<&str> = manifest.external.iter().map(|e| e.name.as_str()).collect();
 
-        // Resolved against everything every other module declares, so that a
+        // Resolved against everything the other modules declare, so that a
         // reference past `depends_on` is found as one rather than reported as
         // unresolved — then left knowing only what it may reach.
         let mut modules = Vec::new();
         let mut gaps: Vec<String> = Vec::new();
         for (name, design) in scanned {
-            let known: Vec<String> = declared_by
+            let own: HashSet<String> = design.entities.iter().map(|e| e.qualified_key()).collect();
+            let known: Vec<(String, EntityType)> = declared
+                .by_name
                 .iter()
-                .filter(|(_, owner)| **owner != name)
-                .map(|(key, _)| key.clone())
+                .filter(|(key, _)| !own.contains(*key))
+                .map(|(key, (kind, _))| (key.clone(), *kind))
                 .collect();
             let mut design = design.resolved(&known);
             let reaches = |module: &String| *module == name || reach[&name].contains(module);
             for entity in design.entities.iter().filter(|e| e.entity_type != EntityType::External) {
-                for r in entity.refs.iter().filter(|r| !r.unresolved) {
-                    if let Some(other) = declared_by.get(&r.name).filter(|m| !reaches(m)) {
+                for r in &entity.refs {
+                    if !r.unresolved && own.contains(&r.name) {
+                        continue;
+                    }
+                    if let Some(by) = declared.of_ref(r).filter(|by| !by.iter().any(reaches)) {
                         let gap = format!(
-                            "✗ dependency gap: {} ({name}) requires {} ({other}) — add {other} to \
-                             modules.{name}.depends_on",
-                            entity.name, r.name
+                            "✗ dependency gap: {} ({name}) requires {} ({}) — add {} to modules.{name}.depends_on",
+                            entity.name,
+                            r.name,
+                            by.join(" or "),
+                            by.join(" or ")
                         );
                         if !gaps.contains(&gap) {
                             gaps.push(gap);
@@ -151,9 +156,14 @@ impl Workspace {
                     }
                 }
             }
-            design
-                .entities
-                .retain(|e| e.entity_type != EntityType::External || declared_by.get(&e.name).is_none_or(reaches));
+            design.entities.retain(|e| {
+                e.entity_type != EntityType::External
+                    || manifest_externals.contains(e.name.as_str())
+                    || declared
+                        .by_name
+                        .get(&e.name)
+                        .is_none_or(|(_, by)| by.iter().any(reaches))
+            });
             modules.push(Module {
                 depends_on: manifest.modules[&name].depends_on.clone(),
                 name: Some(name),
@@ -171,14 +181,22 @@ impl Workspace {
 
         Ok(Self {
             modules,
-            has_modules: true,
+            manifest: Some(manifest),
         })
     }
 
     /// Whether the manifest declares `modules:` — `false` for a project that
     /// is a workspace of one.
     pub fn has_modules(&self) -> bool {
-        self.has_modules
+        self.manifest.is_some()
+    }
+
+    /// The manifest: `design.yaml` as written — its `modules:`, `scopes:` and
+    /// the `apply:` hooks that run around the whole workspace.
+    pub fn config(&self) -> &DesignConfig {
+        self.manifest
+            .as_ref()
+            .unwrap_or_else(|| self.modules[0].design.config())
     }
 
     /// Its modules, in `depends_on` order.
@@ -192,6 +210,59 @@ impl Workspace {
 
     pub fn into_modules(self) -> Vec<Module> {
         self.modules
+    }
+}
+
+/// What the modules declare, and which module declares each — every module's
+/// `known` and the index the T20 check reads.
+struct Declared {
+    /// Each entity a module's file declares, by the name a reference reaches
+    /// it by, whatever its kind: a role is nobody's to own, but one module's
+    /// file declares it all the same. In load order, so what each module knows
+    /// of the others is the same on every load.
+    by_name: IndexMap<String, (EntityType, Vec<String>)>,
+    /// Each object a module's files create, as the registry keys it
+    /// (`schema.name`): what a file creates beside the entity its path names —
+    /// a type a table's file creates — is its module's too, as T19 knows.
+    created: HashMap<String, Vec<String>>,
+}
+
+impl Declared {
+    fn of(scanned: &[(String, Design)], objects: &[Vec<OwnedObject>]) -> Self {
+        let mut by_name: IndexMap<String, (EntityType, Vec<String>)> = IndexMap::new();
+        let mut created: HashMap<String, Vec<String>> = HashMap::new();
+        for ((name, design), objects) in scanned.iter().zip(objects) {
+            let files = design
+                .entities
+                .iter()
+                .filter(|e| e.file.is_some() && e.entity_type != EntityType::External);
+            for entity in files {
+                let (_, by) = by_name
+                    .entry(entity.qualified_key())
+                    .or_insert_with(|| (entity.entity_type, Vec::new()));
+                if !by.contains(name) {
+                    by.push(name.clone());
+                }
+            }
+            for object in objects {
+                let by = created.entry(format!("{}.{}", object.schema, object.name)).or_default();
+                if !by.contains(name) {
+                    by.push(name.clone());
+                }
+            }
+        }
+        Self { by_name, created }
+    }
+
+    /// The modules declaring what `r` reaches: the entity it resolved to, else
+    /// an object a module's file creates by that name — as written, or folded
+    /// as Postgres folds an unquoted one.
+    fn of_ref(&self, r: &Ref) -> Option<&Vec<String>> {
+        (!r.unresolved)
+            .then(|| self.by_name.get(&r.name).map(|(_, by)| by))
+            .flatten()
+            .or_else(|| self.created.get(&r.name))
+            .or_else(|| self.created.get(&r.name.to_ascii_lowercase()))
     }
 }
 
@@ -250,10 +321,31 @@ fn check_manifest(manifest: &DesignConfig, project_dir: &Path) -> Result<IndexMa
     let mut folders: IndexMap<String, PathBuf> = IndexMap::new();
     for (name, module) in modules {
         let relative = module_folder(name, module)?;
-        if let Some((other, _)) = folders.iter().find(|(_, f)| **f == relative) {
+        for (other, folder) in &folders {
+            let said = if *folder == relative {
+                format!(
+                    "modules \"{other}\" and \"{name}\" share the folder {}",
+                    relative.display()
+                )
+            } else if relative.starts_with(folder) || folder.starts_with(&relative) {
+                let (inner, outer) = if relative.starts_with(folder) {
+                    ((name, &relative), (other, folder))
+                } else {
+                    ((other, folder), (name, &relative))
+                };
+                format!(
+                    "module \"{}\"'s folder {} is inside module \"{}\"'s folder {}",
+                    inner.0,
+                    inner.1.display(),
+                    outer.0,
+                    outer.1.display()
+                )
+            } else {
+                continue;
+            };
             return Err(DbdError::Config(format!(
-                "modules \"{other}\" and \"{name}\" share the folder {} — each module has a folder of its own",
-                shown(&relative)
+                "{said} — each module has a folder of its own, which it takes with it if it moves to a \
+                 repository of its own"
             )));
         }
         let dir = project_dir.join(&relative);
@@ -266,16 +358,12 @@ fn check_manifest(manifest: &DesignConfig, project_dir: &Path) -> Result<IndexMa
         folders.insert(name.clone(), relative);
     }
 
-    // A module rooted at the project folder holds the root's folders.
-    if !folders.values().any(|f| f.as_os_str().is_empty()) {
-        for folder in MODULE_FOLDERS {
-            if holds_files(&project_dir.join(folder)) {
-                return Err(DbdError::Config(format!(
-                    "{folder}/ at the root holds files no module holds — design.yaml declares modules:, so \
-                     each module's {folder}/ is in its folder; move them into a module's folder, or root a \
-                     module at the project (path: .)"
-                )));
-            }
+    for folder in MODULE_FOLDERS {
+        if holds_files(&project_dir.join(folder)) {
+            return Err(DbdError::Config(format!(
+                "{folder}/ at the root holds files no module holds — design.yaml declares modules:, so each \
+                 module's {folder}/ is in its folder; move them into the folder of the module they belong to"
+            )));
         }
     }
 
@@ -294,14 +382,17 @@ fn is_module_name(name: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-/// The module's folder relative to the project — empty for the project folder
-/// itself — refusing one outside it.
+/// The module's folder relative to the project, refusing one outside it and
+/// the project's own.
 fn module_folder(name: &str, module: &ModuleConfig) -> Result<PathBuf> {
     let Some(path) = module.path.as_deref() else {
         return Ok(PathBuf::from(name));
     };
     if path.trim_end_matches('/') == "." {
-        return Ok(PathBuf::new());
+        return Err(DbdError::Config(format!(
+            "module \"{name}\": path . is the project's own folder, which holds design.yaml and every other \
+             module — give the module a folder of its own"
+        )));
     }
     crate::path_safe::safe_relative_path(path).ok_or_else(|| {
         DbdError::Config(format!(
@@ -311,59 +402,64 @@ fn module_folder(name: &str, module: &ModuleConfig) -> Result<PathBuf> {
     })
 }
 
-fn shown(relative: &Path) -> String {
-    if relative.as_os_str().is_empty() {
-        ".".to_string()
-    } else {
-        relative.display().to_string()
-    }
-}
-
 /// Whether `dir` holds a file anywhere beneath it. An empty folder holds
-/// nothing a module would lose.
+/// nothing a module would lose, and neither does a dotfile — the `.gitkeep`
+/// `dbd init` keeps an empty folder in git with — nor anything under a dot
+/// folder.
 fn holds_files(dir: &Path) -> bool {
+    let hidden = |e: &walkdir::DirEntry| e.depth() > 0 && e.file_name().to_string_lossy().starts_with('.');
     dir.is_dir()
         && walkdir::WalkDir::new(dir)
             .into_iter()
+            .filter_entry(|e| !hidden(e))
             .filter_map(|e| e.ok())
             .any(|e| e.file_type().is_file())
 }
 
-/// The modules in `depends_on` order: each after its dependencies, ties in
-/// declared order. Refuses a cycle, naming it.
+/// The modules in `depends_on` order: each after its dependencies — of those
+/// whose dependencies are in place, the one `modules:` lists first. Refuses a
+/// cycle, naming it.
 fn depends_on_order(modules: &IndexMap<String, ModuleConfig>) -> Result<Vec<String>> {
-    fn visit(
-        name: &str,
-        modules: &IndexMap<String, ModuleConfig>,
-        path: &mut Vec<String>,
-        order: &mut Vec<String>,
-    ) -> Result<()> {
-        if order.iter().any(|o| o == name) {
-            return Ok(());
+    let mut order: Vec<String> = Vec::new();
+    while order.len() < modules.len() {
+        let placed = |m: &String| order.contains(m);
+        let ready = modules
+            .iter()
+            .find(|(name, module)| !placed(name) && module.depends_on.iter().all(placed));
+        match ready {
+            Some((name, _)) => order.push(name.clone()),
+            None => {
+                let first = modules.keys().find(|m| !placed(m)).expect("a module is left to place");
+                return Err(DbdError::Config(format!(
+                    "modules depend on each other in a cycle: {} — a module's dependencies deploy before it, \
+                     so one of them must not depend back",
+                    cycle_from(first, modules, &order).join(" → ")
+                )));
+            }
         }
-        if let Some(start) = path.iter().position(|p| p == name) {
-            let mut cycle = path[start..].to_vec();
-            cycle.push(name.to_string());
-            return Err(DbdError::Config(format!(
-                "modules depend on each other in a cycle: {} — a module's dependencies deploy before it, so \
-                 one of them must not depend back",
-                cycle.join(" → ")
-            )));
-        }
-        path.push(name.to_string());
-        for dep in &modules[name].depends_on {
-            visit(dep, modules, path, order)?;
-        }
-        path.pop();
-        order.push(name.to_string());
-        Ok(())
-    }
-
-    let mut order = Vec::new();
-    for name in modules.keys() {
-        visit(name, modules, &mut Vec::new(), &mut order)?;
     }
     Ok(order)
+}
+
+/// A cycle among the modules not yet `placed`, followed from `start`: each
+/// unplaced module waits on an unplaced dependency, so following those must
+/// come back round.
+fn cycle_from(start: &str, modules: &IndexMap<String, ModuleConfig>, placed: &[String]) -> Vec<String> {
+    let mut path: Vec<String> = vec![start.to_string()];
+    loop {
+        let last = path.last().expect("the path starts with a module");
+        let next = modules[last.as_str()]
+            .depends_on
+            .iter()
+            .find(|d| !placed.contains(d))
+            .expect("an unplaced module waits on an unplaced dependency");
+        if let Some(at) = path.iter().position(|m| m == next) {
+            let mut cycle = path.split_off(at);
+            cycle.push(next.clone());
+            return cycle;
+        }
+        path.push(next.clone());
+    }
 }
 
 /// Every module each module reaches through `depends_on`, transitively.
@@ -387,18 +483,22 @@ fn dependency_closure(modules: &IndexMap<String, ModuleConfig>) -> HashMap<Strin
 /// Refuse two modules declaring the same entity, as the registry would know
 /// it (T19): a module is a partition, and the second module's claim would be
 /// refused in the database after the first had deployed.
-fn check_overlaps(scanned: &[(String, Design)]) -> Result<()> {
+fn check_overlaps(scanned: &[(String, Design)], objects: &[Vec<OwnedObject>]) -> Result<()> {
     let mut declared: IndexMap<(String, String, String), (String, Vec<&str>)> = IndexMap::new();
-    for (name, design) in scanned {
+    for ((name, design), objects) in scanned.iter().zip(objects) {
         // SQLite knows an entity by its name alone, compared without case — as
         // its adapter's `same_object` does.
-        let sqlite = design.dialect() == "sqlite";
-        for object in design.declared_objects() {
+        let sqlite = crate::parser::Dialect::from_label(design.dialect()) == Some(crate::parser::Dialect::Sqlite);
+        for object in objects {
             let shown = format!("{} {}.{}", object.namespace, object.schema, object.name);
             let key = if sqlite {
-                (object.namespace, String::new(), object.name.to_ascii_lowercase())
+                (
+                    object.namespace.clone(),
+                    String::new(),
+                    object.name.to_ascii_lowercase(),
+                )
             } else {
-                (object.namespace, object.schema, object.name)
+                (object.namespace.clone(), object.schema.clone(), object.name.clone())
             };
             let (_, by) = declared.entry(key).or_insert_with(|| (shown, Vec::new()));
             if !by.contains(&name.as_str()) {
