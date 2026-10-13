@@ -6,17 +6,20 @@
 
 ## Done
 
-- Slices 1–2 (PR #50): registry, claim, uses. Slice 3 (PR #51): prune by
-  ownership — other owners' entities hidden, rules (a)/(b), `--prune-unowned`,
-  release; prune claims and drops in one READ COMMITTED transaction.
-- Embedded 214/214, `cli_live` 48/48, workspace 2002/0, clippy, fmt, doc clean.
+- Slices 1–3 merged into `feat/ownership` (PRs #50, #51): registry, claim,
+  uses, prune by ownership.
+- Slice 4 (red `6476dc39`, `f1e8ad39`; impl `9c91df5b`, `968c1293`): the uses
+  guard — `dependents` walks pg_depend (as a CASCADE reaches) + dbd.uses
+  (routine bodies); reconcile refuses a dropped column/constraint/index/enum
+  value another owner depends on, a prune keeps such a table named; apply
+  refuses a pending migration's DROP / DROP COLUMN / DROP CONSTRAINT of it.
+- Embedded 222/222, `cli_live` 48/48, workspace 2002/0, clippy, fmt, doc clean.
 
 ## Next
 
-    # slice 4: before an owner drops or destructively alters an entity, check
-    # dbd.uses and pg_depend; refuse when another owner depends on it, naming
-    # the use — reconcile's prune (incl. CASCADE reaching another owner's
-    # child/view), its destructive alters, apply's migration drops.
+    # PR for feat/ownership-guard into feat/ownership; focused review; fix
+    # test-first; CI green; merge locally; then slice 5: reset rules (drops
+    # only own; --schemas/--extensions/roles skip what others use).
 
 ## Open
 
