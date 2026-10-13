@@ -119,26 +119,26 @@ pub async fn cmd_reset(
         // A preview of a reset the real run would refuse is a false promise, so
         // with a database to ask, ask it first. With none configured the plan
         // is all there is to show, and the dry run stays database-free.
-        // The roles the real run keeps are asked of the same database, so the
-        // preview does not list a `DROP ROLE` the run will not perform.
-        let mut kept = Vec::new();
-        if let Some(adapter) = super::dry_run_adapter(config, database_url).await? {
-            check_reset_guards(&*adapter, &design, &resolved, force, allow_scope_change).await?;
-            // The real reset claims the design's entities first (#7).
-            design.check_ownership(&*adapter).await?;
-            kept = design.roles_kept_by_reset(&*adapter, target, Some(&resolved)).await?;
-        }
-        let keep: Vec<String> = kept.iter().map(|k| k.role.clone()).collect();
-        let sql = design
-            .reset_script_keeping(target, drop_schemas, drop_extensions, Some(&resolved), &keep)?
-            .unwrap_or_else(|| "-- nothing to drop".to_string());
-        output::info(verbosity, "[dry-run] Reset would run:");
-        output::always(&sql);
-        let preview = dbd_core::ResetComplete {
-            roles_kept: kept,
-            ..Default::default()
+        // What the real run keeps — the roles another database holds, and what
+        // other projects in this one have or use (#7) — is asked of the same
+        // database, so the preview lists no drop the run will not perform.
+        let (sql, preview) = match super::dry_run_adapter(config, database_url).await? {
+            Some(adapter) => {
+                check_reset_guards(&*adapter, &design, &resolved, force, allow_scope_change).await?;
+                // The real reset claims the design's entities first (#7).
+                design.check_ownership(&*adapter).await?;
+                design
+                    .reset_preview(&*adapter, target, force, drop_schemas, drop_extensions, Some(&resolved))
+                    .await?
+            }
+            None => (
+                design.reset_script(target, drop_schemas, drop_extensions, Some(&resolved))?,
+                dbd_core::ResetComplete::default(),
+            ),
         };
-        for line in kept_role_lines(&preview) {
+        output::info(verbosity, "[dry-run] Reset would run:");
+        output::always(&sql.unwrap_or_else(|| "-- nothing to drop".to_string()));
+        for line in kept_lines(&preview) {
             output::info(verbosity, &format!("[dry-run] {line}"));
         }
         return Ok(());
@@ -170,7 +170,7 @@ pub(crate) fn format_reset_summary(summary: &dbd_core::ResetComplete) -> Vec<Str
     use dbd_core::EntityType;
     if summary.dropped.is_empty() {
         let mut lines = vec!["Reset dropped nothing — none of the project's objects were in the database.".to_string()];
-        lines.extend(kept_role_lines(summary));
+        lines.extend(kept_lines(summary));
         return lines;
     }
     let counted = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
@@ -205,12 +205,14 @@ pub(crate) fn format_reset_summary(summary: &dbd_core::ResetComplete) -> Vec<Str
         ));
     }
     let mut lines = vec![format!("Reset dropped {}.", parts.join(", "))];
-    lines.extend(kept_role_lines(summary));
+    lines.extend(kept_lines(summary));
     lines
 }
 
-/// One line per role the reset kept: which, and the databases that hold it.
-fn kept_role_lines(summary: &dbd_core::ResetComplete) -> Vec<String> {
+/// One line per role the reset kept for another database — which, and the
+/// databases that hold it — then one per thing it kept for another project in
+/// this one (#7).
+fn kept_lines(summary: &dbd_core::ResetComplete) -> Vec<String> {
     summary
         .roles_kept
         .iter()
@@ -222,6 +224,7 @@ fn kept_role_lines(summary: &dbd_core::ResetComplete) -> Vec<String> {
                 k.databases.join(", ")
             )
         })
+        .chain(summary.kept.iter().map(|note| format!("{note}.")))
         .collect()
 }
 

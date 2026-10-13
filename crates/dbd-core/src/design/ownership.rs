@@ -597,6 +597,150 @@ impl Design {
         refuse_uses(guarded.iter().zip(&uses))
     }
 
+    /// Refuse a reset, unless forced, while another project's record marks the
+    /// database prod (#7): it is prod for every project in it.
+    pub(crate) async fn check_reset_prod_elsewhere(&self, adapter: &dyn DatabaseAdapter) -> Result<()> {
+        let prod = adapter.other_projects_meta().await?.into_iter().find(|m| {
+            m.project != self.owner() && crate::config::normalize_env(Some(&m.env)).is_ok_and(|env| env == "prod")
+        });
+        match prod {
+            Some(row) => Err(DbdError::SafetyGuard(format!(
+                "reset is blocked — project '{}' marked this database prod, and it is prod for every project \
+                 in it. Use --force to override.",
+                row.project
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// What a reset of this owner's must leave, or refuse, for other owners
+    /// (#7). Refuses, forced or not, when another owner depends on what the
+    /// reset drops — an entity, or a schema `--schemas` drops — since dropped
+    /// `CASCADE` it takes theirs with it. Keeps, naming why: a schema
+    /// `--schemas` would drop that holds anything not this owner's — another
+    /// owner's entity, or one nobody owns — or that another owner uses; an
+    /// extension `--extensions` would drop that another owner uses or depends
+    /// on; a role another owner uses. Reads only.
+    pub(crate) async fn reset_ownership(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        drop: &super::reset::ResetDrops,
+    ) -> Result<ResetKeep> {
+        use crate::adapter::{Guarded, GuardedPart};
+        let mut keep = ResetKeep::default();
+
+        // What the reset drops by name: every key of every entity it drops.
+        let keyed = self.entity_keys();
+        let guarded: Vec<(Guarded, String)> = keyed
+            .iter()
+            .filter(|(e, _)| drop.entities.contains(&e.name))
+            .flat_map(|(_, keys)| keys.iter())
+            .map(|k| {
+                (
+                    Guarded {
+                        object: k.clone(),
+                        part: GuardedPart::Whole,
+                    },
+                    format!("{}.{}", k.schema, k.name),
+                )
+            })
+            .collect();
+        let uses = self.uses_of(adapter, &guarded).await?;
+        refuse_uses(guarded.iter().zip(&uses))?;
+
+        // A schema dropped `CASCADE` takes what is in it — kept when that is
+        // not all this owner's, and guarded when it is: another owner may
+        // depend on an entity of this owner's the design no longer declares.
+        // An extension the design installs in a schema of its own is its
+        // own — unless another owner uses or depends on it.
+        let mine = self.declared_objects();
+        let declared_extensions = self.reset_extensions(None);
+        let mut dropped_schemas = Vec::new();
+        for schema in &drop.schemas {
+            let mut others = Vec::new();
+            for member in adapter.not_owned_in_schema(self.owner(), schema, &mine).await? {
+                let own_extension = member.kind == "extension"
+                    && declared_extensions.contains(&member.name)
+                    && self.extension_users(adapter, &member.name).await?.is_none();
+                if !own_extension {
+                    others.push(member.label(schema));
+                }
+            }
+            let users = adapter.users_of(self.owner(), "schema", schema).await?;
+            let why = if !others.is_empty() {
+                const SHOWN: usize = 5;
+                let mut named: Vec<String> = others.iter().take(SHOWN).cloned().collect();
+                if others.len() > SHOWN {
+                    named.push(format!("and {} more", others.len() - SHOWN));
+                }
+                format!("it holds {}", named.join(", "))
+            } else if !users.is_empty() {
+                format!("{} uses it", quoted(&users))
+            } else {
+                dropped_schemas.push((
+                    Guarded {
+                        object: OwnedObject {
+                            namespace: "schema".to_string(),
+                            schema: schema.clone(),
+                            name: schema.clone(),
+                            kind: String::new(),
+                        },
+                        part: GuardedPart::Whole,
+                    },
+                    format!("schema {schema}"),
+                ));
+                continue;
+            };
+            keep.schemas.push(schema.clone());
+            keep.notes.push(format!("schema {schema} kept: {why}"));
+        }
+        let uses = self.uses_of(adapter, &dropped_schemas).await?;
+        refuse_uses(dropped_schemas.iter().zip(&uses))?;
+        for extension in &drop.extensions {
+            if let Some(why) = self.extension_users(adapter, extension).await? {
+                keep.extensions.push(extension.clone());
+                keep.notes.push(format!("extension {extension} kept: {why}"));
+            }
+        }
+        for role in &drop.roles {
+            let users = adapter.users_of(self.owner(), "role", role).await?;
+            if !users.is_empty() {
+                keep.roles.push(role.clone());
+                keep.notes.push(format!("role {role} kept: {} uses it", quoted(&users)));
+            }
+        }
+        Ok(keep)
+    }
+
+    /// Why another owner needs `extension`, if one does: it records a use of
+    /// it, or something of its depends on it — a column of its type, say.
+    async fn extension_users(&self, adapter: &dyn DatabaseAdapter, extension: &str) -> Result<Option<String>> {
+        use crate::adapter::{Guarded, GuardedPart};
+        let users = adapter.users_of(self.owner(), "extension", extension).await?;
+        if !users.is_empty() {
+            return Ok(Some(format!("{} uses it", quoted(&users))));
+        }
+        let g = (
+            Guarded {
+                object: OwnedObject {
+                    namespace: "extension".to_string(),
+                    schema: String::new(),
+                    name: extension.to_string(),
+                    kind: String::new(),
+                },
+                part: GuardedPart::Whole,
+            },
+            extension.to_string(),
+        );
+        Ok(self
+            .uses_of(adapter, std::slice::from_ref(&g))
+            .await?
+            .into_iter()
+            .next()
+            .flatten()
+            .map(|uses| format!("{uses} depends on it")))
+    }
+
     /// The other owners' uses of each of `guarded`, as one phrase each —
     /// `"billing" (view billing.v_orders)` — or `None` where there are none.
     async fn uses_of(
@@ -702,6 +846,22 @@ impl Design {
         }
         plan.warnings.extend(kept);
     }
+}
+
+/// `"a", "b"`.
+fn quoted(names: &[String]) -> String {
+    names.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", ")
+}
+
+/// What a reset leaves for other owners, and why — see
+/// [`Design::reset_ownership`].
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ResetKeep {
+    pub(crate) schemas: Vec<String>,
+    pub(crate) extensions: Vec<String>,
+    pub(crate) roles: Vec<String>,
+    /// One line each: `schema app kept: it holds table app.invoices ("billing")`.
+    pub(crate) notes: Vec<String>,
 }
 
 /// Refuse, naming each, the guarded entities another owner uses —

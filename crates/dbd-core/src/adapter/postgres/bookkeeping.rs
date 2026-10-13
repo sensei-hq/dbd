@@ -776,6 +776,102 @@ impl Bookkeeping {
         Ok(found)
     }
 
+    /// The other owners that record a shared use of `target` of `kind`.
+    pub(super) async fn users_of(&self, owner: &str, kind: &str, target: &str) -> Result<Vec<String>> {
+        let registry: Option<String> = sqlx::query_scalar("SELECT to_regclass('dbd.uses')::text")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("uses read failed: {e}")))?;
+        if registry.is_none() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_scalar(
+            "SELECT DISTINCT owner FROM dbd.uses WHERE kind = $1 AND target = $2 AND owner <> $3 ORDER BY 1",
+        )
+        .bind(kind)
+        .bind(target)
+        .bind(owner)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbdError::Config(format!("uses read failed: {e}")))
+    }
+
+    /// What `schema` holds that is not `owner`'s, `mine` counted as its own.
+    pub(super) async fn not_owned_in_schema(
+        &self,
+        owner: &str,
+        schema: &str,
+        mine: &[crate::adapter::OwnedObject],
+    ) -> Result<Vec<crate::adapter::SchemaMember>> {
+        let read = |e: sqlx::Error| DbdError::Config(format!("schema contents read failed: {e}"));
+        let registry: Option<String> = sqlx::query_scalar("SELECT to_regclass('dbd.objects')::text")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(read)?;
+        let column = |f: fn(&crate::adapter::OwnedObject) -> &str| -> Vec<String> {
+            mine.iter().map(|o| f(o).to_string()).collect()
+        };
+        // Without a registry nothing is anyone's: every object not declared is
+        // the schema's to keep.
+        let owners = if registry.is_some() {
+            "(SELECT o.owner FROM dbd.objects o WHERE o.namespace = x.namespace AND o.schema = $2 AND o.name = x.name)"
+        } else {
+            "NULL::varchar"
+        };
+        // An extension's members — `deptype = 'e'` — are listed as the
+        // extension, once, whatever it is called.
+        let member = |class: &str, oid: &str| {
+            format!(
+                "NOT EXISTS (SELECT 1 FROM pg_depend e WHERE e.classid = '{class}'::regclass \
+                 AND e.objid = {oid} AND e.deptype = 'e')"
+            )
+        };
+        let sql = format!(
+            "SELECT DISTINCT x.kind, x.name, {owners} AS owner \
+             FROM ( \
+               SELECT 'relation' AS namespace, c.relname AS name, \
+                      CASE c.relkind WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' \
+                                     WHEN 'S' THEN 'sequence' WHEN 'f' THEN 'foreign table' \
+                                     WHEN 'c' THEN 'type' ELSE 'table' END AS kind \
+               FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+               WHERE n.nspname = $2 AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S', 'c') AND {class_member} \
+                 AND NOT (c.relkind = 'S' AND EXISTS (SELECT 1 FROM pg_depend d \
+                          WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid \
+                            AND d.refclassid = 'pg_class'::regclass AND d.deptype IN ('a', 'i'))) \
+               UNION ALL \
+               SELECT 'relation', t.typname, 'type' FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
+               WHERE n.nspname = $2 AND t.typrelid = 0 AND t.typelem = 0 AND t.typtype IN ('e', 'd', 'r', 'm', 'b') \
+                 AND {type_member} \
+               UNION ALL \
+               SELECT 'routine', p.proname, CASE p.prokind WHEN 'p' THEN 'procedure' ELSE 'function' END \
+               FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = $2 AND {proc_member} \
+               UNION ALL \
+               SELECT 'extension', x.extname, 'extension' \
+               FROM pg_extension x JOIN pg_namespace n ON n.oid = x.extnamespace WHERE n.nspname = $2 \
+             ) x \
+             WHERE NOT EXISTS (SELECT 1 FROM unnest($3::text[], $4::text[], $5::text[]) AS m(namespace, schema, name) \
+                               WHERE m.namespace = x.namespace AND m.schema = $2 AND m.name = x.name) \
+               AND {owners} IS DISTINCT FROM $1 \
+             ORDER BY 1, 2",
+            class_member = member("pg_class", "c.oid"),
+            type_member = member("pg_type", "t.oid"),
+            proc_member = member("pg_proc", "p.oid"),
+        );
+        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(&sql)
+            .bind(owner)
+            .bind(schema)
+            .bind(column(|o| &o.namespace))
+            .bind(column(|o| &o.schema))
+            .bind(column(|o| &o.name))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(read)?;
+        Ok(rows
+            .into_iter()
+            .map(|(kind, name, owner)| crate::adapter::SchemaMember { kind, name, owner })
+            .collect())
+    }
+
     /// Read the recorded version for this project (authoritative version source).
     /// Catalog-resolved (both-names aware) so a not-yet-healed legacy DB is read
     /// correctly instead of silently missed as version 0. `0` when there is no

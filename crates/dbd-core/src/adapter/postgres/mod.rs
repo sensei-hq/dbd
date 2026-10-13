@@ -2585,6 +2585,19 @@ ORDER BY 1, 2, 4, 5"#;
         self.bookkeeping.dependents(owner, guarded).await
     }
 
+    async fn users_of(&self, owner: &str, kind: &str, target: &str) -> Result<Vec<String>> {
+        self.bookkeeping.users_of(owner, kind, target).await
+    }
+
+    async fn not_owned_in_schema(
+        &self,
+        owner: &str,
+        schema: &str,
+        mine: &[super::OwnedObject],
+    ) -> Result<Vec<super::SchemaMember>> {
+        self.bookkeeping.not_owned_in_schema(owner, schema, mine).await
+    }
+
     async fn get_db_version(&self) -> Result<u32> {
         self.bookkeeping.version().await
     }

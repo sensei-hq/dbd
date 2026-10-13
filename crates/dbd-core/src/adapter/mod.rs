@@ -162,6 +162,35 @@ pub struct HeldObject {
     pub owner: String,
 }
 
+/// Something a schema holds that one owner's design does not declare (#7): an
+/// entity — another owner's, or one nobody owns — or an extension installed
+/// in the schema, which stands for all its members.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaMember {
+    /// `table`, `view`, `materialized view`, `sequence`, `foreign table`,
+    /// `type`, `function`, `procedure` or `extension`.
+    pub kind: String,
+    /// The bare name; a routine's once for all its overloads.
+    pub name: String,
+    /// Its owner in the registry, if it has one.
+    pub owner: Option<String>,
+}
+
+impl SchemaMember {
+    /// `table app.invoices ("billing")`, `extension citext`.
+    pub fn label(&self, schema: &str) -> String {
+        let named = if self.kind == "extension" {
+            format!("extension {}", self.name)
+        } else {
+            format!("{} {schema}.{}", self.kind, self.name)
+        };
+        match &self.owner {
+            Some(owner) => format!("{named} (\"{owner}\")"),
+            None => named,
+        }
+    }
+}
+
 /// The database adapter trait — each target implements this.
 ///
 /// Adapters handle:
@@ -549,6 +578,25 @@ pub trait DatabaseAdapter: Send + Sync {
     /// registry find none.
     async fn dependents(&self, owner: &str, guarded: &[Guarded]) -> Result<Vec<Dependence>> {
         let _ = (owner, guarded);
+        Ok(Vec::new())
+    }
+
+    /// The other owners that record a shared use — `kind` `schema`,
+    /// `extension` or `role` — of `target` (#7). Reads only. Adapters without
+    /// a registry find none.
+    async fn users_of(&self, owner: &str, kind: &str, target: &str) -> Result<Vec<String>> {
+        let _ = (owner, kind, target);
+        Ok(Vec::new())
+    }
+
+    /// What `schema` holds that is not `owner`'s — another owner's entity, one
+    /// nobody owns, and every extension installed there — sorted (#7). `mine`
+    /// — the entities the owner's design declares — count as its own, claimed
+    /// yet or not. A sequence a column owns, a row type and an array type are
+    /// their owner's, and an extension's members the extension's, not the
+    /// schema's. Reads only. Adapters without a registry find none.
+    async fn not_owned_in_schema(&self, owner: &str, schema: &str, mine: &[OwnedObject]) -> Result<Vec<SchemaMember>> {
+        let _ = (owner, schema, mine);
         Ok(Vec::new())
     }
     async fn get_db_version(&self) -> Result<u32>;
