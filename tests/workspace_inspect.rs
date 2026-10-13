@@ -347,7 +347,9 @@ fn a_sqlite_workspace_reloads_its_modules_data() {
         let o = dbd(dir, &["export", "-o", out.to_str().unwrap()]);
         assert!(o.status.success(), "export after the {run}: {}", text(&o));
         assert_eq!(
-            fs::read_to_string(out.join("Tags.csv")).unwrap(),
+            // Exported as its file names it — `tags.ddl` — whatever the case
+            // its `CREATE` gives the table.
+            fs::read_to_string(out.join("tags.csv")).unwrap(),
             "name\na\nb\n",
             "{run}"
         );
