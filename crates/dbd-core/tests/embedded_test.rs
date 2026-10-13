@@ -15962,3 +15962,199 @@ async fn a_full_reset_forgets_the_projects_uses() {
         .await
         .expect("nothing of billing's uses app.orders any more");
 }
+
+// ── Workspaces (#7 phase 3) ──────────────────────────────────────────────────
+
+/// `shop` as a workspace: `shared` holds currencies, `core` the orders and
+/// `dojo` the sessions that reference them. The manifest's hooks and `core`'s
+/// own log, in `public.hook_log`, the order they ran in.
+fn shop_workspace(root: &std::path::Path) -> dbd_core::design::Workspace {
+    let files: &[(&str, &str)] = &[
+        (
+            "design.yaml",
+            "project:\n  name: shop\n\nschemas:\n  - app\n  - dojo\n\n\
+             apply:\n  before: [hooks/ws-before.sql]\n  after: [hooks/ws-after.sql]\n\n\
+             modules:\n  shared: {}\n  core:\n    depends_on: [shared]\n    apply:\n      \
+             after: [hooks/core-after.sql]\n  dojo:\n    depends_on: [shared]\n",
+        ),
+        (
+            "hooks/ws-before.sql",
+            "create table if not exists public.hook_log (n serial primary key, said text);\n\
+             insert into public.hook_log (said) values ('workspace before');\n",
+        ),
+        (
+            "hooks/ws-after.sql",
+            "insert into public.hook_log (said) values ('workspace after');\n",
+        ),
+        (
+            "core/hooks/core-after.sql",
+            "insert into public.hook_log (said) values ('core after');\n",
+        ),
+        (
+            "shared/ddl/table/app/currencies.ddl",
+            "set search_path to app;\ncreate table if not exists currencies (code text primary key);\n",
+        ),
+        (
+            "core/ddl/table/app/orders.ddl",
+            "set search_path to app;\ncreate table if not exists orders (\n  id integer primary key\n, \
+             currency text references currencies (code)\n);\n",
+        ),
+        (
+            "dojo/ddl/table/dojo/sessions.ddl",
+            "set search_path to dojo;\ncreate table if not exists sessions (\n  id integer primary key\n, \
+             currency text references app.currencies (code)\n);\n",
+        ),
+    ];
+    for (rel, text) in files {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, text).unwrap();
+    }
+    dbd_core::design::Workspace::load(&root.join("design.yaml"), "dev", Some(root)).expect("load the workspace")
+}
+
+/// Deploy each of `modules` as its own owner, in order.
+async fn deploy_modules(url: &str, modules: &[dbd_core::design::Module]) {
+    for module in modules {
+        let adapter = connect(url, module.owner()).await.unwrap();
+        module
+            .design()
+            .deploy(&*adapter, false, None, |_| {})
+            .await
+            .unwrap_or_else(|e| panic!("{}'s deploy: {e}", module.owner()));
+    }
+}
+
+/// T21: a workspace deploys shared, core and dojo into one database, each
+/// module as its own owner — its own record, its own entities, and its uses
+/// of the modules it depends on.
+#[tokio::test]
+async fn t21_a_workspace_deploys_each_module_as_its_own_owner() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let modules = shop_workspace(tmp.path()).select(None).expect("select");
+    deploy_modules(&url, &modules).await;
+
+    let adapter = connect(&url, "shop/shared").await.unwrap();
+    for owner in ["shop/shared", "shop/core", "shop/dojo"] {
+        assert_catalog(
+            &*adapter,
+            true,
+            &format!("SELECT 1 FROM dbd.meta WHERE project = '{owner}' AND env = 'dev'"),
+            &format!("the record of {owner}"),
+        )
+        .await;
+    }
+    assert_catalog(
+        &*adapter,
+        false,
+        "SELECT 1 FROM dbd.meta WHERE project = 'shop'",
+        "a record of the workspace as one owner",
+    )
+    .await;
+    for (schema, name, owner) in [
+        ("app", "currencies", "shop/shared"),
+        ("app", "orders", "shop/core"),
+        ("dojo", "sessions", "shop/dojo"),
+    ] {
+        assert_catalog(
+            &*adapter,
+            true,
+            &owned_by("relation", schema, name, "table", owner),
+            &format!("{schema}.{name} owned by {owner}"),
+        )
+        .await;
+    }
+    for owner in ["shop/core", "shop/dojo"] {
+        assert_catalog(
+            &*adapter,
+            true,
+            &format!(
+                "SELECT 1 FROM dbd.uses WHERE owner = '{owner}' AND kind = 'entity' \
+                 AND target = 'relation:app.currencies'"
+            ),
+            &format!("{owner}'s use of app.currencies"),
+        )
+        .await;
+    }
+}
+
+/// The manifest's hooks run once around the run: before the first module's
+/// entities, after the last module's own hooks.
+#[tokio::test]
+async fn a_workspace_runs_its_manifests_hooks_once_around_its_modules() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let modules = shop_workspace(tmp.path()).select(None).expect("select");
+    deploy_modules(&url, &modules).await;
+
+    let adapter = connect(&url, "shop/shared").await.unwrap();
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 WHERE (SELECT array_agg(said ORDER BY n) FROM public.hook_log) \
+         = ARRAY['workspace before', 'core after', 'workspace after']",
+        "the hooks, once each, in order",
+    )
+    .await;
+}
+
+/// A workspace resets its modules in reverse: each before the modules it
+/// depends on, whose entities it uses — forward, `shared` would be refused
+/// for what `core` and `dojo` use.
+#[tokio::test]
+async fn a_workspace_resets_its_modules_in_reverse() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = shop_workspace(tmp.path());
+    deploy_modules(&url, &workspace.select(None).expect("select")).await;
+
+    let workspace = dbd_core::design::Workspace::load(&tmp.path().join("design.yaml"), "dev", Some(tmp.path()))
+        .expect("load the workspace");
+    for module in workspace.selected_to_reset(None).expect("select") {
+        let adapter = connect(&url, module.owner()).await.unwrap();
+        module
+            .design()
+            .reset(&*adapter, "postgres", true, false, false, None)
+            .await
+            .unwrap_or_else(|e| panic!("{}'s reset: {e}", module.owner()));
+    }
+
+    let adapter = connect(&url, "shop/shared").await.unwrap();
+    assert_table_absent(&*adapter, "app", "currencies").await;
+    assert_table_absent(&*adapter, "app", "orders").await;
+    assert_table_absent(&*adapter, "dojo", "sessions").await;
+    assert_catalog(
+        &*adapter,
+        false,
+        "SELECT 1 FROM dbd.meta WHERE project LIKE 'shop/%'",
+        "a module's record after its full reset",
+    )
+    .await;
+}
+
+/// A workspace's reconcile runs the manifest's hooks once around its modules,
+/// as its deploy does.
+#[tokio::test]
+async fn a_workspace_reconcile_runs_its_manifests_hooks_once_around_its_modules() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    for module in shop_workspace(tmp.path()).select(None).expect("select") {
+        let adapter = connect(&url, module.owner()).await.unwrap();
+        module
+            .design()
+            .reconcile(&*adapter, false, false, false, None, Progress::none())
+            .await
+            .unwrap_or_else(|e| panic!("{}'s reconcile: {e}", module.owner()));
+    }
+
+    let adapter = connect(&url, "shop/shared").await.unwrap();
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 WHERE (SELECT array_agg(said ORDER BY n) FROM public.hook_log) \
+         = ARRAY['workspace before', 'core after', 'workspace after']",
+        "the hooks, once each, in order",
+    )
+    .await;
+}

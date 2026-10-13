@@ -38,8 +38,9 @@ impl From<bool> for Prune {
 }
 
 impl Design {
-    /// The owner this design's runs claim as: its project's name.
-    pub(crate) fn owner(&self) -> &str {
+    /// The owner this design's runs claim as, and connect to a database as:
+    /// its project's name — `<project>/<module>` for a module of a workspace.
+    pub fn owner(&self) -> &str {
         &self.config.project.name
     }
 
@@ -892,6 +893,9 @@ impl Design {
         for schema in &drop.schemas {
             let mut others = Vec::new();
             for member in adapter.not_owned_in_schema(self.owner(), schema, &mine).await? {
+                if member.owner.as_ref().is_some_and(|o| self.reset_beside.contains(o)) {
+                    continue;
+                }
                 let own_extension = member.kind == "extension"
                     && declared_extensions.contains(&member.name)
                     && self.extension_users(adapter, &member.name).await?.is_none();
@@ -899,7 +903,7 @@ impl Design {
                     others.push(member.label(schema));
                 }
             }
-            let users = adapter.users_of(self.owner(), "schema", schema).await?;
+            let users = self.users_besides(adapter, "schema", schema).await?;
             let why = if !others.is_empty() {
                 const SHOWN: usize = 5;
                 let mut named: Vec<String> = others.iter().take(SHOWN).cloned().collect();
@@ -936,7 +940,7 @@ impl Design {
             }
         }
         for role in &drop.roles {
-            let users = adapter.users_of(self.owner(), "role", role).await?;
+            let users = self.users_besides(adapter, "role", role).await?;
             if !users.is_empty() {
                 keep.roles.push(role.clone());
                 keep.notes.push(format!("role {role} kept: {} uses it", quoted(&users)));
@@ -949,7 +953,7 @@ impl Design {
     /// it, or something of its depends on it — a column of its type, say.
     async fn extension_users(&self, adapter: &dyn DatabaseAdapter, extension: &str) -> Result<Option<String>> {
         use crate::adapter::{Guarded, GuardedPart};
-        let users = adapter.users_of(self.owner(), "extension", extension).await?;
+        let users = self.users_besides(adapter, "extension", extension).await?;
         if !users.is_empty() {
             return Ok(Some(format!("{} uses it", quoted(&users))));
         }
@@ -972,6 +976,17 @@ impl Design {
             .next()
             .flatten()
             .map(|uses| format!("{uses} depends on it")))
+    }
+
+    /// The other owners recording a use of the `kind` `target` — but those a
+    /// reset runs beside (see [`Design::resetting_beside`]).
+    async fn users_besides(&self, adapter: &dyn DatabaseAdapter, kind: &str, target: &str) -> Result<Vec<String>> {
+        Ok(adapter
+            .users_of(self.owner(), kind, target)
+            .await?
+            .into_iter()
+            .filter(|o| !self.reset_beside.contains(o))
+            .collect())
     }
 
     /// The other owners' uses of each of `guarded`, as one phrase each —
@@ -1002,6 +1017,7 @@ impl Design {
             .await?
             .into_iter()
             .filter(|d| d.owner.is_some() || !going.contains(&d.via))
+            .filter(|d| d.owner.as_ref().is_none_or(|o| !self.reset_beside.contains(o)))
             .collect();
         // What nobody owns is guarded where a project might own it, by the
         // rule `--prune` keeps such a table by: in a schema another owner

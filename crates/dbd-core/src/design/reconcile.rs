@@ -554,33 +554,17 @@ impl Design {
         if dry_run {
             // Checked as the run checks them, executing none: a hook file that
             // is missing is a misconfiguration whether or not we write.
-            for (entries, kind) in [
-                (&self.config.apply.before, hooks::HookKind::Before),
-                (&self.config.apply.after, hooks::HookKind::After),
-            ] {
-                hooks::run_hooks(
-                    adapter,
-                    self.hook_source(),
-                    entries,
-                    kind,
-                    hook_scope,
-                    true,
-                    &mut progress,
-                )
-                .await?;
+            for kind in [hooks::HookKind::Before, hooks::HookKind::After] {
+                self.run_apply_hooks(adapter, kind, hook_scope, true, &mut progress)
+                    .await?;
             }
             return Ok(plan);
         }
 
-        ensure_reconcile_not_destructive(&plan, allow_destructive)?;
+        plan.refuse_destructive(allow_destructive)?;
         // The before-hooks' own refusals — a file missing, a path outside the
         // project — are the last.
-        hooks::plan_hooks(
-            self.hook_source(),
-            &self.config.apply.before,
-            hooks::HookKind::Before,
-            hook_scope,
-        )?;
+        self.plan_apply_hooks(hooks::HookKind::Before, hook_scope)?;
         // Past the last refusal, before the first write: heal the bookkeeping
         // and claim. Reconcile's writes commit as they run, so it claims first
         // — see `Design::claim_first` (#7).
@@ -589,16 +573,9 @@ impl Design {
         // `apply.before` where apply runs it: after every gate, so a refused
         // reconcile fires no hook, and before the first write, so a hook can
         // prepare the ground the DDL lands on.
-        let before = hooks::run_hooks(
-            adapter,
-            self.hook_source(),
-            &self.config.apply.before,
-            hooks::HookKind::Before,
-            hook_scope,
-            false,
-            &mut progress,
-        )
-        .await?;
+        let before = self
+            .run_apply_hooks(adapter, hooks::HookKind::Before, hook_scope, false, &mut progress)
+            .await?;
 
         // The writes, in dependency order (see `execute_reconcile_writes`).
         let mut summary = self
@@ -630,16 +607,9 @@ impl Design {
         adapter.sync_refresh_jobs(&self.all_matview_jobs()).await?;
 
         // `apply.after`, once everything it may seed or adjust is in place.
-        let after = hooks::run_hooks(
-            adapter,
-            self.hook_source(),
-            &self.config.apply.after,
-            hooks::HookKind::After,
-            hook_scope,
-            false,
-            &mut progress,
-        )
-        .await?;
+        let after = self
+            .run_apply_hooks(adapter, hooks::HookKind::After, hook_scope, false, &mut progress)
+            .await?;
         summary.before_scripts = before.ran;
         summary.after_scripts = after.ran;
 

@@ -55,11 +55,58 @@ Taken in slice 1:
   `depends_on` closure (T20) — to any entity another module's file declares,
   roles included, or creates beside it.
 - A module's design has no `scopes:`: scopes select over the workspace
-  (slice 3). Until then `inspect` refuses `--scope` and `--deps` on a
-  workspace, and every command but `inspect` and `install` refuses a
-  workspace until slice 2 runs it.
+  (slice 3). Until then a command that reads `--scope` or `--deps` refuses it
+  on a workspace (one that ignores it, `migrate`, warns as before).
 - `Workspace::config` is the manifest as written — its `apply:` hooks, which
   run around the whole workspace, and its `scopes:`.
+
+Taken in slice 2:
+
+- `Workspace::select(module)` is what a run that builds or reads goes over:
+  every module, or the module and every module it depends on, in load order;
+  the manifest's `apply.before` runs ahead of the first module's own, its
+  `apply.after` and `import.after` behind the last's, read from the project
+  folder, in that module's run. `Workspace::select_declaring(module, name)`
+  is `-n`'s: the module declaring the entity, the hooks around it; one
+  `--module` leaves out is refused naming its module. `select_alone(module)`
+  is `export`'s: the module alone — an export only reads.
+  `Workspace::selected_to_reset(module)` is every module in reverse, or the
+  module alone — never its dependencies, which are other owners. Each module
+  connects as its owner (`Design::owner`, now public); `--adopt-from` and
+  `--allow-ownership-change` apply to each.
+- `--module` is a global flag; on a design without `modules:` it is refused.
+- A run over more than one module checks every module's run as its dry run
+  checks it — scope pin, guards, claims, migrations, hook files, imports —
+  before the first module writes, so a refusal any module would meet comes
+  first. A reset previews every module, each beside the modules reset
+  before it (`Design::resetting_beside`: their uses and holdings do not hold
+  it back, their prod marks still do; the modules after it still hold what
+  they hold), and is refused whole or run whole; its `--dry-run` passes
+  where it passes. An error past those checks — a statement the database
+  refuses — still stops the run with the modules before it applied, as one
+  project's run stops with its earlier statements committed.
+- A workspace's import reloads as one project's does: its first module
+  empties, together, every table the run reloads that exists by then, in
+  load order by the database's keys (`Design::emptying_for_import`), the
+  others none — so `shared`'s reference data reloads with the tables that
+  hold keys to it, and `--module shared` alone is refused naming them. An
+  import that fails names what it emptied and did not reload.
+- A workspace's deploy goes over the modules twice: every module's schema
+  (`Design::deploy_schema`: apply, grants), then every module's data
+  (`Design::deploy_data`: import, policies). No module migrates after the
+  import has emptied the tables it reloads.
+- Each `export:` entry is the module's that declares its entity; one no
+  module declares stays with the first module, which warns about it once.
+- Each module's run is headed `module <name> (<owner>)`. `inspect --shared`
+  lists what shares the database once, then each module's conflicts; `diff`
+  answers for every module — `--exit-code` over all, `--json` one document,
+  `{"modules": [{"module", "owner", "diff"}]}` (a project's is its diff, as
+  before); a policy failing in one module is reported, the modules after it
+  still run, and the run fails at the end.
+- Still refusing a workspace: `format`, `doctor`, `snapshot` and `release`
+  (slice 4), `combine`, `emit`, `graph`, `dbml` and `diagram` (slice 5).
+  `init` and `merge` onboard a project into one design and refuse a
+  workspace, pointing at `dbd split` (slice 6).
 
 ## Slices
 
@@ -75,16 +122,21 @@ PR into the integration branch `feat/workspaces`.
 2. **Running a workspace.** `apply`, `deploy`, `reconcile`, `diff`, `import`,
    `export`, `policies`, `refresh`, `migrate --status` run each selected module
    in order; `reset` in reverse. Each module claims, applies and records its own
-   row (T21). `--module <name>` selects a module and its dependencies.
+   row (T21). `--module <name>` selects a module and its dependencies —
+   `reset` and `export`, the module alone.
 3. **Scopes over modules.** `scopes.<name>.modules: [...]` selects modules (and
    their dependencies), alongside entity selection. Running inside a module
    folder finds the workspace root by walking up and selects that module.
 4. **Per-module history.** `snapshot`, `release` and `apply`'s migrations per
    module: each module's own `snapshots/`, `migrations/` and version. A
    version bump or a release writes `modules.<name>.version` / `released`,
-   never `project.*` — which a workspace refuses.
+   never `project.*` — which a workspace refuses. `format` and `doctor` go
+   over the modules too.
 5. **The viewer.** The diagram model carries each entity's module; the viewer
-   groups the diagram and sidebar by module.
+   groups the diagram and sidebar by module, reading each entity's definition
+   from the module declaring it (a dependency is an external in its
+   dependents). `dbml`, `diagram`, `graph`, `combine` and `emit` go over the
+   workspace.
 6. **Converting a project: `dbd split --from-scopes`.** The plan (regions of the
    scopes' Venn diagram after `deps: include`, entity counts, inferred
    `depends_on`, rewritten `scopes:`), and `--write` (moves files with `git mv`,

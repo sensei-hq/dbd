@@ -48,6 +48,7 @@ async fn main() {
         &args.source,
         args.scope.as_deref(),
         args.deps.map(Into::into),
+        args.module.as_deref(),
         verbosity,
     )
     .await

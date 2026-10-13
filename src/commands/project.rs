@@ -401,6 +401,7 @@ pub async fn cmd_deploy(
     clear_cache: bool,
     allow_scope_change: bool,
     ownership: &super::OwnershipChange,
+    module: Option<&str>,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
@@ -423,10 +424,173 @@ pub async fn cmd_deploy(
         anyhow::bail!("No {} found in {}", config_name.display(), project_dir.display());
     }
 
-    let mut design = ownership.applied_to(
-        Design::from_config_with_dir(&config_path, env, Some(&project_dir))
-            .context("Failed to load design from source")?,
-    );
+    let targets: Vec<super::Target> =
+        super::targets(&config_path, env, &project_dir, module, None, super::Order::Build)
+            .context("Failed to load design from source")?
+            .into_iter()
+            .map(|target| target.map_design(|design| ownership.applied_to(design)))
+            .collect();
+    let (targets, emptied) = super::emptied_together(targets, None, scope, deps)?;
+    let run = DeployRun {
+        config_path: &config_path,
+        database_url,
+        dry_run,
+        allow_scope_change,
+        scope,
+        deps,
+        verbosity,
+    };
+    if targets.len() > 1 && !dry_run {
+        preflight_deploy(&targets, &run).await?;
+        return deploy_workspace(targets, &emptied, &run).await;
+    }
+    for (i, target) in targets.into_iter().enumerate() {
+        let (design, dir) = target.enter(i == 0);
+        deploy_design(design, &dir, &run).await?;
+    }
+    Ok(())
+}
+
+/// A workspace's deploy: every module's schema, then every module's data
+/// (#7). Its import empties what the run reloads together, before the first
+/// module loads — so no module may migrate after that, reading a table emptied
+/// for a reload that has not happened yet.
+async fn deploy_workspace(targets: Vec<super::Target>, emptied: &super::Emptied, run: &DeployRun<'_>) -> Result<()> {
+    let verbosity = run.verbosity;
+    let mut built = Vec::new();
+    for (i, target) in targets.into_iter().enumerate() {
+        let label = target.label();
+        let (design, _) = target.enter(i == 0);
+        let resolved = design
+            .resolve_scope(run.scope, run.deps)
+            .context("Failed to resolve scope")?;
+        let (kept, total) = design.scope_counts(&resolved)?;
+        output::scope_filtered(&resolved, kept, total);
+        for warning in design.search_path_warnings(None, Some(&resolved))? {
+            output::warn(&warning);
+        }
+        let adapter = get_adapter(run.config_path, run.database_url, design.owner()).await?;
+        let marks = design.database_marks(&*adapter).await?;
+        Design::check_scope_guard(&marks, &resolved.name, run.allow_scope_change)?;
+        super::announce_adoptions(&design, &*adapter, false).await?;
+        for skip in design.hook_skips(Some(&resolved))? {
+            output::warn(&skip);
+        }
+        output::info(verbosity, "Applying schema...");
+        let spinner = output::StepSpinner::new(verbosity);
+        let result = design
+            .deploy_schema(
+                &*adapter,
+                false,
+                Some(&resolved),
+                &mut |desc: &str| spinner.start(desc),
+                &mut |desc: &str, err: Option<&str>| spinner.done(desc, err),
+            )
+            .await;
+        spinner.finish();
+        let (apply, grants) = result.context("Deploy failed")?;
+        super::note_promotion(&marks, design.env());
+        output::info(
+            verbosity,
+            &format!(
+                "{}{}",
+                super::format_apply_summary(&apply),
+                super::format_grants(&grants)
+            ),
+        );
+        built.push((label, design, adapter, resolved));
+    }
+
+    output::always("");
+    output::info(verbosity, "Loading data...");
+    for (i, (label, design, adapter, resolved)) in built.into_iter().enumerate() {
+        if let Some(label) = label {
+            output::always(&if i == 0 { label } else { format!("\n{label}") });
+        }
+        let spinner = output::StepSpinner::new(verbosity);
+        let result = design
+            .deploy_data(
+                &*adapter,
+                false,
+                Some(&resolved),
+                &mut |desc: &str| spinner.start(desc),
+                &mut |desc: &str, err: Option<&str>| spinner.done(desc, err),
+            )
+            .await;
+        spinner.finish();
+        let (import, policies) = result
+            .context("Deploy failed")
+            .map_err(|e| emptied.explain(i, i > 0 || design.emptied_for_import(), e))?;
+        for warning in &import.warnings {
+            output::warn(warning);
+        }
+        if !policies.applied.is_empty() {
+            output::info(
+                verbosity,
+                &format!("Applied {} policy file(s).", policies.applied.len()),
+            );
+        }
+        let summary = dbd_core::design::DeployComplete {
+            policies,
+            ..Default::default()
+        };
+        for warning in summary.policy_warnings() {
+            output::warn(&warning);
+        }
+        output::info(
+            verbosity,
+            &format!(
+                "{} {}",
+                super::format_import_summary(&import),
+                super::format_policy_line(&summary.policies)
+            ),
+        );
+    }
+    Ok(())
+}
+
+/// Before the first module of a workspace deploys, each module's deploy
+/// checked as its dry run checks it — its scope pin, its guards, what it would
+/// claim, its migrations, hooks and imports — so a refusal any module's run
+/// would meet comes before any module has written (#7).
+async fn preflight_deploy(targets: &[super::Target], run: &DeployRun<'_>) -> Result<()> {
+    for target in targets {
+        let design = &target.design;
+        let check = async {
+            let adapter = get_adapter(run.config_path, run.database_url, design.owner()).await?;
+            let resolved = design.resolve_scope(run.scope, run.deps)?;
+            let marks = design.database_marks(&*adapter).await?;
+            Design::check_scope_guard(&marks, &resolved.name, run.allow_scope_change)?;
+            design.deploy(&*adapter, true, Some(&resolved), |_| {}).await?;
+            anyhow::Ok(())
+        };
+        check.await.with_context(|| target.label().unwrap_or_default())?;
+    }
+    Ok(())
+}
+
+/// What `dbd deploy` was asked, for each design it deploys.
+struct DeployRun<'a> {
+    config_path: &'a Path,
+    database_url: Option<&'a str>,
+    dry_run: bool,
+    allow_scope_change: bool,
+    scope: Option<&'a str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
+    verbosity: Verbosity,
+}
+
+/// [`cmd_deploy`] for one design: the project's, or one module's.
+async fn deploy_design(mut design: Design, project_dir: &Path, run: &DeployRun<'_>) -> Result<()> {
+    let &DeployRun {
+        config_path,
+        database_url,
+        dry_run,
+        allow_scope_change,
+        scope,
+        deps,
+        verbosity,
+    } = run;
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
     // What the scope builds, not what the design declares: a scoped deploy
     // never touches the rest, so the whole-design tally described a run that
@@ -448,7 +612,7 @@ pub async fn cmd_deploy(
         // With a database to ask, refuse where the deploy refuses: the scope
         // pin, then its apply's environment and version guards — the import's
         // environment guard is the same one.
-        let adapter = super::dry_run_adapter(&config_path, database_url).await?;
+        let adapter = super::dry_run_adapter(config_path, database_url, design.owner()).await?;
         if let Some(adapter) = &adapter {
             let marks = design.database_marks(&**adapter).await?;
             Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
@@ -483,7 +647,7 @@ pub async fn cmd_deploy(
         // The migrations its apply phase executes first, as `apply --dry-run` lists them.
         match &preview {
             Some(preview) => super::print_migration_preview(verbosity, preview),
-            None => super::note_unlisted_migrations(verbosity, &project_dir),
+            None => super::note_unlisted_migrations(verbosity, project_dir),
         }
 
         // Preview the import the same way the real run reports it: always state
@@ -507,7 +671,7 @@ pub async fn cmd_deploy(
         // deploy's summary counts it.
         let policy_ws = super::schema::policy_working_set(&design, &resolved)?;
         let policies =
-            dbd_core::design::plan_policies(&project_dir, policy_ws.as_ref().map(|(n, ws)| (n.as_str(), ws)))?;
+            dbd_core::design::plan_policies(project_dir, policy_ws.as_ref().map(|(n, ws)| (n.as_str(), ws)))?;
         output::info(
             verbosity,
             &format!(
@@ -523,7 +687,7 @@ pub async fn cmd_deploy(
         return Ok(());
     }
 
-    let adapter = get_adapter(&config_path, database_url).await?;
+    let adapter = get_adapter(config_path, database_url, design.owner()).await?;
     let marks = design.database_marks(&*adapter).await?;
     Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
     super::announce_adoptions(&design, &*adapter, false).await?;
@@ -595,19 +759,89 @@ pub async fn cmd_reconcile(
     prune: dbd_core::Prune,
     allow_scope_change: bool,
     ownership: &super::OwnershipChange,
+    module: Option<&str>,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let design = ownership
-        .applied_to(Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?);
+    let targets: Vec<super::Target> = super::targets(config, env, project_dir, module, None, super::Order::Build)?
+        .into_iter()
+        .map(|target| target.map_design(|design| ownership.applied_to(design)))
+        .collect();
+    if targets.len() > 1 && !dry_run {
+        // Before the first module writes, each module's reconcile checked as
+        // its dry run checks it — so a refusal any module's would meet comes
+        // before any module has written (#7).
+        for target in &targets {
+            let design = &target.design;
+            let check = async {
+                refuse_a_released_reconcile(design)?;
+                let adapter = get_adapter(config, database_url, design.owner()).await?;
+                let resolved = design.resolve_scope(scope, deps)?;
+                let marks = design.database_marks(&*adapter).await?;
+                Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
+                design
+                    .reconcile(
+                        &*adapter,
+                        true,
+                        allow_destructive,
+                        prune,
+                        Some(&resolved),
+                        Progress::none(),
+                    )
+                    .await?
+                    .refuse_destructive(allow_destructive)?;
+                anyhow::Ok(())
+            };
+            check.await.with_context(|| target.label().unwrap_or_default())?;
+        }
+    }
+    for (i, target) in targets.into_iter().enumerate() {
+        let (design, _) = target.enter(i == 0);
+        reconcile_design(
+            design,
+            config,
+            database_url,
+            dry_run,
+            allow_destructive,
+            prune,
+            allow_scope_change,
+            scope,
+            deps,
+            verbosity,
+        )
+        .await?;
+    }
+    Ok(())
+}
 
+/// A released project — or module — changes through `dbd snapshot` and
+/// migrations; `reconcile` is the pre-release workflow.
+fn refuse_a_released_reconcile(design: &Design) -> Result<()> {
     if design.config().project.released {
         anyhow::bail!(
             "Project is released — `reconcile` is disabled. \
              Capture changes with `dbd snapshot`, then migrate with `dbd apply`."
         );
     }
+    Ok(())
+}
+
+/// [`cmd_reconcile`] for one design: the project's, or one module's.
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_design(
+    design: Design,
+    config: &Path,
+    database_url: Option<&str>,
+    dry_run: bool,
+    allow_destructive: bool,
+    prune: dbd_core::Prune,
+    allow_scope_change: bool,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
+    verbosity: Verbosity,
+) -> Result<()> {
+    refuse_a_released_reconcile(&design)?;
 
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
     let (kept, total) = design.scope_counts(&resolved)?;
@@ -622,7 +856,7 @@ pub async fn cmd_reconcile(
     let configured = super::configured_database_url(config, database_url)?;
     let adapter = match configured {
         Some(url) if dry_run => {
-            let project = &design.config().project.name;
+            let project = design.owner();
             match dbd_core::connect_existing(&url, project)
                 .await
                 .context("Failed to connect to database")?
@@ -633,7 +867,7 @@ pub async fn cmd_reconcile(
                     .context("Failed to open an empty database to preview against")?,
             }
         }
-        _ => get_adapter(config, database_url).await?,
+        _ => get_adapter(config, database_url, design.owner()).await?,
     };
     reconcile_with_adapter(
         &*adapter,
@@ -1084,6 +1318,7 @@ mod tests {
             &crate::commands::OwnershipChange::default(),
             None,
             None,
+            None,
             Verbosity::Normal,
         )
         .await
@@ -1108,6 +1343,7 @@ mod tests {
             /*clear_cache*/ false,
             /*allow_scope_change*/ false,
             &crate::commands::OwnershipChange::default(),
+            None,
             None,
             None,
             Verbosity::Normal,
@@ -1222,6 +1458,7 @@ mod tests {
             &crate::commands::OwnershipChange::default(),
             None,
             None,
+            None,
             Verbosity::Normal,
         )
         .await
@@ -1298,6 +1535,7 @@ mod tests {
             &crate::commands::OwnershipChange::default(),
             None,
             None,
+            None,
             Verbosity::Normal,
         )
         .await
@@ -1322,6 +1560,7 @@ mod tests {
             &crate::commands::OwnershipChange::default(),
             None,
             None,
+            None,
             Verbosity::Normal,
         )
         .await
@@ -1343,6 +1582,7 @@ mod tests {
             /*clear_cache*/ false,
             /*allow_scope_change*/ false,
             &crate::commands::OwnershipChange::default(),
+            None,
             None,
             None,
             Verbosity::Normal,
@@ -1375,6 +1615,7 @@ mod tests {
             /*clear_cache*/ false,
             /*allow_scope_change*/ false,
             &crate::commands::OwnershipChange::default(),
+            None,
             Some("incomplete_auto"),
             None,
             Verbosity::Normal,

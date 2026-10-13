@@ -460,8 +460,10 @@ projects.
   (`<project>/<module>`). Each module also has its own version, `snapshots/`
   and `migrations/`, so modules release independently.
 - **Selecting what to run.** `--module core` selects one module, plus its
-  dependencies. Workspace scopes select modules (above). Sensei's 32-entry
-  `dojo` includes list becomes one line.
+  dependencies; `reset` takes the module alone (a full reset goes in reverse
+  `depends_on` order), and so does `export`, which only reads. Workspace
+  scopes select modules (above). Sensei's 32-entry `dojo` includes list
+  becomes one line.
 - **Running inside a module folder** finds the workspace root by walking up, as
   Cargo does, and selects that module.
 - **The viewer** groups the diagram and sidebar by module, alongside the schema

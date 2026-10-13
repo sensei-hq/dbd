@@ -297,21 +297,14 @@ fn read_hook(canon_root: &Path, script: &str, kind: HookKind) -> Result<String> 
     crate::source_text::read_to_string(&path).map_err(|e| denied(e.to_string()))
 }
 
-/// Run one phase's hook scripts, honouring scope and `dry_run`.
-///
-/// `scope` is `Some((name, working_set))` for a narrowed run and `None` for an
-/// unscoped or all-scope one, where every hook runs without paying for
-/// derivation.
-///
-/// [`plan_hooks`] makes every decision; this only executes it, so `dry_run`
-/// reports the identical set of steps while running none of them — the shape
-/// `import_run_after_scripts` already had.
-pub(in crate::design) async fn run_hooks<S, D, C>(
+/// Execute what [`plan_hooks`] decided, in order, every script on
+/// `search_path`, honouring `dry_run`: it reports the identical set of steps
+/// while running none of them. A phase is planned from every list it runs
+/// before any of them runs — see `Design::run_hook_phase`.
+pub(in crate::design) async fn run_planned<S, D, C>(
     adapter: &dyn DatabaseAdapter,
-    source: HookSource<'_>,
-    entries: &[ScriptEntry],
-    kind: HookKind,
-    scope: Option<(&str, &HashSet<String>)>,
+    plan: HookPlan,
+    search_path: Option<&[PathEntry]>,
     dry_run: bool,
     progress: &mut super::Progress<S, D, C>,
 ) -> Result<HookOutcome>
@@ -319,7 +312,6 @@ where
     S: FnMut(&str),
     D: FnMut(&str, Option<&str>),
 {
-    let plan = plan_hooks(source, entries, kind, scope)?;
     let mut outcome = HookOutcome {
         ran: 0,
         warnings: plan.warnings,
@@ -330,7 +322,7 @@ where
         let result = if dry_run {
             Ok(())
         } else {
-            adapter.execute_project_script(sql, source.search_path).await
+            adapter.execute_project_script(sql, search_path).await
         };
         super::report_step_result(&desc, &mut progress.on_done, result)?;
         outcome.ran += 1;
@@ -341,6 +333,33 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run one phase's hook scripts, honouring scope and `dry_run`.
+    ///
+    /// `scope` is `Some((name, working_set))` for a narrowed run and `None` for an
+    /// unscoped or all-scope one, where every hook runs without paying for
+    /// derivation.
+    ///
+    /// [`plan_hooks`] makes every decision; this only executes it, so `dry_run`
+    /// reports the identical set of steps while running none of them — the shape
+    /// `import_run_after_scripts` already had.
+    async fn run_hooks<S, D, C>(
+        adapter: &dyn DatabaseAdapter,
+        source: HookSource<'_>,
+        entries: &[ScriptEntry],
+        kind: HookKind,
+        scope: Option<(&str, &HashSet<String>)>,
+        dry_run: bool,
+        progress: &mut crate::design::Progress<S, D, C>,
+    ) -> Result<HookOutcome>
+    where
+        S: FnMut(&str),
+        D: FnMut(&str, Option<&str>),
+    {
+        let plan = plan_hooks(source, entries, kind, scope)?;
+        run_planned(adapter, plan, source.search_path, dry_run, progress).await
+    }
+
     use crate::adapter::mock::MockAdapter;
     use crate::design::Progress;
     use std::collections::HashSet;

@@ -2962,3 +2962,632 @@ async fn inspect_shared_reports_the_projects_and_fails_on_a_conflict() {
     assert!(!conflicted.status.success(), "{said}");
     assert!(said.contains("relation app.widgets is owned by \"clilive\""), "{said}");
 }
+
+// ── Workspaces (#7 phase 3) ──────────────────────────────────────────────────
+
+/// `shop` as a workspace: `shared` holds currencies; `core`'s orders and
+/// `dojo`'s sessions reference them.
+fn shop_workspace(dir: &Path) {
+    let files: &[(&str, &str)] = &[
+        (
+            "design.yaml",
+            "project:\n  name: shop\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n  - dojo\n\n\
+             modules:\n  shared: {}\n  core:\n    depends_on: [shared]\n  dojo:\n    depends_on: [shared]\n",
+        ),
+        (
+            "shared/ddl/table/app/currencies.ddl",
+            "set search_path to app;\ncreate table if not exists currencies (code text primary key);\n",
+        ),
+        (
+            "core/ddl/table/app/orders.ddl",
+            "set search_path to app;\ncreate table if not exists orders (\n  id integer primary key\n, \
+             currency text references currencies (code)\n);\n",
+        ),
+        (
+            "dojo/ddl/table/dojo/sessions.ddl",
+            "set search_path to dojo;\ncreate table if not exists sessions (\n  id integer primary key\n, \
+             currency text references app.currencies (code)\n);\n",
+        ),
+    ];
+    for (rel, text) in files {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, text).unwrap();
+    }
+}
+
+/// Where each `module <name> (<owner>)` header is in `text`, in order.
+fn module_headers(text: &str) -> Vec<&str> {
+    text.lines()
+        .filter_map(|l| l.trim().strip_prefix("module "))
+        .filter_map(|l| l.split(' ').next())
+        .collect()
+}
+
+/// The projects `inspect --shared` lists, a line each: `shop/core (prod, v0) —
+/// owns 1: relation app.orders`.
+fn owners_listed(dir: &Path, url: &str) -> Vec<String> {
+    let o = dbd(dir, url, &["inspect", "--shared"]);
+    stdout(&o)
+        .lines()
+        .take_while(|l| !l.starts_with("No conflicts") && !l.starts_with("Conflicts") && !l.is_empty())
+        .filter(|l| l.starts_with("  ") && !l.starts_with("    "))
+        .map(|l| l.trim().to_string())
+        .collect()
+}
+
+/// Every command that runs a design runs a workspace module by module, in
+/// `depends_on` order, each as its own owner — and `reset` in reverse.
+#[tokio::test]
+async fn a_workspace_runs_module_by_module() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    shop_workspace(dir);
+
+    // A deploy goes over the modules twice: every module's schema, then every
+    // module's data.
+    let o = dbd(dir, &url, &["deploy"]);
+    assert!(o.status.success(), "deploy: {}", combined(&o));
+    assert_eq!(
+        module_headers(&stdout(&o)),
+        ["shared", "core", "dojo", "shared", "core", "dojo"],
+        "{}",
+        combined(&o)
+    );
+    let out = stdout(&o);
+    let data = out.find("Loading data...").expect("the data pass");
+    assert!(
+        out[..data].contains("module dojo (shop/dojo)"),
+        "every schema first: {out}"
+    );
+    // Each module ran, as its own owner: its record, and what it owns.
+    let owners = owners_listed(dir, &url);
+    for line in [
+        "shop/shared (prod, v0) — owns 1: relation app.currencies",
+        "shop/core (prod, v0) — owns 1: relation app.orders",
+        "shop/dojo (prod, v0) — owns 1: relation dojo.sessions",
+    ] {
+        assert!(owners.iter().any(|o| o == line), "{line}: {owners:?}");
+    }
+    assert!(!owners.iter().any(|o| o.starts_with("shop (")), "{owners:?}");
+
+    for args in [
+        &["apply"][..],
+        &["apply", "--dry-run"],
+        &["diff"],
+        &["reconcile", "--dry-run"],
+        &["migrate", "--status"],
+        &["refresh"],
+        &["policies"],
+        &["import"],
+        &["inspect", "--shared"],
+    ] {
+        let o = dbd(dir, &url, args);
+        assert!(o.status.success(), "{args:?}: {}", combined(&o));
+        assert_eq!(
+            module_headers(&stdout(&o)),
+            ["shared", "core", "dojo"],
+            "{args:?}: {}",
+            combined(&o)
+        );
+    }
+
+    let o = dbd(dir, &url, &["reset", "--force"]);
+    assert!(o.status.success(), "reset: {}", combined(&o));
+    assert_eq!(
+        module_headers(&stdout(&o)),
+        ["dojo", "core", "shared"],
+        "{}",
+        combined(&o)
+    );
+}
+
+/// `--module` runs one module and the modules it depends on — a reset, the
+/// one module alone.
+#[tokio::test]
+async fn module_runs_one_module_and_its_dependencies() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    shop_workspace(dir);
+
+    let o = dbd(dir, &url, &["apply", "--module", "core"]);
+    assert!(o.status.success(), "apply --module core: {}", combined(&o));
+    assert_eq!(module_headers(&stdout(&o)), ["shared", "core"], "{}", combined(&o));
+
+    let owners = owners_listed(dir, &url);
+    assert!(
+        owners
+            .iter()
+            .any(|o| o == "shop/shared (prod, v0) — owns 1: relation app.currencies")
+            && owners
+                .iter()
+                .any(|o| o == "shop/core (prod, v0) — owns 1: relation app.orders")
+            && !owners.iter().any(|o| o.starts_with("shop/dojo")),
+        "{owners:?}"
+    );
+
+    // `-n`: the module declaring the entity.
+    let o = dbd(dir, &url, &["apply", "-n", "app.orders"]);
+    assert!(o.status.success(), "apply -n app.orders: {}", combined(&o));
+    assert_eq!(module_headers(&stdout(&o)), ["core"], "{}", combined(&o));
+
+    // A dry run asks the database as the module's owner: core's record says
+    // prod, so an unforced reset of it is refused, preview and all.
+    let o = dbd(dir, &url, &["reset", "--dry-run", "--module", "core"]);
+    assert!(!o.status.success(), "{}", combined(&o));
+    assert!(combined(&o).contains("marked as prod"), "{}", combined(&o));
+    let o = dbd(dir, &url, &["reset", "--dry-run", "--force", "--module", "core"]);
+    assert!(o.status.success(), "{}", combined(&o));
+    assert_eq!(module_headers(&stdout(&o)), ["core"], "{}", combined(&o));
+
+    let o = dbd(dir, &url, &["reset", "--force", "--module", "core"]);
+    assert!(o.status.success(), "reset --module core: {}", combined(&o));
+    assert_eq!(module_headers(&stdout(&o)), ["core"], "{}", combined(&o));
+
+    let o = dbd(dir, &url, &["apply", "--module", "nope"]);
+    assert!(!o.status.success(), "{}", combined(&o));
+    assert!(combined(&o).contains("\"nope\""), "{}", combined(&o));
+}
+
+/// A workspace's diff is one answer: `--exit-code` says whether any module
+/// drifts — not only the first — and `--json` is one document, each module's
+/// diff under its name.
+#[tokio::test]
+async fn a_workspace_diff_answers_for_every_module() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    shop_workspace(dir);
+    let o = dbd(dir, &url, &["deploy"]);
+    assert!(o.status.success(), "deploy: {}", combined(&o));
+
+    // Only the last module drifts: a table its design has and the database
+    // does not.
+    std::fs::write(
+        dir.join("dojo/ddl/table/dojo/belts.ddl"),
+        "set search_path to dojo;\ncreate table if not exists belts (id integer primary key);\n",
+    )
+    .unwrap();
+
+    let o = dbd(dir, &url, &["diff", "--exit-code"]);
+    assert_eq!(o.status.code(), Some(2), "a module drifts: {}", combined(&o));
+
+    let o = dbd(dir, &url, &["diff", "--json"]);
+    assert!(o.status.success(), "{}", combined(&o));
+    let doc: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap_or_else(|e| panic!("{e}: {}", stdout(&o)));
+    let modules: Vec<&str> = doc["modules"]
+        .as_array()
+        .expect("a modules array")
+        .iter()
+        .map(|m| m["module"].as_str().expect("a module name"))
+        .collect();
+    assert_eq!(modules, ["shared", "core", "dojo"], "{doc}");
+    assert_eq!(doc["modules"][2]["owner"], "shop/dojo", "{doc}");
+    let changed = |i: usize| -> Vec<String> {
+        doc["modules"][i]["diff"]["changes"]
+            .as_array()
+            .expect("changes")
+            .iter()
+            .map(|c| c["entity_name"].as_str().expect("entity_name").to_string())
+            .collect()
+    };
+    assert_eq!(changed(0), Vec::<String>::new(), "{doc}");
+    assert_eq!(changed(1), Vec::<String>::new(), "{doc}");
+    assert_eq!(changed(2), ["dojo.belts"], "{doc}");
+
+    // The first module drifting, and the last not, drifts the run all the same.
+    std::fs::remove_file(dir.join("dojo/ddl/table/dojo/belts.ddl")).unwrap();
+    std::fs::write(
+        dir.join("shared/ddl/table/app/rates.ddl"),
+        "set search_path to app;\ncreate table if not exists rates (id integer primary key);\n",
+    )
+    .unwrap();
+    let o = dbd(dir, &url, &["diff", "--exit-code"]);
+    assert_eq!(o.status.code(), Some(2), "the first module drifts: {}", combined(&o));
+}
+
+/// A policy failing in one module is reported, and the modules after it still
+/// get theirs; the run then fails — `policies` and `apply --with-policies` alike.
+#[tokio::test]
+async fn a_workspace_policy_failure_does_not_skip_the_modules_after_it() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    shop_workspace(dir);
+    let o = dbd(dir, &url, &["deploy"]);
+    assert!(o.status.success(), "deploy: {}", combined(&o));
+
+    for (rel, sql) in [
+        (
+            "shared/policies/app/currencies.sql",
+            "alter table app.no_such_table enable row level security;\n",
+        ),
+        (
+            "core/policies/app/orders.sql",
+            "alter table app.orders enable row level security;\n",
+        ),
+    ] {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, sql).unwrap();
+    }
+
+    for (args, applied) in [
+        (&["policies"][..], "Policies: 1 applied, 0 failed."),
+        (&["apply", "--with-policies"], "Applied 1 policy file(s)."),
+    ] {
+        let o = dbd(dir, &url, args);
+        let text = combined(&o);
+        assert!(!o.status.success(), "{args:?}: shared's policy fails: {text}");
+        assert_eq!(
+            module_headers(&stdout(&o)),
+            ["shared", "core", "dojo"],
+            "{args:?}: every module still runs: {text}"
+        );
+        let out = stdout(&o);
+        let core = out.find("module core (shop/core)").expect("core's header");
+        let dojo = out.find("module dojo (shop/dojo)").expect("dojo's header");
+        assert!(
+            out[core..dojo].contains(applied),
+            "{args:?}: core's policy applied: {out}"
+        );
+    }
+}
+
+/// A project without modules prints no module header, whatever it runs.
+#[tokio::test]
+async fn a_project_without_modules_prints_no_module_header() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir);
+    for args in [
+        &["apply"][..],
+        &["apply", "--dry-run"],
+        &["diff"],
+        &["reconcile", "--dry-run"],
+        &["migrate", "--status"],
+        &["policies"],
+        &["inspect", "--shared"],
+        &["reset", "--force"],
+    ] {
+        let o = dbd(dir, &url, args);
+        assert!(o.status.success(), "{args:?}: {}", combined(&o));
+        assert_eq!(
+            module_headers(&stdout(&o)),
+            Vec::<&str>::new(),
+            "{args:?}: {}",
+            combined(&o)
+        );
+    }
+}
+
+/// A reset that one module's guard refuses is refused before any module
+/// drops anything — and its preview, which reads what the run would, passes
+/// where the run passes.
+#[tokio::test]
+async fn a_workspace_reset_is_refused_whole_or_runs_whole() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    shop_workspace(dir);
+    let o = dbd(dir, &url, &["deploy", "-e", "dev"]);
+    assert!(o.status.success(), "deploy: {}", combined(&o));
+
+    // The preview of a reset the run performs: dojo and core go before shared,
+    // so their uses of shared's currencies do not hold it back.
+    let o = dbd(dir, &url, &["reset", "-e", "dev", "--dry-run"]);
+    assert!(o.status.success(), "{}", combined(&o));
+    assert!(stdout(&o).contains("\"app\".\"currencies\""), "{}", combined(&o));
+
+    // shared is versioned: an unforced reset is refused — before dojo and
+    // core drop anything.
+    let manifest = std::fs::read_to_string(dir.join("design.yaml")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        manifest.replace("  shared: {}\n", "  shared:\n    version: 1\n"),
+    )
+    .unwrap();
+    let o = dbd(dir, &url, &["deploy", "-e", "dev", "--module", "shared"]);
+    assert!(o.status.success(), "deploy shared at v1: {}", combined(&o));
+    let o = dbd(dir, &url, &["reset", "-e", "dev"]);
+    assert!(!o.status.success(), "shared's guard refuses: {}", combined(&o));
+    let owners = owners_listed(dir, &url);
+    for owned in [
+        "relation app.orders",
+        "relation dojo.sessions",
+        "relation app.currencies",
+    ] {
+        assert!(owners.iter().any(|o| o.ends_with(owned)), "{owned} kept: {owners:?}");
+    }
+}
+
+/// A workspace's import reloads a module's reference data the modules after
+/// it reference — emptied together, as one project's tables are — and does so
+/// again; its export writes each module's tables.
+#[tokio::test]
+async fn a_workspace_imports_across_its_modules_and_exports_each() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    shop_workspace(dir);
+    for (rel, csv) in [
+        ("shared/import/app/currencies.csv", "code\nUSD\n"),
+        ("core/import/app/orders.csv", "id,currency\n1,USD\n"),
+        ("dojo/import/dojo/sessions.csv", "id,currency\n7,USD\n"),
+    ] {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, csv).unwrap();
+    }
+    let o = dbd(dir, &url, &["deploy", "-e", "dev"]);
+    assert!(o.status.success(), "deploy: {}", combined(&o));
+    let o = dbd(dir, &url, &["import", "-e", "dev"]);
+    assert!(o.status.success(), "a second load: {}", combined(&o));
+
+    let out = dir.join("out");
+    let o = dbd(dir, &url, &["export", "-o", out.to_str().unwrap()]);
+    assert!(o.status.success(), "export: {}", combined(&o));
+    for (rel, row) in [
+        ("app/currencies.csv", "USD"),
+        ("app/orders.csv", "1,USD"),
+        ("dojo/sessions.csv", "7,USD"),
+    ] {
+        let text = std::fs::read_to_string(out.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"));
+        assert!(text.contains(row), "{rel}: {text}");
+    }
+
+    // `--module` exports the module alone: an export reads, and needs nothing
+    // of its dependencies.
+    let only = dir.join("only");
+    let o = dbd(dir, &url, &["export", "--module", "core", "-o", only.to_str().unwrap()]);
+    assert!(o.status.success(), "export --module core: {}", combined(&o));
+    assert_eq!(module_headers(&stdout(&o)), ["core"], "{}", combined(&o));
+    assert!(!only.join("app/currencies.csv").exists());
+}
+
+/// A refusal any module's run would meet before its first write — a hook file
+/// that is missing — refuses the workspace's run before the first module
+/// writes.
+#[tokio::test]
+async fn a_refusal_in_a_later_module_refuses_the_run_before_any_module_writes() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    shop_workspace(dir);
+    let manifest = std::fs::read_to_string(dir.join("design.yaml")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        format!("{manifest}\napply:\n  after: [hooks/missing.sql]\n"),
+    )
+    .unwrap();
+
+    for args in [&["apply"][..], &["deploy"], &["reconcile"]] {
+        let o = dbd(dir, &url, args);
+        assert!(!o.status.success(), "{args:?}: {}", combined(&o));
+        assert!(combined(&o).contains("hooks/missing.sql"), "{args:?}: {}", combined(&o));
+        let owners = owners_listed(dir, &url);
+        assert!(
+            !owners.iter().any(|o| o.contains("owns")),
+            "{args:?}: nothing built: {owners:?}"
+        );
+    }
+}
+
+/// A workspace deploys every module's schema before any module's data: a
+/// module's migration reads the reference data it migrates by, not a table
+/// an earlier module's import emptied for the reload that follows.
+#[tokio::test]
+async fn a_workspace_deploy_migrates_every_module_before_it_reloads_data() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let manifest = |core_version: u32| {
+        format!(
+            "project:\n  name: shop\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n\n\
+             modules:\n  shared: {{}}\n  core:\n    depends_on: [shared]\n    version: {core_version}\n"
+        )
+    };
+    for (rel, text) in [
+        ("design.yaml", manifest(1).as_str()),
+        (
+            "shared/ddl/table/app/currencies.ddl",
+            "set search_path to app;\ncreate table if not exists currencies (code text primary key);\n",
+        ),
+        ("shared/import/app/currencies.csv", "code\nUSD\n"),
+        (
+            "core/ddl/table/app/statuses.ddl",
+            "set search_path to app;\ncreate table if not exists statuses (id integer primary key, label text);\n",
+        ),
+        ("core/import/app/statuses.csv", "id,label\n1,Open\n2,Closed\n"),
+        (
+            "core/ddl/table/app/orders.ddl",
+            "set search_path to app;\ncreate table if not exists orders (\n  id integer primary key\n, \
+             status_id integer\n, status_label text\n);\n",
+        ),
+    ] {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    let o = dbd(dir, &url, &["deploy", "-e", "dev"]);
+    assert!(o.status.success(), "deploy v1: {}", combined(&o));
+    std::fs::write(dir.join("orders.csv"), "id,status_id\n1,1\n2,2\n").unwrap();
+    let o = dbd(
+        dir,
+        &url,
+        &["import", "-e", "dev", "-n", "app.orders", "-f", "orders.csv"],
+    );
+    assert!(o.status.success(), "orders: {}", combined(&o));
+
+    // v2 backfills each order's label from the statuses core reloads.
+    std::fs::write(dir.join("design.yaml"), manifest(2)).unwrap();
+    for (rel, text) in [
+        (
+            "core/migrations/002/graph.json",
+            "{\"fromVersion\": 1, \"toVersion\": 2, \"added\": [], \"altered\": [\"app.orders\"], \"dropped\": []}\n",
+        ),
+        (
+            "core/migrations/002/app/orders.sql",
+            "update app.orders o set status_label = s.label from app.statuses s where s.id = o.status_id;\n",
+        ),
+    ] {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    let o = dbd(dir, &url, &["deploy", "-e", "dev"]);
+    assert!(o.status.success(), "deploy v2: {}", combined(&o));
+
+    let out = dir.join("out");
+    let o = dbd(dir, &url, &["export", "-o", out.to_str().unwrap()]);
+    assert!(o.status.success(), "export: {}", combined(&o));
+    let orders = std::fs::read_to_string(out.join("app/orders.csv")).unwrap();
+    assert!(orders.contains("1,1,Open") && orders.contains("2,2,Closed"), "{orders}");
+}
+
+/// An import that fails in one module names what an earlier module emptied
+/// for the run and no module has reloaded.
+#[tokio::test]
+async fn a_failed_workspace_import_names_the_tables_it_left_emptied() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    shop_workspace(dir);
+    for (rel, text) in [
+        ("shared/import/app/currencies.csv", "code\nUSD\n"),
+        ("core/import/app/orders.csv", "id,currency\n1,USD\n"),
+        (
+            "dojo/ddl/table/dojo/belts.ddl",
+            "set search_path to dojo;\ncreate table if not exists belts (id integer primary key);\n",
+        ),
+        ("dojo/import/dojo/sessions.csv", "id,currency\n7,USD\n"),
+        ("dojo/import/dojo/belts.csv", "id\n1\n2\n"),
+    ] {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    let o = dbd(dir, &url, &["deploy", "-e", "dev"]);
+    assert!(o.status.success(), "deploy: {}", combined(&o));
+
+    // A row the database refuses, once the run has emptied every table.
+    std::fs::write(dir.join("core/import/app/orders.csv"), "id,currency\n1,USD\n1,USD\n").unwrap();
+    let o = dbd(dir, &url, &["import", "-e", "dev"]);
+    assert!(!o.status.success(), "core's load fails: {}", combined(&o));
+    let said = combined(&o);
+    let err = said.find("Error:").map(|at| &said[at..]).unwrap_or_default();
+    assert!(
+        err.contains("dojo.belts") && err.contains("dojo.sessions") && !err.contains("app.currencies"),
+        "the error names what the run emptied and did not reload: {said}"
+    );
+}
+
+/// A reconcile one module would refuse — a destructive change without
+/// `--allow-destructive` — is refused before an earlier module reconciles.
+#[tokio::test]
+async fn a_destructive_reconcile_in_a_later_module_refuses_the_run_first() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    shop_workspace(dir);
+    let o = dbd(dir, &url, &["deploy", "-e", "dev"]);
+    assert!(o.status.success(), "deploy: {}", combined(&o));
+
+    std::fs::write(
+        dir.join("shared/ddl/table/app/rates.ddl"),
+        "set search_path to app;\ncreate table if not exists rates (id integer primary key);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("core/ddl/table/app/orders.ddl"),
+        "set search_path to app;\ncreate table if not exists orders (\n  id integer primary key\n);\n",
+    )
+    .unwrap();
+    let o = dbd(dir, &url, &["reconcile", "-e", "dev"]);
+    assert!(!o.status.success(), "{}", combined(&o));
+    assert!(combined(&o).contains("destructive"), "{}", combined(&o));
+    let owners = owners_listed(dir, &url);
+    assert!(
+        owners
+            .iter()
+            .any(|o| o == "shop/shared (dev, v0) — owns 1: relation app.currencies"),
+        "shared reconciled nothing: {owners:?}"
+    );
+}
+
+/// Each module resets beside the modules reset before it, not after: a role
+/// the later modules still grant on is kept until the last of them, and a
+/// schema holding a later module's tables is kept for it.
+#[tokio::test]
+async fn a_workspace_reset_keeps_for_later_modules_what_they_still_hold() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    shop_workspace(dir);
+    let manifest = std::fs::read_to_string(dir.join("design.yaml")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        manifest.replace(
+            "schemas:\n",
+            "target:\n  postgres:\n    roles:\n      - name: rv_reader\n\nschemas:\n",
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("shared/policies/app")).unwrap();
+    std::fs::write(
+        dir.join("shared/policies/app/currencies.sql"),
+        "grant select on app.currencies to rv_reader;\n",
+    )
+    .unwrap();
+    let o = dbd(dir, &url, &["deploy", "-e", "dev"]);
+    assert!(o.status.success(), "deploy: {}", combined(&o));
+
+    let o = dbd(dir, &url, &["reset", "-e", "dev", "--schemas"]);
+    assert!(o.status.success(), "reset: {}", combined(&o));
+    assert!(
+        !stdout(&o).contains("dropped nothing"),
+        "each module drops its own: {}",
+        combined(&o)
+    );
+}
+
+/// An import refused at the emptying — Postgres empties tables together or
+/// not at all — emptied nothing, and says so rather than that it left tables
+/// to reload.
+#[tokio::test]
+async fn a_workspace_import_refused_at_the_emptying_claims_nothing_emptied() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    shop_workspace(dir);
+    let o = dbd(dir, &url, &["deploy", "-e", "dev"]);
+    assert!(o.status.success(), "deploy: {}", combined(&o));
+    std::fs::write(dir.join("eur.csv"), "code\nEUR\n").unwrap();
+    let o = dbd(
+        dir,
+        &url,
+        &["import", "-e", "dev", "-n", "app.currencies", "-f", "eur.csv"],
+    );
+    assert!(o.status.success(), "seeding: {}", combined(&o));
+
+    // shared reloads its currencies, and the tables holding keys to them
+    // reload nothing: the emptying is refused whole.
+    std::fs::create_dir_all(dir.join("shared/import/app")).unwrap();
+    std::fs::write(dir.join("shared/import/app/currencies.csv"), "code\nUSD\n").unwrap();
+    let o = dbd(dir, &url, &["import", "-e", "dev"]);
+    assert!(!o.status.success(), "{}", combined(&o));
+    assert!(!combined(&o).contains("the import emptied"), "{}", combined(&o));
+
+    let out = dir.join("out");
+    let o = dbd(
+        dir,
+        &url,
+        &["export", "--module", "shared", "-o", out.to_str().unwrap()],
+    );
+    assert!(o.status.success(), "export: {}", combined(&o));
+    let currencies = std::fs::read_to_string(out.join("app/currencies.csv")).unwrap();
+    assert!(currencies.contains("EUR"), "nothing was emptied: {currencies}");
+}

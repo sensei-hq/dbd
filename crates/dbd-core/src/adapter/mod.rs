@@ -389,6 +389,14 @@ pub trait DatabaseAdapter: Send + Sync {
     /// key to (SQLite enforces foreign keys on dbd's connections), and with
     /// the table that failed named — the database's own error names none.
     /// Postgres truncates them in one statement instead (see its override).
+    /// Which of `tables` exist, in the order given. A workspace's import
+    /// empties what the whole run reloads before its first module loads, and
+    /// on a fresh database a later module's tables are not built yet (#7).
+    /// Adapters with no catalog to ask take every table to exist.
+    async fn existing_tables(&self, tables: &[String]) -> Result<Vec<String>> {
+        Ok(tables.to_vec())
+    }
+
     async fn truncate_tables(&self, tables: &[String]) -> Result<()> {
         for table in tables.iter().rev() {
             self.truncate_table(table).await.map_err(|e| {

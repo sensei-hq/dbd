@@ -328,9 +328,9 @@ impl SqliteAdapter {
     }
 
     /// Whether `table` exists — read via `sqlite_master`, so a missing one is
-    /// no error.
+    /// no error — matched as SQLite matches a name: without regard to case.
     async fn has_table(&self, table: &str) -> Result<bool> {
-        let found = sqlx::query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")
+        let found = sqlx::query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 COLLATE NOCASE")
             .bind(table)
             .fetch_optional(&self.pool)
             .await
@@ -450,6 +450,16 @@ impl DatabaseAdapter for SqliteAdapter {
             }
             _ => Err(DbdError::Config(format!("Unsupported sqlite import format: {format}"))),
         }
+    }
+
+    async fn existing_tables(&self, tables: &[String]) -> Result<Vec<String>> {
+        let mut existing = Vec::new();
+        for table in tables {
+            if self.has_table(Self::bare_name(table)).await? {
+                existing.push(table.clone());
+            }
+        }
+        Ok(existing)
     }
 
     async fn truncate_table(&self, table: &str) -> Result<()> {

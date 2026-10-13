@@ -12,10 +12,12 @@
 
 ## Next
 
-Slice 2 (running a workspace): per-module runs and adapters for apply, deploy,
-reconcile, diff, import, export, policies, refresh, migrate --status, reset
-(reverse), inspect --shared; `--module` (+ dependencies); manifest `apply:`
-hooks around the run; T21. Branch `feat/workspaces-run`, red tests first.
+Slice 2 PR #62 (`feat/workspaces-run` → `feat/workspaces`): every review round
+fixed — last: a failed import claims emptied tables only when it emptied them
+(dabb0bdf). Next: full suites, CI, merge into `feat/workspaces`; then slice 3
+(scopes over modules, walking up from a module folder).
+
+    gh pr checks 62
 
 ## Open
 
