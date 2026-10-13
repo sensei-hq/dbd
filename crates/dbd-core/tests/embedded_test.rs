@@ -7333,8 +7333,11 @@ async fn a_renamed_project_is_held_to_the_record_its_old_name_left() {
 /// More than one project may share a database, each with its own record. A
 /// project's guards read its own record, and another project's only when the
 /// database holds this project's objects with no record of it — a rename.
-/// So a second project builds, runs dev, resets and rebuilds beside a
-/// production one at a higher version, and the production one stays guarded.
+/// So a second project builds, runs dev and rebuilds beside a production one
+/// at a higher version, and the production one stays guarded. A reset is the
+/// exception: a database one project marked prod is prod for every project in
+/// it, so another's unforced reset is refused too, and its forced one still
+/// drops only its own (#7).
 #[tokio::test]
 async fn two_projects_in_one_database_are_each_guarded_by_their_own_record() {
     let (_pg, url) = start_pg().await;
@@ -7357,10 +7360,16 @@ async fn two_projects_in_one_database_are_each_guarded_by_their_own_record() {
         .import_data(&*b, None, false, None, Progress::none())
         .await
         .expect("its dev seed data");
-    b_dev
+    let err = b_dev
         .reset(&*b, "postgres", false, false, false, None)
         .await
-        .expect("its unforced reset: its own record is dev and unversioned");
+        .expect_err("its unforced reset: the first project marked the database prod")
+        .to_string();
+    assert!(err.contains("'first'") && err.contains("prod"), "{err}");
+    b_dev
+        .reset(&*b, "postgres", true, false, false, None)
+        .await
+        .expect("its forced reset: its own record is dev and unversioned");
     b_dev
         .apply(&*b, None, false, None, Progress::none())
         .await
@@ -13879,4 +13888,140 @@ async fn a_reset_is_refused_while_another_project_marks_the_database_prod() {
         .to_string();
     assert!(err.contains("billing") && err.contains("prod"), "{err}");
     assert_table_exists(&*shop, "app", "orders").await;
+}
+
+/// A schema another project declares is one it uses — its grants, its next
+/// apply's home — even holding nothing of its yet: `--schemas` keeps it (#7).
+#[tokio::test]
+async fn a_reset_keeps_a_schema_another_project_uses() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let design = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1]);
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    write_project(
+        bd.path(),
+        "project:\n  name: billing\nsource:\n  dialect: postgresql\nschemas:\n  - app\n  - billing\n",
+        &[(
+            "ddl/table/billing/ledger.ddl",
+            "create table if not exists billing.ledger (id int primary key);\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    let summary = design
+        .reset(&*shop, "postgres", true, true, false, None)
+        .await
+        .expect("shop's reset");
+    assert_table_absent(&*shop, "app", "orders").await;
+    assert_schema_exists(&*shop, "app").await;
+    assert!(
+        summary
+            .kept
+            .iter()
+            .any(|k| k.contains("schema app") && k.contains("\"billing\"")),
+        "{:?}",
+        summary.kept
+    );
+}
+
+/// A schema `--schemas` drops holding only this project's entities still
+/// takes, `CASCADE`, what another project depends on in it — an entity the
+/// design no longer declares included, which the entity guard never sees (#7).
+#[tokio::test]
+async fn a_reset_with_schemas_is_refused_when_another_project_depends_on_what_the_schema_holds() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let design = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1]);
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    // A table shop once declared: still shop's, no longer in its design.
+    shop.execute_script(
+        "CREATE TABLE app.old (id int); \
+         INSERT INTO dbd.objects (namespace, schema, name, kind, owner) VALUES ('relation', 'app', 'old', 'table', 'shop');",
+    )
+    .await
+    .unwrap();
+    billing_reading(
+        bd.path(),
+        &[(
+            "ddl/view/billing/v_old.ddl",
+            "create or replace view billing.v_old as select id from app.old;\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    let err = design
+        .reset(&*shop, "postgres", true, true, false, None)
+        .await
+        .expect_err("billing's view reads app.old, which DROP SCHEMA app CASCADE takes")
+        .to_string();
+    assert!(err.contains("schema app") && err.contains("billing.v_old"), "{err}");
+    assert_table_exists(&*shop, "app", "orders").await;
+    assert_catalog(
+        &*shop,
+        true,
+        "SELECT 1 FROM pg_views WHERE schemaname = 'billing' AND viewname = 'v_old'",
+        "billing's view",
+    )
+    .await;
+}
+
+/// An extension another project depends on without declaring it — a column of
+/// its type — is kept by `--extensions` as one it declares is (#7).
+#[tokio::test]
+async fn a_reset_keeps_an_extension_another_project_depends_on_undeclared() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let with_citext = "target:\n  postgres:\n    url: $DATABASE_URL\n    extensions:\n      - citext\n";
+    let design = named_project(sd.path(), "shop", with_citext, &ORDERS_OWNER_FILES[..1]);
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    billing_reading(
+        bd.path(),
+        &[(
+            "ddl/table/billing/contacts.ddl",
+            "create table if not exists billing.contacts (id int primary key, email public.citext);\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    let summary = design
+        .reset(&*shop, "postgres", true, false, true, None)
+        .await
+        .expect("shop's reset");
+    assert_catalog(
+        &*shop,
+        true,
+        "SELECT 1 FROM information_schema.columns WHERE table_schema = 'billing' \
+         AND table_name = 'contacts' AND column_name = 'email'",
+        "billing.contacts.email",
+    )
+    .await;
+    assert!(
+        summary
+            .kept
+            .iter()
+            .any(|k| k.contains("extension citext") && k.contains("billing.contacts")),
+        "{:?}",
+        summary.kept
+    );
 }

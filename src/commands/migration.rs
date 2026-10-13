@@ -455,6 +455,20 @@ mod tests {
     use super::*;
     use crate::commands::testutil;
 
+    /// What a reset kept for another project is named after what it dropped,
+    /// so a schema it left standing is not taken for one it forgot (#7).
+    #[test]
+    fn a_reset_summary_names_what_it_kept_for_another_project() {
+        let note = "schema app kept: it holds table app.invoices (\"billing\")";
+        let summary = dbd_core::ResetComplete {
+            dropped: vec![(dbd_core::EntityType::Table, "app.orders".to_string())],
+            kept: vec![note.to_string()],
+            ..Default::default()
+        };
+        let lines = format_reset_summary(&summary);
+        assert_eq!(lines, ["Reset dropped 1 table.".to_string(), format!("{note}.")]);
+    }
+
     /// An empty project has no snapshots — the listing takes the early return.
     #[test]
     fn snapshot_list_empty_dir_is_noop() {
