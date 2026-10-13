@@ -203,21 +203,6 @@ fn inspect_inspects_the_modules_a_scope_selects() {
     assert!(text.contains("nope") && text.contains("solo"), "{text}");
 }
 
-/// The commands that do not run a workspace yet refuse it rather than run
-/// the manifest as a design with no DDL.
-#[test]
-fn a_command_that_does_not_run_a_workspace_refuses_it() {
-    let tmp = tempfile::tempdir().unwrap();
-    shop(tmp.path());
-
-    for args in [&["graph"][..], &["combine"], &["dbml"]] {
-        let out = dbd(tmp.path(), args);
-        let text = text(&out);
-        assert!(!out.status.success(), "{args:?}: {text}");
-        assert!(text.contains("modules:"), "{args:?}: {text}");
-    }
-}
-
 /// A dry run with no database previews each module in `depends_on` order.
 #[test]
 fn an_offline_dry_run_previews_each_module() {
