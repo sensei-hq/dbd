@@ -244,9 +244,9 @@ pub async fn cmd_import(
     }
     for (i, target) in targets.into_iter().enumerate() {
         let (design, _) = target.enter(i == 0);
-        import_design(design, config, database_url, name, file, scope, deps, verbosity)
+        import_design(&design, config, database_url, name, file, scope, deps, verbosity)
             .await
-            .map_err(|e| emptied.explain(i, e))?;
+            .map_err(|e| emptied.explain(i, i > 0 || design.emptied_for_import(), e))?;
     }
     Ok(())
 }
@@ -282,7 +282,7 @@ async fn preflight_import(
 /// [`cmd_import`] for one design: the project's, or one module's.
 #[allow(clippy::too_many_arguments)]
 async fn import_design(
-    design: Design,
+    design: &Design,
     config: &Path,
     database_url: Option<&str>,
     name: Option<&str>,
@@ -304,7 +304,7 @@ async fn import_design(
     }
 
     let adapter = get_adapter(config, database_url, design.owner()).await?;
-    import_with_adapter(&*adapter, &design, name, file, scope, deps, verbosity).await
+    import_with_adapter(&*adapter, design, name, file, scope, deps, verbosity).await
 }
 
 /// The body of `dbd import`, with the adapter supplied rather than connected.

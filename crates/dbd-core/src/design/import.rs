@@ -885,6 +885,9 @@ impl Design {
                 }
             };
             adapter.truncate_tables(&truncated).await?;
+            if !truncated.is_empty() {
+                self.import_emptied.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
         }
 
         let mut loaded: HashSet<&str> = HashSet::new();

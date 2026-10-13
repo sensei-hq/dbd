@@ -249,10 +249,12 @@ impl Emptied {
 
     /// `err`, from the module at `failed`'s import, saying what the run
     /// emptied that no module has reloaded since: that module's tables and
-    /// those of the modules after it.
-    pub fn explain(&self, failed: usize, err: anyhow::Error) -> anyhow::Error {
+    /// those of the modules after it — when the first module's import did
+    /// empty them (`first_emptied`): one refused at the emptying emptied
+    /// nothing.
+    pub fn explain(&self, failed: usize, first_emptied: bool, err: anyhow::Error) -> anyhow::Error {
         let left = self.from(failed);
-        if left.is_empty() {
+        if left.is_empty() || (failed == 0 && !first_emptied) {
             return err;
         }
         err.context(format!(

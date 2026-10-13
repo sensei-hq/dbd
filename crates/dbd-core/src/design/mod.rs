@@ -614,6 +614,9 @@ pub struct Design {
     /// What this design's import empties, when a workspace run decides it —
     /// see [`Design::emptying_for_import`].
     import_truncates: Option<Vec<String>>,
+    /// Whether its import has emptied tables — see
+    /// [`Design::emptied_for_import`].
+    import_emptied: std::sync::atomic::AtomicBool,
     /// The owners a reset runs beside — see [`Design::resetting_beside`].
     reset_beside: std::collections::HashSet<String>,
 }
@@ -1012,6 +1015,7 @@ impl Design {
             allow_ownership_change: false,
             outer_hooks: None,
             import_truncates: None,
+            import_emptied: std::sync::atomic::AtomicBool::new(false),
             reset_beside: std::collections::HashSet::new(),
         })
     }
@@ -1188,6 +1192,14 @@ impl Design {
     pub fn emptying_for_import(mut self, tables: Vec<String>) -> Self {
         self.import_truncates = Some(tables);
         self
+    }
+
+    /// Whether this design's import emptied tables before it loaded — false
+    /// until one has, and for one Postgres refused to empty, which empties
+    /// nothing. What a workspace run says of a failed import rests on it: an
+    /// emptying refused left nothing to reload.
+    pub fn emptied_for_import(&self) -> bool {
+        self.import_emptied.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The tables this design's import empties before it loads, under

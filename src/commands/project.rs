@@ -518,7 +518,9 @@ async fn deploy_workspace(targets: Vec<super::Target>, emptied: &super::Emptied,
             )
             .await;
         spinner.finish();
-        let (import, policies) = result.context("Deploy failed").map_err(|e| emptied.explain(i, e))?;
+        let (import, policies) = result
+            .context("Deploy failed")
+            .map_err(|e| emptied.explain(i, i > 0 || design.emptied_for_import(), e))?;
         for warning in &import.warnings {
             output::warn(warning);
         }
