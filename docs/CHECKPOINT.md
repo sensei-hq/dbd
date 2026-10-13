@@ -14,13 +14,13 @@
 
 ## Next
 
-Slice 3 on `feat/workspaces-scopes`: implemented (d44d4950) — module-selecting
-scopes projected per module, `Workspace::under_scope`, walking up from a module
-folder (`Workspace::locate`); plan updated. Next: full suites, PR into
-`feat/workspaces`, adversarial review, CI, merge; then slice 4 (per-module
-history: snapshot, release, migrations, format, doctor).
+Slice 3 PR #63 (`feat/workspaces-scopes` → `feat/workspaces`): review findings
+fixed (schema items, cross-module scope gaps, `under_scope_of`, -n outside a
+scope, logical-path walk-up) and the plan updated. Next: full suites, CI, merge;
+then slice 4 (per-module history: snapshot, release, migrations; format and
+doctor over modules).
 
-    gh pr checks <slice 3 PR>
+    gh pr checks 63
 
 ## Open
 

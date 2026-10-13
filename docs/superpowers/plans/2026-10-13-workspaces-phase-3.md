@@ -123,10 +123,21 @@ Taken in slice 3:
   module; `all` is every module. `--module` within a scope must be one of
   its modules. Refused at load: a scope naming an undeclared module, an item
   no module declares, and `modules:` in a design without modules.
+- An include selects the modules with entities it names (a bare schema alone
+  selects none: every module has the manifest's schemas). A scope leaving out
+  of one module what another it selects requires is refused as a gap when it
+  is chosen — not when the workspace loads, so other scopes still run.
+- With no `--scope`, a module asked for — `--module`, or the folder dbd runs
+  in — that the `default` scope leaves out runs on its own with its
+  dependencies (`Workspace::under_scope_of`), each module resolving its own
+  `default`, else `all`; the scope guard still holds each to its pin.
 - Run inside a module's folder — no design.yaml of its own — dbd walks up to
-  the nearest design.yaml declaring `modules:` (`Workspace::locate`) and runs
-  that module, unless `--module` says otherwise; `init` and `install` do not
-  walk up, and a design without modules is not looked for above.
+  the nearest design.yaml declaring `modules:` (`Workspace::locate`), along
+  the path the run was started in (a module folder may be a link), and runs
+  that module, unless `--module` says otherwise. Run in a folder of the
+  workspace no module holds, it runs the workspace; `-s <module folder>`
+  runs that module. `init` and `install` do not walk up, and a design
+  without modules is not looked for above.
 
 ## Slices
 
