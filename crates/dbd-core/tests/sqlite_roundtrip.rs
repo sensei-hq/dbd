@@ -355,3 +355,61 @@ async fn reset_drops_a_sqlite_projects_tables_and_views() {
         "a full reset forgets the database's record of the project"
     );
 }
+
+/// A SQLite project's migration is SQLite, which libpg_query cannot read —
+/// `AUTOINCREMENT`, `INSERT OR IGNORE` — and the uses guard, Postgres's,
+/// refused it as unreadable: no SQLite migration could run (#7).
+#[tokio::test]
+async fn a_sqlite_migration_in_sqlite_syntax_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let yaml = |version: u32| {
+        format!(
+            "project:\n  name: lite\n  version: {version}\n\nsource:\n  dialect: sqlite\n\n\
+             target:\n  sqlite:\n    url: $DATABASE_URL\n\nschemas: []\n"
+        )
+    };
+    std::fs::create_dir_all(dir.join("ddl/table")).unwrap();
+    std::fs::write(
+        dir.join("ddl/table/items.ddl"),
+        "CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("design.yaml"), yaml(1)).unwrap();
+    let db_path = dir.join("lite.db");
+    let db = dbd_core::connect(&format!("sqlite://{}", db_path.display()), "lite")
+        .await
+        .expect("connect");
+    Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir))
+        .expect("load v1")
+        .apply(&*db, None, false, None, dbd_core::design::Progress::none())
+        .await
+        .expect("v1 applies");
+
+    std::fs::create_dir_all(dir.join("migrations/002")).unwrap();
+    std::fs::write(
+        dir.join("migrations/002/graph.json"),
+        r#"{"fromVersion":1,"toVersion":2,"added":[],"altered":["items"],"dropped":[]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("migrations/002/items.sql"),
+        "CREATE TABLE items_new (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, note TEXT);\n\
+         INSERT OR IGNORE INTO items_new (id, name) SELECT id, name FROM items;\n\
+         DROP TABLE items;\n\
+         ALTER TABLE items_new RENAME TO items;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/table/items.ddl"),
+        "CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, note TEXT);\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("design.yaml"), yaml(2)).unwrap();
+    Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir))
+        .expect("load v2")
+        .apply(&*db, None, false, None, dbd_core::design::Progress::none())
+        .await
+        .expect("v2's SQLite migration runs");
+    assert_eq!(db.get_db_version().await.unwrap(), 2);
+}

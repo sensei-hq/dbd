@@ -1833,4 +1833,20 @@ mod tests {
             )]
         );
     }
+
+    /// `"$user"` on a search path is the connecting role's schema, which no
+    /// script names: a bare name is in the first schema the path names (#7).
+    #[test]
+    fn a_bare_drop_after_user_on_the_path_is_in_the_first_named_schema() {
+        use crate::adapter::GuardedPart;
+        assert_eq!(
+            drops_in("SET search_path TO \"$user\", app; DROP TABLE old CASCADE;"),
+            vec![(
+                "relation",
+                Some("app".to_string()),
+                "old".to_string(),
+                GuardedPart::Whole
+            )]
+        );
+    }
 }

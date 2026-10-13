@@ -13352,3 +13352,167 @@ async fn a_migration_dbd_cannot_read_is_refused() {
         .to_string();
     assert!(err.contains("orders.sql"), "{err}");
 }
+
+/// A generated column is computed from another: dropping that one `CASCADE`
+/// drops the generated column and what reads it — another project's view
+/// over it went, unguarded (#7).
+#[tokio::test]
+async fn a_migration_cascading_through_a_generated_column_is_refused() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let dir = sd.path();
+    let g = |extra: &str| {
+        format!(
+            "set search_path to app;\ncreate table if not exists orders (id integer primary key, \
+             x integer, doubled integer generated always as (x * 2) stored{extra});\n"
+        )
+    };
+    released_shop(dir, &g(""), &[]);
+    released(dir)
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    billing_reading(
+        bd.path(),
+        &[(
+            "ddl/view/billing/v_doubled.ddl",
+            "create or replace view billing.v_doubled as select doubled from app.orders;\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    let yaml = "project:\n  name: shop\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+    let v2 = g(", note text");
+    cut_version(dir, yaml, &[("ddl/table/app/orders.ddl", &v2)], &[], "v2");
+    let sql_path = dir.join("migrations/002/app/orders.sql");
+    let generated = std::fs::read_to_string(&sql_path).unwrap();
+    std::fs::write(
+        &sql_path,
+        format!("{generated}\nALTER TABLE app.orders DROP COLUMN x CASCADE;\n"),
+    )
+    .unwrap();
+    let err = released(dir)
+        .apply(&*shop, None, true, None, Progress::none())
+        .await
+        .expect_err("billing's view reads the column x generates")
+        .to_string();
+    assert!(err.contains("\"billing\" (view billing.v_doubled)"), "{err}");
+}
+
+/// An extension's members — its types, its functions — are what another
+/// project's columns and views use: `DROP EXTENSION … CASCADE` dropped them,
+/// unguarded (#7).
+#[tokio::test]
+async fn a_migration_dropping_an_extension_another_project_uses_is_refused() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let dir = sd.path();
+    shop.execute_script("CREATE EXTENSION IF NOT EXISTS citext;")
+        .await
+        .unwrap();
+    let orders = "set search_path to app;\ncreate table if not exists orders (id integer primary key);\n";
+    released_shop(dir, orders, &[]);
+    released(dir)
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    billing_reading(
+        bd.path(),
+        &[(
+            "ddl/table/billing/contacts.ddl",
+            "create table if not exists billing.contacts (id int primary key, email citext);\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    let yaml = "project:\n  name: shop\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+    cut_version(
+        dir,
+        yaml,
+        &[(
+            "ddl/table/app/orders.ddl",
+            "set search_path to app;\ncreate table if not exists orders (id integer primary key, note text);\n",
+        )],
+        &[],
+        "v2",
+    );
+    let sql_path = dir.join("migrations/002/app/orders.sql");
+    let generated = std::fs::read_to_string(&sql_path).unwrap();
+    std::fs::write(&sql_path, format!("{generated}\nDROP EXTENSION citext CASCADE;\n")).unwrap();
+    let err = released(dir)
+        .apply(&*shop, None, true, None, Progress::none())
+        .await
+        .expect_err("billing's table uses citext")
+        .to_string();
+    assert!(err.contains("\"billing\" (table billing.contacts)"), "{err}");
+}
+
+/// `TRUNCATE … CASCADE` empties the tables whose foreign keys point at the
+/// truncated one — and nothing else: another project's view reading it is no
+/// reason to refuse a data script's reload, its table referencing it is (#7).
+#[tokio::test]
+async fn a_truncate_cascade_is_refused_only_for_another_projects_referencing_table() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let dir = sd.path();
+    let orders = "set search_path to app;\ncreate table if not exists orders (id integer primary key);\n";
+    released_shop(dir, orders, &[]);
+    released(dir)
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    billing_reading(
+        bd.path(),
+        &[(
+            "ddl/view/billing/v_orders.ddl",
+            "create or replace view billing.v_orders as select id from app.orders;\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    let yaml = "project:\n  name: shop\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+    cut_version(
+        dir,
+        yaml,
+        &[(
+            "ddl/table/app/orders.ddl",
+            "set search_path to app;\ncreate table if not exists orders (id integer primary key, note text);\n",
+        )],
+        &[],
+        "v2",
+    );
+    let sql_path = dir.join("migrations/002/app/orders.sql");
+    let generated = std::fs::read_to_string(&sql_path).unwrap();
+    std::fs::write(&sql_path, format!("{generated}\nTRUNCATE app.orders CASCADE;\n")).unwrap();
+    released(dir)
+        .apply(&*shop, None, true, None, Progress::none())
+        .await
+        .expect("a view reading app.orders is not emptied by its TRUNCATE");
+
+    billing
+        .execute_script(
+            "CREATE TABLE billing.refs (order_id int REFERENCES app.orders (id)); \
+             INSERT INTO dbd.objects (namespace, schema, name, kind, owner) \
+             VALUES ('relation', 'billing', 'refs', 'table', 'billing');",
+        )
+        .await
+        .unwrap();
+    let err = released(dir)
+        .apply(&*shop, None, true, None, Progress::none())
+        .await
+        .expect_err("billing.refs references app.orders")
+        .to_string();
+    assert!(err.contains("\"billing\" (table billing.refs)"), "{err}");
+}
