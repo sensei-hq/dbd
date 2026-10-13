@@ -128,14 +128,17 @@ impl Workspace {
         let mut modules = Vec::new();
         let mut gaps: Vec<String> = Vec::new();
         for (name, design) in scanned {
-            let own: HashSet<String> = design.entities.iter().map(|e| e.qualified_key()).collect();
-            let known: Vec<(String, EntityType)> = declared
-                .by_name
+            // What a reference can name in the module itself. Not its schemas
+            // and extensions: every module has those, and a role another
+            // module declares is that module's though a schema here shares
+            // its name.
+            let own: HashSet<String> = design
+                .entities
                 .iter()
-                .filter(|(key, _)| !own.contains(*key))
-                .map(|(key, (kind, _))| (key.clone(), *kind))
+                .filter(|e| !declares_nothing(e.entity_type))
+                .map(|e| e.qualified_key())
                 .collect();
-            let mut design = design.resolved(&known);
+            let mut design = design.resolved(&declared.known_to(&own));
             let reaches = |module: &String| *module == name || reach[&name].contains(module);
             for entity in design.entities.iter().filter(|e| e.entity_type != EntityType::External) {
                 for r in &entity.refs {
@@ -159,10 +162,7 @@ impl Workspace {
             design.entities.retain(|e| {
                 e.entity_type != EntityType::External
                     || manifest_externals.contains(e.name.as_str())
-                    || declared
-                        .by_name
-                        .get(&e.name)
-                        .is_none_or(|(_, by)| by.iter().any(reaches))
+                    || declared.of_name(&e.name).is_none_or(|by| by.iter().any(reaches))
             });
             modules.push(Module {
                 depends_on: manifest.modules[&name].depends_on.clone(),
@@ -217,25 +217,34 @@ impl Workspace {
 /// `known` and the index the T20 check reads.
 struct Declared {
     /// Each entity a module's file declares, by the name a reference reaches
-    /// it by, whatever its kind: a role is nobody's to own, but one module's
-    /// file declares it all the same. In load order, so what each module knows
-    /// of the others is the same on every load.
+    /// it by, whatever its kind but a schema or an extension (see
+    /// [`declares_nothing`]): a role is nobody's to own, but one module's file
+    /// declares it all the same. In load order, so what each module knows of
+    /// the others is the same on every load.
     by_name: IndexMap<String, (EntityType, Vec<String>)>,
     /// Each object a module's files create, as the registry keys it
-    /// (`schema.name`): what a file creates beside the entity its path names —
-    /// a type a table's file creates — is its module's too, as T19 knows.
-    created: HashMap<String, Vec<String>>,
+    /// (`schema.name`, as Postgres names it): what a file creates beside the
+    /// entity its path names — a type a table's file creates — is its
+    /// module's too, as T19 knows. In load order.
+    created: IndexMap<String, Vec<String>>,
+}
+
+/// Every module has the schemas and extensions it uses — the manifest's, and
+/// those its entities live in — so one module's file declaring one is nothing
+/// another module depends on it for.
+fn declares_nothing(kind: EntityType) -> bool {
+    matches!(kind, EntityType::Schema | EntityType::Extension | EntityType::External)
 }
 
 impl Declared {
     fn of(scanned: &[(String, Design)], objects: &[Vec<OwnedObject>]) -> Self {
         let mut by_name: IndexMap<String, (EntityType, Vec<String>)> = IndexMap::new();
-        let mut created: HashMap<String, Vec<String>> = HashMap::new();
+        let mut created: IndexMap<String, Vec<String>> = IndexMap::new();
         for ((name, design), objects) in scanned.iter().zip(objects) {
             let files = design
                 .entities
                 .iter()
-                .filter(|e| e.file.is_some() && e.entity_type != EntityType::External);
+                .filter(|e| e.file.is_some() && !declares_nothing(e.entity_type));
             for entity in files {
                 let (_, by) = by_name
                     .entry(entity.qualified_key())
@@ -254,15 +263,47 @@ impl Declared {
         Self { by_name, created }
     }
 
-    /// The modules declaring what `r` reaches: the entity it resolved to, else
-    /// an object a module's file creates by that name — as written, or folded
-    /// as Postgres folds an unquoted one.
+    /// What a module whose own names are `own` resolves its references
+    /// against besides: every entity another module's file declares, and every
+    /// object one creates beside it — by the name Postgres gives it, so a bare
+    /// name on a file's search path reaches it. An object that is a declared
+    /// entity by another spelling (`OrderStatus.ddl` creates `orderstatus`) is
+    /// reached through the entity, as a folded name reaches one.
+    fn known_to(&self, own: &HashSet<String>) -> Vec<(String, EntityType)> {
+        let folded = |key: &String| key.to_ascii_lowercase();
+        let entities: HashSet<String> = self.by_name.keys().chain(own).map(folded).collect();
+        let named = self
+            .by_name
+            .iter()
+            .filter(|(key, _)| !own.contains(*key))
+            .map(|(key, (kind, _))| (key.clone(), *kind));
+        let created = self
+            .created
+            .keys()
+            .filter(|key| !entities.contains(&folded(key)))
+            .map(|key| (key.clone(), EntityType::External));
+        named.chain(created).collect()
+    }
+
+    /// The modules declaring the entity or creating the object called `name`.
+    fn of_name(&self, name: &str) -> Option<&Vec<String>> {
+        self.by_name
+            .get(name)
+            .map(|(_, by)| by)
+            .or_else(|| self.created.get(name))
+    }
+
+    /// The modules declaring what `r` reaches: the entity or object it
+    /// resolved to, else an object a module's file creates by the name it
+    /// states. Never by a name folded here: the parser folds an unquoted name
+    /// already, so a ref spelled `app.Status` is a quoted `"Status"` — not the
+    /// `app.status` another module may create.
     fn of_ref(&self, r: &Ref) -> Option<&Vec<String>> {
-        (!r.unresolved)
-            .then(|| self.by_name.get(&r.name).map(|(_, by)| by))
-            .flatten()
-            .or_else(|| self.created.get(&r.name))
-            .or_else(|| self.created.get(&r.name.to_ascii_lowercase()))
+        if r.unresolved {
+            self.created.get(&r.name)
+        } else {
+            self.of_name(&r.name)
+        }
     }
 }
 
@@ -358,8 +399,9 @@ fn check_manifest(manifest: &DesignConfig, project_dir: &Path) -> Result<IndexMa
         folders.insert(name.clone(), relative);
     }
 
+    let module_dirs: Vec<PathBuf> = folders.values().map(|f| project_dir.join(f)).collect();
     for folder in MODULE_FOLDERS {
-        if holds_files(&project_dir.join(folder)) {
+        if holds_files(&project_dir.join(folder), &module_dirs) {
             return Err(DbdError::Config(format!(
                 "{folder}/ at the root holds files no module holds — design.yaml declares modules:, so each \
                  module's {folder}/ is in its folder; move them into the folder of the module they belong to"
@@ -402,16 +444,18 @@ fn module_folder(name: &str, module: &ModuleConfig) -> Result<PathBuf> {
     })
 }
 
-/// Whether `dir` holds a file anywhere beneath it. An empty folder holds
-/// nothing a module would lose, and neither does a dotfile — the `.gitkeep`
-/// `dbd init` keeps an empty folder in git with — nor anything under a dot
-/// folder.
-fn holds_files(dir: &Path) -> bool {
+/// Whether `dir` holds a file anywhere beneath it that is no module's. An
+/// empty folder holds nothing a module would lose, and neither does a dotfile —
+/// the `.gitkeep` `dbd init` keeps an empty folder in git with — nor anything
+/// under a dot folder; and what is in a module's folder (`module_dirs`) is
+/// that module's, a module named `import` included.
+fn holds_files(dir: &Path, module_dirs: &[PathBuf]) -> bool {
     let hidden = |e: &walkdir::DirEntry| e.depth() > 0 && e.file_name().to_string_lossy().starts_with('.');
+    let a_module = |e: &walkdir::DirEntry| module_dirs.iter().any(|m| e.path() == m);
     dir.is_dir()
         && walkdir::WalkDir::new(dir)
             .into_iter()
-            .filter_entry(|e| !hidden(e))
+            .filter_entry(|e| !hidden(e) && !a_module(e))
             .filter_map(|e| e.ok())
             .any(|e| e.file_type().is_file())
 }
