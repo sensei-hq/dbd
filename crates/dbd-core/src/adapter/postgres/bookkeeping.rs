@@ -750,13 +750,18 @@ impl Bookkeeping {
                 .map_err(read)?
                 .into_iter()
                 .collect();
+            // A schema's uses are its entities' uses.
             let uses: Vec<(String, String)> = sqlx::query_as(
-                "SELECT owner, via FROM dbd.uses WHERE kind = 'entity' AND target = $1 AND owner <> $2 \
+                "SELECT owner, via FROM dbd.uses WHERE kind = 'entity' AND owner <> $2 \
+                   AND (target = $1 OR ($4 AND (starts_with(target, 'relation:' || $5 || '.') \
+                                                OR starts_with(target, 'routine:' || $5 || '.')))) \
                    AND ($3 OR via LIKE 'function %' OR via LIKE 'procedure %')",
             )
             .bind(format!("{}:{}.{}", g.object.namespace, g.object.schema, g.object.name))
             .bind(owner)
             .bind(part == "whole")
+            .bind(g.object.namespace == "schema")
+            .bind(&g.object.schema)
             .fetch_all(&self.pool)
             .await
             .map_err(read)?;

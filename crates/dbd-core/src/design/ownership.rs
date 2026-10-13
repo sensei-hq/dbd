@@ -461,10 +461,13 @@ impl Design {
     }
 
     /// The uses guard for `apply` (#7): what a pending migration the run
-    /// executes drops — a `.drop.sql`'s table, a `.sql`'s `DROP` or `DROP
-    /// COLUMN` — that another owner depends on refuses the run, before
-    /// anything runs and under a dry run, naming each use. `plan` is the run's
-    /// own, built without writing.
+    /// executes drops — read from each script it runs, a `.drop.sql`, `.sql`
+    /// or `.data.sql` — that another owner depends on refuses the run, before
+    /// anything runs and under a dry run, naming each use. A script dbd cannot
+    /// read is refused too: what it drops is unknown. A name the script leaves
+    /// to the search path is read in its own `SET search_path`, else the path
+    /// the migration runs on — its entity's. `plan` is the run's own, built
+    /// without writing.
     pub(crate) async fn guard_migration_drops(
         &self,
         adapter: &dyn DatabaseAdapter,
@@ -484,17 +487,46 @@ impl Design {
                     migration_sql_path,
                     ..
                 } => (entity_name, migration_sql_path),
+                super::ExecutionStep::MigrateData {
+                    entity_name,
+                    data_sql_path,
+                    ..
+                } => (entity_name, data_sql_path),
                 _ => continue,
             };
             let Ok(sql) = crate::source_text::read_to_string(path) else {
                 continue;
             };
-            let entity_schema = crate::entity::split_qualified_name(entity)
-                .0
+            if let Err(e) = pg_query::parse(&sql) {
+                return Err(DbdError::Config(format!(
+                    "{}: dbd cannot read this migration ({e}), so cannot tell what it drops that \
+                     another project depends on — fix the script",
+                    path.display()
+                )));
+            }
+            // The path the migration runs on: its entity's — the one its file
+            // states, else the project's — and for an entity the design no
+            // longer has, the project's.
+            let entity_schema = self
+                .entities
+                .iter()
+                .find(|e| &e.name == entity)
+                .and_then(|e| e.schema_path.default_schema().map(str::to_string))
+                .or_else(|| {
+                    self.config
+                        .source
+                        .search_path
+                        .as_ref()
+                        .and_then(|path| path.first().cloned())
+                })
+                .or_else(|| crate::entity::split_qualified_name(entity).0)
                 .unwrap_or_else(|| crate::reconcile::DEFAULT_SCHEMA.to_string());
             for (namespace, schema, name, part) in crate::script::drops_in(&sql) {
                 let schema = schema.unwrap_or_else(|| entity_schema.clone());
                 let label = match &part {
+                    GuardedPart::Whole if namespace == "schema" => format!("schema {name}"),
+                    GuardedPart::Whole if namespace == "extension" => format!("extension {name}"),
+                    GuardedPart::Index(i) if *i == name => format!("index {schema}.{i}"),
                     GuardedPart::Whole => format!("{schema}.{name}"),
                     GuardedPart::Column(column) => format!("{schema}.{name}.{column}"),
                     GuardedPart::Constraint(c) => format!("{schema}.{name} constraint {c}"),

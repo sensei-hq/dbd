@@ -278,18 +278,39 @@ fn first_token_at(piece: &str) -> usize {
 
 /// What script `sql` drops, statement by statement — for the uses guard (#7):
 /// a `DROP` of a table, view, materialized view, sequence, foreign table, type
-/// or domain (`relation`), or of a function, procedure or routine
-/// (`routine`), whole; and an `ALTER TABLE`'s `DROP COLUMN` or `DROP
-/// CONSTRAINT`, a part. Each as `(namespace, schema, name, part)`, the schema
-/// `None` where the statement leaves it to the search path. Empty for a script
-/// that does not parse.
+/// or domain (`relation`), of a function, procedure or routine (`routine`), of
+/// a schema (`schema`, everything in it) or of an extension (`extension`),
+/// whole; a `DROP INDEX`, an index; an `ALTER TABLE`'s `DROP COLUMN` or `DROP
+/// CONSTRAINT`, a part; and a `TRUNCATE … CASCADE`'s tables, whole, since it
+/// empties every table that refers to them. The statements a `DO` block runs
+/// count. Each as `(namespace, schema, name, part)`; the schema is the one the
+/// statement states, else the script's own `SET search_path` before it, else
+/// `None`. Empty for a script that does not parse.
 pub(crate) fn drops_in(sql: &str) -> Vec<(&'static str, Option<String>, String, crate::adapter::GuardedPart)> {
-    use crate::adapter::GuardedPart;
-    use pg_query::NodeEnum;
-    use pg_query::protobuf::{AlterTableType, ObjectType};
     let Ok(parsed) = pg_query::parse(sql) else {
         return Vec::new();
     };
+    let mut path: Option<String> = None;
+    let mut drops = Vec::new();
+    collect_drops(&parsed, &mut path, &mut drops);
+    for query in crate::parser::pg::do_block_statements(&parsed, sql) {
+        if let Ok(inner) = pg_query::parse(&query) {
+            collect_drops(&inner, &mut path, &mut drops);
+        }
+    }
+    drops
+}
+
+/// [`drops_in`]'s walk of one parsed script, `path` the search path's first
+/// schema as the script sets it.
+fn collect_drops(
+    parsed: &pg_query::ParseResult,
+    path: &mut Option<String>,
+    drops: &mut Vec<(&'static str, Option<String>, String, crate::adapter::GuardedPart)>,
+) {
+    use crate::adapter::GuardedPart;
+    use pg_query::NodeEnum;
+    use pg_query::protobuf::{AlterTableType, DropBehavior, ObjectType};
     let strings = |nodes: &[pg_query::protobuf::Node]| -> Vec<String> {
         nodes
             .iter()
@@ -299,43 +320,85 @@ pub(crate) fn drops_in(sql: &str) -> Vec<(&'static str, Option<String>, String, 
             })
             .collect()
     };
-    let named = |parts: Vec<String>| -> Option<(Option<String>, String)> {
-        match parts.as_slice() {
-            [name] => Some((None, name.clone())),
-            [.., schema, name] => Some((Some(schema.clone()), name.clone())),
-            [] => None,
-        }
-    };
-    let mut drops = Vec::new();
     for node in parsed
         .protobuf
         .stmts
         .iter()
         .filter_map(|raw| raw.stmt.as_ref().and_then(|s| s.node.as_ref()))
     {
+        let named = |parts: Vec<String>| -> Option<(Option<String>, String)> {
+            match parts.as_slice() {
+                [name] => Some((path.clone(), name.clone())),
+                [.., schema, name] => Some((Some(schema.clone()), name.clone())),
+                [] => None,
+            }
+        };
         match node {
+            NodeEnum::VariableSetStmt(set) if set.name.eq_ignore_ascii_case("search_path") => {
+                *path = set.args.iter().find_map(|a| match a.node.as_ref() {
+                    Some(NodeEnum::AConst(c)) => match c.val.as_ref() {
+                        Some(pg_query::protobuf::a_const::Val::Sval(s)) => Some(s.sval.clone()),
+                        _ => None,
+                    },
+                    Some(NodeEnum::String(s)) => Some(s.sval.clone()),
+                    _ => None,
+                });
+            }
             NodeEnum::DropStmt(d) => {
                 let kind = d.remove_type();
-                let namespace = match kind {
-                    ObjectType::ObjectTable
-                    | ObjectType::ObjectView
-                    | ObjectType::ObjectMatview
-                    | ObjectType::ObjectSequence
-                    | ObjectType::ObjectForeignTable
-                    | ObjectType::ObjectType
-                    | ObjectType::ObjectDomain => "relation",
-                    ObjectType::ObjectFunction | ObjectType::ObjectProcedure | ObjectType::ObjectRoutine => "routine",
-                    _ => continue,
-                };
                 for object in &d.objects {
                     let parts = match object.node.as_ref() {
                         Some(NodeEnum::List(list)) => strings(&list.items),
                         Some(NodeEnum::TypeName(t)) => strings(&t.names),
                         Some(NodeEnum::ObjectWithArgs(f)) => strings(&f.objname),
+                        Some(NodeEnum::String(s)) => vec![s.sval.clone()],
                         _ => continue,
                     };
-                    if let Some((schema, name)) = named(parts) {
-                        drops.push((namespace, schema, name, GuardedPart::Whole));
+                    match kind {
+                        ObjectType::ObjectTable
+                        | ObjectType::ObjectView
+                        | ObjectType::ObjectMatview
+                        | ObjectType::ObjectSequence
+                        | ObjectType::ObjectForeignTable
+                        | ObjectType::ObjectType
+                        | ObjectType::ObjectDomain => {
+                            if let Some((schema, name)) = named(parts) {
+                                drops.push(("relation", schema, name, GuardedPart::Whole));
+                            }
+                        }
+                        ObjectType::ObjectFunction | ObjectType::ObjectProcedure | ObjectType::ObjectRoutine => {
+                            if let Some((schema, name)) = named(parts) {
+                                drops.push(("routine", schema, name, GuardedPart::Whole));
+                            }
+                        }
+                        ObjectType::ObjectIndex => {
+                            if let Some((schema, name)) = named(parts) {
+                                drops.push(("relation", schema, name.clone(), GuardedPart::Index(name)));
+                            }
+                        }
+                        ObjectType::ObjectSchema => {
+                            if let Some(name) = parts.last() {
+                                drops.push(("schema", Some(name.clone()), name.clone(), GuardedPart::Whole));
+                            }
+                        }
+                        ObjectType::ObjectExtension => {
+                            if let Some(name) = parts.last() {
+                                drops.push(("extension", None, name.clone(), GuardedPart::Whole));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            NodeEnum::TruncateStmt(t) if t.behavior() == DropBehavior::DropCascade => {
+                for rel in &t.relations {
+                    if let Some(NodeEnum::RangeVar(rv)) = rel.node.as_ref() {
+                        let schema = if rv.schemaname.is_empty() {
+                            path.clone()
+                        } else {
+                            Some(rv.schemaname.clone())
+                        };
+                        drops.push(("relation", schema, rv.relname.clone(), GuardedPart::Whole));
                     }
                 }
             }
@@ -343,7 +406,11 @@ pub(crate) fn drops_in(sql: &str) -> Vec<(&'static str, Option<String>, String, 
                 let Some(rv) = a.relation.as_ref() else {
                     continue;
                 };
-                let schema = (!rv.schemaname.is_empty()).then(|| rv.schemaname.clone());
+                let schema = if rv.schemaname.is_empty() {
+                    path.clone()
+                } else {
+                    Some(rv.schemaname.clone())
+                };
                 for cmd in &a.cmds {
                     let Some(NodeEnum::AlterTableCmd(cmd)) = cmd.node.as_ref() else {
                         continue;
@@ -359,7 +426,6 @@ pub(crate) fn drops_in(sql: &str) -> Vec<(&'static str, Option<String>, String, 
             _ => {}
         }
     }
-    drops
 }
 
 /// Whether statement `piece` is an `ALTER TYPE … ADD VALUE`.
