@@ -106,10 +106,29 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   extension another project uses or depends on — a column of its type — and
   a full reset keeps a role another project uses. Each is named after what
   the reset dropped: `schema app kept: it holds table app.invoices
-  ("billing").` `reset --dry-run` asks the same database, and shows the same
-  script and the same lines. A database any project marked prod is prod for
-  every project in it: another project's unforced reset is refused, where
-  only its own mark refused it.
+  ("billing").` A role kept for another project keeps its grants. A
+  `supabase` target resets the same way. `reset --dry-run` asks the same
+  database, and shows the same script and the same lines. A database any
+  project marked prod — or recorded with an env dbd does not know — is prod
+  for every project in it: another project's unforced reset is refused,
+  where only its own mark refused it.
+- **Runs of different projects no longer interleave with a reset** (#7,
+  phase 2). A reset read what other projects had, then dropped `CASCADE`:
+  another project's apply committing in between had its table taken by
+  `DROP SCHEMA … CASCADE`, and both runs reported success. Every writing
+  `apply` (a `deploy`'s included), `reconcile` and `reset` now holds the
+  database's dbd write lock (`pg_advisory_lock` on `dbd:write`, in a session of its own) —
+  shared, so applies and reconciles of different projects still run side by
+  side; exclusive for a reset, which waits for the runs before it, at most 5
+  minutes, while the runs after it wait for it.
+- **The uses guard sees further** (#7, phase 2). A dependent nobody owns —
+  a project's not yet recording its uses — is guarded where a project might
+  own it, by `--prune`'s rule: in a schema another project uses, or anywhere
+  while a project does not record its uses (`view billing.v_orders (owned by
+  nobody; maybe by "billing")`); elsewhere a `CASCADE` takes it as before. A
+  schema is guarded from its collations, text search objects, operators and
+  conversions too: `DROP SCHEMA … CASCADE` took another project's column
+  collated by one.
 
 ### Library API
 
@@ -138,7 +157,10 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   each, and `Design::reset_preview` returns the script a reset would run and
   that summary, asked of the database. `DatabaseAdapter` gains `users_of` and
   `not_owned_in_schema` (defaults: none), with the `adapter::SchemaMember`
-  the second returns.
+  the second returns; and `lock_writes` and `unlock_writes` (defaults: no
+  lock), which `Design::apply`, `reconcile` and `reset` hold around a run.
+  `Dependence::owner` is an `Option` — `None` for a dependent nobody owns —
+  and `Dependence::schema` names the dependent's schema.
 
 ### Fixed
 

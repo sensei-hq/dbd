@@ -207,14 +207,22 @@ with its row type and that type's array; a type and its array; a column, with
 the same column of every table inheriting it (dropped through inheritance,
 which `pg_depend` does not record); a constraint, with the index behind a
 primary key, unique or exclusion constraint; an index; a routine's overloads;
-a whole schema; an extension's members. Each dependent is walked as itself — a
+a whole schema — its relations, types and routines, and its collations, text
+search objects, operators, operator classes and families and conversions, since
+a column collated by one goes with it; an extension's members. Each dependent is walked as itself — a
 column as its column, a constraint, default, trigger or policy as itself — so a
 part reaches only what depends on the part; a view's rewrite rule stands for
 the whole view, and a generated column's expression leads to its column. A
 `TRUNCATE … CASCADE` reaches what it empties and drops nothing: the table, the
 partitions and inheriting tables of what it empties, and every table whose
 foreign key points at what it empties. Each is named by its owning
-relation, type or routine. For a part
+relation, type or routine. A dependent nobody owns is guarded by prune's rule
+(b): where a project might own it — in a schema another owner uses, or
+anywhere while a recorded owner does not record its uses — it refuses as
+another owner's would, named `view billing.v_orders (owned by nobody; maybe by
+"billing")`; elsewhere it goes with the drop, as it always did. Only one that
+stands on its own counts: not an owned sequence, a partition, an array type,
+an extension's member, nor the object dropped. For a part
 of a table, `dbd.uses` adds only the uses recorded through routine bodies,
 which the catalog does not track. It runs before any write, dry runs
 included:
@@ -239,12 +247,18 @@ services.
 **Reset.** Reset drops only entities this owner owns; it claims its design's
 entities before it drops any (see Claim). On top of that:
 
-- The prod guard refuses while any owner's row is `env = 'prod'`, unless
-  `--force` is given. It reads before the claim, so a refused reset writes
-  nothing.
+- The prod guard refuses while any owner's row is `env = 'prod'` — or an env
+  dbd does not know — unless `--force` is given. It reads before the claim, so
+  a refused reset writes nothing.
 - `CASCADE` stays, after the same uses guard: every entity the reset drops,
-  whole. Postgres's cascade cannot reach another owner's entity, because the
-  guard refused first — `--force` or not.
+  whole, as its `DROP` names it — not the rest of what its file creates, which
+  the reset leaves. Postgres's cascade cannot reach another owner's entity,
+  because the guard refused first — `--force` or not.
+- The reset holds the database's dbd write lock — `pg_advisory_lock` on
+  `dbd:write`, exclusive — from its first read to its last drop, and every
+  writing `apply` and `reconcile` holds it shared. So no other project's run
+  writes between what the reset reads and what it drops: the reset waits for
+  the runs before it, at most 5 minutes, and the runs after it wait for it.
 - `--schemas` keeps a schema that holds an entity owned by anyone else, an
   unowned entity, or an extension another owner uses or depends on, and one
   another owner records a use of. An extension the design installs there and
@@ -252,7 +266,10 @@ entities before it drops any (see Claim). On top of that:
   drops is guarded whole, since its `CASCADE` takes this owner's entities the
   design no longer declares too.
 - `--extensions` keeps an extension another owner uses or depends on, and a
-  full reset keeps a role another owner uses.
+  full reset keeps a role another owner uses — and its grants, which that
+  owner relies on. A role kept because another database holds it still has
+  this database's grants revoked.
+- A `supabase` target is Postgres, and resets as one.
 - What it keeps is left out of the script and named, one line each, on
   `ResetComplete::kept`: `schema app kept: it holds table app.invoices
   ("billing")`. `Design::reset_preview` answers the same for `reset --dry-run`,
