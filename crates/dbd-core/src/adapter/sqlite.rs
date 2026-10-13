@@ -452,6 +452,16 @@ impl DatabaseAdapter for SqliteAdapter {
         }
     }
 
+    async fn existing_tables(&self, tables: &[String]) -> Result<Vec<String>> {
+        let mut existing = Vec::new();
+        for table in tables {
+            if self.has_table(Self::bare_name(table)).await? {
+                existing.push(table.clone());
+            }
+        }
+        Ok(existing)
+    }
+
     async fn truncate_table(&self, table: &str) -> Result<()> {
         // SQLite has no `TRUNCATE`; an unfiltered `DELETE` is its equivalent,
         // and SQLite optimizes it to drop the table's pages wholesale. The

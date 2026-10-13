@@ -627,17 +627,49 @@ pub struct Design {
     /// declares none of — `--allow-ownership-change` (#7). See
     /// [`Design::allowing_ownership_change`].
     allow_ownership_change: bool,
-    /// The workspace manifest's `apply:` hooks a run attaches to the first and
-    /// last module it runs, read from the project folder (#7). See
+    /// The workspace manifest's hooks a run attaches to the first and last
+    /// module it runs, read from the project folder (#7). See
     /// [`Workspace::select`].
     outer_hooks: Option<OuterHooks>,
+    /// What this design's import empties, when a workspace run decides it —
+    /// see [`Design::emptying_for_import`].
+    import_truncates: Option<Vec<String>>,
+    /// The owners a reset runs beside — see [`Design::resetting_beside`].
+    reset_beside: std::collections::HashSet<String>,
 }
 
-/// A workspace manifest's `apply:` hooks, and the folder their paths are
-/// relative to — attached to a module's design for a run (#7).
+/// A workspace manifest's hooks, and the folder their paths are relative to —
+/// attached to a module's design for a run (#7): its `apply.before` to the
+/// first module, its `apply.after` and `import.after` to the last.
 pub(crate) struct OuterHooks {
     pub(crate) dir: PathBuf,
     pub(crate) apply: config::ApplyConfig,
+    pub(crate) import_after: Vec<config::ScriptEntry>,
+}
+
+/// Which list of hooks a run executes, for [`Design::plan_hook_phase`].
+#[derive(Clone, Copy)]
+pub(in crate::design) enum HookPhase {
+    ApplyBefore,
+    ApplyAfter,
+    ImportAfter,
+}
+
+/// The apply phase of a `kind` of hook.
+fn apply_phase(kind: hooks::HookKind) -> HookPhase {
+    match kind {
+        hooks::HookKind::Before => HookPhase::ApplyBefore,
+        hooks::HookKind::After => HookPhase::ApplyAfter,
+    }
+}
+
+impl HookPhase {
+    fn kind(self) -> hooks::HookKind {
+        match self {
+            Self::ApplyBefore => hooks::HookKind::Before,
+            Self::ApplyAfter | Self::ImportAfter => hooks::HookKind::After,
+        }
+    }
 }
 
 /// The phrase [`warn_if_no_search_path`] reports with, so
@@ -999,6 +1031,8 @@ impl Design {
             adopt_from: None,
             allow_ownership_change: false,
             outer_hooks: None,
+            import_truncates: None,
+            reset_beside: std::collections::HashSet::new(),
         })
     }
 
@@ -1074,14 +1108,16 @@ impl Design {
         }
     }
 
-    /// Each list of `kind` apply hooks a run executes, in the order it runs
+    /// Each list of `phase`'s hooks a run executes, in the order it runs
     /// them, with where its paths are read: the workspace manifest's
     /// `apply.before` a run attaches ahead of the design's own, its
-    /// `apply.after` behind (#7 — see [`Workspace::select`]).
-    fn apply_hook_lists(&self, kind: hooks::HookKind) -> Vec<(hooks::HookSource<'_>, &[config::ScriptEntry])> {
-        let own = match kind {
-            hooks::HookKind::Before => &self.config.apply.before[..],
-            hooks::HookKind::After => &self.config.apply.after[..],
+    /// `apply.after` and `import.after` behind (#7 — see
+    /// [`Workspace::select`]).
+    fn hook_lists(&self, phase: HookPhase) -> Vec<(hooks::HookSource<'_>, &[config::ScriptEntry])> {
+        let own = match phase {
+            HookPhase::ApplyBefore => &self.config.apply.before[..],
+            HookPhase::ApplyAfter => &self.config.apply.after[..],
+            HookPhase::ImportAfter => &self.config.import.after[..],
         };
         let own = (self.hook_source(), own);
         let outer = self.outer_hooks.as_ref().map(|outer| {
@@ -1090,35 +1126,62 @@ impl Design {
                 search_path: self.script_search_path(),
                 entities: &self.entities,
             };
-            match kind {
-                hooks::HookKind::Before => (source, &outer.apply.before[..]),
-                hooks::HookKind::After => (source, &outer.apply.after[..]),
+            match phase {
+                HookPhase::ApplyBefore => (source, &outer.apply.before[..]),
+                HookPhase::ApplyAfter => (source, &outer.apply.after[..]),
+                HookPhase::ImportAfter => (source, &outer.import_after[..]),
             }
         });
-        match kind {
-            hooks::HookKind::Before => outer.into_iter().chain([own]).collect(),
-            hooks::HookKind::After => [own].into_iter().chain(outer).collect(),
+        match phase {
+            HookPhase::ApplyBefore => outer.into_iter().chain([own]).collect(),
+            HookPhase::ApplyAfter | HookPhase::ImportAfter => [own].into_iter().chain(outer).collect(),
         }
     }
 
-    /// What a run's `kind` apply hooks would do — every list decided before
-    /// any of them runs, so a hook file missing from one aborts the phase
-    /// before a hook of another has run.
-    pub(in crate::design) fn plan_apply_hooks(
+    /// What a run's `phase` hooks would do — every list decided before any of
+    /// them runs, so a hook file missing from one aborts the phase before a
+    /// hook of another has run.
+    pub(in crate::design) fn plan_hook_phase(
         &self,
-        kind: hooks::HookKind,
+        phase: HookPhase,
         scope: Option<(&str, &std::collections::HashSet<String>)>,
     ) -> Result<hooks::HookPlan> {
         let mut plan = hooks::HookPlan::default();
-        for (source, entries) in self.apply_hook_lists(kind) {
-            let list = hooks::plan_hooks(source, entries, kind, scope)?;
+        for (source, entries) in self.hook_lists(phase) {
+            let list = hooks::plan_hooks(source, entries, phase.kind(), scope)?;
             plan.runnable.extend(list.runnable);
             plan.warnings.extend(list.warnings);
         }
         Ok(plan)
     }
 
-    /// Run a run's `kind` apply hooks, as [`Self::plan_apply_hooks`] decides.
+    /// Run a run's `phase` hooks, as [`Self::plan_hook_phase`] decides.
+    pub(in crate::design) async fn run_hook_phase<S, D, C>(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        phase: HookPhase,
+        scope: Option<(&str, &std::collections::HashSet<String>)>,
+        dry_run: bool,
+        progress: &mut Progress<S, D, C>,
+    ) -> Result<hooks::HookOutcome>
+    where
+        S: FnMut(&str),
+        D: FnMut(&str, Option<&str>),
+    {
+        let plan = self.plan_hook_phase(phase, scope)?;
+        hooks::run_planned(adapter, plan, self.script_search_path(), dry_run, progress).await
+    }
+
+    /// [`Self::plan_hook_phase`] for a `kind` of apply hook.
+    pub(in crate::design) fn plan_apply_hooks(
+        &self,
+        kind: hooks::HookKind,
+        scope: Option<(&str, &std::collections::HashSet<String>)>,
+    ) -> Result<hooks::HookPlan> {
+        self.plan_hook_phase(apply_phase(kind), scope)
+    }
+
+    /// [`Self::run_hook_phase`] for a `kind` of apply hook.
     pub(in crate::design) async fn run_apply_hooks<S, D, C>(
         &self,
         adapter: &dyn DatabaseAdapter,
@@ -1131,8 +1194,45 @@ impl Design {
         S: FnMut(&str),
         D: FnMut(&str, Option<&str>),
     {
-        let plan = self.plan_apply_hooks(kind, scope)?;
-        hooks::run_planned(adapter, plan, self.script_search_path(), dry_run, progress).await
+        self.run_hook_phase(adapter, apply_phase(kind), scope, dry_run, progress)
+            .await
+    }
+
+    /// Have this design's import empty `tables`, and only them, before it
+    /// loads (#7). A workspace's modules import one after another, and
+    /// Postgres empties a table another references only with it — so a run
+    /// has its first module's import empty, together, every table the run
+    /// reloads that exists, and the others empty none: `shared`'s reference
+    /// data reloads with the `core` tables that hold keys to it, as one
+    /// project's import empties its own.
+    pub fn emptying_for_import(mut self, tables: Vec<String>) -> Self {
+        self.import_truncates = Some(tables);
+        self
+    }
+
+    /// The tables this design's import empties before it loads, under
+    /// `scope` and narrowed by `name`: each it reloads, unless its
+    /// `import.tables` entry says `truncate: false`.
+    pub fn import_truncations(&self, name: Option<&str>, scope: Option<&ResolvedScope>) -> Result<Vec<String>> {
+        let (plan, _) = self.scoped_import_plan(name, scope)?;
+        let mut tables: Vec<String> = Vec::new();
+        for entry in plan {
+            let table = entry.table.name;
+            if self.config.import.table_truncate(&table) && !tables.contains(&table) {
+                tables.push(table);
+            }
+        }
+        Ok(tables)
+    }
+
+    /// Reset beside `owners` (#7): a workspace resets its modules in one run,
+    /// each before the modules it depends on, so what they use or hold of
+    /// this one's is gone by the time it resets. Their uses do not hold this
+    /// reset back, and what they hold in a schema does not keep it — though
+    /// a prod mark of theirs still does.
+    pub fn resetting_beside(mut self, owners: impl IntoIterator<Item = String>) -> Self {
+        self.reset_beside = owners.into_iter().filter(|o| o != self.owner()).collect();
+        self
     }
 
     /// Access the parsed config.

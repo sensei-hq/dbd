@@ -336,10 +336,8 @@ impl Design {
     pub fn import_after_preview(&self, scope: Option<&ResolvedScope>) -> Result<(Vec<String>, Vec<String>)> {
         let working_set = self.scope_working_set(scope)?;
         let hook_scope = self.hook_scope(scope, working_set.as_ref());
-        let plan = hooks::plan_hooks(
-            self.hook_source(),
-            &self.config.import.after,
-            hooks::HookKind::After,
+        let plan = self.plan_hook_phase(
+            super::HookPhase::ImportAfter,
             hook_scope.as_ref().map(|(name, outside)| (*name, outside)),
         )?;
         Ok((
@@ -830,16 +828,15 @@ impl Design {
             .import_call_procedures(adapter, &plan, dry_run, &mut progress.on_start, &mut progress.on_done)
             .await?;
         let hook_scope = self.hook_scope(scope, working_set.as_ref());
-        let after = hooks::run_hooks(
-            adapter,
-            self.hook_source(),
-            &self.config.import.after,
-            hooks::HookKind::After,
-            hook_scope.as_ref().map(|(name, outside)| (*name, outside)),
-            dry_run,
-            &mut progress,
-        )
-        .await?;
+        let after = self
+            .run_hook_phase(
+                adapter,
+                super::HookPhase::ImportAfter,
+                hook_scope.as_ref().map(|(name, outside)| (*name, outside)),
+                dry_run,
+                &mut progress,
+            )
+            .await?;
         warnings.extend(after.warnings);
 
         (progress.on_complete)(ImportComplete {
@@ -871,13 +868,21 @@ impl Design {
             // Together, in one call: a table may have two data files (a shared
             // one and an env's own), and Postgres truncates tables linked by a
             // foreign key only together.
-            let mut truncated: Vec<String> = Vec::new();
-            for entry in plan {
-                let table = &entry.table.name;
-                if self.config.import.table_truncate(table) && !truncated.contains(table) {
-                    truncated.push(table.clone());
+            let truncated = match &self.import_truncates {
+                // A workspace run's: what the run reloads, of what exists by
+                // now — see `Design::emptying_for_import`.
+                Some(tables) => adapter.existing_tables(tables).await?,
+                None => {
+                    let mut truncated: Vec<String> = Vec::new();
+                    for entry in plan {
+                        let table = &entry.table.name;
+                        if self.config.import.table_truncate(table) && !truncated.contains(table) {
+                            truncated.push(table.clone());
+                        }
+                    }
+                    truncated
                 }
-            }
+            };
             adapter.truncate_tables(&truncated).await?;
         }
 

@@ -98,24 +98,64 @@ pub async fn cmd_reset(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    // A workspace's modules in reverse: each before the modules it depends on.
+    // A workspace's modules in reverse: each before the modules it depends on,
+    // so what they use of one another is gone by the time each resets.
     let targets = super::targets(config, env, project_dir, module, None, super::Order::Reset)?;
+    let owners: Vec<String> = targets.iter().map(|t| t.design.owner().to_string()).collect();
     let ownership = super::OwnershipChange::new(None, opts.allow_ownership_change);
+    let targets: Vec<super::Target> = targets
+        .into_iter()
+        .map(|t| t.map_design(|design| ownership.applied_to(design).resetting_beside(owners.clone())))
+        .collect();
+    if targets.len() > 1 && !opts.dry_run {
+        // Every module's reset checked as its preview checks it before any
+        // module drops a thing: a reset refused for one module is refused
+        // whole (#7).
+        for reset in &targets {
+            let design = &reset.design;
+            let check = async {
+                let resolved = design.resolve_scope(scope, deps)?;
+                let platform = checked_reset_target(design, config, database_url, target)?;
+                let adapter = get_adapter(config, database_url, design.owner()).await?;
+                check_reset_guards(&*adapter, design, &resolved, opts.force, opts.allow_scope_change).await?;
+                design.check_ownership(&*adapter).await?;
+                design
+                    .reset_preview(
+                        &*adapter,
+                        platform,
+                        opts.force,
+                        opts.drop_schemas,
+                        opts.drop_extensions,
+                        Some(&resolved),
+                    )
+                    .await?;
+                anyhow::Ok(())
+            };
+            check.await.with_context(|| reset.label().unwrap_or_default())?;
+        }
+    }
     for (i, reset) in targets.into_iter().enumerate() {
         let (design, _) = reset.enter(i == 0);
-        reset_design(
-            ownership.applied_to(design),
-            config,
-            database_url,
-            target,
-            opts,
-            scope,
-            deps,
-            verbosity,
-        )
-        .await?;
+        reset_design(design, config, database_url, target, opts, scope, deps, verbosity).await?;
     }
     Ok(())
+}
+
+/// The platform a reset drops on — `--target`, else the design's — refusing
+/// one reset has no script for, and one the connection says it is not.
+fn checked_reset_target<'a>(
+    design: &'a Design,
+    config: &Path,
+    database_url: Option<&str>,
+    target: Option<&'a str>,
+) -> Result<&'a str> {
+    let flagged = target.is_some();
+    let target = reset_target(target, design);
+    check_reset_target(target)?;
+    if let Some(url) = super::configured_database_url(config, database_url)? {
+        check_target_matches_connection(target, flagged, &url)?;
+    }
+    Ok(target)
 }
 
 /// [`cmd_reset`] for one design: the project's, or one module's.
@@ -141,12 +181,7 @@ async fn reset_design(
     let resolved = design.resolve_scope(scope, deps)?;
     let (kept, total) = design.scope_counts(&resolved)?;
     output::scope_filtered(&resolved, kept, total);
-    let flagged = target.is_some();
-    let target = reset_target(target, &design);
-    check_reset_target(target)?;
-    if let Some(url) = super::configured_database_url(config, database_url)? {
-        check_target_matches_connection(target, flagged, &url)?;
-    }
+    let target = checked_reset_target(&design, config, database_url, target)?;
     if target == "sqlite" && (drop_schemas || drop_extensions) {
         output::warn("SQLite has no schemas or extensions: --schemas, --extensions and --clean change nothing here.");
     }

@@ -174,6 +174,27 @@ impl Workspace {
                 design,
             });
         }
+        // Each `export:` entry is the module's that declares its entity; one no
+        // module declares stays with the first, which warns about it once.
+        let declares = |m: &Module, name: &str| {
+            m.design
+                .entities
+                .iter()
+                .any(|e| e.name == name && e.entity_type != EntityType::External)
+        };
+        let owners_of_exports: Vec<Option<usize>> = manifest
+            .export
+            .iter()
+            .map(|entry| modules.iter().position(|m| declares(m, &entry.name())))
+            .collect();
+        for (i, module) in modules.iter_mut().enumerate() {
+            let mut entry = 0;
+            module.design.config.export.retain(|_| {
+                let owner = owners_of_exports[entry];
+                entry += 1;
+                owner == Some(i) || (owner.is_none() && i == 0)
+            });
+        }
         if !gaps.is_empty() {
             return Err(DbdError::Config(format!(
                 "{} dependency gap(s) between modules — a module references only its own entities and \
@@ -217,70 +238,65 @@ impl Workspace {
         self.modules
     }
 
-    /// The modules a run that builds goes over — `apply`, `deploy`,
-    /// `reconcile`, an import — in `depends_on` order: every module, or the
-    /// module `module` and every module it depends on, directly or through
-    /// another. The manifest's own `apply:` hooks run once around them: its
-    /// `apply.before` ahead of the first module's, its `apply.after` behind
-    /// the last's. A design without `modules:` is its one module, with no
-    /// module to name.
+    /// The modules a run that builds or reads goes over — `apply`, `deploy`,
+    /// `reconcile`, an import, a diff — in `depends_on` order: every module,
+    /// or the module `module` and every module it depends on, directly or
+    /// through another. The manifest's own hooks run once around them: its
+    /// `apply.before` ahead of the first module's, its `apply.after` and
+    /// `import.after` behind the last's. A design without `modules:` is its
+    /// one module, with no module to name.
     pub fn select(self, module: Option<&str>) -> Result<Vec<Module>> {
-        let Some(mut manifest) = self.manifest else {
+        let Some(manifest) = &self.manifest else {
             return match module {
                 Some(name) => Err(no_modules_to_name(name)),
                 None => Ok(self.modules),
             };
         };
-        let wanted: HashSet<String> = match module {
-            None => manifest.modules.keys().cloned().collect(),
-            Some(name) => {
-                known_module(&manifest, name)?;
-                let mut wanted: HashSet<String> =
-                    dependency_closure(&manifest.modules).remove(name).unwrap_or_default();
-                wanted.insert(name.to_string());
-                wanted
-            }
-        };
-        let mut selected: Vec<Module> = self
-            .modules
-            .into_iter()
-            .filter(|m| m.name.as_ref().is_some_and(|n| wanted.contains(n)))
-            .collect();
-
-        let crate::config::ApplyConfig { before, after } = std::mem::take(&mut manifest.apply);
-        let outer = |apply| super::OuterHooks {
-            dir: self.root.clone(),
-            apply,
-        };
-        if let Some(first) = selected.first_mut()
-            && !before.is_empty()
-        {
-            first.design.outer_hooks = Some(outer(crate::config::ApplyConfig {
-                before,
-                after: Vec::new(),
-            }));
-        }
-        if let Some(last) = selected.last_mut()
-            && !after.is_empty()
-        {
-            match &mut last.design.outer_hooks {
-                Some(hooks) => hooks.apply.after = after,
-                None => {
-                    last.design.outer_hooks = Some(outer(crate::config::ApplyConfig {
-                        before: Vec::new(),
-                        after,
-                    }))
-                }
-            }
-        }
-        Ok(selected)
+        let wanted = selection(manifest, module)?;
+        self.with_hooks_around(|m| wanted.contains(m.name.as_deref().unwrap_or_default()))
     }
 
-    /// The modules a reset goes over: every module in reverse `depends_on`
-    /// order, each dropped before the modules it depends on — or exactly the
-    /// module `module`. Not its dependencies: they are other owners, and what
-    /// it used of theirs the reset no longer needs. A reset runs no hooks.
-    pub fn selected_to_reset(self, module: Option<&str>) -> Result<Vec<Module>> {
+    /// [`Self::select`] narrowed to the module declaring the entity `name` —
+    /// what `-n` runs — with the manifest's hooks around it, as around any
+    /// run. Refuses a name no module declares, and one `module` does not
+    /// select, naming its module.
+    pub fn select_declaring(self, module: Option<&str>, name: &str) -> Result<Vec<Module>> {
+        let Some(manifest) = &self.manifest else {
+            return self.select(module);
+        };
+        let wanted = selection(manifest, module)?;
+        let declaring: Vec<&str> = self
+            .modules
+            .iter()
+            .filter(|m| {
+                m.design
+                    .resolve_name(name, None)
+                    .is_ok_and(|e| e.entity_type != EntityType::External)
+            })
+            .filter_map(|m| m.name.as_deref())
+            .collect();
+        if declaring.is_empty() {
+            return Err(DbdError::Config(format!("no module declares {name}")));
+        }
+        if !declaring.iter().any(|d| wanted.contains(*d)) {
+            return Err(DbdError::Config(format!(
+                "{name} is module \"{}\"'s, and --module {} does not select it",
+                declaring.join("\" or \""),
+                module.unwrap_or_default()
+            )));
+        }
+        let declaring: HashSet<String> = declaring.into_iter().map(str::to_string).collect();
+        self.with_hooks_around(|m| {
+            m.name
+                .as_ref()
+                .is_some_and(|n| declaring.contains(n) && wanted.contains(n))
+        })
+    }
+
+    /// The modules a run that only reads one module goes over — `export`: the
+    /// module `module` alone, or every module in `depends_on` order. Its
+    /// dependencies are not read with it, and no hooks run.
+    pub fn select_alone(self, module: Option<&str>) -> Result<Vec<Module>> {
         let Some(manifest) = &self.manifest else {
             return match module {
                 Some(name) => Err(no_modules_to_name(name)),
@@ -288,7 +304,7 @@ impl Workspace {
             };
         };
         match module {
-            None => Ok(self.modules.into_iter().rev().collect()),
+            None => Ok(self.modules),
             Some(name) => {
                 known_module(manifest, name)?;
                 Ok(self
@@ -299,6 +315,63 @@ impl Workspace {
             }
         }
     }
+
+    /// The modules a reset goes over: every module in reverse `depends_on`
+    /// order, each dropped before the modules it depends on — or exactly the
+    /// module `module`. Not its dependencies: they are other owners, and what
+    /// it used of theirs the reset no longer needs. A reset runs no hooks.
+    pub fn selected_to_reset(self, module: Option<&str>) -> Result<Vec<Module>> {
+        let all = module.is_none();
+        let selected = self.select_alone(module)?;
+        Ok(if all {
+            selected.into_iter().rev().collect()
+        } else {
+            selected
+        })
+    }
+
+    /// The modules `keep` keeps, in load order, with the manifest's hooks on
+    /// the first and the last.
+    fn with_hooks_around(self, keep: impl Fn(&Module) -> bool) -> Result<Vec<Module>> {
+        let mut selected: Vec<Module> = self.modules.into_iter().filter(|m| keep(m)).collect();
+        let Some(mut manifest) = self.manifest else {
+            return Ok(selected);
+        };
+        let crate::config::ApplyConfig { before, after } = std::mem::take(&mut manifest.apply);
+        let import_after = std::mem::take(&mut manifest.import.after);
+        let outer = || super::OuterHooks {
+            dir: self.root.clone(),
+            apply: crate::config::ApplyConfig::default(),
+            import_after: Vec::new(),
+        };
+        if let Some(first) = selected.first_mut()
+            && !before.is_empty()
+        {
+            first.design.outer_hooks.get_or_insert_with(outer).apply.before = before;
+        }
+        if let Some(last) = selected.last_mut()
+            && !(after.is_empty() && import_after.is_empty())
+        {
+            let hooks = last.design.outer_hooks.get_or_insert_with(outer);
+            hooks.apply.after = after;
+            hooks.import_after = import_after;
+        }
+        Ok(selected)
+    }
+}
+
+/// The modules `module` selects: itself and every module it depends on,
+/// directly or through another — or every module.
+fn selection(manifest: &DesignConfig, module: Option<&str>) -> Result<HashSet<String>> {
+    Ok(match module {
+        None => manifest.modules.keys().cloned().collect(),
+        Some(name) => {
+            known_module(manifest, name)?;
+            let mut wanted: HashSet<String> = dependency_closure(&manifest.modules).remove(name).unwrap_or_default();
+            wanted.insert(name.to_string());
+            wanted
+        }
+    })
 }
 
 /// Refuse a module `name` the manifest does not declare, naming those it does.
@@ -415,7 +488,9 @@ impl Declared {
 
 /// The module `name`'s design config: the manifest's, with the module's own
 /// project identity, version, release state and hooks. Scopes select over
-/// the whole workspace, not within a module, so a module has none.
+/// the whole workspace, not within a module, so a module has none; the
+/// manifest's hooks are the workspace's, and its `export:` entries are each
+/// the module's that declares the entity (see `Workspace::load`).
 fn module_config(text: &str, project: &str, name: &str) -> Result<DesignConfig> {
     let mut config: DesignConfig = serde_yaml::from_str(text)?;
     let module = config
@@ -429,6 +504,9 @@ fn module_config(text: &str, project: &str, name: &str) -> Result<DesignConfig> 
         released: module.released,
     };
     config.apply = module.apply;
+    // The manifest's `import.after` is the workspace's, as its `apply:` is:
+    // it runs once, after the last module's import (see `Workspace::select`).
+    config.import.after.clear();
     config.modules.clear();
     config.scopes.clear();
     Ok(config)

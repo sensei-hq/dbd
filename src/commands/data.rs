@@ -238,9 +238,41 @@ pub async fn cmd_import(
     verbosity: Verbosity,
 ) -> Result<()> {
     let targets = super::targets(config, env, project_dir, module, name, super::Order::Build)?;
+    let targets = super::emptied_together(targets, name, scope, deps)?;
+    if targets.len() > 1 && file.is_none() {
+        preflight_import(&targets, config, database_url, name, scope, deps).await?;
+    }
     for (i, target) in targets.into_iter().enumerate() {
         let (design, _) = target.enter(i == 0);
         import_design(design, config, database_url, name, file, scope, deps, verbosity).await?;
+    }
+    Ok(())
+}
+
+/// Before the first module of a workspace loads, each module's import checked
+/// as its dry run checks it — so a refusal any module's would meet comes
+/// before any module has emptied or loaded a table (#7).
+async fn preflight_import(
+    targets: &[super::Target],
+    config: &Path,
+    database_url: Option<&str>,
+    name: Option<&str>,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
+) -> Result<()> {
+    for target in targets {
+        let design = &target.design;
+        let check = async {
+            design.check_import_plan(name)?;
+            let adapter = get_adapter(config, database_url, design.owner()).await?;
+            let resolved = design.resolve_scope(scope, deps)?;
+            super::check_pinned_scope(&*adapter, design, &resolved, PINNED).await?;
+            design
+                .import_data(&*adapter, name, true, Some(&resolved), Progress::none())
+                .await?;
+            anyhow::Ok(())
+        };
+        check.await.with_context(|| target.label().unwrap_or_default())?;
     }
     Ok(())
 }
@@ -365,7 +397,7 @@ pub async fn cmd_export(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let targets = super::targets(config, env, project_dir, module, name, super::Order::Build)?;
+    let targets = super::targets(config, env, project_dir, module, name, super::Order::Alone)?;
     for (i, target) in targets.into_iter().enumerate() {
         let (design, _) = target.enter(i == 0);
         export_design(

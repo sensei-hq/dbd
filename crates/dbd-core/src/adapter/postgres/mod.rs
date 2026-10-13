@@ -1981,6 +1981,23 @@ impl DatabaseAdapter for PostgresAdapter {
         Ok(())
     }
 
+    async fn existing_tables(&self, tables: &[String]) -> Result<Vec<String>> {
+        let qualified: Vec<String> = tables.iter().map(|t| crate::sql_quote::qualified(t)).collect();
+        let exists: Vec<bool> = sqlx::query_scalar(
+            "SELECT to_regclass(t) IS NOT NULL FROM unnest($1::text[]) WITH ORDINALITY AS u(t, i) ORDER BY i",
+        )
+        .bind(&qualified)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbdError::Config(format!("reading which tables exist failed: {e}")))?;
+        Ok(tables
+            .iter()
+            .zip(exists)
+            .filter(|(_, exists)| *exists)
+            .map(|(t, _)| t.clone())
+            .collect())
+    }
+
     /// One `TRUNCATE` for every table an import reloads. Postgres refuses to
     /// truncate a table another references — unless both are truncated
     /// together — so staging tables linked by a foreign key failed one at a

@@ -131,13 +131,20 @@ fn check_workspace_selection(
         }
         return Ok(());
     }
+    if matches!(command, Commands::Init { .. } | Commands::Merge { .. }) {
+        anyhow::bail!(
+            "{} declares modules: — init and merge onboard a project into one design; a project becomes a \
+             workspace with dbd split",
+            config.display()
+        );
+    }
     if !runs_a_workspace(command) {
         anyhow::bail!(
             "{} declares modules: — this command does not run a design with modules: yet",
             config.display()
         );
     }
-    if scope.is_some() || deps.is_some() {
+    if command_honors_scope(command) && (scope.is_some() || deps.is_some()) {
         anyhow::bail!("--scope and --deps do not select over a design with modules: yet — run without them");
     }
     Ok(())
@@ -149,6 +156,9 @@ pub(super) enum Order {
     /// A run that builds or reads: in `depends_on` order, `--module` with the
     /// modules it depends on, the manifest's hooks around the run.
     Build,
+    /// A run that reads one module — `export`: in `depends_on` order,
+    /// `--module` alone.
+    Alone,
     /// A reset: in reverse, `--module` alone.
     Reset,
 }
@@ -163,6 +173,14 @@ pub(super) struct Target {
 }
 
 impl Target {
+    /// This target, its design remade by `f` — `--adopt-from` and the like.
+    pub fn map_design(self, f: impl FnOnce(Design) -> Design) -> Self {
+        Self {
+            design: f(self.design),
+            ..self
+        }
+    }
+
     /// `module core (shop/core)`, said before a module's run.
     pub fn label(&self) -> Option<String> {
         self.module
@@ -178,6 +196,37 @@ impl Target {
         }
         (self.design, self.dir)
     }
+}
+
+/// A workspace run's import, as one project's (#7): its first module empties,
+/// together, every table the run reloads that exists by then, and the others
+/// none — see `Design::emptying_for_import`. One design's run empties its own.
+pub(super) fn emptied_together(
+    targets: Vec<Target>,
+    name: Option<&str>,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
+) -> Result<Vec<Target>> {
+    if targets.len() < 2 {
+        return Ok(targets);
+    }
+    let mut tables: Vec<String> = Vec::new();
+    for target in &targets {
+        let resolved = target.design.resolve_scope(scope, deps)?;
+        for table in target.design.import_truncations(name, Some(&resolved))? {
+            if !tables.contains(&table) {
+                tables.push(table);
+            }
+        }
+    }
+    Ok(targets
+        .into_iter()
+        .enumerate()
+        .map(|(i, target)| {
+            let emptied = if i == 0 { tables.clone() } else { Vec::new() };
+            target.map_design(|design| design.emptying_for_import(emptied))
+        })
+        .collect())
 }
 
 /// Warn when a run's design has no DDL of its own. For a project it is the
@@ -213,20 +262,25 @@ pub(super) fn targets(
 ) -> Result<Vec<Target>> {
     let workspace = Workspace::load(config, env, Some(project_dir)).context("Failed to load design")?;
     let has_modules = workspace.has_modules();
-    let mut modules = match order {
-        Order::Build => workspace.select(module)?,
-        Order::Reset => workspace.selected_to_reset(module)?,
-    };
-    if has_modules && let Some(n) = name {
-        modules.retain(|m| {
-            m.design()
-                .resolve_name(n, None)
-                .is_ok_and(|e| e.entity_type != dbd_core::EntityType::External)
-        });
-        if modules.is_empty() {
-            anyhow::bail!("no module declares {n}");
+    let modules = match (order, name) {
+        (Order::Build, Some(n)) if has_modules => workspace.select_declaring(module, n)?,
+        (Order::Build, _) => workspace.select(module)?,
+        (Order::Alone, name) => {
+            let mut modules = workspace.select_alone(module)?;
+            if has_modules && let Some(n) = name {
+                modules.retain(|m| {
+                    m.design()
+                        .resolve_name(n, None)
+                        .is_ok_and(|e| e.entity_type != dbd_core::EntityType::External)
+                });
+                if modules.is_empty() {
+                    anyhow::bail!("no module selected declares {n}");
+                }
+            }
+            modules
         }
-    }
+        (Order::Reset, _) => workspace.selected_to_reset(module)?,
+    };
     Ok(modules
         .into_iter()
         .map(|m| Target {

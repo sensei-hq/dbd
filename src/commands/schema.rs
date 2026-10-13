@@ -978,28 +978,56 @@ pub async fn cmd_apply(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let targets = super::targets(config, env, project_dir, module, name, super::Order::Build)?;
+    let targets: Vec<super::Target> = super::targets(config, env, project_dir, module, name, super::Order::Build)?
+        .into_iter()
+        .map(|target| target.map_design(|design| ownership.applied_to(design)))
+        .collect();
+    let run = ApplyRun {
+        config,
+        database_url,
+        name,
+        dry_run,
+        with_policies,
+        allow_scope_change,
+        scope,
+        deps,
+        verbosity,
+    };
+    if targets.len() > 1 && !dry_run {
+        preflight_apply(&targets, &run).await?;
+    }
     let mut code = 0;
     for (i, target) in targets.into_iter().enumerate() {
         let in_module = target.module.is_some();
         let (design, dir) = target.enter(i == 0);
         super::warn_if_no_authored_ddl(&design, &dir, in_module);
-        let run = ApplyRun {
-            config,
-            database_url,
-            name,
-            dry_run,
-            with_policies,
-            allow_scope_change,
-            scope,
-            deps,
-            verbosity,
-        };
-        code = code.max(apply_design(ownership.applied_to(design), &dir, &run).await?);
+        code = code.max(apply_design(design, &dir, &run).await?);
     }
     // A module's failed policy fails the run, once every module has run.
     if code != 0 {
         std::process::exit(code);
+    }
+    Ok(())
+}
+
+/// Before the first module of a workspace builds, each module's apply checked
+/// as its dry run checks it — its scope pin, its guards, what it would claim,
+/// its migrations, its hook files — so a refusal any module's run would meet
+/// comes before any module has written (#7).
+async fn preflight_apply(targets: &[super::Target], run: &ApplyRun<'_>) -> Result<()> {
+    for target in targets {
+        let design = &target.design;
+        let check = async {
+            let adapter = get_adapter(run.config, run.database_url, design.owner()).await?;
+            let resolved = design.resolve_scope(run.scope, run.deps)?;
+            let marks = design.database_marks(&*adapter).await?;
+            Design::check_scope_guard(&marks, &resolved.name, run.allow_scope_change)?;
+            design
+                .apply(&*adapter, run.name, true, Some(&resolved), Progress::none())
+                .await?;
+            anyhow::Ok(())
+        };
+        check.await.with_context(|| target.label().unwrap_or_default())?;
     }
     Ok(())
 }
@@ -1310,6 +1338,20 @@ pub async fn cmd_policies(
     verbosity: Verbosity,
 ) -> Result<()> {
     let targets = super::targets(config, env, project_dir, module, None, super::Order::Build)?;
+    if targets.len() > 1 && !dry_run {
+        // Each module's guards before any module's policies apply (#7).
+        for target in &targets {
+            let design = &target.design;
+            let check = async {
+                let adapter = get_adapter(config, database_url, design.owner()).await?;
+                let resolved = design.resolve_scope(scope, deps)?;
+                super::check_pinned_scope(&*adapter, design, &resolved, POLICY_CONSEQUENCE).await?;
+                design.check_ownership(&*adapter).await?;
+                anyhow::Ok(())
+            };
+            check.await.with_context(|| target.label().unwrap_or_default())?;
+        }
+    }
     let mut code = 0;
     for (i, target) in targets.into_iter().enumerate() {
         let (design, dir) = target.enter(i == 0);
@@ -1321,6 +1363,10 @@ pub async fn cmd_policies(
     }
     Ok(())
 }
+
+/// What a policy for another scope would do to this database.
+const POLICY_CONSEQUENCE: &str =
+    "Applying another scope's policies would secure tables this database was not built with.";
 
 /// [`cmd_policies`] for one design: the project's, or one module's. Returns
 /// the exit code its failed policies ask for.
@@ -1342,10 +1388,6 @@ async fn policies_design(
     let (kept, total) = design.scope_counts(&resolved)?;
     output::scope_filtered(&resolved, kept, total);
     let policy_ws = policy_working_set(&design, &resolved)?;
-
-    // What a policy for another scope would do to this database.
-    const POLICY_CONSEQUENCE: &str =
-        "Applying another scope's policies would secure tables this database was not built with.";
 
     if dry_run {
         // The real run's guard, whenever there is a database to ask: a preview

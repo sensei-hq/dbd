@@ -424,20 +424,48 @@ pub async fn cmd_deploy(
         anyhow::bail!("No {} found in {}", config_name.display(), project_dir.display());
     }
 
-    let targets = super::targets(&config_path, env, &project_dir, module, None, super::Order::Build)
-        .context("Failed to load design from source")?;
+    let targets: Vec<super::Target> =
+        super::targets(&config_path, env, &project_dir, module, None, super::Order::Build)
+            .context("Failed to load design from source")?
+            .into_iter()
+            .map(|target| target.map_design(|design| ownership.applied_to(design)))
+            .collect();
+    let targets = super::emptied_together(targets, None, scope, deps)?;
+    let run = DeployRun {
+        config_path: &config_path,
+        database_url,
+        dry_run,
+        allow_scope_change,
+        scope,
+        deps,
+        verbosity,
+    };
+    if targets.len() > 1 && !dry_run {
+        preflight_deploy(&targets, &run).await?;
+    }
     for (i, target) in targets.into_iter().enumerate() {
         let (design, dir) = target.enter(i == 0);
-        let run = DeployRun {
-            config_path: &config_path,
-            database_url,
-            dry_run,
-            allow_scope_change,
-            scope,
-            deps,
-            verbosity,
+        deploy_design(design, &dir, &run).await?;
+    }
+    Ok(())
+}
+
+/// Before the first module of a workspace deploys, each module's deploy
+/// checked as its dry run checks it — its scope pin, its guards, what it would
+/// claim, its migrations, hooks and imports — so a refusal any module's run
+/// would meet comes before any module has written (#7).
+async fn preflight_deploy(targets: &[super::Target], run: &DeployRun<'_>) -> Result<()> {
+    for target in targets {
+        let design = &target.design;
+        let check = async {
+            let adapter = get_adapter(run.config_path, run.database_url, design.owner()).await?;
+            let resolved = design.resolve_scope(run.scope, run.deps)?;
+            let marks = design.database_marks(&*adapter).await?;
+            Design::check_scope_guard(&marks, &resolved.name, run.allow_scope_change)?;
+            design.deploy(&*adapter, true, Some(&resolved), |_| {}).await?;
+            anyhow::Ok(())
         };
-        deploy_design(ownership.applied_to(design), &dir, &run).await?;
+        check.await.with_context(|| target.label().unwrap_or_default())?;
     }
     Ok(())
 }
@@ -637,11 +665,41 @@ pub async fn cmd_reconcile(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let targets = super::targets(config, env, project_dir, module, None, super::Order::Build)?;
+    let targets: Vec<super::Target> = super::targets(config, env, project_dir, module, None, super::Order::Build)?
+        .into_iter()
+        .map(|target| target.map_design(|design| ownership.applied_to(design)))
+        .collect();
+    if targets.len() > 1 && !dry_run {
+        // Before the first module writes, each module's reconcile checked as
+        // its dry run checks it — so a refusal any module's would meet comes
+        // before any module has written (#7).
+        for target in &targets {
+            let design = &target.design;
+            let check = async {
+                refuse_a_released_reconcile(design)?;
+                let adapter = get_adapter(config, database_url, design.owner()).await?;
+                let resolved = design.resolve_scope(scope, deps)?;
+                let marks = design.database_marks(&*adapter).await?;
+                Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
+                design
+                    .reconcile(
+                        &*adapter,
+                        true,
+                        allow_destructive,
+                        prune,
+                        Some(&resolved),
+                        Progress::none(),
+                    )
+                    .await?;
+                anyhow::Ok(())
+            };
+            check.await.with_context(|| target.label().unwrap_or_default())?;
+        }
+    }
     for (i, target) in targets.into_iter().enumerate() {
         let (design, _) = target.enter(i == 0);
         reconcile_design(
-            ownership.applied_to(design),
+            design,
             config,
             database_url,
             dry_run,
@@ -653,6 +711,18 @@ pub async fn cmd_reconcile(
             verbosity,
         )
         .await?;
+    }
+    Ok(())
+}
+
+/// A released project — or module — changes through `dbd snapshot` and
+/// migrations; `reconcile` is the pre-release workflow.
+fn refuse_a_released_reconcile(design: &Design) -> Result<()> {
+    if design.config().project.released {
+        anyhow::bail!(
+            "Project is released — `reconcile` is disabled. \
+             Capture changes with `dbd snapshot`, then migrate with `dbd apply`."
+        );
     }
     Ok(())
 }
@@ -671,12 +741,7 @@ async fn reconcile_design(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    if design.config().project.released {
-        anyhow::bail!(
-            "Project is released — `reconcile` is disabled. \
-             Capture changes with `dbd snapshot`, then migrate with `dbd apply`."
-        );
-    }
+    refuse_a_released_reconcile(&design)?;
 
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
     let (kept, total) = design.scope_counts(&resolved)?;
