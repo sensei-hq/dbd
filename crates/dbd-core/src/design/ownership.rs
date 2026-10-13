@@ -917,14 +917,26 @@ impl Design {
 }
 
 /// Run `work` holding the database's dbd write lock (#7), released however
-/// `work` ends — see [`DatabaseAdapter::lock_writes`].
+/// `work` ends, a run dropped part-way included — see
+/// [`DatabaseAdapter::lock_writes`].
 pub(crate) async fn with_write_lock<T>(
     adapter: &dyn DatabaseAdapter,
     exclusive: bool,
     work: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
+    /// Gives the lock up if the run is dropped before it ends.
+    struct Abandon<'a>(Option<&'a dyn DatabaseAdapter>);
+    impl Drop for Abandon<'_> {
+        fn drop(&mut self) {
+            if let Some(adapter) = self.0 {
+                adapter.abandon_writes();
+            }
+        }
+    }
     adapter.lock_writes(exclusive).await?;
+    let mut abandon = Abandon(Some(adapter));
     let done = work.await;
+    abandon.0 = None;
     let released = adapter.unlock_writes().await;
     let value = done?;
     released?;

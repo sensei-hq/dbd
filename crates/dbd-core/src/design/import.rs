@@ -774,6 +774,29 @@ impl Design {
         name: Option<&str>,
         dry_run: bool,
         scope: Option<&ResolvedScope>,
+        progress: Progress<S, D, C>,
+    ) -> Result<()>
+    where
+        S: FnMut(&str),
+        D: FnMut(&str, Option<&str>),
+        C: FnMut(ImportComplete),
+    {
+        // A real import — its `import.after` scripts included — holds the
+        // database's dbd write lock, shared, as an apply does (#7).
+        let run = self.import_run(adapter, name, dry_run, scope, progress);
+        if dry_run {
+            return run.await;
+        }
+        ownership::with_write_lock(adapter, false, run).await
+    }
+
+    /// [`Design::import_data`]'s run, under the write lock when it writes.
+    async fn import_run<S, D, C>(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        name: Option<&str>,
+        dry_run: bool,
+        scope: Option<&ResolvedScope>,
         mut progress: Progress<S, D, C>,
     ) -> Result<()>
     where

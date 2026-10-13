@@ -979,7 +979,8 @@ impl Design {
         }
         match crate::script::build_grants_script(&schema_grants, &supabase_schemas) {
             Some(sql) => {
-                adapter.execute_script(&sql).await?;
+                // Under the database's dbd write lock, shared, as an apply (#7).
+                ownership::with_write_lock(adapter, false, adapter.execute_script(&sql)).await?;
                 Ok(GrantsOutcome::Applied)
             }
             None => Ok(GrantsOutcome::None),

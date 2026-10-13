@@ -24,9 +24,17 @@ use crate::error::{DbdError, Result};
 pub(super) struct Bookkeeping {
     pool: PgPool,
     project: String,
-    /// The database's dbd write lock while this adapter holds it: how many
-    /// runs nested in it, and the session holding it.
-    write_lock: tokio::sync::Mutex<(usize, Option<sqlx::PgConnection>)>,
+    /// The database's dbd write lock while this adapter holds it.
+    write_lock: tokio::sync::Mutex<WriteLock>,
+}
+
+/// The database's dbd write lock as an adapter holds it: how many runs nested
+/// in it, the session holding it, and whether exclusive.
+#[derive(Default)]
+struct WriteLock {
+    depth: usize,
+    session: Option<sqlx::PgConnection>,
+    exclusive: bool,
 }
 
 impl Bookkeeping {
@@ -59,70 +67,129 @@ impl Bookkeeping {
         Self {
             pool,
             project,
-            write_lock: tokio::sync::Mutex::new((0, None)),
+            write_lock: tokio::sync::Mutex::new(WriteLock::default()),
         }
     }
 
-    /// Take the database's dbd write lock (#7) — `pg_advisory_lock` on
+    /// Take the database's dbd write lock (#7) — the advisory lock on
     /// `dbd:write`, shared or exclusive — in a session of its own, held until
     /// [`Self::unlock_writes`]. A session lock, not a transaction's: a run
     /// commits as it goes, and holds it across. The session is out of the
-    /// pool, so a run that never unlocks — dropped part-way — returns no
-    /// locked connection to it, and closing the session releases the lock.
-    /// A nested call shares the lock already held. Waits at most
-    /// [`WRITE_LOCK_TIMEOUT`].
+    /// pool, so dropping it — [`Self::abandon_writes`] — releases the lock;
+    /// and it sits idle through the run, so no `idle_session_timeout` may end
+    /// it. A nested call shares the lock already held, and is refused one
+    /// exclusive inside a shared one. It waits by asking again, not in one
+    /// long statement — a statement holds a snapshot, which the run holding
+    /// the lock waits out to `CREATE INDEX CONCURRENTLY` — saying so in its
+    /// `application_name`, for at most [`WRITE_LOCK_TIMEOUT`].
     pub(super) async fn lock_writes(&self, exclusive: bool) -> Result<()> {
+        use sqlx::Connection;
         let mut held = self.write_lock.lock().await;
-        if held.0 > 0 {
-            held.0 += 1;
+        if held.depth > 0 {
+            if exclusive && !held.exclusive {
+                return Err(DbdError::Config(
+                    "a run holding the dbd write lock shared cannot take it exclusive".to_string(),
+                ));
+            }
+            held.depth += 1;
             return Ok(());
         }
         let failed = |e: sqlx::Error| DbdError::Config(format!("taking the dbd write lock failed: {e}"));
         let mut session = self.pool.acquire().await.map_err(failed)?.detach();
-        sqlx::query(&format!("SET lock_timeout = '{WRITE_LOCK_TIMEOUT}'"))
+        for prepare in [
+            "SELECT set_config('idle_session_timeout', '0', false) \
+               WHERE current_setting('idle_session_timeout', true) IS NOT NULL",
+            "SET application_name = 'dbd: waiting for the write lock'",
+        ] {
+            if let Err(e) = sqlx::query(prepare).execute(&mut session).await {
+                let _ = session.close().await;
+                return Err(failed(e));
+            }
+        }
+        let try_lock = if exclusive {
+            "SELECT pg_try_advisory_lock(hashtext('dbd:write'))"
+        } else {
+            "SELECT pg_try_advisory_lock_shared(hashtext('dbd:write'))"
+        };
+        let deadline = std::time::Instant::now() + WRITE_LOCK_TIMEOUT;
+        loop {
+            match sqlx::query_scalar::<_, bool>(try_lock).fetch_one(&mut session).await {
+                Ok(true) => break,
+                Ok(false) if std::time::Instant::now() < deadline => tokio::time::sleep(WRITE_LOCK_POLL).await,
+                Ok(false) => {
+                    let _ = session.close().await;
+                    return Err(DbdError::Config(format!(
+                        "waited {} minutes for another dbd run writing to this database to finish; try again \
+                         once it has",
+                        WRITE_LOCK_TIMEOUT.as_secs() / 60
+                    )));
+                }
+                Err(e) => {
+                    let _ = session.close().await;
+                    return Err(failed(e));
+                }
+            }
+        }
+        if let Err(e) = sqlx::query("SET application_name = 'dbd: holding the write lock'")
             .execute(&mut session)
             .await
-            .map_err(failed)?;
-        let lock = if exclusive {
-            "SELECT pg_advisory_lock(hashtext('dbd:write'))"
-        } else {
-            "SELECT pg_advisory_lock_shared(hashtext('dbd:write'))"
-        };
-        if let Err(e) = sqlx::query(lock).execute(&mut session).await {
-            use sqlx::Connection;
+        {
             let _ = session.close().await;
-            return Err(if sqlstate(&e).as_deref() == Some("55P03") {
-                DbdError::Config(format!(
-                    "waited {WRITE_LOCK_TIMEOUT} for another dbd run writing to this database to finish; \
-                     try again once it has"
-                ))
-            } else {
-                failed(e)
-            });
+            return Err(failed(e));
         }
-        *held = (1, Some(session));
+        *held = WriteLock {
+            depth: 1,
+            session: Some(session),
+            exclusive,
+        };
         Ok(())
     }
 
     /// Release the lock [`Self::lock_writes`] took, once the outermost run
-    /// that took it is done: closing its session releases it.
+    /// that took it is done. A lock its session no longer holds — the session
+    /// ended mid-run — fails the run: another project's may have written
+    /// beside it.
     pub(super) async fn unlock_writes(&self) -> Result<()> {
         use sqlx::Connection;
         let mut held = self.write_lock.lock().await;
-        match held.0 {
+        match held.depth {
             0 => return Ok(()),
-            1 => held.0 = 0,
+            1 => held.depth = 0,
             _ => {
-                held.0 -= 1;
+                held.depth -= 1;
                 return Ok(());
             }
         }
-        match held.1.take() {
-            Some(session) => session
-                .close()
-                .await
-                .map_err(|e| DbdError::Config(format!("releasing the dbd write lock failed: {e}"))),
-            None => Ok(()),
+        let Some(mut session) = held.session.take() else {
+            return Ok(());
+        };
+        let unlock = if held.exclusive {
+            "SELECT pg_advisory_unlock(hashtext('dbd:write'))"
+        } else {
+            "SELECT pg_advisory_unlock_shared(hashtext('dbd:write'))"
+        };
+        let released = sqlx::query_scalar::<_, bool>(unlock).fetch_one(&mut session).await;
+        let _ = session.close().await;
+        match released {
+            Ok(true) => Ok(()),
+            Ok(false) | Err(_) => Err(DbdError::Config(
+                "the dbd write lock was lost during the run — its session ended — so another project's run \
+                 may have written beside it; check the database before running again"
+                    .to_string(),
+            )),
+        }
+    }
+
+    /// Give up the lock without a word to the server, for a run dropped
+    /// part-way: one level of nesting, and at the outermost the session —
+    /// dropped, it closes, and the server releases the lock.
+    pub(super) fn abandon_writes(&self) {
+        if let Ok(mut held) = self.write_lock.try_lock() {
+            match held.depth {
+                0 => {}
+                1 => *held = WriteLock::default(),
+                _ => held.depth -= 1,
+            }
         }
     }
 
@@ -1269,7 +1336,10 @@ const HEAL_LOCK_TIMEOUT: &str = "5s";
 /// How long a run waits for the database's dbd write lock — for another
 /// project's run to finish — before it gives up. A run holds it from its
 /// first write to its last, an apply's data load included.
-const WRITE_LOCK_TIMEOUT: &str = "5min";
+const WRITE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How often a run waiting for the write lock asks for it again.
+const WRITE_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// `"schema"."relname"`, each part quoted.
 fn quoted_table(schema: &str, relname: &str) -> String {

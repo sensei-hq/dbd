@@ -612,18 +612,23 @@ pub trait DatabaseAdapter: Send + Sync {
     /// shared by a run that builds, exclusive for one that drops `CASCADE` by
     /// what it read of other projects — a reset, a reconcile, an apply running
     /// migrations — so no other project's run writes between its reads and its
-    /// drops. A nested call shares the lock
-    /// already held. Waits a bounded time, then fails. Adapters without other
-    /// projects to wait for need none.
+    /// drops. A nested call shares the lock already held, and is refused one
+    /// exclusive inside a shared one. Waits a bounded time, then fails.
+    /// Adapters without other projects to wait for need none.
     async fn lock_writes(&self, exclusive: bool) -> Result<()> {
         let _ = exclusive;
         Ok(())
     }
 
-    /// Release what [`Self::lock_writes`] took.
+    /// Release what [`Self::lock_writes`] took — failing if the lock was
+    /// lost on the way.
     async fn unlock_writes(&self) -> Result<()> {
         Ok(())
     }
+
+    /// Give up what [`Self::lock_writes`] took, at once and without asking
+    /// the database: for a run dropped part-way.
+    fn abandon_writes(&self) {}
     async fn get_db_version(&self) -> Result<u32>;
     async fn apply_migration(&self, version: u32, sql: &str, description: &str, checksum: &str) -> Result<()>;
     async fn clear_project_migrations(&self) -> Result<()>;
