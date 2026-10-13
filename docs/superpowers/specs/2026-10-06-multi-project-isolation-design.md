@@ -307,6 +307,18 @@ but not the environment guard. A project replacing every live entity at once —
 a one-table project renaming its table — reads as a reused name too, and takes
 the override once.
 
+**Inspection.** `dbd inspect --shared` reads the database's records and its
+registry: each project, its env and version, what it owns, the schemas it uses
+and what of others' it uses through what of its own, and which projects record
+nothing of what they own yet. It lists what would refuse this design there — an
+entity another owner holds, a reused owner name — and exits non-zero over any.
+
+**Onboarding** (H9). `init --from-db` refuses only a database dbd manages for
+the project it is creating; another project's record is no bar. It and `merge`
+leave out what other owners hold, naming each. While a project the database
+records keeps no record of what it owns, both refuse: its entities cannot be
+told from nobody's.
+
 **Backfill.** The first upgraded run of each owner claims the declared entities
 that already exist and nobody owns. Undeclared live entities stay unowned. On a
 database with one owner, rule (b) keeps pruning them exactly as today. No

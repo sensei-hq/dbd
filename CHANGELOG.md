@@ -146,6 +146,19 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   the adopted table as its own. The giver's next run neither owns nor prunes
   it, and declaring it still is refused; and neither the adoption nor a run
   that adopted and then failed reads as a rename of the giver.
+- **`dbd inspect --shared` reports what shares a database** (#7, phase 2):
+  each project it records — env and version, what it owns, the schemas it
+  uses and what of others' it uses through what of its own — which record
+  nothing of what they own yet, and what would refuse this design there: an
+  entity another project owns, or an owner name it reuses. It exits non-zero
+  over any conflict.
+- **A second project can onboard beside the first** (#7, phase 2). `init
+  --from-db` refused any database with dbd bookkeeping; it now refuses only one
+  dbd manages for this project (`merge` syncs that), and leaves out what other
+  projects own, naming each — as `merge` now does, where it took another
+  project's entities into this one. Both are refused while a project the
+  database records keeps no record of what it owns: its entities cannot be told
+  from nobody's.
 - **The uses guard sees further** (#7, phase 2). A dependent nobody owns —
   a project's not yet recording its uses — is guarded where a project might
   own it, by `--prune`'s rule: in a schema another project uses, or anywhere
@@ -190,6 +203,9 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   and `Dependence::schema` names the dependent's schema.
 - `Design::adopting_from`, `allowing_ownership_change`, `adoptions` and
   `check_run_guards` — the guards `apply` checks, name reuse first;
+  `Design::shared_database` (`SharedDatabase`, `SharedProject`, `SharedUse`)
+  and `design::leave_out_other_owners`; `DatabaseAdapter::registry`
+  (`adapter::Registry`, `RecordedUse`; default empty);
   `DatabaseAdapter::claim_objects` takes `adopt_from`, and the adapter gains
   `owned_objects` (default: nothing held).
 
