@@ -18,8 +18,11 @@ A **workspace** is the manifest plus its modules in `depends_on` order. A
 `design.yaml` without `modules:` is a workspace of one module rooted at the
 project directory, owned by `project.name` — today's behaviour, untouched.
 
-A module knows its dependencies' entities as full definitions, not `external:`
-stubs: a foreign key into `shared` resolves to the real table.
+A module references its dependencies' entities without `external:` entries:
+they are added to its design as externals, which resolve its references and
+are never its to build, claim or own. Their definitions stay in their module —
+so what reads a module's definitions of another's (the viewer, DBML) reads them
+from the owning module (slice 5).
 
 ## Decisions taken here (the spec leaves them open)
 
@@ -27,12 +30,36 @@ stubs: a foreign key into `shared` resolves to the real table.
   `modules.<name>.version`, `modules.<name>.released`. `project.version` is the
   workspace's only when it has no `modules:`.
 - A module's folder is `modules.<name>.path`, default `<name>/`, relative to
-  `design.yaml`; it holds `ddl/`, `import/`, `policies/`, `snapshots/`,
-  `migrations/`, and its hook scripts.
+  the project directory (`--source`, as `ddl/` is; design.yaml's folder when
+  loaded without one); it holds `ddl/`, `import/`, `policies/`, `snapshots/`,
+  `migrations/`, and its hook scripts. It is a folder of its own — not the
+  project's (`path: .`), not inside another module's — since a module that
+  moves to a repository of its own takes it.
 - `modules.<name>.apply` holds that module's `apply.before`/`apply.after`;
   the manifest's top-level `apply:` runs once around the whole workspace run.
 - A run without `--module` or a module-selecting scope runs every module, in
-  `depends_on` order (reset in reverse).
+  `depends_on` order (reset in reverse): of the modules whose dependencies are
+  in place, the one `modules:` lists first.
+
+Taken in slice 1:
+
+- `Workspace::load` refuses, before any database work and so for every
+  command: a module name outside `[A-Za-z0-9_][A-Za-z0-9_-]*` (it names an
+  owner and a folder); unknown keys in a module block; `project.version` or
+  `project.released` (each module has its own); an unknown dependency or a
+  cycle, named; a folder outside the project, the project's own, inside
+  another's, shared or missing; files in a root `ddl/`, `import/`, `policies/`,
+  `snapshots/` or `migrations/` (dotfiles such as `.gitkeep` aside) — they
+  belong to no module; two modules declaring the same entity, keyed as the
+  registry keys it (T19); and a reference into a module outside the
+  `depends_on` closure (T20) — to any entity another module's file declares,
+  roles included, or creates beside it.
+- A module's design has no `scopes:`: scopes select over the workspace
+  (slice 3). Until then `inspect` refuses `--scope` and `--deps` on a
+  workspace, and every command but `inspect` and `install` refuses a
+  workspace until slice 2 runs it.
+- `Workspace::config` is the manifest as written — its `apply:` hooks, which
+  run around the whole workspace, and its `scopes:`.
 
 ## Slices
 
@@ -53,13 +80,17 @@ PR into the integration branch `feat/workspaces`.
    their dependencies), alongside entity selection. Running inside a module
    folder finds the workspace root by walking up and selects that module.
 4. **Per-module history.** `snapshot`, `release` and `apply`'s migrations per
-   module: each module's own `snapshots/`, `migrations/` and version.
+   module: each module's own `snapshots/`, `migrations/` and version. A
+   version bump or a release writes `modules.<name>.version` / `released`,
+   never `project.*` — which a workspace refuses.
 5. **The viewer.** The diagram model carries each entity's module; the viewer
    groups the diagram and sidebar by module.
 6. **Converting a project: `dbd split --from-scopes`.** The plan (regions of the
    scopes' Venn diagram after `deps: include`, entity counts, inferred
    `depends_on`, rewritten `scopes:`), and `--write` (moves files with `git mv`,
-   splits `import/` by owning module, writes `modules:` and `scopes:`). The
+   splits `import/`, `policies/`, `snapshots/` and `migrations/` by owning
+   module — a root folder left holding files refuses the workspace — writes
+   `modules:` and `scopes:`). The
    **workspace transfer rule**: a module's first run, where the predecessor
    owner is the same project (`sensei` before `sensei/core`), takes over what
    it declares from the predecessor and retires the predecessor's record once

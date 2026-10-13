@@ -1,8 +1,9 @@
 # Multi-Project Isolation in One Database (#7)
 
 **Date:** 2026-10-06 (rev 3, 2026-10-07)
-**Status:** Proposed — Phase 1 done on `develop` (1a in 0.25.0; 1b, 1c, 1d
-after 0.25.1); Phases 2–4 next; the decisions below are settled.
+**Status:** Phases 1 and 2 shipped (Phase 1 in 0.25.x, Phase 2 in 0.26.0);
+Phase 3 in progress (plan: `docs/superpowers/plans/2026-10-13-workspaces-phase-3.md`);
+Phase 4 later; the decisions below are settled.
 **Scope:** Let several owners share one database safely: independent projects
 from different repositories, and modules of one workspace kept under
 `database/<module>/`. Ownership is per **entity**, recorded in the shared `dbd`
@@ -422,8 +423,9 @@ Why one manifest:
   folder its DDL is in. A per-module manifest would only repeat names the folder
   already settles.
 - The only per-module facts are `depends_on`, an optional `note`, an optional
-  `path` (default `<module>/`), and apply hooks that belong to one module
-  (`modules.<name>.apply`). All of those fit in one block.
+  `path` (default `<module>/`), its own `version` and `released` (decision 2),
+  and apply hooks that belong to one module (`modules.<name>.apply`). All of
+  those fit in one block.
 - One file shows the whole database: what is in it, what depends on what, and
   what deploys where.
 - A module that later moves to its own repository takes its folder, and its
@@ -442,13 +444,17 @@ projects.
 
 ### Behaviour
 
-- **Static overlap check.** `dbd inspect` refuses when two modules declare the
-  same entity. This is the workspace version of the claim rule, caught before
-  any database is involved.
-- **Cross-module references** must follow `depends_on`. A reference into a
-  module that is not a dependency is a gap, reported with the same machinery
-  and wording as scope gaps. Within a workspace dbd knows the real definition,
-  so a dependency's entities are full FK targets, not `external:` stubs.
+- **Static overlap check.** A workspace in which two modules declare the same
+  entity does not load, so `dbd inspect` — and every other command — refuses
+  it. This is the workspace version of the claim rule, caught before any
+  database is involved.
+- **Cross-module references** must follow `depends_on`, directly or through a
+  dependency's own. A reference into a module that is not a dependency is a
+  gap: the workspace does not load, and the refusal names the module to add to
+  `depends_on`. (Unlike a scope gap there is nothing to auto-include: the fix
+  is the dependency.) A module references what its dependencies declare without
+  `external:` entries; those entities resolve its references and are never its
+  own to build, claim or own — their definitions stay in their module.
 - **Deploy order** is topological by `depends_on`: shared, then core, then dojo.
   Each module claims, applies and records its own meta row
   (`<project>/<module>`). Each module also has its own version, `snapshots/`
