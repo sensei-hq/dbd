@@ -14,10 +14,13 @@
 
 ## Next
 
-Slice 3 (scopes over modules): `scopes.<name>.modules: [...]` selects modules
-and their dependencies, alongside entity selection; running inside a module
-folder finds the workspace root by walking up and selects that module.
-Branch `feat/workspaces-scopes`, red tests first.
+Slice 3 on `feat/workspaces-scopes`: red tests committed (1bd5201a) —
+`crates/dbd-core/tests/workspace_scopes.rs`, CLI scopes and walking up, a live
+scope-pin test. Implement: `ScopeSpec.modules`, each manifest scope projected
+onto each module at load, `Workspace::under_scope`, the guard no longer
+refusing `--scope`, the walk up from a module folder.
+
+    cargo test -p dbd-core --test workspace_scopes && cargo test --test workspace_inspect
 
 ## Open
 
