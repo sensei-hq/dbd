@@ -207,10 +207,13 @@ with its row type and that type's array; a type and its array; a column, with
 the same column of every table inheriting it (dropped through inheritance,
 which `pg_depend` does not record); a constraint, with the index behind a
 primary key, unique or exclusion constraint; an index; a routine's overloads;
-a whole schema or extension. Each dependent is walked as itself — a column as
-its column, a constraint, default, trigger or policy as itself — so a part
-reaches only what depends on the part; a view's rewrite rule stands for the
-whole view. Each is named by its owning relation, type or routine. For a part
+a whole schema; an extension's members. Each dependent is walked as itself — a
+column as its column, a constraint, default, trigger or policy as itself — so a
+part reaches only what depends on the part; a view's rewrite rule stands for
+the whole view, and a generated column's expression leads to its column. A
+`TRUNCATE … CASCADE` reaches only the tables whose foreign keys point at the
+truncated one: it empties them and drops nothing. Each is named by its owning
+relation, type or routine. For a part
 of a table, `dbd.uses` adds only the uses recorded through routine bodies,
 which the catalog does not track. It runs before any write, dry runs
 included:
@@ -224,7 +227,9 @@ included:
   type, routine, index, schema or extension, an `ALTER TABLE … DROP COLUMN` or
   `DROP CONSTRAINT`, a `TRUNCATE … CASCADE` — with a bare name on the path the
   migration runs on, and refuses the run when another owner depends on any of
-  it. A script dbd cannot parse is refused: what it drops is unknown.
+  it. A script dbd cannot parse is refused where another project is recorded:
+  what it drops is unknown. A design not read as Postgres — SQLite's — keeps
+  migrations in its own dialect, which this guard does not judge.
 
 This is the contract between owners. It plays the role an API plays between
 services.
