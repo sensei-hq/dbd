@@ -12,9 +12,13 @@
 
 ## Next
 
-    git checkout -b feat/workspaces-load
-    # slice 1: modules: block, Workspace::load, per-module Designs, inspect's
-    # overlap check (T19) and depends_on gaps (T20); red tests first
+Slice 1 on `feat/workspaces-load`: red tests committed
+(`crates/dbd-core/tests/workspace_load.rs`, `tests/workspace_inspect.rs`, the
+config `modules:` parse tests). Implement: `ModuleConfig`, `design/workspace.rs`
+(`Workspace::load`, validation, T19 overlap, T20 gaps), `Design::from_config`
+refusing `modules:`, `dbd inspect` per module.
+
+    cargo test -p dbd-core --test workspace_load && cargo test --test workspace_inspect
 
 ## Open
 
