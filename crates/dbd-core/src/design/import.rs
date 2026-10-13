@@ -870,8 +870,9 @@ impl Design {
             // foreign key only together.
             let truncated = match &self.import_truncates {
                 // A workspace run's: what the run reloads, of what exists by
-                // now — see `Design::emptying_for_import`.
-                Some(tables) => adapter.existing_tables(tables).await?,
+                // now — see `Design::emptying_for_import` — in load order by
+                // the database's own keys, as one project's plan is.
+                Some(tables) => in_load_order(adapter.existing_tables(tables).await?, &adapter.foreign_keys().await?),
                 None => {
                     let mut truncated: Vec<String> = Vec::new();
                     for entry in plan {
@@ -945,6 +946,31 @@ impl Design {
         }
         Ok(count)
     }
+}
+
+/// `tables` in load order by `keys` — the database's foreign keys, each
+/// `(referencing table, referenced table)` as it names them: each table after
+/// those it references, ties as given. A key naming no schema reaches a table
+/// by its bare name, without regard to case, as SQLite names one.
+fn in_load_order(tables: Vec<String>, keys: &[(String, String)]) -> Vec<String> {
+    let names =
+        |table: &str, live: &str| table == live || (!live.contains('.') && bare_name(table).eq_ignore_ascii_case(live));
+    let references = |table: &str, other: &str| {
+        table != other
+            && keys
+                .iter()
+                .any(|(referencing, referenced)| names(table, referencing) && names(other, referenced))
+    };
+    let mut ordered: Vec<String> = Vec::with_capacity(tables.len());
+    let mut left = tables;
+    while !left.is_empty() {
+        let ready = left
+            .iter()
+            .position(|t| !left.iter().any(|other| references(t, other)))
+            .unwrap_or(0);
+        ordered.push(left.remove(ready));
+    }
+    ordered
 }
 
 #[cfg(test)]

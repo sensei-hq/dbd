@@ -206,27 +206,90 @@ pub(super) fn emptied_together(
     name: Option<&str>,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
-) -> Result<Vec<Target>> {
+) -> Result<(Vec<Target>, Emptied)> {
     if targets.len() < 2 {
-        return Ok(targets);
+        return Ok((targets, Emptied::default()));
     }
-    let mut tables: Vec<String> = Vec::new();
+    let mut by_module: Vec<Vec<String>> = Vec::new();
     for target in &targets {
         let resolved = target.design.resolve_scope(scope, deps)?;
-        for table in target.design.import_truncations(name, Some(&resolved))? {
-            if !tables.contains(&table) {
-                tables.push(table);
-            }
-        }
+        by_module.push(target.design.import_truncations(name, Some(&resolved))?);
     }
-    Ok(targets
+    let emptied = Emptied { by_module };
+    let all = emptied.from(0);
+    let targets = targets
         .into_iter()
         .enumerate()
         .map(|(i, target)| {
-            let emptied = if i == 0 { tables.clone() } else { Vec::new() };
-            target.map_design(|design| design.emptying_for_import(emptied))
+            let tables = if i == 0 { all.clone() } else { Vec::new() };
+            target.map_design(|design| design.emptying_for_import(tables))
         })
-        .collect())
+        .collect();
+    Ok((targets, emptied))
+}
+
+/// What a workspace run's import empties, module by module — see
+/// [`emptied_together`].
+#[derive(Default)]
+pub(super) struct Emptied {
+    by_module: Vec<Vec<String>>,
+}
+
+impl Emptied {
+    /// The tables the modules from `module` on reload, once each.
+    fn from(&self, module: usize) -> Vec<String> {
+        let mut tables: Vec<String> = Vec::new();
+        for table in self.by_module.iter().skip(module).flatten() {
+            if !tables.contains(table) {
+                tables.push(table.clone());
+            }
+        }
+        tables
+    }
+
+    /// `err`, from the module at `failed`'s import, saying what the run
+    /// emptied that no module has reloaded since: that module's tables and
+    /// those of the modules after it.
+    pub fn explain(&self, failed: usize, err: anyhow::Error) -> anyhow::Error {
+        let left = self.from(failed);
+        if left.is_empty() {
+            return err;
+        }
+        err.context(format!(
+            "the import emptied {} to reload them and stopped before it did — run it again once this is fixed",
+            left.join(", ")
+        ))
+    }
+}
+
+/// `Grants applied.`, as a deploy's summary says it — empty when there were
+/// none to apply.
+pub(super) fn format_grants(grants: &dbd_core::design::GrantsOutcome) -> &'static str {
+    match grants {
+        dbd_core::design::GrantsOutcome::Applied => " Grants applied.",
+        dbd_core::design::GrantsOutcome::Unsupported => " Grants skipped (target has no grant model).",
+        dbd_core::design::GrantsOutcome::None => "",
+    }
+}
+
+/// `2 policy file(s) applied, 1 skipped (out of scope).`, as a deploy's
+/// summary says it.
+pub(super) fn format_policy_line(policies: &dbd_core::design::PolicyReport) -> String {
+    // A scoped deploy skips policies whose table is not in this plane. That is
+    // deliberate, but it must still be visible — otherwise the summary reports
+    // only what ran and nothing accounts for the rest.
+    format!(
+        "{} policy file(s) applied{}{}.",
+        policies.applied.len(),
+        match policies.failed.len() {
+            0 => String::new(),
+            n => format!(", {n} failed"),
+        },
+        match policies.skipped.len() {
+            0 => String::new(),
+            n => format!(", {n} skipped (out of scope)"),
+        }
+    )
 }
 
 /// Warn when a run's design has no DDL of its own. For a project it is the
@@ -787,26 +850,8 @@ pub(super) fn format_import_summary(s: &ImportComplete) -> String {
 pub(super) fn format_deploy_summary(s: &dbd_core::design::DeployComplete) -> String {
     let apply_line = format_apply_summary(&s.apply);
     let import_line = format_import_summary(&s.import);
-    // A scoped deploy skips policies whose table is not in this plane. That is
-    // deliberate, but it must still be visible — otherwise the summary reports
-    // only what ran and nothing accounts for the rest.
-    let policy_line = format!(
-        "{} policy file(s) applied{}{}.",
-        s.policies.applied.len(),
-        match s.policies.failed.len() {
-            0 => String::new(),
-            n => format!(", {n} failed"),
-        },
-        match s.policies.skipped.len() {
-            0 => String::new(),
-            n => format!(", {n} skipped (out of scope)"),
-        }
-    );
-    let grants = match s.grants {
-        dbd_core::design::GrantsOutcome::Applied => " Grants applied.",
-        dbd_core::design::GrantsOutcome::Unsupported => " Grants skipped (target has no grant model).",
-        dbd_core::design::GrantsOutcome::None => "",
-    };
+    let policy_line = format_policy_line(&s.policies);
+    let grants = format_grants(&s.grants);
     format!("{apply_line}{grants} {import_line} {policy_line}")
 }
 

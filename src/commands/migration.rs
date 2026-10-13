@@ -103,9 +103,12 @@ pub async fn cmd_reset(
     let targets = super::targets(config, env, project_dir, module, None, super::Order::Reset)?;
     let owners: Vec<String> = targets.iter().map(|t| t.design.owner().to_string()).collect();
     let ownership = super::OwnershipChange::new(None, opts.allow_ownership_change);
+    // Each beside the modules reset before it — not those after, which still
+    // hold what they hold, and use what they use, when it resets.
     let targets: Vec<super::Target> = targets
         .into_iter()
-        .map(|t| t.map_design(|design| ownership.applied_to(design).resetting_beside(owners.clone())))
+        .enumerate()
+        .map(|(i, t)| t.map_design(|design| ownership.applied_to(design).resetting_beside(owners[..i].to_vec())))
         .collect();
     if targets.len() > 1 && !opts.dry_run {
         // Every module's reset checked as its preview checks it before any

@@ -281,26 +281,6 @@ fn ensure_no_pending_todos(pending: &[PendingMigration]) -> Result<()> {
     )))
 }
 
-/// Refuse a destructive reconcile (dropped columns, constraints, foreign keys,
-/// or indexes) unless the caller explicitly opted in with `allow_destructive`.
-fn ensure_reconcile_not_destructive(plan: &crate::reconcile::ReconcilePlan, allow_destructive: bool) -> Result<()> {
-    if !plan.destructive || allow_destructive {
-        return Ok(());
-    }
-    // What is destructive, and only that: listing every altered table named
-    // ones that merely gained a column.
-    let details: String = plan
-        .destructive_changes
-        .iter()
-        .map(|change| format!("  {change}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    Err(DbdError::Config(format!(
-        "reconcile would make destructive changes:\n{details}\n\
-         Re-run with --allow-destructive to proceed."
-    )))
-}
-
 /// Build a `SET search_path` prelude covering every managed schema plus public,
 /// so bare references in generated ALTERs resolve like the project's DDL files.
 fn search_path_prelude(managed_schemas: &std::collections::HashSet<String>) -> String {
@@ -1226,10 +1206,11 @@ impl Design {
     }
 
     /// Reset beside `owners` (#7): a workspace resets its modules in one run,
-    /// each before the modules it depends on, so what they use or hold of
-    /// this one's is gone by the time it resets. Their uses do not hold this
-    /// reset back, and what they hold in a schema does not keep it — though
-    /// a prod mark of theirs still does.
+    /// each before the modules it depends on — so the modules reset before
+    /// this one, `owners`, are gone by the time it resets. Their uses do not
+    /// hold this reset back, and what they hold in a schema does not keep it
+    /// — though a prod mark of theirs still does. A preview names them so it
+    /// reads the database as the run will find it.
     pub fn resetting_beside(mut self, owners: impl IntoIterator<Item = String>) -> Self {
         self.reset_beside = owners.into_iter().filter(|o| o != self.owner()).collect();
         self
@@ -4024,7 +4005,7 @@ import:
         let desired = snap(vec![table("a", &["id"]), table("b", &["id", "added"])]);
 
         let plan = crate::reconcile::plan_reconcile(&live, &desired);
-        let err = ensure_reconcile_not_destructive(&plan, false).unwrap_err().to_string();
+        let err = plan.refuse_destructive(false).unwrap_err().to_string();
 
         assert!(err.contains("app.a") && err.contains("gone"), "{err}");
         assert!(

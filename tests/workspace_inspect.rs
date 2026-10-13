@@ -343,7 +343,7 @@ fn a_sqlite_workspace_reloads_its_modules_data() {
     for run in ["import", "re-import"] {
         let o = dbd(dir, &["import"]);
         assert!(o.status.success(), "{run}: {}", text(&o));
-        let out = dir.join(run);
+        let out = dir.join(format!("out-{run}"));
         let o = dbd(dir, &["export", "-o", out.to_str().unwrap()]);
         assert!(o.status.success(), "export after the {run}: {}", text(&o));
         assert_eq!(

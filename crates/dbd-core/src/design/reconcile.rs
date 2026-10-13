@@ -561,7 +561,7 @@ impl Design {
             return Ok(plan);
         }
 
-        ensure_reconcile_not_destructive(&plan, allow_destructive)?;
+        plan.refuse_destructive(allow_destructive)?;
         // The before-hooks' own refusals — a file missing, a path outside the
         // project — are the last.
         self.plan_apply_hooks(hooks::HookKind::Before, hook_scope)?;

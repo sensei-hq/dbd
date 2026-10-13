@@ -1011,17 +1011,46 @@ impl Design {
         // applied, data not loaded.
         self.scoped_import_plan(None, scope)?;
 
-        let mut apply_summary: Option<ApplyComplete> = None;
-        let mut import_summary: Option<ImportComplete> = None;
+        let (apply, grants) = self
+            .deploy_schema(adapter, dry_run, scope, &mut progress.on_start, &mut progress.on_done)
+            .await?;
+        let (import, policies) = self
+            .deploy_data(adapter, dry_run, scope, &mut progress.on_start, &mut progress.on_done)
+            .await?;
+        (progress.on_complete)(DeployComplete {
+            apply,
+            grants,
+            import,
+            policies,
+        });
+        Ok(())
+    }
 
+    /// [`Design::deploy`]'s schema: the apply, then the grants. A workspace
+    /// deploys every module's schema before any module's data (#7), so that a
+    /// module's migrations read the tables they migrate by as they are, not as
+    /// an earlier module's import emptied them for the reload that follows.
+    pub async fn deploy_schema<S, D>(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        dry_run: bool,
+        scope: Option<&ResolvedScope>,
+        on_start: &mut S,
+        on_done: &mut D,
+    ) -> Result<(ApplyComplete, GrantsOutcome)>
+    where
+        S: FnMut(&str),
+        D: FnMut(&str, Option<&str>),
+    {
+        let mut apply_summary: Option<ApplyComplete> = None;
         self.apply(
             adapter,
             None,
             dry_run,
             scope,
             Progress {
-                on_start: &mut progress.on_start,
-                on_done: &mut progress.on_done,
+                on_start: &mut *on_start,
+                on_done: &mut *on_done,
                 on_complete: |s| {
                     apply_summary = Some(s);
                 },
@@ -1036,7 +1065,24 @@ impl Design {
         } else {
             self.apply_grants(adapter, scope).await?
         };
+        Ok((apply_summary.unwrap_or_default(), grants))
+    }
 
+    /// [`Design::deploy`]'s data: the import, then the policies — see
+    /// [`Design::deploy_schema`].
+    pub async fn deploy_data<S, D>(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        dry_run: bool,
+        scope: Option<&ResolvedScope>,
+        on_start: &mut S,
+        on_done: &mut D,
+    ) -> Result<(ImportComplete, PolicyReport)>
+    where
+        S: FnMut(&str),
+        D: FnMut(&str, Option<&str>),
+    {
+        let mut import_summary: Option<ImportComplete> = None;
         // Always run the import phase, even when the plan is empty: it still
         // executes the project's `import.after` scripts, and its summary is what
         // reports "0 table(s) loaded" plus the reason why.
@@ -1046,8 +1092,8 @@ impl Design {
             dry_run,
             scope,
             Progress {
-                on_start: &mut progress.on_start,
-                on_done: &mut progress.on_done,
+                on_start: &mut *on_start,
+                on_done: &mut *on_done,
                 on_complete: |s| {
                     import_summary = Some(s);
                 },
@@ -1068,14 +1114,7 @@ impl Design {
             policy_ws.as_ref().map(|(n, ws)| (n.as_str(), ws)),
         )
         .await?;
-
-        (progress.on_complete)(DeployComplete {
-            apply: apply_summary.unwrap_or_default(),
-            grants,
-            import: import_summary.unwrap_or_default(),
-            policies,
-        });
-        Ok(())
+        Ok((import_summary.unwrap_or_default(), policies))
     }
 }
 

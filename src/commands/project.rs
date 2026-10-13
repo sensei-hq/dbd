@@ -430,7 +430,7 @@ pub async fn cmd_deploy(
             .into_iter()
             .map(|target| target.map_design(|design| ownership.applied_to(design)))
             .collect();
-    let targets = super::emptied_together(targets, None, scope, deps)?;
+    let (targets, emptied) = super::emptied_together(targets, None, scope, deps)?;
     let run = DeployRun {
         config_path: &config_path,
         database_url,
@@ -442,10 +442,107 @@ pub async fn cmd_deploy(
     };
     if targets.len() > 1 && !dry_run {
         preflight_deploy(&targets, &run).await?;
+        return deploy_workspace(targets, &emptied, &run).await;
     }
     for (i, target) in targets.into_iter().enumerate() {
         let (design, dir) = target.enter(i == 0);
         deploy_design(design, &dir, &run).await?;
+    }
+    Ok(())
+}
+
+/// A workspace's deploy: every module's schema, then every module's data
+/// (#7). Its import empties what the run reloads together, before the first
+/// module loads — so no module may migrate after that, reading a table emptied
+/// for a reload that has not happened yet.
+async fn deploy_workspace(targets: Vec<super::Target>, emptied: &super::Emptied, run: &DeployRun<'_>) -> Result<()> {
+    let verbosity = run.verbosity;
+    let mut built = Vec::new();
+    for (i, target) in targets.into_iter().enumerate() {
+        let label = target.label();
+        let (design, _) = target.enter(i == 0);
+        let resolved = design
+            .resolve_scope(run.scope, run.deps)
+            .context("Failed to resolve scope")?;
+        let (kept, total) = design.scope_counts(&resolved)?;
+        output::scope_filtered(&resolved, kept, total);
+        for warning in design.search_path_warnings(None, Some(&resolved))? {
+            output::warn(&warning);
+        }
+        let adapter = get_adapter(run.config_path, run.database_url, design.owner()).await?;
+        let marks = design.database_marks(&*adapter).await?;
+        Design::check_scope_guard(&marks, &resolved.name, run.allow_scope_change)?;
+        super::announce_adoptions(&design, &*adapter, false).await?;
+        for skip in design.hook_skips(Some(&resolved))? {
+            output::warn(&skip);
+        }
+        output::info(verbosity, "Applying schema...");
+        let spinner = output::StepSpinner::new(verbosity);
+        let result = design
+            .deploy_schema(
+                &*adapter,
+                false,
+                Some(&resolved),
+                &mut |desc: &str| spinner.start(desc),
+                &mut |desc: &str, err: Option<&str>| spinner.done(desc, err),
+            )
+            .await;
+        spinner.finish();
+        let (apply, grants) = result.context("Deploy failed")?;
+        super::note_promotion(&marks, design.env());
+        output::info(
+            verbosity,
+            &format!(
+                "{}{}",
+                super::format_apply_summary(&apply),
+                super::format_grants(&grants)
+            ),
+        );
+        built.push((label, design, adapter, resolved));
+    }
+
+    output::always("");
+    output::info(verbosity, "Loading data...");
+    for (i, (label, design, adapter, resolved)) in built.into_iter().enumerate() {
+        if let Some(label) = label {
+            output::always(&if i == 0 { label } else { format!("\n{label}") });
+        }
+        let spinner = output::StepSpinner::new(verbosity);
+        let result = design
+            .deploy_data(
+                &*adapter,
+                false,
+                Some(&resolved),
+                &mut |desc: &str| spinner.start(desc),
+                &mut |desc: &str, err: Option<&str>| spinner.done(desc, err),
+            )
+            .await;
+        spinner.finish();
+        let (import, policies) = result.context("Deploy failed").map_err(|e| emptied.explain(i, e))?;
+        for warning in &import.warnings {
+            output::warn(warning);
+        }
+        if !policies.applied.is_empty() {
+            output::info(
+                verbosity,
+                &format!("Applied {} policy file(s).", policies.applied.len()),
+            );
+        }
+        let summary = dbd_core::design::DeployComplete {
+            policies,
+            ..Default::default()
+        };
+        for warning in summary.policy_warnings() {
+            output::warn(&warning);
+        }
+        output::info(
+            verbosity,
+            &format!(
+                "{} {}",
+                super::format_import_summary(&import),
+                super::format_policy_line(&summary.policies)
+            ),
+        );
     }
     Ok(())
 }
@@ -690,7 +787,8 @@ pub async fn cmd_reconcile(
                         Some(&resolved),
                         Progress::none(),
                     )
-                    .await?;
+                    .await?
+                    .refuse_destructive(allow_destructive)?;
                 anyhow::Ok(())
             };
             check.await.with_context(|| target.label().unwrap_or_default())?;

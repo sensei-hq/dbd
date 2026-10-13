@@ -3025,13 +3025,21 @@ async fn a_workspace_runs_module_by_module() {
     let dir = tmp.path();
     shop_workspace(dir);
 
+    // A deploy goes over the modules twice: every module's schema, then every
+    // module's data.
     let o = dbd(dir, &url, &["deploy"]);
     assert!(o.status.success(), "deploy: {}", combined(&o));
     assert_eq!(
         module_headers(&stdout(&o)),
-        ["shared", "core", "dojo"],
+        ["shared", "core", "dojo", "shared", "core", "dojo"],
         "{}",
         combined(&o)
+    );
+    let out = stdout(&o);
+    let data = out.find("Loading data...").expect("the data pass");
+    assert!(
+        out[..data].contains("module dojo (shop/dojo)"),
+        "every schema first: {out}"
     );
     // Each module ran, as its own owner: its record, and what it owns.
     let owners = owners_listed(dir, &url);
