@@ -306,12 +306,16 @@ pub(super) fn warn_if_no_authored_ddl(design: &Design, dir: &Path, in_module: bo
 
 /// The designs a run goes over (#7): the project's — or, for a workspace, each
 /// module `scope` and `module` select in `order` — narrowed with `name` to
-/// the module declaring that entity. Each module resolves `scope` as its own.
+/// the module declaring that entity. Each module resolves `scope` (with
+/// `deps`) as its own, and a run that builds or reads is refused a gap between
+/// them.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn targets(
     config: &Path,
     env: &str,
     project_dir: &Path,
     scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
     module: Option<&str>,
     name: Option<&str>,
     order: Order,
@@ -339,6 +343,11 @@ pub(super) fn targets(
         }
         (Order::Reset, _) => workspace.selected_to_reset(module)?,
     };
+    // A run that builds or reads goes over its modules as one design goes over
+    // its entities: what one requires of another is in the run's scope.
+    if matches!(order, Order::Build) {
+        dbd_core::design::check_scope_gaps(&modules, scope, deps)?;
+    }
     Ok(modules
         .into_iter()
         .map(|m| Target {

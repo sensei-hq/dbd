@@ -30,7 +30,7 @@ pub use marks::DatabaseMarks;
 pub use ownership::{Prune, SharedDatabase, SharedProject, SharedUse, leave_out_other_owners};
 pub use plan::{ApplyStrategy, ExecutionPlan, ExecutionStep, build_execution_plan};
 pub use reset::{KeptRole, ResetComplete};
-pub use workspace::{Module, Workspace};
+pub use workspace::{Module, Workspace, check_scope_gaps};
 
 /// Summary passed to the `on_complete` callback of `apply()`.
 #[derive(Debug, Clone, Default)]

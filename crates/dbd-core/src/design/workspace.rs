@@ -232,31 +232,47 @@ impl Workspace {
     /// none: a design without modules is not looked for above where it is run.
     pub fn locate(dir: &Path, config_name: &Path) -> Option<(PathBuf, Option<String>)> {
         // Along the path the run was started in — a module folder may be a
-        // link to its files elsewhere — and, failing that, the real one.
-        let logical = logical_path(dir)?;
-        let real = logical.canonicalize().ok();
-        for root in logical.ancestors().skip(1) {
-            let config_path = root.join(config_name);
-            if !config_path.is_file() {
-                continue;
+        // link to its files elsewhere — and, failing that, the real one: a
+        // link from outside the workspace to a module folder.
+        let real = dir.canonicalize().ok();
+        let logical = logical_path(dir).or_else(|| real.clone())?;
+        let walk = |start: &Path| -> Option<Option<(PathBuf, Option<String>)>> {
+            for root in start.ancestors().skip(1) {
+                let config_path = root.join(config_name);
+                if !config_path.is_file() {
+                    continue;
+                }
+                let Ok(manifest) = crate::config::read(&config_path) else {
+                    // Its own load says what is wrong with it.
+                    return Some(Some((root.to_path_buf(), None)));
+                };
+                if manifest.modules.is_empty() {
+                    return Some(None);
+                }
+                let folders: Vec<(&String, PathBuf)> = manifest
+                    .modules
+                    .iter()
+                    .filter_map(|(name, module)| Some((name, root.join(module_folder(name, module).ok()?))))
+                    .collect();
+                // The folder the run starts in names its module first; the
+                // real folder a link in it points at, only failing that.
+                let module = folders
+                    .iter()
+                    .find(|(_, folder)| logical.starts_with(folder))
+                    .or_else(|| {
+                        folders.iter().find(|(_, folder)| {
+                            matches!((&real, folder.canonicalize().ok()), (Some(d), Some(f)) if d.starts_with(&f))
+                        })
+                    })
+                    .map(|(name, _)| (*name).clone());
+                return Some(Some((root.to_path_buf(), module)));
             }
-            let Ok(manifest) = crate::config::read(&config_path) else {
-                // Its own load says what is wrong with it.
-                return Some((root.to_path_buf(), None));
-            };
-            if manifest.modules.is_empty() {
-                return None;
-            }
-            let module = manifest.modules.iter().find_map(|(name, module)| {
-                let folder = root.join(module_folder(name, module).ok()?);
-                let real_folder = folder.canonicalize().ok();
-                let holds = logical.starts_with(&folder)
-                    || matches!((&real, &real_folder), (Some(d), Some(f)) if d.starts_with(f));
-                holds.then(|| name.clone())
-            });
-            return Some((root.to_path_buf(), module));
+            None
+        };
+        match walk(&logical) {
+            Some(found) => found,
+            None => real.as_deref().and_then(walk).flatten(),
         }
-        None
     }
 
     /// Whether the manifest declares `modules:` — `false` for a project that
@@ -320,7 +336,6 @@ impl Workspace {
         self.modules = kept;
         self.left_out = left_out;
         self.scope = Some(name.to_string());
-        self.check_scope_gaps(name)?;
         Ok(self)
     }
 
@@ -338,71 +353,6 @@ impl Workspace {
             (None, Some(m)) if default_leaves_out(m) => self.under_scope(Some("all")),
             _ => self.under_scope(scope),
         }
-    }
-
-    /// Refuse a scope leaving out of one module what another it selects
-    /// requires — a gap, as in one design: the module requiring it holds it
-    /// as an external, which no scope's gap analysis follows.
-    fn check_scope_gaps(&self, scope: &str) -> Result<()> {
-        let mut in_scope: HashMap<&str, HashSet<String>> = HashMap::new();
-        for module in &self.modules {
-            let resolved = module.design.resolve_scope(Some(scope), None)?;
-            let name = module.name.as_deref().unwrap_or_default();
-            in_scope.insert(name, module.design.working_set(&resolved)?);
-        }
-        let declared_by = |entity: &str| {
-            self.modules.iter().find_map(|m| {
-                m.design
-                    .entities
-                    .iter()
-                    .any(|e| e.name == entity && e.entity_type != EntityType::External)
-                    .then(|| m.name.as_deref().unwrap_or_default())
-            })
-        };
-        let mut gaps: Vec<String> = Vec::new();
-        for module in &self.modules {
-            let name = module.name.as_deref().unwrap_or_default();
-            let externals: HashSet<&str> = module
-                .design
-                .entities
-                .iter()
-                .filter(|e| e.entity_type == EntityType::External)
-                .map(|e| e.name.as_str())
-                .collect();
-            for entity in module
-                .design
-                .entities
-                .iter()
-                .filter(|e| in_scope[name].contains(&e.name))
-            {
-                for r in entity
-                    .refs
-                    .iter()
-                    .filter(|r| !r.unresolved && externals.contains(r.name.as_str()))
-                {
-                    if let Some(owner) = declared_by(&r.name)
-                        && !in_scope[owner].contains(&r.name)
-                    {
-                        let gap = format!(
-                            "{} (module \"{name}\") requires {}, which scope '{scope}' leaves out of module \"{owner}\"",
-                            entity.name, r.name
-                        );
-                        if !gaps.contains(&gap) {
-                            gaps.push(gap);
-                        }
-                    }
-                }
-            }
-        }
-        if gaps.is_empty() {
-            return Ok(());
-        }
-        Err(DbdError::Config(format!(
-            "{} dependency gap(s) in scope '{scope}' — stop excluding what is required, or exclude what requires \
-             it too:\n  {}",
-            gaps.len(),
-            gaps.join("\n  ")
-        )))
     }
 
     /// Refuse a module `name` the scope this workspace runs under leaves out.
@@ -562,6 +512,80 @@ impl Workspace {
     }
 }
 
+/// Refuse a run whose scope leaves out of one of its modules what another
+/// requires (#7) — a gap, as in one design, but one no design's own gap
+/// analysis sees: the module requiring it holds it as an external. Checked
+/// over `modules`, the ones the run goes over, each resolving `scope` and
+/// `deps` as the run's commands do — a module the `default` scope leaves out
+/// resolving its own — and naming the module a refusal is for.
+pub fn check_scope_gaps(
+    modules: &[Module],
+    scope: Option<&str>,
+    deps: Option<crate::config::DepsPolicy>,
+) -> Result<()> {
+    if modules.iter().all(|m| m.name.is_none()) {
+        return Ok(());
+    }
+    let label = |m: &Module| m.name.clone().unwrap_or_default();
+    let mut in_scope: HashMap<String, (String, HashSet<String>)> = HashMap::new();
+    for module in modules {
+        let name = label(module);
+        let refused = |e: DbdError| DbdError::Config(format!("module \"{name}\": {e}"));
+        let resolved = module.design.resolve_scope(scope, deps).map_err(refused)?;
+        let working_set = module.design.working_set(&resolved).map_err(refused)?;
+        in_scope.insert(name, (resolved.name, working_set));
+    }
+    let declared_by = |entity: &str| {
+        modules.iter().find_map(|m| {
+            m.design
+                .entities
+                .iter()
+                .any(|e| e.name == entity && e.entity_type != EntityType::External)
+                .then(|| label(m))
+        })
+    };
+    let mut gaps: Vec<String> = Vec::new();
+    for module in modules {
+        let name = label(module);
+        let externals: HashSet<&str> = module
+            .design
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == EntityType::External)
+            .map(|e| e.name.as_str())
+            .collect();
+        let (_, own) = &in_scope[&name];
+        for entity in module.design.entities.iter().filter(|e| own.contains(&e.name)) {
+            for r in entity
+                .refs
+                .iter()
+                .filter(|r| !r.unresolved && externals.contains(r.name.as_str()))
+            {
+                let Some(owner) = declared_by(&r.name) else { continue };
+                let (owner_scope, theirs) = &in_scope[&owner];
+                if !theirs.contains(&r.name) {
+                    let gap = format!(
+                        "{} (module \"{name}\") requires {}, which scope '{owner_scope}' leaves out of module \"{owner}\"",
+                        entity.name, r.name
+                    );
+                    if !gaps.contains(&gap) {
+                        gaps.push(gap);
+                    }
+                }
+            }
+        }
+    }
+    if gaps.is_empty() {
+        return Ok(());
+    }
+    Err(DbdError::Config(format!(
+        "{} dependency gap(s) between modules — stop excluding what is required, or exclude what requires it \
+         too:\n  {}",
+        gaps.len(),
+        gaps.join("\n  ")
+    )))
+}
+
 /// Each manifest scope, projected onto each module it selects (#7): set in
 /// the module's config under the scope's name, so the module resolves it as
 /// its own. A module the scope names — or one a named module depends on, or
@@ -595,6 +619,7 @@ fn project_scopes(manifest: &DesignConfig, modules: &mut [Module]) -> Result<Ind
         // included.
         let matched = |item: &str, entities_only: bool| -> Result<IndexMap<String, ()>> {
             let mut hits = IndexMap::new();
+            let mut known = false;
             for module in modules.iter() {
                 let own: Vec<crate::entity::Entity> = module
                     .design
@@ -603,7 +628,9 @@ fn project_scopes(manifest: &DesignConfig, modules: &mut [Module]) -> Result<Ind
                     .filter(|e| e.entity_type != EntityType::External)
                     .cloned()
                     .collect();
-                let hit = crate::scope::match_item(item, &own).is_ok_and(|names| {
+                let names = crate::scope::match_item(item, &own);
+                known |= names.is_ok();
+                let hit = names.is_ok_and(|names| {
                     names
                         .iter()
                         .any(|n| !entities_only || own.iter().any(|e| &e.name == n && crate::scope::is_scopable(e)))
@@ -612,7 +639,9 @@ fn project_scopes(manifest: &DesignConfig, modules: &mut [Module]) -> Result<Ind
                     hits.insert(name.clone(), ());
                 }
             }
-            if hits.is_empty() {
+            // An item some module knows — a declared schema with nothing in
+            // it, say — selects nothing; one no module knows is a mistake.
+            if !known {
                 return Err(DbdError::Config(format!(
                     "scope '{scope}': item '{item}' matches nothing any module declares"
                 )));

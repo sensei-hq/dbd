@@ -100,7 +100,7 @@ pub async fn cmd_reset(
 ) -> Result<()> {
     // A workspace's modules in reverse: each before the modules it depends on,
     // so what they use of one another is gone by the time each resets.
-    let targets = super::targets(config, env, project_dir, scope, module, None, super::Order::Reset)?;
+    let targets = super::targets(config, env, project_dir, scope, deps, module, None, super::Order::Reset)?;
     let owners: Vec<String> = targets.iter().map(|t| t.design.owner().to_string()).collect();
     let ownership = super::OwnershipChange::new(None, opts.allow_ownership_change);
     // Each beside the modules reset before it — not those after, which still
@@ -353,7 +353,16 @@ pub async fn cmd_migrate_status(
     module: Option<&str>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let targets = super::targets(config, env, project_dir, Some("all"), module, None, super::Order::Build)?;
+    let targets = super::targets(
+        config,
+        env,
+        project_dir,
+        Some("all"),
+        None,
+        module,
+        None,
+        super::Order::Build,
+    )?;
     for (i, target) in targets.into_iter().enumerate() {
         let (design, dir) = target.enter(i == 0);
         migrate_status_design(design, config, database_url, &dir, verbosity).await?;

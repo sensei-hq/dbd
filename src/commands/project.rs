@@ -429,6 +429,7 @@ pub async fn cmd_deploy(
         env,
         &project_dir,
         scope,
+        deps,
         module,
         None,
         super::Order::Build,
@@ -772,7 +773,7 @@ pub async fn cmd_reconcile(
     verbosity: Verbosity,
 ) -> Result<()> {
     let targets: Vec<super::Target> =
-        super::targets(config, env, project_dir, scope, module, None, super::Order::Build)?
+        super::targets(config, env, project_dir, scope, deps, module, None, super::Order::Build)?
             .into_iter()
             .map(|target| target.map_design(|design| ownership.applied_to(design)))
             .collect();
