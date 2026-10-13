@@ -12,10 +12,12 @@
 
 ## Next
 
-Slice 2 (running a workspace): per-module runs and adapters for apply, deploy,
-reconcile, diff, import, export, policies, refresh, migrate --status, reset
-(reverse), inspect --shared; `--module` (+ dependencies); manifest `apply:`
-hooks around the run; T21. Branch `feat/workspaces-run`, red tests first.
+Slice 2 on `feat/workspaces-run`: red tests committed (05e41ea7). Implement
+`Workspace::select`/`selected_to_reset`, the manifest's hooks as a hook phase
+of the first/last module's design, a global `--module`, and the per-module CLI
+loop connecting as each module's owner.
+
+    cargo test -p dbd-core --test workspace_select && cargo test --test workspace_inspect
 
 ## Open
 
