@@ -1,13 +1,10 @@
 # Checkpoint
 
 **Slice:** #7 Phase 2, slice 5 (reset rules) on `feat/ownership-reset`, from
-`feat/ownership` — where slices 1–4 landed as PRs #50, #51, #52 (`64e09594`).
-Phase 1 is on `develop`, unreleased.
+`feat/ownership` (slices 1–4: PRs #50–#52). Phase 1 is on `develop`, unreleased.
 
 ## Done
 
-- Slices 1–4 in `feat/ownership`: registry, claim, uses; prune by ownership;
-  the uses guard on reconcile's drops and apply's migrations.
 - Slice 5 (PR #53): reset keeps/refuses for other projects, `ResetComplete.kept`,
   `reset_preview`. Review round 1 fixed test-first: the dbd write lock
   (`dbd:write` advisory; exclusive for reset, reconcile, migrating apply);
@@ -34,8 +31,7 @@ Phase 1 is on `develop`, unreleased.
   (documented in the spec). `dbd.objects` still allows namespace `type`, unused.
 - Docs slice (end of Phase 2) must cover `--prune-unowned`, reset's kept
   lines and the write lock's waits in the guides.
-- Scratch dirs to delete by hand: `/tmp/dbd-mut` (a reviewer's worktree;
-  then `git worktree prune`), `/tmp/dbd-mut-target`, `/tmp/dbd-idx.*`.
+- Delete by hand: `/tmp/dbd-mut` (+ `git worktree prune`), `/tmp/dbd-mut-target`, `/tmp/dbd-idx.*`.
 - Phase 1 is releasable as 0.25.2 when asked.
 
 ## Known limits
