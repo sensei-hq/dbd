@@ -1,21 +1,22 @@
 # Checkpoint
 
-**Slice:** #7 Phase 2, docs slice on `feat/ownership-docs`, from `feat/ownership`
-(slices 1–8: PRs #50–#56, `42b4c09d`). Phase 1 is on `develop`, unreleased.
+**Slice:** #7 Phase 2 complete in `feat/ownership` (PRs #50–#57, `5c852618`); its PR
+into `develop` is next. Phase 1 is on `develop`, unreleased.
 
 ## Done
 
-- Phase 2 code complete in `feat/ownership`: registry, claim, uses; prune by
-  ownership; uses guard; reset rules and the write lock; name reuse and
-  `--adopt-from`; `inspect --shared`, onboarding; SQLite parity.
-- Embedded 295/295, `cli_live` 61/61, workspace 2017/0, clippy, fmt, doc clean.
+- Entity ownership for projects sharing a database: registry and claim, uses,
+  prune by ownership (`--prune-unowned`), uses guard, reset rules, the dbd write
+  lock, name reuse (`--allow-ownership-change`), `--adopt-from`, `inspect
+  --shared`, onboarding beside other projects, SQLite parity; guide 14 and the
+  references (04, 06, 08, 12, llms, both SKILL.md, README, agent).
+- Embedded 299/299, `cli_live` 61/61, workspace 2017/0, clippy, fmt, doc, site.
 
 ## Next
 
-    gh pr create --base feat/ownership --head feat/ownership-docs
-    # docs written (978b2d7c): guide 14, guide 04/08, llms, both SKILL.md,
-    # README. Spec-conformance audit, fixes, CI, merge; then feat/ownership →
-    # develop (PR, CI, local merge)
+    gh pr create --base develop --head feat/ownership   # Phase 2 → develop
+    # CI green → local --no-ff merge into develop; then Phase 3 (workspaces)
+    # only when asked; a release (0.26.0, minor) only when asked
 
 ## Open
 
