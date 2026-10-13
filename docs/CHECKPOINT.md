@@ -12,11 +12,10 @@
 
 ## Next
 
-Slice 2 PR #62 (`feat/workspaces-run` → `feat/workspaces`): second re-review's
-findings fixed (2adf8a1d) — two-pass workspace deploy, failed import names what
-it emptied, keys/case-blind emptying, reconcile destructive preflight, reset
-beside earlier modules. Next: full suites, a last focused review, CI, merge;
-then slice 3 (scopes over modules, walking up from a module folder).
+Slice 2 PR #62 (`feat/workspaces-run` → `feat/workspaces`): every review round
+fixed — last: a failed import claims emptied tables only when it emptied them
+(dabb0bdf). Next: full suites, CI, merge into `feat/workspaces`; then slice 3
+(scopes over modules, walking up from a module folder).
 
     gh pr checks 62
 
