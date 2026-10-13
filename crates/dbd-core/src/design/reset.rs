@@ -257,19 +257,13 @@ impl Design {
         scope: Option<&ResolvedScope>,
     ) -> Result<(super::ownership::ResetKeep, Vec<KeptRole>)> {
         let roles_kept = self.roles_kept_by_reset(adapter, target, scope).await?;
-        // SQLite's reset drops its own tables and views, without `CASCADE`;
-        // `postgres` and `supabase` are both Postgres.
-        let mut keep = if target == "sqlite" {
-            super::ownership::ResetKeep::default()
-        } else {
-            let drops = self.reset_drops(target, drop_schemas, drop_extensions, scope)?;
-            self.reset_ownership(adapter, &drops).await?
-        };
+        let drops = self.reset_drops(target, drop_schemas, drop_extensions, scope)?;
+        let mut keep = self.reset_ownership(adapter, &drops).await?;
         keep.held_elsewhere = roles_kept.iter().map(|k| k.role.clone()).collect();
         Ok((keep, roles_kept))
     }
 
-    /// What a Postgres reset would drop by name, before anything is kept.
+    /// What a reset would drop by name, before anything is kept.
     fn reset_drops(
         &self,
         target: &str,
@@ -277,6 +271,21 @@ impl Design {
         drop_extensions: bool,
         scope: Option<&ResolvedScope>,
     ) -> Result<ResetDrops> {
+        // SQLite's reset drops the project's tables and views, without
+        // `CASCADE`, and has no schemas, extensions or roles to drop.
+        if target == "sqlite" {
+            return Ok(ResetDrops {
+                entities: self
+                    .reset_entities(scope)?
+                    .iter()
+                    .filter(|e| matches!(e.entity_type, EntityType::Table | EntityType::View))
+                    .map(|e| e.name.clone())
+                    .collect(),
+                schemas: Vec::new(),
+                extensions: Vec::new(),
+                roles: Vec::new(),
+            });
+        }
         let entities = self.reset_entities(scope)?.iter().map(|e| e.name.clone()).collect();
         let schemas = if drop_schemas {
             self.reset_target_schemas(scope)?

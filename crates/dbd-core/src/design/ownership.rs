@@ -176,11 +176,7 @@ impl Design {
         declared: &[OwnedObject],
     ) -> Result<Option<Vec<OwnedObject>>> {
         let held = adapter.owned_objects(self.owner()).await?;
-        let declares_any = held.iter().any(|h| {
-            declared
-                .iter()
-                .any(|d| d.namespace == h.namespace && d.schema == h.schema && d.name == h.name)
-        });
+        let declares_any = held.iter().any(|h| declared.iter().any(|d| adapter.same_object(d, h)));
         Ok((!held.is_empty() && !declares_any).then_some(held))
     }
 
@@ -1159,21 +1155,7 @@ pub async fn leave_out_other_owners(
             if one { "its" } else { "their" },
         )));
     }
-    let held: std::collections::HashMap<(&str, &str, &str), &HeldObject> = registry
-        .claims
-        .iter()
-        .filter(|h| h.owner != owner)
-        .map(|h| {
-            (
-                (
-                    h.object.namespace.as_str(),
-                    h.object.schema.as_str(),
-                    h.object.name.as_str(),
-                ),
-                h,
-            )
-        })
-        .collect();
+    let held: Vec<&HeldObject> = registry.claims.iter().filter(|h| h.owner != owner).collect();
     let mut kept = Vec::new();
     let mut left = Vec::new();
     for e in entities {
@@ -1189,7 +1171,13 @@ pub async fn leave_out_other_owners(
         let schema = schema
             .or_else(|| e.schema.clone())
             .unwrap_or_else(|| crate::reconcile::DEFAULT_SCHEMA.to_string());
-        match held.get(&(namespace, schema.as_str(), name.as_str())) {
+        let key = OwnedObject {
+            namespace: namespace.to_string(),
+            schema,
+            name,
+            kind: String::new(),
+        };
+        match held.iter().find(|h| adapter.same_object(&key, &h.object)) {
             Some(h) => left.push((*h).clone()),
             None => kept.push(e),
         }

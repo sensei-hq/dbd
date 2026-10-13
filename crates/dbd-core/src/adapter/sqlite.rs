@@ -299,17 +299,19 @@ impl SqliteAdapter {
     }
 
     /// The ownership registry's tables (#7): `_dbd_objects`, what each owner
-    /// holds, and `_dbd_uses`, what each records it uses.
+    /// holds, and `_dbd_uses`, what each records it uses. SQLite has no
+    /// schemas and matches names without regard to case, so an object is its
+    /// namespace and its name, so compared; `schema` is the key's as given.
     async fn ensure_registry_inner(&self) -> Result<()> {
         self.execute_script(
             "CREATE TABLE IF NOT EXISTS _dbd_objects ( \
                 namespace  TEXT NOT NULL CHECK (namespace IN ('relation', 'routine')), \
                 schema     TEXT NOT NULL, \
-                name       TEXT NOT NULL, \
+                name       TEXT NOT NULL COLLATE NOCASE, \
                 kind       TEXT NOT NULL, \
                 owner      TEXT NOT NULL, \
                 claimed_at TEXT NOT NULL DEFAULT (datetime('now')), \
-                PRIMARY KEY (namespace, schema, name) \
+                PRIMARY KEY (namespace, name) \
             )",
         )
         .await?;
@@ -808,6 +810,80 @@ impl DatabaseAdapter for SqliteAdapter {
         true
     }
 
+    fn same_object(&self, a: &super::OwnedObject, b: &super::OwnedObject) -> bool {
+        a.namespace == b.namespace && a.name.eq_ignore_ascii_case(&b.name)
+    }
+
+    /// What depends on `guarded`, from what SQLite can say: the uses other
+    /// owners recorded, and the tables whose foreign keys reference one —
+    /// with their owner, none for one nobody owns. SQLite has no catalog of
+    /// what a view reads; a design read as Postgres records it as a use.
+    async fn dependents(
+        &self,
+        owner: &str,
+        guarded: &[super::Guarded],
+        mine: &[super::OwnedObject],
+    ) -> Result<Vec<super::Dependence>> {
+        if !self.has_table("_dbd_objects").await? {
+            return Ok(Vec::new());
+        }
+        let registry = self.registry().await?;
+        let foreign_keys = self.foreign_keys().await?;
+        let mut found = std::collections::BTreeMap::new();
+        for (i, g) in guarded.iter().enumerate() {
+            if g.part != super::GuardedPart::Whole {
+                continue;
+            }
+            for u in registry.uses.iter().filter(|u| u.kind == "entity" && u.owner != owner) {
+                let Some((namespace, target)) = u.target.split_once(':') else {
+                    continue;
+                };
+                let name = target.rsplit('.').next().unwrap_or(target);
+                if namespace == g.object.namespace && name.eq_ignore_ascii_case(&g.object.name) {
+                    found.insert((i, Some(u.owner.clone()), u.via.clone()), String::new());
+                }
+            }
+            if g.object.namespace != "relation" {
+                continue;
+            }
+            for (referencing, _) in foreign_keys
+                .iter()
+                .filter(|(from, to)| to.eq_ignore_ascii_case(&g.object.name) && !from.eq_ignore_ascii_case(to))
+            {
+                let key = super::OwnedObject {
+                    namespace: "relation".to_string(),
+                    schema: crate::reconcile::DEFAULT_SCHEMA.to_string(),
+                    name: referencing.clone(),
+                    kind: String::new(),
+                };
+                if mine.iter().any(|m| self.same_object(m, &key)) {
+                    continue;
+                }
+                let holder = registry
+                    .claims
+                    .iter()
+                    .find(|h| self.same_object(&h.object, &key))
+                    .map(|h| h.owner.clone());
+                if holder.as_deref() == Some(owner) {
+                    continue;
+                }
+                found.insert(
+                    (i, holder, format!("table {}.{referencing}", key.schema)),
+                    key.schema.clone(),
+                );
+            }
+        }
+        Ok(found
+            .into_iter()
+            .map(|((guarded, owner, via), schema)| super::Dependence {
+                guarded,
+                owner,
+                via,
+                schema,
+            })
+            .collect())
+    }
+
     async fn claim_objects(
         &self,
         owner: &str,
@@ -830,11 +906,10 @@ impl DatabaseAdapter for SqliteAdapter {
             for o in objects {
                 sqlx::query(
                     "UPDATE _dbd_objects SET owner = ?1, claimed_at = datetime('now') \
-                     WHERE namespace = ?2 AND schema = ?3 AND name = ?4 AND owner = ?5",
+                     WHERE namespace = ?2 AND name = ?3 AND owner = ?4",
                 )
                 .bind(owner)
                 .bind(&o.namespace)
-                .bind(&o.schema)
                 .bind(&o.name)
                 .bind(from)
                 .execute(&mut *tx)
@@ -845,7 +920,7 @@ impl DatabaseAdapter for SqliteAdapter {
         for o in objects {
             sqlx::query(
                 "INSERT INTO _dbd_objects (namespace, schema, name, kind, owner) VALUES (?1, ?2, ?3, ?4, ?5) \
-                 ON CONFLICT (namespace, schema, name) DO UPDATE SET kind = excluded.kind \
+                 ON CONFLICT (namespace, name) DO UPDATE SET schema = excluded.schema, kind = excluded.kind \
                  WHERE _dbd_objects.owner = excluded.owner",
             )
             .bind(&o.namespace)
@@ -903,29 +978,26 @@ impl DatabaseAdapter for SqliteAdapter {
         if !self.has_table("_dbd_objects").await? {
             return Ok(());
         }
-        let live: std::collections::HashSet<(String, String, String)> = self
-            .owned_objects(owner)
-            .await?
-            .into_iter()
-            .map(|o| (o.namespace, o.schema, o.name))
-            .collect();
+        let live = self.owned_objects(owner).await?;
         let rows: Vec<(String, String, String)> =
             sqlx::query_as("SELECT namespace, schema, name FROM _dbd_objects WHERE owner = ?1")
                 .bind(owner)
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| DbdError::Config(format!("release read failed: {e}")))?;
-        for key in rows {
-            let declares = declared
-                .iter()
-                .any(|d| d.namespace == key.0 && d.schema == key.1 && d.name == key.2);
-            if declares || live.contains(&key) {
+        for (namespace, schema, name) in rows {
+            let key = super::OwnedObject {
+                namespace,
+                schema,
+                name,
+                kind: String::new(),
+            };
+            if declared.iter().chain(&live).any(|d| self.same_object(d, &key)) {
                 continue;
             }
-            sqlx::query("DELETE FROM _dbd_objects WHERE namespace = ?1 AND schema = ?2 AND name = ?3 AND owner = ?4")
-                .bind(&key.0)
-                .bind(&key.1)
-                .bind(&key.2)
+            sqlx::query("DELETE FROM _dbd_objects WHERE namespace = ?1 AND name = ?2 AND owner = ?3")
+                .bind(&key.namespace)
+                .bind(&key.name)
                 .bind(owner)
                 .execute(&self.pool)
                 .await
@@ -943,15 +1015,13 @@ impl DatabaseAdapter for SqliteAdapter {
         let read = |e: sqlx::Error| DbdError::Config(format!("ownership read failed: {e}"));
         if self.has_table("_dbd_objects").await? {
             for o in objects {
-                let held: Option<String> = sqlx::query_scalar(
-                    "SELECT owner FROM _dbd_objects WHERE namespace = ?1 AND schema = ?2 AND name = ?3",
-                )
-                .bind(&o.namespace)
-                .bind(&o.schema)
-                .bind(&o.name)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(read)?;
+                let held: Option<String> =
+                    sqlx::query_scalar("SELECT owner FROM _dbd_objects WHERE namespace = ?1 AND name = ?2")
+                        .bind(&o.namespace)
+                        .bind(&o.name)
+                        .fetch_optional(&self.pool)
+                        .await
+                        .map_err(read)?;
                 found.owners.push(held);
             }
         } else {
@@ -981,7 +1051,8 @@ impl DatabaseAdapter for SqliteAdapter {
         if self.has_table("_dbd_objects").await? {
             let rows: Vec<(String, String, String, String, String)> = sqlx::query_as(
                 "SELECT o.owner, o.namespace, o.schema, o.name, o.kind FROM _dbd_objects o \
-                 WHERE EXISTS (SELECT 1 FROM sqlite_master m WHERE m.name = o.name) \
+                 WHERE EXISTS (SELECT 1 FROM sqlite_master m \
+                               WHERE m.name = o.name COLLATE NOCASE AND m.type IN ('table', 'view')) \
                  ORDER BY o.owner, o.namespace, o.schema, o.name",
             )
             .fetch_all(&self.pool)
@@ -1044,11 +1115,10 @@ async fn held_in(
     let mut held = Vec::new();
     for o in objects {
         let row: Option<(String, String)> = sqlx::query_as(
-            "SELECT kind, owner FROM _dbd_objects WHERE namespace = ?1 AND schema = ?2 AND name = ?3 \
-             AND owner <> ?4 AND (?5 IS NULL OR owner <> ?5)",
+            "SELECT kind, owner FROM _dbd_objects WHERE namespace = ?1 AND name = ?2 \
+             AND owner <> ?3 AND (?4 IS NULL OR owner <> ?4)",
         )
         .bind(&o.namespace)
-        .bind(&o.schema)
         .bind(&o.name)
         .bind(owner)
         .bind(adopting_from)
