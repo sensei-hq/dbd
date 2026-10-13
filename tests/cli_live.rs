@@ -473,9 +473,10 @@ async fn an_unparseable_design_exits_non_zero() {
 ///
 /// The guard matters more than the happy path here: without it, reverse
 /// engineering a managed database would overwrite the project that created it
-/// with a round-tripped copy of itself.
+/// with a round-tripped copy of itself. It is the project's own record that
+/// refuses: another project may onboard beside it (#7).
 #[tokio::test]
-async fn init_from_db_refuses_a_database_dbd_manages() {
+async fn init_from_db_refuses_a_database_dbd_manages_for_the_project() {
     let (_pg, url) = start_pg().await;
     let src = tempfile::tempdir().unwrap();
     project(src.path());
@@ -484,7 +485,7 @@ async fn init_from_db_refuses_a_database_dbd_manages() {
     let out = tempfile::tempdir().unwrap();
     let o = Command::cargo_bin("dbd")
         .unwrap()
-        .args(["init", "--from-db", "-d", &url])
+        .args(["init", "--from-db", "-d", &url, "--name", "clilive"])
         .current_dir(out.path())
         .output()
         .expect("dbd failed to run");
@@ -1616,7 +1617,8 @@ async fn a_dry_run_checks_every_guard_its_real_run_checks() {
 /// guard, and an unscoped apply passed the scope pin. Each — and the dry runs
 /// that check the same guards — must be refused, naming the project the
 /// database records and the likely rename. `--force` and
-/// `--allow-scope-change` are honoured as they are on the project's own mark.
+/// `--allow-scope-change` lift their guards as they do on the project's own
+/// mark, but not the old name's ownership of the objects.
 #[tokio::test]
 async fn a_renamed_project_is_refused_where_its_old_name_would_be() {
     let (pg, url) = start_pg().await;
@@ -1650,10 +1652,21 @@ async fn a_renamed_project_is_refused_where_its_old_name_would_be() {
     }
     assert_eq!(schemas_of(&pg, &url, "nodes"), "hub", "the reset dropped nothing");
 
-    let o = dbd(dir, &url, &["reset", "--scope", "hub", "--dry-run", "--force"]);
-    assert!(o.status.success(), "--force is honoured: {}", combined(&o));
-    let o = dbd(dir, &url, &["apply", "--dry-run", "--allow-scope-change"]);
-    assert!(o.status.success(), "--allow-scope-change is honoured: {}", combined(&o));
+    // `--force` and `--allow-scope-change` lift the guards they name — and no
+    // further: the database's objects are still owned by `scoped`, which a
+    // renamed project takes over only by adopting them (#7).
+    for args in [
+        &["reset", "--scope", "hub", "--dry-run", "--force"][..],
+        &["apply", "--dry-run", "--allow-scope-change"],
+    ] {
+        let o = dbd(dir, &url, args);
+        assert!(!o.status.success(), "{args:?}: {}", combined(&o));
+        assert!(
+            combined(&o).contains("is owned by \"scoped\""),
+            "{args:?} is refused for the objects scoped owns: {}",
+            combined(&o)
+        );
+    }
 }
 
 // ── init --from-db writes a project that applies ────────────────────────────
@@ -2146,4 +2159,806 @@ async fn awkward_names_survive_dbml_init_from_dbml_and_a_real_apply() {
     assert!(o.status.success(), "apply: {}\n{dbml}", combined(&o));
     let o = dbd(dir, &url, &["diff", "--exit-code"]);
     assert!(o.status.success(), "diff: {}\n{dbml}", combined(&o));
+}
+
+/// A project declaring an entity another owns is refused by the commands that
+/// claim nothing, too — `refresh` and `policies` — naming the entity and its
+/// owner, before either touches the database (#7).
+#[tokio::test]
+async fn refresh_and_policies_refuse_a_design_declaring_another_owners_entity() {
+    let (pg, url) = start_pg().await;
+    let owner = tempfile::tempdir().unwrap();
+    project(owner.path());
+    let applied = dbd(owner.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+
+    let intruder = tempfile::tempdir().unwrap();
+    let dir = intruder.path();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: intruder\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    for (rel, sql) in [
+        (
+            "ddl/table/app/widgets.ddl",
+            "set search_path to app;\ncreate table if not exists widgets (id integer primary key);\n",
+        ),
+        (
+            "ddl/materialized_view/app/counts.ddl",
+            "create materialized view if not exists app.counts as select count(*) as n from app.widgets with data;\n",
+        ),
+        (
+            "policies/app/widgets.sql",
+            "alter table app.widgets enable row level security;\n",
+        ),
+    ] {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, sql).unwrap();
+    }
+
+    for command in ["refresh", "policies"] {
+        let out = dbd(dir, &url, &[command]);
+        assert!(!out.status.success(), "{command} succeeded: {}", combined(&out));
+        assert!(
+            combined(&out).contains("relation app.widgets is owned by \"clilive\""),
+            "{command} did not name the entity and its owner: {}",
+            combined(&out)
+        );
+    }
+    // Refused before it touched anything: the owner's table is as it was.
+    let rls = psql(
+        &pg,
+        &url,
+        &[
+            "-tA",
+            "-c",
+            "select relrowsecurity from pg_class where oid = 'app.widgets'::regclass",
+        ],
+    );
+    assert!(rls.status.success(), "{}", combined(&rls));
+    assert_eq!(
+        stdout(&rls).trim(),
+        "f",
+        "row level security on the owner's app.widgets"
+    );
+}
+
+/// The CLI's previews — `apply`, `deploy`, `reset`, `import` and `policies`
+/// with `--dry-run` — said "no issues" for a run the real command refuses, a
+/// design declaring another owner's entity. A preview refuses it too (#7).
+#[tokio::test]
+async fn dry_runs_refuse_a_design_declaring_another_owners_entity() {
+    let (_pg, url) = start_pg().await;
+    let owner = tempfile::tempdir().unwrap();
+    project(owner.path());
+    let applied = dbd(owner.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+
+    let intruder = tempfile::tempdir().unwrap();
+    let dir = intruder.path();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: intruder\n  version: 1\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    for (rel, body) in [
+        (
+            "ddl/table/app/widgets.ddl",
+            "set search_path to app;\ncreate table if not exists widgets (id integer primary key);\n",
+        ),
+        (
+            "policies/app/widgets.sql",
+            "alter table app.widgets enable row level security;\n",
+        ),
+        ("import/app/widgets.csv", "id\n1\n"),
+    ] {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    for args in [
+        &["apply", "--dry-run"][..],
+        &["deploy", "--dry-run"],
+        // `--force` past the reset guard the owner's prod mark raises, as the
+        // real reset would need: ownership is what this preview must refuse on.
+        &["reset", "--dry-run", "--force"],
+        &["import", "--dry-run"],
+        &["policies", "--dry-run"],
+    ] {
+        let out = dbd(dir, &url, args);
+        assert!(!out.status.success(), "{args:?} succeeded: {}", combined(&out));
+        assert!(
+            combined(&out).contains("relation app.widgets is owned by \"clilive\""),
+            "{args:?} did not name the entity and its owner: {}",
+            combined(&out)
+        );
+    }
+}
+
+/// A run killed part-way — the wrong database, noticed in time — leaves no
+/// claim behind: it claims what it built, once built (#7).
+#[tokio::test]
+async fn an_interrupted_apply_holds_no_claims() {
+    let (pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir);
+    let yaml = std::fs::read_to_string(dir.join("design.yaml")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        format!("{yaml}apply:\n  before:\n    - sql/slow.sql\n"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("sql")).unwrap();
+    std::fs::write(dir.join("sql/slow.sql"), "select pg_sleep(20);\n").unwrap();
+
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("dbd"))
+        .args(["apply", "-c", dir.join("design.yaml").to_str().unwrap(), "-d", &url])
+        .current_dir(dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn dbd");
+    // Killed inside its hook — past the check, before any work — not after a
+    // guess at how long getting there takes.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let in_hook = psql(
+            &pg,
+            &url,
+            &[
+                "-tA",
+                "-c",
+                "select count(*) from pg_stat_activity \
+                 where state = 'active' and query like '%pg_sleep(20)%' and pid <> pg_backend_pid()",
+            ],
+        );
+        assert!(in_hook.status.success(), "{}", combined(&in_hook));
+        if stdout(&in_hook).trim() != "0" {
+            break;
+        }
+        assert!(
+            child.try_wait().expect("poll dbd").is_none(),
+            "dbd exited before its hook"
+        );
+        assert!(std::time::Instant::now() < deadline, "dbd never reached its hook");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert!(
+        child.try_wait().expect("poll dbd").is_none(),
+        "dbd finished before the kill"
+    );
+    child.kill().expect("kill dbd");
+    let _ = child.wait();
+
+    // The registry exists — the run healed before its hook — and holds nothing.
+    let held = psql(&pg, &url, &["-tA", "-c", "select count(*) from dbd.objects"]);
+    assert!(held.status.success(), "{}", combined(&held));
+    assert_eq!(stdout(&held).trim(), "0", "the killed run's claims");
+}
+
+/// Outside one transaction the claim comes before the first write, and an
+/// `apply.before` hook writes: it ran ahead of the claim, so a hook could
+/// write over an entity another project claimed while it waited. The run
+/// claims before its hooks (#7).
+#[tokio::test]
+async fn an_apply_outside_a_transaction_claims_before_its_hooks() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir);
+    let yaml = std::fs::read_to_string(dir.join("design.yaml")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        format!("{yaml}apply:\n  before:\n    - sql/claimed.sql\n"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("sql")).unwrap();
+    std::fs::write(
+        dir.join("sql/claimed.sql"),
+        "do $$ begin if not exists (select 1 from dbd.objects where owner = 'clilive' and name = 'widgets') \
+         then raise exception 'the hook ran before the claim'; end if; end $$;\n",
+    )
+    .unwrap();
+
+    let out = std::process::Command::new(assert_cmd::cargo::cargo_bin("dbd"))
+        .args(["apply", "-c", dir.join("design.yaml").to_str().unwrap(), "-d", &url])
+        .env("DBD_NO_TX", "1")
+        .current_dir(dir)
+        .output()
+        .expect("run dbd");
+    assert!(out.status.success(), "{}", combined(&out));
+}
+
+/// A before-hook that cannot run — its file missing — refuses the run, and
+/// an apply outside one transaction claims only past its last refusal: the
+/// CLI's own run claims nothing (#7).
+#[tokio::test]
+async fn an_apply_outside_a_transaction_refused_its_hook_claims_nothing() {
+    let (pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir);
+    let yaml = std::fs::read_to_string(dir.join("design.yaml")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        format!("{yaml}apply:\n  before:\n    - sql/missing.sql\n"),
+    )
+    .unwrap();
+
+    let out = std::process::Command::new(assert_cmd::cargo::cargo_bin("dbd"))
+        .args(["apply", "-c", dir.join("design.yaml").to_str().unwrap(), "-d", &url])
+        .env("DBD_NO_TX", "1")
+        .current_dir(dir)
+        .output()
+        .expect("run dbd");
+    assert!(!out.status.success(), "the hook file is missing: {}", combined(&out));
+    assert!(combined(&out).contains("missing.sql"), "{}", combined(&out));
+
+    // The CLI refuses before it heals, so there may be no registry at all.
+    let unclaimed = psql(
+        &pg,
+        &url,
+        &[
+            "-c",
+            "do $$ begin if to_regclass('dbd.objects') is not null then \
+             if exists (select 1 from dbd.objects where owner = 'clilive') then \
+             raise exception 'clilive holds claims'; end if; end if; end $$;",
+        ],
+    );
+    assert!(unclaimed.status.success(), "{}", combined(&unclaimed));
+}
+
+/// `DBD_NO_TX` runs each statement on its own — what `CREATE INDEX
+/// CONCURRENTLY` needs — so nothing it builds rolls back: it claims before it
+/// builds, and a run that fails part-way keeps its claims (#7).
+#[tokio::test]
+async fn an_apply_outside_a_transaction_claims_before_it_builds() {
+    let (pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir);
+    std::fs::write(
+        dir.join("ddl/view/app/broken.ddl"),
+        "create or replace view app.broken as select * from app.nowhere;\n",
+    )
+    .unwrap();
+
+    let out = std::process::Command::new(assert_cmd::cargo::cargo_bin("dbd"))
+        .args(["apply", "-c", dir.join("design.yaml").to_str().unwrap(), "-d", &url])
+        .env("DBD_NO_TX", "1")
+        .current_dir(dir)
+        .output()
+        .expect("run dbd");
+    assert!(!out.status.success(), "app.nowhere does not exist: {}", combined(&out));
+    assert!(combined(&out).contains("nowhere"), "{}", combined(&out));
+
+    let held = psql(
+        &pg,
+        &url,
+        &[
+            "-tA",
+            "-c",
+            "select string_agg(name, ',' order by name) from dbd.objects where owner = 'clilive'",
+        ],
+    );
+    assert!(held.status.success(), "{}", combined(&held));
+    assert_eq!(stdout(&held).trim(), "broken,named,widgets", "clilive's claims");
+}
+
+/// `reconcile --prune` keeps a table nobody owns in a schema another project
+/// uses, saying why; `--prune-unowned` drops it, naming it as it goes (#7).
+#[tokio::test]
+async fn reconcile_prunes_an_unowned_table_in_a_shared_schema_only_when_told() {
+    let (pg, url) = start_pg().await;
+    let shop = tempfile::tempdir().unwrap();
+    project(shop.path());
+    let applied = dbd(shop.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+
+    let other = tempfile::tempdir().unwrap();
+    std::fs::write(
+        other.path().join("design.yaml"),
+        "project:\n  name: other\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(other.path().join("ddl/table/app")).unwrap();
+    std::fs::write(
+        other.path().join("ddl/table/app/gadgets.ddl"),
+        "create table if not exists app.gadgets (id integer primary key);\n",
+    )
+    .unwrap();
+    let applied = dbd(other.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+
+    let made = psql(&pg, &url, &["-c", "create table app.tmp_report (id int)"]);
+    assert!(made.status.success(), "{}", combined(&made));
+    let exists = |pg: &PostgreSQL| {
+        let o = psql(
+            pg,
+            &url,
+            &["-tA", "-c", "select to_regclass('app.tmp_report') is not null"],
+        );
+        assert!(o.status.success(), "{}", combined(&o));
+        stdout(&o).trim() == "t"
+    };
+
+    let kept = dbd(shop.path(), &url, &["reconcile", "--prune"]);
+    assert!(kept.status.success(), "{}", combined(&kept));
+    assert!(
+        combined(&kept).contains(
+            "unowned: app.tmp_report — not dropped because app is shared with \"other\" (--prune-unowned drops it)"
+        ),
+        "{}",
+        combined(&kept)
+    );
+    assert!(exists(&pg), "--prune kept app.tmp_report");
+
+    let dropped = dbd(shop.path(), &url, &["reconcile", "--prune-unowned"]);
+    assert!(dropped.status.success(), "{}", combined(&dropped));
+    assert!(
+        combined(&dropped).contains("unowned: app.tmp_report — dropped by --prune-unowned"),
+        "{}",
+        combined(&dropped)
+    );
+    assert!(!exists(&pg), "--prune-unowned dropped app.tmp_report");
+    let gadgets = psql(
+        &pg,
+        &url,
+        &["-tA", "-c", "select to_regclass('app.gadgets') is not null"],
+    );
+    assert_eq!(stdout(&gadgets).trim(), "t", "other's app.gadgets survives");
+}
+
+/// `reset --dry-run --schemas` previews what the run does: it keeps a schema
+/// another project has tables in, and says so, rather than listing a `DROP
+/// SCHEMA` the run will not perform (#7).
+#[tokio::test]
+async fn a_reset_preview_keeps_what_another_project_has() {
+    let (_pg, url) = start_pg().await;
+    let shop = tempfile::tempdir().unwrap();
+    project(shop.path());
+    let applied = dbd(shop.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+
+    let other = tempfile::tempdir().unwrap();
+    std::fs::write(
+        other.path().join("design.yaml"),
+        "project:\n  name: other\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(other.path().join("ddl/table/app")).unwrap();
+    std::fs::write(
+        other.path().join("ddl/table/app/gadgets.ddl"),
+        "create table if not exists app.gadgets (id integer primary key);\n",
+    )
+    .unwrap();
+    let applied = dbd(other.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+
+    let preview = dbd(shop.path(), &url, &["reset", "--dry-run", "--force", "--schemas"]);
+    assert!(preview.status.success(), "{}", combined(&preview));
+    let out = combined(&preview);
+    assert!(!out.contains("DROP SCHEMA IF EXISTS \"app\""), "{out}");
+    assert!(out.contains("schema app kept") && out.contains("\"other\""), "{out}");
+}
+
+/// `--adopt-from` takes over what the design declares that the named owner
+/// holds, and says what it takes (#7).
+#[tokio::test]
+async fn apply_adopting_from_an_owner_says_what_it_takes() {
+    let (_pg, url) = start_pg().await;
+    let giver = tempfile::tempdir().unwrap();
+    project(giver.path());
+    let applied = dbd(giver.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+
+    // Versioned as the giver is, so what refuses it is ownership alone.
+    let taker = tempfile::tempdir().unwrap();
+    std::fs::write(
+        taker.path().join("design.yaml"),
+        "project:\n  name: taker\n  version: 1\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(taker.path().join("ddl/table/app")).unwrap();
+    std::fs::copy(
+        giver.path().join("ddl/table/app/widgets.ddl"),
+        taker.path().join("ddl/table/app/widgets.ddl"),
+    )
+    .unwrap();
+    let refused = dbd(taker.path(), &url, &["apply"]);
+    let out = combined(&refused);
+    assert!(!refused.status.success(), "{out}");
+    assert!(out.contains("owned by \"clilive\""), "{out}");
+
+    let adopted = dbd(taker.path(), &url, &["apply", "--adopt-from", "clilive"]);
+    let out = combined(&adopted);
+    assert!(adopted.status.success(), "{out}");
+    assert!(out.contains("adopting relation app.widgets from \"clilive\""), "{out}");
+}
+
+/// A design reusing an owner's name is refused, and `--allow-ownership-change`
+/// lets it run (#7).
+#[tokio::test]
+async fn apply_under_a_reused_owner_name_needs_allow_ownership_change() {
+    let (_pg, url) = start_pg().await;
+    let first = tempfile::tempdir().unwrap();
+    project(first.path());
+    let applied = dbd(first.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+
+    let second = tempfile::tempdir().unwrap();
+    std::fs::write(
+        second.path().join("design.yaml"),
+        "project:\n  name: clilive\n  version: 1\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(second.path().join("ddl/table/app")).unwrap();
+    std::fs::write(
+        second.path().join("ddl/table/app/gadgets.ddl"),
+        "create table if not exists app.gadgets (id integer primary key);\n",
+    )
+    .unwrap();
+    let refused = dbd(second.path(), &url, &["apply"]);
+    let out = combined(&refused);
+    assert!(!refused.status.success(), "{out}");
+    assert!(out.contains("this design declares none of them"), "{out}");
+
+    let allowed = dbd(second.path(), &url, &["apply", "--allow-ownership-change"]);
+    assert!(allowed.status.success(), "{}", combined(&allowed));
+}
+
+/// A deploy adopting says what it takes, as an apply does (#7).
+#[tokio::test]
+async fn deploy_adopting_from_an_owner_says_what_it_takes() {
+    let (_pg, url) = start_pg().await;
+    let giver = tempfile::tempdir().unwrap();
+    project(giver.path());
+    let applied = dbd(giver.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+    let taker = taker_of_widgets(giver.path());
+
+    let deployed = dbd(taker.path(), &url, &["deploy", "--adopt-from", "clilive"]);
+    let out = combined(&deployed);
+    assert!(deployed.status.success(), "{out}");
+    assert!(out.contains("adopting relation app.widgets from \"clilive\""), "{out}");
+}
+
+/// A run refused — a third project holds an entity the design declares —
+/// adopts nothing, and says nothing of adopting (#7).
+#[tokio::test]
+async fn a_refused_apply_says_nothing_of_adopting() {
+    let (_pg, url) = start_pg().await;
+    let giver = tempfile::tempdir().unwrap();
+    project(giver.path());
+    let applied = dbd(giver.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+    let other = tempfile::tempdir().unwrap();
+    std::fs::write(
+        other.path().join("design.yaml"),
+        "project:\n  name: other\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(other.path().join("ddl/table/app")).unwrap();
+    std::fs::write(
+        other.path().join("ddl/table/app/gadgets.ddl"),
+        "create table if not exists app.gadgets (id integer primary key);\n",
+    )
+    .unwrap();
+    let applied = dbd(other.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+
+    let taker = taker_of_widgets(giver.path());
+    std::fs::copy(
+        other.path().join("ddl/table/app/gadgets.ddl"),
+        taker.path().join("ddl/table/app/gadgets.ddl"),
+    )
+    .unwrap();
+    let refused = dbd(taker.path(), &url, &["apply", "--adopt-from", "clilive"]);
+    let out = combined(&refused);
+    assert!(!refused.status.success(), "{out}");
+    assert!(out.contains("owned by \"other\""), "{out}");
+    assert!(!out.contains("adopting"), "{out}");
+}
+
+/// A project `taker` declaring the `clilive` fixture's `app.widgets`.
+fn taker_of_widgets(giver: &Path) -> tempfile::TempDir {
+    let taker = tempfile::tempdir().unwrap();
+    std::fs::write(
+        taker.path().join("design.yaml"),
+        "project:\n  name: taker\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(taker.path().join("ddl/table/app")).unwrap();
+    std::fs::copy(
+        giver.join("ddl/table/app/widgets.ddl"),
+        taker.path().join("ddl/table/app/widgets.ddl"),
+    )
+    .unwrap();
+    taker
+}
+
+/// A preview adopting says what the run would adopt — apply, deploy and
+/// reconcile alike — and a reconcile adopting what it takes (#7).
+#[tokio::test]
+async fn previews_say_what_they_would_adopt_and_a_reconcile_what_it_takes() {
+    let (_pg, url) = start_pg().await;
+    let giver = tempfile::tempdir().unwrap();
+    project(giver.path());
+    let applied = dbd(giver.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+    let taker = taker_of_widgets(giver.path());
+
+    for command in ["apply", "deploy", "reconcile"] {
+        let previewed = dbd(taker.path(), &url, &[command, "--dry-run", "--adopt-from", "clilive"]);
+        let out = combined(&previewed);
+        assert!(previewed.status.success(), "{command}: {out}");
+        assert!(
+            out.contains("[dry-run] would adopt relation app.widgets from \"clilive\""),
+            "{command}: {out}"
+        );
+    }
+    let reconciled = dbd(taker.path(), &url, &["reconcile", "--adopt-from", "clilive"]);
+    let out = combined(&reconciled);
+    assert!(reconciled.status.success(), "{out}");
+    assert!(out.contains("adopting relation app.widgets from \"clilive\""), "{out}");
+}
+
+/// Under a reused owner name, `deploy`, `reconcile` and `reset` are refused,
+/// and run with `--allow-ownership-change` (#7).
+#[tokio::test]
+async fn deploy_reconcile_and_reset_take_allow_ownership_change() {
+    let (_pg, url) = start_pg().await;
+    let first = tempfile::tempdir().unwrap();
+    project(first.path());
+    let applied = dbd(first.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+
+    for (table, args) in [
+        ("gadgets", &["deploy"][..]),
+        ("sprockets", &["reconcile"]),
+        ("cogs", &["reset", "--force"]),
+    ] {
+        let reuser = tempfile::tempdir().unwrap();
+        std::fs::write(
+            reuser.path().join("design.yaml"),
+            "project:\n  name: clilive\n  version: 1\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(reuser.path().join("ddl/table/app")).unwrap();
+        std::fs::write(
+            reuser.path().join(format!("ddl/table/app/{table}.ddl")),
+            format!("create table if not exists app.{table} (id integer primary key);\n"),
+        )
+        .unwrap();
+        let refused = dbd(reuser.path(), &url, args);
+        let out = combined(&refused);
+        assert!(
+            !refused.status.success() && out.contains("this design declares none of them"),
+            "{args:?}: {out}"
+        );
+        let allowed = dbd(reuser.path(), &url, &[args, &["--allow-ownership-change"]].concat());
+        assert!(allowed.status.success(), "{args:?}: {}", combined(&allowed));
+    }
+}
+
+/// `init --from-db` in a database another project manages onboards a second
+/// project: it refused on any bookkeeping, and had it not, it took the first
+/// project's entities as the second's. What another project owns is left out,
+/// and named (#7, H9).
+#[tokio::test]
+async fn init_from_db_onboards_a_second_project_without_the_firsts_entities() {
+    let (_pg, url) = start_pg().await;
+    let first = tempfile::tempdir().unwrap();
+    project(first.path());
+    std::fs::create_dir_all(first.path().join("ddl/function/app")).unwrap();
+    std::fs::write(
+        first.path().join("ddl/function/app/total.ddl"),
+        "create or replace function app.total() returns int language sql as $$ select 1 $$;\n",
+    )
+    .unwrap();
+    assert!(dbd(first.path(), &url, &["apply"]).status.success());
+    dbd_core::connect(&url, "setup")
+        .await
+        .unwrap()
+        .execute_script("CREATE TABLE app.loose (id int PRIMARY KEY);")
+        .await
+        .unwrap();
+
+    let second = tempfile::tempdir().unwrap();
+    let o = Command::cargo_bin("dbd")
+        .unwrap()
+        .args(["init", "--from-db", "-d", &url, "--name", "second"])
+        .current_dir(second.path())
+        .output()
+        .expect("dbd failed to run");
+    let said = combined(&o);
+    assert!(o.status.success(), "{said}");
+    assert!(second.path().join("ddl/table/app/loose.ddl").exists(), "{said}");
+    assert!(!second.path().join("ddl/table/app/widgets.ddl").exists(), "{said}");
+    assert!(!second.path().join("ddl/view/app/named.ddl").exists(), "{said}");
+    assert!(!second.path().join("ddl/function/app/total.ddl").exists(), "{said}");
+    assert!(
+        said.contains("relation app.widgets") && said.contains("\"clilive\""),
+        "{said}"
+    );
+    assert!(said.contains("routine app.total (\"clilive\")"), "{said}");
+}
+
+/// What the second project references of the first's — a foreign key's
+/// table, a view's — is declared `external:`, so the references resolve; it
+/// was neither captured nor declared (#7).
+#[tokio::test]
+async fn init_from_db_declares_external_what_it_references_of_another_projects() {
+    let (_pg, url) = start_pg().await;
+    let first = tempfile::tempdir().unwrap();
+    project(first.path());
+    assert!(dbd(first.path(), &url, &["apply"]).status.success());
+    dbd_core::connect(&url, "setup")
+        .await
+        .unwrap()
+        .execute_script(
+            "CREATE TABLE app.parts (id int PRIMARY KEY, widget_id int REFERENCES app.widgets (id)); \
+             CREATE VIEW app.part_names AS SELECT p.id, n.name FROM app.parts p JOIN app.named n ON n.id = p.widget_id;",
+        )
+        .await
+        .unwrap();
+
+    let second = tempfile::tempdir().unwrap();
+    let o = Command::cargo_bin("dbd")
+        .unwrap()
+        .args(["init", "--from-db", "-d", &url, "--name", "second"])
+        .current_dir(second.path())
+        .output()
+        .expect("dbd failed to run");
+    let said = combined(&o);
+    assert!(o.status.success(), "{said}");
+    let config = dbd_core::config::read(&second.path().join("design.yaml")).unwrap();
+    let externals: Vec<&str> = config.external.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        externals.contains(&"app.widgets") && externals.contains(&"app.named"),
+        "{externals:?}\n{said}"
+    );
+}
+
+/// While a project the database records keeps no record of what it owns, its
+/// entities cannot be told from nobody's: `init --from-db` is refused, naming
+/// it (#7).
+#[tokio::test]
+async fn init_from_db_is_refused_while_a_project_here_records_no_uses() {
+    let (_pg, url) = start_pg().await;
+    let first = tempfile::tempdir().unwrap();
+    project(first.path());
+    assert!(dbd(first.path(), &url, &["apply"]).status.success());
+    dbd_core::connect(&url, "setup")
+        .await
+        .unwrap()
+        .execute_script("INSERT INTO dbd.meta (project, env, version) VALUES ('oldie', 'prod', 1);")
+        .await
+        .unwrap();
+
+    let second = tempfile::tempdir().unwrap();
+    let o = Command::cargo_bin("dbd")
+        .unwrap()
+        .args(["init", "--from-db", "-d", &url, "--name", "second"])
+        .current_dir(second.path())
+        .output()
+        .expect("dbd failed to run");
+    let said = combined(&o);
+    assert!(!o.status.success(), "{said}");
+    assert!(said.contains("\"oldie\""), "{said}");
+    assert!(!second.path().join("design.yaml").exists(), "{said}");
+}
+
+/// `merge` read every schema, and took another project's entities into this
+/// one. What another project owns is left out, and named (#7, H9).
+#[tokio::test]
+async fn merge_leaves_out_what_another_project_owns() {
+    let (_pg, url) = start_pg().await;
+    let first = tempfile::tempdir().unwrap();
+    project(first.path());
+    assert!(dbd(first.path(), &url, &["apply"]).status.success());
+
+    let second = tempfile::tempdir().unwrap();
+    std::fs::write(
+        second.path().join("design.yaml"),
+        "project:\n  name: second\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(second.path().join("ddl/table/app")).unwrap();
+    std::fs::write(
+        second.path().join("ddl/table/app/gadgets.ddl"),
+        "create table if not exists app.gadgets (id integer primary key);\n",
+    )
+    .unwrap();
+    let applied = dbd(second.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+
+    let merged = dbd(second.path(), &url, &["merge"]);
+    let said = combined(&merged);
+    assert!(merged.status.success(), "{said}");
+    assert!(second.path().join("ddl/table/app/gadgets.ddl").exists(), "{said}");
+    assert!(!second.path().join("ddl/table/app/widgets.ddl").exists(), "{said}");
+    assert!(
+        said.contains("relation app.widgets") && said.contains("\"clilive\""),
+        "{said}"
+    );
+    // Its own is no other project's, nor an orphan.
+    assert!(!said.contains("app.gadgets (\"second\")"), "{said}");
+    assert!(
+        !said.contains("orphan (no DB entity): ddl/table/app/gadgets.ddl"),
+        "{said}"
+    );
+}
+
+/// A file of the project's for an entity another project owns is no orphan:
+/// the entity is there, and `merge` says whose it is (#7).
+#[tokio::test]
+async fn merge_names_the_owner_of_what_it_left_out_that_the_project_has_a_file_for() {
+    let (_pg, url) = start_pg().await;
+    let first = tempfile::tempdir().unwrap();
+    project(first.path());
+    assert!(dbd(first.path(), &url, &["apply"]).status.success());
+    let second = tempfile::tempdir().unwrap();
+    std::fs::write(
+        second.path().join("design.yaml"),
+        "project:\n  name: second\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(second.path().join("ddl/table/app")).unwrap();
+    std::fs::copy(
+        first.path().join("ddl/table/app/widgets.ddl"),
+        second.path().join("ddl/table/app/widgets.ddl"),
+    )
+    .unwrap();
+
+    let merged = dbd(second.path(), &url, &["merge", "--dry-run"]);
+    let said = combined(&merged);
+    assert!(merged.status.success(), "{said}");
+    assert!(
+        !said.contains("orphan (no DB entity): ddl/table/app/widgets.ddl"),
+        "{said}"
+    );
+    assert!(
+        said.contains("ddl/table/app/widgets.ddl") && said.contains("owned by \"clilive\""),
+        "{said}"
+    );
+}
+
+/// `inspect --shared` reports what shares the database, and exits non-zero
+/// over a conflict of this design's (#7).
+#[tokio::test]
+async fn inspect_shared_reports_the_projects_and_fails_on_a_conflict() {
+    let (_pg, url) = start_pg().await;
+    let first = tempfile::tempdir().unwrap();
+    project(first.path());
+    assert!(dbd(first.path(), &url, &["apply"]).status.success());
+
+    let clean = dbd(first.path(), &url, &["inspect", "--shared"]);
+    let said = combined(&clean);
+    assert!(clean.status.success(), "{said}");
+    assert!(
+        said.contains("clilive") && said.contains("relation app.widgets"),
+        "{said}"
+    );
+
+    let taker = tempfile::tempdir().unwrap();
+    std::fs::write(
+        taker.path().join("design.yaml"),
+        "project:\n  name: taker\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(taker.path().join("ddl/table/app")).unwrap();
+    std::fs::copy(
+        first.path().join("ddl/table/app/widgets.ddl"),
+        taker.path().join("ddl/table/app/widgets.ddl"),
+    )
+    .unwrap();
+    let conflicted = dbd(taker.path(), &url, &["inspect", "--shared"]);
+    let said = combined(&conflicted);
+    assert!(!conflicted.status.success(), "{said}");
+    assert!(said.contains("relation app.widgets is owned by \"clilive\""), "{said}");
 }

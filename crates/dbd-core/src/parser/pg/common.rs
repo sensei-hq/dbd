@@ -219,6 +219,47 @@ pub(crate) fn nextval_sequence(expr: &pg_query::protobuf::Node) -> Option<String
     }
 }
 
+/// The name a `regclass` string names, as Postgres reads one — `nextval`'s
+/// argument: dot-separated parts, whitespace around each skipped, each
+/// double-quoted as written (`""` a quote) or folded to lower case. `None`
+/// for a string that is not a name — a number is an OID.
+pub(crate) fn regclass_name(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let space = |c: &char| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c');
+    let mut parts: Vec<String> = Vec::new();
+    let mut chars = text.chars().peekable();
+    loop {
+        while chars.next_if(space).is_some() {}
+        let mut part = String::new();
+        if chars.next_if_eq(&'"').is_some() {
+            loop {
+                match chars.next()? {
+                    '"' if chars.next_if_eq(&'"').is_some() => part.push('"'),
+                    '"' => break,
+                    c => part.push(c),
+                }
+            }
+        } else {
+            while let Some(c) = chars.next_if(|c| *c != '.' && !space(c)) {
+                part.push(c.to_ascii_lowercase());
+            }
+        }
+        if part.is_empty() {
+            return None;
+        }
+        parts.push(part);
+        while chars.next_if(space).is_some() {}
+        match chars.next() {
+            None => return Some(parts.join(".")),
+            Some('.') => {}
+            Some(_) => return None,
+        }
+    }
+}
+
 /// [`nextval_sequence`] for an expression held as text — a column default as
 /// the parser rendered it or as introspection reported it.
 pub(crate) fn nextval_sequence_of(expr: &str) -> Option<String> {
@@ -326,7 +367,7 @@ pub(in crate::parser) fn extract_proc_refs_via_pg_query(
 
 /// Recursively collect every embedded SQL `query` string from a parsed PL/pgSQL
 /// JSON tree (libpg_query stores each statement's SQL under a `"query"` key).
-fn collect_plpgsql_queries(value: &serde_json::Value, out: &mut Vec<String>) {
+pub(in crate::parser) fn collect_plpgsql_queries(value: &serde_json::Value, out: &mut Vec<String>) {
     match value {
         serde_json::Value::Object(map) => {
             for (key, val) in map {
@@ -426,5 +467,20 @@ mod tests {
     fn pg_query_enum_fallback_is_empty_when_no_enum_is_declared() {
         assert!(extract_enum_values_via_pg_query("do $$ begin perform 1; end $$;").is_empty());
         assert!(extract_enum_values_via_pg_query("NOT SQL AT ALL ;;;").is_empty());
+    }
+
+    /// As Postgres's `regclass` input reads a name: whitespace around each
+    /// part is skipped, quoted parts are kept as written, the rest folded; a
+    /// number is an OID, not a name (#7).
+    #[test]
+    fn a_regclass_string_is_read_as_postgres_reads_it() {
+        assert_eq!(regclass_name("App.Order_No").as_deref(), Some("app.order_no"));
+        assert_eq!(regclass_name("\"app\" . \"order_no\"").as_deref(), Some("app.order_no"));
+        assert_eq!(regclass_name("app. \"Seq\"").as_deref(), Some("app.Seq"));
+        assert_eq!(regclass_name(" app . seq ").as_deref(), Some("app.seq"));
+        assert_eq!(regclass_name("\"a\"\"b\"").as_deref(), Some("a\"b"));
+        assert_eq!(regclass_name("12345"), None);
+        assert_eq!(regclass_name("app..seq"), None);
+        assert_eq!(regclass_name("app.seq."), None);
     }
 }

@@ -183,8 +183,8 @@ What a scope does not narrow:
   and views it drops go first, with them, so one calling an in-scope function
   does not refuse it.
 - **pg_cron refresh jobs.** A scoped apply syncs the jobs of every materialized
-  view in the design, because the sync unschedules any `dbd:refresh:` job
-  missing from the set it is given. A scope whose `extensions:` allowlist
+  view in the design, because the sync unschedules any of the project's
+  `dbd:refresh:` jobs missing from the set it is given. A scope whose `extensions:` allowlist
   leaves out `pg_cron` therefore fails when a materialized view outside it has
   a schedule.
 - `dbd import -n <table> -f <file>` into a table the design does not declare —

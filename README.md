@@ -151,6 +151,15 @@ Where `apply` can write. See the table above for what dbd can *read*.
   Whole-deployment export remains the Convex CLI's job (`npx convex export`)
   because the CLI doesn't expose per-table dumps.
 
+## Sharing a database
+
+Several projects can deploy into one database. Each entity has one owner — the
+project whose design declares it — and no run changes or drops another
+project's: declaring one is refused, `reconcile --prune` leaves it alone, and a
+drop another project depends on is refused, naming the use. Move an entity with
+`--adopt-from <owner>`, and see what shares a database with
+`dbd inspect --shared`. See [sharing a database](docs/guide/14-sharing-a-database.md).
+
 ## Offline reference cache
 
 After `dbd inspect --from-db`, dbd writes a snapshot of all user-defined
@@ -304,9 +313,13 @@ materialized_views:
 ```
 
 On `apply`, dbd syncs one pg_cron job per scheduled matview, named
-`dbd:refresh:<schema>.<name>`, running `REFRESH MATERIALIZED VIEW
-[CONCURRENTLY] …`. dbd only ever touches jobs with that reserved prefix —
-hand-authored cron jobs are left alone. A matview with no resolved schedule
+`dbd-refresh:<project>:<schema>.<name>`, running `REFRESH MATERIALIZED VIEW
+[CONCURRENTLY] …` — at most 63 bytes, which pg_cron 1.3 and 1.4 keep, a hash
+ending a longer one. dbd only ever touches the project's own jobs with that
+reserved prefix — another project's sharing the database, and hand-authored
+cron jobs, are left alone. A job an older dbd named
+`dbd:refresh:<schema>.<name>` is replaced for a matview the project declares,
+and unscheduled when the view it refreshes no longer exists. A matview with no resolved schedule
 gets no job; refresh it on demand with `dbd refresh`.
 
 `dbd inspect` validates the config offline: scheduling requires `pg_cron` in
@@ -329,7 +342,7 @@ left to you (drop + recreate, or the snapshot/migrate workflow).
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.25.1
+  rev: v0.26.0
   hooks:
     - id: dbd-format
 ```
@@ -386,6 +399,7 @@ See [Embedding dbd-core](docs/guide/12-embedding.md) for the whole API.
 - [The schema viewer](docs/guide/11-schema-viewer.md)
 - [Embedding dbd-core](docs/guide/12-embedding.md)
 - [Other dialects](docs/guide/13-other-dialects.md)
+- [Sharing a database](docs/guide/14-sharing-a-database.md)
 - [Changelog](CHANGELOG.md)
 - [Design document](docs/design/architecture.md)
 

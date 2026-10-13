@@ -15,6 +15,8 @@ pub(crate) struct ResetOptions {
     pub drop_schemas: bool,
     pub drop_extensions: bool,
     pub allow_scope_change: bool,
+    /// `--allow-ownership-change` (#7).
+    pub allow_ownership_change: bool,
 }
 
 /// The targets `reset` has a script for — what `--target` accepts.
@@ -100,8 +102,10 @@ pub async fn cmd_reset(
         drop_schemas,
         drop_extensions,
         allow_scope_change,
+        allow_ownership_change,
     } = opts;
-    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
+    let design = super::OwnershipChange::new(None, allow_ownership_change)
+        .applied_to(Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?);
     let resolved = design.resolve_scope(scope, deps)?;
     let (kept, total) = design.scope_counts(&resolved)?;
     output::scope_filtered(&resolved, kept, total);
@@ -119,24 +123,26 @@ pub async fn cmd_reset(
         // A preview of a reset the real run would refuse is a false promise, so
         // with a database to ask, ask it first. With none configured the plan
         // is all there is to show, and the dry run stays database-free.
-        // The roles the real run keeps are asked of the same database, so the
-        // preview does not list a `DROP ROLE` the run will not perform.
-        let mut kept = Vec::new();
-        if let Some(adapter) = super::dry_run_adapter(config, database_url).await? {
-            check_reset_guards(&*adapter, &design, &resolved, force, allow_scope_change).await?;
-            kept = design.roles_kept_by_reset(&*adapter, target, Some(&resolved)).await?;
-        }
-        let keep: Vec<String> = kept.iter().map(|k| k.role.clone()).collect();
-        let sql = design
-            .reset_script_keeping(target, drop_schemas, drop_extensions, Some(&resolved), &keep)?
-            .unwrap_or_else(|| "-- nothing to drop".to_string());
-        output::info(verbosity, "[dry-run] Reset would run:");
-        output::always(&sql);
-        let preview = dbd_core::ResetComplete {
-            roles_kept: kept,
-            ..Default::default()
+        // What the real run keeps — the roles another database holds, and what
+        // other projects in this one have or use (#7) — is asked of the same
+        // database, so the preview lists no drop the run will not perform.
+        let (sql, preview) = match super::dry_run_adapter(config, database_url).await? {
+            Some(adapter) => {
+                check_reset_guards(&*adapter, &design, &resolved, force, allow_scope_change).await?;
+                // The real reset claims the design's entities first (#7).
+                design.check_ownership(&*adapter).await?;
+                design
+                    .reset_preview(&*adapter, target, force, drop_schemas, drop_extensions, Some(&resolved))
+                    .await?
+            }
+            None => (
+                design.reset_script(target, drop_schemas, drop_extensions, Some(&resolved))?,
+                dbd_core::ResetComplete::default(),
+            ),
         };
-        for line in kept_role_lines(&preview) {
+        output::info(verbosity, "[dry-run] Reset would run:");
+        output::always(&sql.unwrap_or_else(|| "-- nothing to drop".to_string()));
+        for line in kept_lines(&preview) {
             output::info(verbosity, &format!("[dry-run] {line}"));
         }
         return Ok(());
@@ -168,7 +174,7 @@ pub(crate) fn format_reset_summary(summary: &dbd_core::ResetComplete) -> Vec<Str
     use dbd_core::EntityType;
     if summary.dropped.is_empty() {
         let mut lines = vec!["Reset dropped nothing — none of the project's objects were in the database.".to_string()];
-        lines.extend(kept_role_lines(summary));
+        lines.extend(kept_lines(summary));
         return lines;
     }
     let counted = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
@@ -203,12 +209,14 @@ pub(crate) fn format_reset_summary(summary: &dbd_core::ResetComplete) -> Vec<Str
         ));
     }
     let mut lines = vec![format!("Reset dropped {}.", parts.join(", "))];
-    lines.extend(kept_role_lines(summary));
+    lines.extend(kept_lines(summary));
     lines
 }
 
-/// One line per role the reset kept: which, and the databases that hold it.
-fn kept_role_lines(summary: &dbd_core::ResetComplete) -> Vec<String> {
+/// One line per role the reset kept for another database — which, and the
+/// databases that hold it — then one per thing it kept for another project in
+/// this one (#7).
+fn kept_lines(summary: &dbd_core::ResetComplete) -> Vec<String> {
     summary
         .roles_kept
         .iter()
@@ -220,6 +228,7 @@ fn kept_role_lines(summary: &dbd_core::ResetComplete) -> Vec<String> {
                 k.databases.join(", ")
             )
         })
+        .chain(summary.kept.iter().map(|note| format!("{note}.")))
         .collect()
 }
 
@@ -262,9 +271,7 @@ pub(crate) async fn check_reset_guards(
 ) -> Result<()> {
     let marks = design.database_marks(adapter).await?;
     Design::check_scope_guard(&marks, &resolved.name, force || allow_scope_change)?;
-    if !force {
-        design.check_reset_guard(&marks)?;
-    }
+    design.check_reset_run_guards(adapter, &marks, force).await?;
     Ok(())
 }
 
@@ -453,6 +460,20 @@ mod tests {
     use super::*;
     use crate::commands::testutil;
 
+    /// What a reset kept for another project is named after what it dropped,
+    /// so a schema it left standing is not taken for one it forgot (#7).
+    #[test]
+    fn a_reset_summary_names_what_it_kept_for_another_project() {
+        let note = "schema app kept: it holds table app.invoices (\"billing\")";
+        let summary = dbd_core::ResetComplete {
+            dropped: vec![(dbd_core::EntityType::Table, "app.orders".to_string())],
+            kept: vec![note.to_string()],
+            ..Default::default()
+        };
+        let lines = format_reset_summary(&summary);
+        assert_eq!(lines, ["Reset dropped 1 table.".to_string(), format!("{note}.")]);
+    }
+
     /// An empty project has no snapshots — the listing takes the early return.
     #[test]
     fn snapshot_list_empty_dir_is_noop() {
@@ -536,6 +557,7 @@ mod tests {
                 drop_schemas: false,
                 drop_extensions: false,
                 allow_scope_change: false,
+                allow_ownership_change: false,
             },
             None,
             None,
@@ -578,6 +600,7 @@ mod tests {
                 drop_schemas: false,
                 drop_extensions: false,
                 allow_scope_change: false,
+                allow_ownership_change: false,
             },
             None,
             None,

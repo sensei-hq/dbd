@@ -87,10 +87,17 @@ impl Design {
     /// design: read-only, and read before any heal, under either bookkeeping
     /// layout. Another project's record is read only when this project has
     /// none, and counts only when the database holds any of this design's
-    /// tables, views, materialized views, enums or sequences.
+    /// tables, views, materialized views, enums or sequences — not those it
+    /// adopts.
     pub async fn database_marks(&self, adapter: &dyn DatabaseAdapter) -> Result<DatabaseMarks> {
         let mut marks = DatabaseMarks::of_own(&self.config.project.name, adapter.get_project_meta().await?);
         if marks.own.is_some() {
+            return Ok(marks);
+        }
+        // Claims under this project's name are its own: it has run here, and
+        // is no project renamed from another — one that adopted, then failed
+        // before it wrote its record, included (#7).
+        if !adapter.owned_objects(self.owner()).await?.is_empty() {
             return Ok(marks);
         }
         let others = adapter.other_projects_meta().await?;
@@ -102,11 +109,29 @@ impl Design {
 
     /// Whether the database holds any of this design's own objects — the
     /// kinds a project alone creates, not the schemas, extensions and roles
-    /// two projects may share, nor what it declares `external:`.
+    /// two projects may share, nor what it declares `external:`. What it
+    /// adopts is known to be another project's, so is no sign of a rename
+    /// (#7).
     async fn database_holds_objects(&self, adapter: &dyn DatabaseAdapter) -> Result<bool> {
+        let adopted: std::collections::HashSet<(String, String, String)> = self
+            .adoptions(adapter)
+            .await?
+            .into_iter()
+            .map(|h| (h.object.namespace, h.object.schema, h.object.name))
+            .collect();
+        let adopting: std::collections::HashSet<&str> = self
+            .entity_keys()
+            .into_iter()
+            .filter(|(_, keys)| {
+                keys.iter()
+                    .any(|k| adopted.contains(&(k.namespace.clone(), k.schema.clone(), k.name.clone())))
+            })
+            .map(|(e, _)| e.name.as_str())
+            .collect();
         let objects: Vec<(EntityType, String)> = self
             .entities
             .iter()
+            .filter(|e| !adopting.contains(e.name.as_str()))
             .filter(|e| {
                 matches!(
                     e.entity_type,

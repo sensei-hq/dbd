@@ -77,6 +77,21 @@ impl Design {
         Self::check_env_guard(marks, &self.env)?;
         Self::check_version_guard(marks, self.config.project.version.unwrap_or(0))
     }
+
+    /// The guards [`Self::apply`] checks before it runs anything, as it checks
+    /// them (#7): first a design reusing an owner's name, refused unless
+    /// [`Self::allowing_ownership_change`] — named before the guards, which
+    /// read the record the name keys, the previous design's. Then
+    /// [`Self::check_apply_guards`], except that a reuse allowed passes the
+    /// version guard: the version recorded is the previous design's history,
+    /// not this one's. The environment guard holds either way.
+    pub async fn check_run_guards(&self, adapter: &dyn DatabaseAdapter, marks: &DatabaseMarks) -> Result<()> {
+        if self.reuses_owner_name(adapter).await? {
+            Self::check_env_guard(marks, &self.env)
+        } else {
+            self.check_apply_guards(marks)
+        }
+    }
 }
 
 #[cfg(test)]

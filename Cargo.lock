@@ -527,7 +527,7 @@ dependencies = [
 
 [[package]]
 name = "dbd-cli"
-version = "0.25.1"
+version = "0.26.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -546,7 +546,7 @@ dependencies = [
 
 [[package]]
 name = "dbd-core"
-version = "0.25.1"
+version = "0.26.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2152,9 +2152,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.17"
+version = "0.11.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04759210543be93709136e28212294a659ef5001836ff4eab4d663e4529bba83"
+checksum = "0e750cca55fe4f0439a15d0bb529da9651e79993e8e72c61a899a36d462befbe"
 dependencies = [
  "bytes",
  "getrandom 0.4.3",

@@ -74,6 +74,55 @@ pub(crate) fn parse_proc(mut entity: Entity, sql: &str) -> Result<Entity> {
     Ok(finish(entity, reads, writes, functions))
 }
 
+/// Each routine `sql` creates, with what its body refers to — read as a
+/// routine file's body is, on `schema_path` — as `(schema, name, refs)`: the
+/// schema `None` where the statement leaves it to the search path. For a
+/// routine in a file that is not a routine's own — a table's trigger function
+/// — whose uses are its own (#7).
+pub(crate) fn routine_body_refs(
+    sql: &str,
+    schema_path: &crate::entity::SchemaPath,
+) -> Vec<(Option<String>, String, Vec<crate::entity::Ref>)> {
+    let Ok(parsed) = pg_query::parse(sql) else {
+        return Vec::new();
+    };
+    let mut routines = Vec::new();
+    for raw in &parsed.protobuf.stmts {
+        let Some(pg_query::NodeEnum::CreateFunctionStmt(create)) = raw.stmt.as_ref().and_then(|s| s.node.as_ref())
+        else {
+            continue;
+        };
+        let parts: Vec<String> = create
+            .funcname
+            .iter()
+            .filter_map(|n| match n.node.as_ref() {
+                Some(pg_query::NodeEnum::String(s)) => Some(s.sval.clone()),
+                _ => None,
+            })
+            .collect();
+        let (schema, name) = match parts.as_slice() {
+            [name] => (None, name.clone()),
+            [.., schema, name] => (Some(schema.clone()), name.clone()),
+            [] => continue,
+        };
+        let start = (raw.stmt_location as usize).min(sql.len());
+        let end = if raw.stmt_len == 0 {
+            sql.len()
+        } else {
+            (start + raw.stmt_len as usize).min(sql.len())
+        };
+        let Some(text) = sql.get(start..end) else {
+            continue;
+        };
+        let mut routine = Entity::new(crate::entity::EntityType::Function, &name);
+        routine.schema_path = schema_path.clone();
+        if let Ok(read) = parse_proc(routine, text) {
+            routines.push((schema, name, read.refs));
+        }
+    }
+    routines
+}
+
 /// Fill the entity's reference fields.
 ///
 /// Mirrors `parser::apply_proc_refs`: reads and writes become hard references,

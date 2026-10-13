@@ -55,7 +55,7 @@ pub mod sql_expr;
 pub mod sql_quote;
 
 pub use adapter::DatabaseAdapter;
-pub use design::{ApplyComplete, ApplyStrategy, DeployComplete, Design, ImportComplete, ResetComplete};
+pub use design::{ApplyComplete, ApplyStrategy, DeployComplete, Design, ImportComplete, Prune, ResetComplete};
 pub use entity::{Entity, EntityType};
 pub use error::{DbdError, Result};
 pub use project::{ProjectSurvey, survey};

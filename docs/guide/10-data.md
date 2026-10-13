@@ -32,7 +32,8 @@ so is anything outside `import/`: data under `data/` or `seeds/` is never
 scanned.
 
 On PostgreSQL, CSV and TSV stream through `COPY`. JSON and JSON Lines records
-are staged one at a time as bound `json` values in `dbd.import_tmp` and moved
+are staged one at a time as bound `json` values in the project's own
+`dbd."import_tmp:<project>"` (a name past 63 bytes ends in a hash) and moved
 into the table by `dbd.import_jsonb_to_table` — a procedure the load installs
 itself, in dbd's own `dbd` schema beside the bookkeeping, so a JSON import works
 on a database no import has touched and creates no schema your design does not

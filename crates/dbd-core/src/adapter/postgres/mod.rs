@@ -42,14 +42,37 @@ fn pg_conf_action(code: &str) -> Option<crate::entity::FkAction> {
 /// `dbd` is excluded from introspection, so the machinery stays out of both.
 const JSONB_IMPORT_SCHEMA: &str = "dbd";
 
-/// Fully-qualified, dbd-owned staging table that jsonl rows are loaded into
-/// before `import_jsonb_to_table` moves them to the target. Schema-qualified so
-/// it resolves regardless of the session `search_path`, and in dbd's own schema
-/// so it never collides with a user table. Pooled connections don't share
-/// `search_path`, so an unqualified `_temp` resolves nondeterministically — the
-/// same failure mode fixed for `_dbd_meta` (see [`bookkeeping::Bookkeeping`]).
-/// See sensei-hq/dbd#6.
-const JSONB_IMPORT_TMP: &str = "dbd.import_tmp";
+/// Fully-qualified, dbd-owned staging table that `project`'s jsonl rows are
+/// loaded into before `import_jsonb_to_table` moves them to the target:
+/// `dbd."import_tmp:<project>"`. Schema-qualified so it resolves regardless of
+/// the session `search_path`, and in dbd's own schema so it never collides with
+/// a user table. Pooled connections don't share `search_path`, so an
+/// unqualified `_temp` resolves nondeterministically — the same failure mode
+/// fixed for `_dbd_meta` (see [`bookkeeping::Bookkeeping`]). See sensei-hq/dbd#6.
+///
+/// One per project: each load drops and recreates its table, and a single
+/// shared one let two projects importing at once empty each other's (#7, H7).
+/// A name past Postgres's 63-byte limit, which Postgres would cut short —
+/// merging two long names that share a start — keeps what fits of the
+/// project's name and ends in a hash of all of it. Imports run through the
+/// pool, so a `TEMP` table, which lives on one connection, cannot serve.
+fn jsonb_import_tmp(project: &str) -> String {
+    use sha2::{Digest, Sha256};
+    const MAX_IDENTIFIER: usize = 63;
+    const HASH_HEX: usize = 16;
+    let full = format!("import_tmp:{project}");
+    let name = if full.len() <= MAX_IDENTIFIER {
+        full
+    } else {
+        let hash = format!("{:x}", Sha256::digest(project.as_bytes()));
+        let mut cut = MAX_IDENTIFIER - "import_tmp:".len() - 1 - HASH_HEX;
+        while !project.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("import_tmp:{}:{}", &project[..cut], &hash[..HASH_HEX])
+    };
+    format!("{JSONB_IMPORT_SCHEMA}.\"{}\"", name.replace('"', "\"\""))
+}
 
 /// One column of a table or view, as [`PostgresAdapter::column_kinds`] reads it.
 struct ColumnKind {
@@ -60,21 +83,24 @@ struct ColumnKind {
     generated: bool,
 }
 
-/// `CALL` that moves staged rows into `target` via the internal import
-/// procedure. Both the procedure schema and the source table are pinned and
-/// fully-qualified so resolution never depends on the session `search_path`.
-/// `target` must be the schema-qualified destination table.
-fn jsonb_import_call_sql(target: &str) -> String {
+/// `CALL` that moves the rows staged in `source` ([`jsonb_import_tmp`]) into
+/// `target` via the internal import procedure. Both the procedure schema and
+/// the source table are pinned and fully-qualified so resolution never depends
+/// on the session `search_path`. `target` must be the schema-qualified
+/// destination table.
+fn jsonb_import_call_sql(source: &str, target: &str) -> String {
     format!(
-        "CALL {JSONB_IMPORT_SCHEMA}.import_jsonb_to_table('{JSONB_IMPORT_TMP}', '{}')",
+        "CALL {JSONB_IMPORT_SCHEMA}.import_jsonb_to_table('{}', '{}')",
+        source.replace('\'', "''"),
         target.replace('\'', "''")
     )
 }
 
 // ── pg_cron refresh-job planning (pure, unit-tested) ──────────────────────────
 //
-// dbd owns the set of `dbd:refresh:<schema>.<name>` cron jobs that refresh
-// scheduled materialized views. These free functions build the SQL and decide
+// Each project owns the `dbd:refresh:<owner>:<schema>.<name>` cron jobs that
+// refresh its scheduled materialized views — and only those, since projects may
+// share a database (#7, H4). These free functions build the SQL and decide
 // the sync plan WITHOUT a live connection, so the decision logic is fully
 // unit-testable. `sync_refresh_jobs` below wires them to a real database, guarded
 // by a pg_cron-presence check (pg_cron is optional — querying `cron.job` on a DB
@@ -89,13 +115,89 @@ fn split_qualified(qualified: &str) -> (&str, &str) {
     }
 }
 
-/// Build the `SELECT cron.schedule(...)` statement that (re)schedules a matview
-/// refresh. `cron.schedule(name, sched, cmd)` upserts by job name, so this
-/// doubles as the update path. Single quotes are escaped in every SQL literal
-/// and double quotes in the schema/name identifiers.
-fn refresh_job_sql(qualified: &str, schedule: &str, concurrently: bool) -> String {
+/// The longest job name pg_cron 1.3 and 1.4 keep: they store it as `name`,
+/// which Postgres cuts at 63 bytes — and a cut name is not the one a sync
+/// keeps, so the sync unscheduled the job it had just made. 1.5 made it `text`.
+const MAX_JOB_NAME: usize = 63;
+
+/// The longest owner part written as it is; a longer one is cut and hashed, so
+/// every prefix leaves room for the view's name.
+const MAX_JOB_OWNER: usize = 24;
+
+/// The first `hex` hex digits of the SHA-256 of `s`.
+fn short_hash(s: &str, hex: usize) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(s.as_bytes()))[..hex].to_string()
+}
+
+/// `s` cut to at most `max` bytes, at a character boundary.
+fn cut_to(s: &str, max: usize) -> &str {
+    let mut cut = max.min(s.len());
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &s[..cut]
+}
+
+/// The start of every refresh job `owner` names: `dbd-refresh:<owner>:`.
+///
+/// Not `dbd:refresh:`, which a dbd before owner-named jobs swept whole —
+/// unscheduling every such job it was not given — so a project sharing the
+/// database that has not upgraded would still take this owner's jobs (H4); and
+/// a legacy name with a `:` in its schema would read as an owner's. A `%` or
+/// `:` in the owner is percent-encoded, so the owner's part ends at the first
+/// `:` after the namespace — owner `b` cannot reach `b:c`'s jobs. An owner part
+/// past [`MAX_JOB_OWNER`] keeps its start and ends in `%%` and a hash of the
+/// whole name; an encoded owner never holds `%%`, so the two never meet.
+fn refresh_job_prefix(owner: &str) -> String {
+    let encoded = owner.replace('%', "%25").replace(':', "%3A");
+    let part = if encoded.len() <= MAX_JOB_OWNER {
+        encoded
+    } else {
+        format!("{}%%{}", cut_to(&encoded, MAX_JOB_OWNER - 10), short_hash(owner, 8))
+    };
+    format!("dbd-refresh:{part}:")
+}
+
+/// The name of `owner`'s job refreshing `qualified`, at most [`MAX_JOB_NAME`]
+/// bytes: one that would be longer keeps what fits of `qualified` and ends in
+/// `%%` and a hash of all of it.
+fn refresh_job_name(owner: &str, qualified: &str) -> String {
+    let prefix = refresh_job_prefix(owner);
+    let full = format!("{prefix}{qualified}");
+    if full.len() <= MAX_JOB_NAME {
+        return full;
+    }
+    let room = MAX_JOB_NAME - prefix.len() - 2 - 16;
+    format!("{prefix}{}%%{}", cut_to(qualified, room), short_hash(qualified, 16))
+}
+
+/// The name dbd gave `qualified`'s job before it named the owner. Whose it is
+/// the name does not say, so only an owner declaring `qualified` replaces it.
+fn legacy_refresh_job_name(qualified: &str) -> String {
+    format!("dbd:refresh:{qualified}")
+}
+
+/// A typed `text[]` literal of `items`, `ARRAY[]::text[]` when empty.
+fn text_array(items: &[String]) -> String {
+    if items.is_empty() {
+        return "ARRAY[]::text[]".to_string();
+    }
+    let items = items
+        .iter()
+        .map(|n| format!("'{}'", n.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("ARRAY[{items}]::text[]")
+}
+
+/// Build the `SELECT cron.schedule(...)` statement that (re)schedules `owner`'s
+/// matview refresh. `cron.schedule(name, sched, cmd)` upserts by job name, so
+/// this doubles as the update path. Single quotes are escaped in every SQL
+/// literal and double quotes in the schema/name identifiers.
+fn refresh_job_sql(owner: &str, qualified: &str, schedule: &str, concurrently: bool) -> String {
     let (schema, name) = split_qualified(qualified);
-    let job_name = format!("dbd:refresh:{qualified}");
+    let job_name = refresh_job_name(owner, qualified);
     let concurrent = if concurrently { "CONCURRENTLY " } else { "" };
     let command = format!(
         "REFRESH MATERIALIZED VIEW {concurrent}\"{}\".\"{}\"",
@@ -110,27 +212,58 @@ fn refresh_job_sql(qualified: &str, schedule: &str, concurrently: bool) -> Strin
     )
 }
 
-/// Build the statement that unschedules every `dbd:refresh:%` job NOT in
-/// `keep_job_names`. An empty keep list still yields valid SQL via an explicitly
-/// typed empty array (`ARRAY[]::text[]`).
-fn unschedule_stale_sql(keep_job_names: &[String]) -> String {
-    let array = if keep_job_names.is_empty() {
-        "ARRAY[]::text[]".to_string()
-    } else {
-        let items = keep_job_names
-            .iter()
-            .map(|n| format!("'{}'", n.replace('\'', "''")))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("ARRAY[{items}]")
-    };
+/// The form of the command dbd gives a refresh job, `REFRESH MATERIALIZED
+/// VIEW [CONCURRENTLY] "schema"."name"`, as a Postgres regular expression.
+const REFRESH_COMMAND: &str = r#"^REFRESH MATERIALIZED VIEW (CONCURRENTLY )?"([^"]|"")+"\."([^"]|"")+"$"#;
+
+/// Build the statement that unschedules `owner`'s refresh jobs NOT in
+/// `keep_job_names`; the legacy untagged jobs named in `legacy_job_names` —
+/// those of the matviews `owner` declares, which an owner-named job replaces;
+/// and a legacy job in dbd's own form whose view no longer exists, which
+/// nobody can want — it fails on every tick. Another owner's jobs, and a job
+/// written by hand, are never matched.
+///
+/// The owner's prefix is compared with `left`, not `LIKE`, whose `_` and `%`
+/// an owner's name may hold, and Postgres measures it as it measures the job's
+/// name: in bytes in a `SQL_ASCII` database, in characters elsewhere. Whether
+/// a view exists is read from `pg_class`, which any role may read —
+/// `to_regclass` raises for a schema the role cannot use, and one such job
+/// failed every sync. Only a named job whose command is in dbd's form is looked
+/// at, `CASE` keeping the lookup from anything else.
+///
+/// Names are compared as Postgres reads them, cut at 63 bytes
+/// (`parse_ident(…)::name`): a view named past that is the cut name, and so is
+/// the one its job's `REFRESH` reaches.
+///
+/// Every project's sync goes for the same gone jobs, and pg_cron raises when
+/// asked to unschedule one already gone, so the statement first takes a lock
+/// held to the end of its transaction: syncs take turns, and the next one's
+/// read — `READ COMMITTED`, whatever the database's default, so its snapshot
+/// follows the wait — finds the job gone. Empty lists still yield valid SQL
+/// via a typed empty array (`ARRAY[]::text[]`).
+fn unschedule_stale_sql(owner: &str, keep_job_names: &[String], legacy_job_names: &[String]) -> String {
+    let prefix = refresh_job_prefix(owner).replace('\'', "''");
     format!(
-        "SELECT cron.unschedule(jobid) FROM cron.job \
-         WHERE jobname LIKE 'dbd:refresh:%' AND jobname <> ALL({array});"
+        "SET TRANSACTION ISOLATION LEVEL READ COMMITTED; \
+         SELECT pg_advisory_xact_lock(hashtext('dbd:cron')); \
+         SELECT cron.unschedule(jobid) FROM cron.job \
+         WHERE (left(jobname, length('{prefix}')) = '{prefix}' AND jobname <> ALL({})) \
+            OR jobname = ANY({}) \
+            OR (jobname IS NOT NULL AND left(jobname, 12) = 'dbd:refresh:' \
+                AND CASE WHEN command ~ '{REFRESH_COMMAND}' THEN NOT EXISTS ( \
+                      SELECT 1 FROM pg_catalog.pg_class c \
+                      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace, \
+                      parse_ident(substring(command from '^REFRESH MATERIALIZED VIEW (?:CONCURRENTLY )?(.*)$')) \
+                        AS v(parts) \
+                      WHERE n.nspname = v.parts[1]::name AND c.relname = v.parts[2]::name) \
+                    ELSE false END);",
+        text_array(keep_job_names),
+        text_array(legacy_job_names),
     )
 }
 
-/// Decide the cron-sync plan for a set of `(qualified_name, ResolvedMatview)`.
+/// Decide `owner`'s cron-sync plan for a set of `(qualified_name, ResolvedMatview)`
+/// — every matview `owner` declares.
 ///
 /// - No scheduled matviews and no pg_cron → `Ok(vec![])` (safe no-op for DBs
 ///   without the extension).
@@ -138,8 +271,9 @@ fn unschedule_stale_sql(keep_job_names: &[String]) -> String {
 /// - pg_cron present → one `refresh_job_sql` per scheduled matview (sorted by
 ///   name for determinism) followed by ONE `unschedule_stale_sql` keeping exactly
 ///   the scheduled jobs (so a matview whose schedule was removed gets its stale
-///   dbd-owned job dropped).
-fn plan_cron_sync(jobs: &[(String, ResolvedMatview)], pg_cron_present: bool) -> Result<Vec<String>> {
+///   job dropped), and dropping the legacy untagged job of every matview in
+///   `jobs`, which a tagged one replaces.
+fn plan_cron_sync(owner: &str, jobs: &[(String, ResolvedMatview)], pg_cron_present: bool) -> Result<Vec<String>> {
     let mut scheduled: Vec<&(String, ResolvedMatview)> = jobs.iter().filter(|(_, mv)| mv.refresh.is_some()).collect();
 
     if scheduled.is_empty() && !pg_cron_present {
@@ -160,10 +294,11 @@ fn plan_cron_sync(jobs: &[(String, ResolvedMatview)], pg_cron_present: bool) -> 
     let mut keep = Vec::with_capacity(scheduled.len());
     for (name, mv) in &scheduled {
         let schedule = mv.refresh.as_deref().expect("filtered to Some above");
-        stmts.push(refresh_job_sql(name, schedule, mv.concurrently));
-        keep.push(format!("dbd:refresh:{name}"));
+        stmts.push(refresh_job_sql(owner, name, schedule, mv.concurrently));
+        keep.push(refresh_job_name(owner, name));
     }
-    stmts.push(unschedule_stale_sql(&keep));
+    let legacy: Vec<String> = jobs.iter().map(|(name, _)| legacy_refresh_job_name(name)).collect();
+    stmts.push(unschedule_stale_sql(owner, &keep, &legacy));
     Ok(stmts)
 }
 
@@ -1811,8 +1946,9 @@ impl DatabaseAdapter for PostgresAdapter {
                 // value — its spacing and key order — on the way through. Dropped
                 // and created rather than reused, so a `jsonb` table an earlier
                 // dbd left behind after a failed import is not read as this one.
+                let staging = jsonb_import_tmp(self.bookkeeping.project());
                 self.execute_script(&format!(
-                    "DROP TABLE IF EXISTS {JSONB_IMPORT_TMP}; CREATE TABLE {JSONB_IMPORT_TMP} (data json)"
+                    "DROP TABLE IF EXISTS {staging}; CREATE TABLE {staging} (data json)"
                 ))
                 .await?;
 
@@ -1821,7 +1957,7 @@ impl DatabaseAdapter for PostgresAdapter {
                 // was read as SQL (a value quoting `set search_path to …;` was
                 // once rewritten on the way in). On the pool, as the CSV `COPY`
                 // is: an import never runs inside an apply batch.
-                let insert = format!("INSERT INTO {JSONB_IMPORT_TMP} (data) VALUES ($1::json)");
+                let insert = format!("INSERT INTO {staging} (data) VALUES ($1::json)");
                 for record in records {
                     sqlx::query(&insert)
                         .bind(record)
@@ -1832,9 +1968,9 @@ impl DatabaseAdapter for PostgresAdapter {
 
                 // Move data from the temp table to the target. `entity.name` is the
                 // schema-qualified destination; the procedure always lives in `staging`.
-                self.execute_script(&jsonb_import_call_sql(&entity.name)).await?;
-                self.execute_script(&format!("DROP TABLE IF EXISTS {JSONB_IMPORT_TMP}"))
+                self.execute_script(&jsonb_import_call_sql(&staging, &entity.name))
                     .await?;
+                self.execute_script(&format!("DROP TABLE IF EXISTS {staging}")).await?;
                 self.advance_sequences(&entity.name, &loaded).await?;
             }
             _ => {
@@ -2419,8 +2555,81 @@ ORDER BY 1, 2, 4, 5"#;
         self.bookkeeping.heal().await
     }
 
+    async fn claim_objects(
+        &self,
+        owner: &str,
+        objects: &[super::OwnedObject],
+        write: bool,
+        adopt_from: Option<&str>,
+    ) -> Result<Vec<super::HeldObject>> {
+        let mut guard = self.batch.lock().await;
+        self.bookkeeping
+            .claim_objects(guard.as_mut(), owner, objects, write, adopt_from)
+            .await
+    }
+
+    async fn owned_objects(&self, owner: &str) -> Result<Vec<super::OwnedObject>> {
+        self.bookkeeping.owned_objects(owner).await
+    }
+
+    async fn registry(&self) -> Result<super::Registry> {
+        self.bookkeeping.registry().await
+    }
+
+    fn keeps_registry(&self) -> bool {
+        true
+    }
+
+    async fn record_uses(&self, owner: &str, uses: &[super::Use]) -> Result<()> {
+        let mut guard = self.batch.lock().await;
+        self.bookkeeping.record_uses(guard.as_mut(), owner, uses).await
+    }
+
+    async fn ownership(&self, owner: &str, objects: &[super::OwnedObject]) -> Result<super::Ownership> {
+        self.bookkeeping.ownership(owner, objects).await
+    }
+
+    async fn release_objects(&self, owner: &str, declared: &[super::OwnedObject]) -> Result<()> {
+        let mut guard = self.batch.lock().await;
+        self.bookkeeping.release_objects(guard.as_mut(), owner, declared).await
+    }
+
+    async fn dependents(
+        &self,
+        owner: &str,
+        guarded: &[super::Guarded],
+        mine: &[super::OwnedObject],
+    ) -> Result<Vec<super::Dependence>> {
+        self.bookkeeping.dependents(owner, guarded, mine).await
+    }
+
+    async fn users_of(&self, owner: &str, kind: &str, target: &str) -> Result<Vec<String>> {
+        self.bookkeeping.users_of(owner, kind, target).await
+    }
+
+    async fn not_owned_in_schema(
+        &self,
+        owner: &str,
+        schema: &str,
+        mine: &[super::OwnedObject],
+    ) -> Result<Vec<super::SchemaMember>> {
+        self.bookkeeping.not_owned_in_schema(owner, schema, mine).await
+    }
+
     async fn get_db_version(&self) -> Result<u32> {
         self.bookkeeping.version().await
+    }
+
+    async fn lock_writes(&self, exclusive: bool) -> Result<()> {
+        self.bookkeeping.lock_writes(exclusive).await
+    }
+
+    async fn unlock_writes(&self) -> Result<()> {
+        self.bookkeeping.unlock_writes().await
+    }
+
+    fn abandon_writes(&self) {
+        self.bookkeeping.abandon_writes()
     }
 
     async fn apply_migration(&self, version: u32, sql: &str, description: &str, checksum: &str) -> Result<()> {
@@ -2648,9 +2857,15 @@ ORDER BY 1, 2, 4, 5"#;
         // error). `plan_cron_sync` returns a no-op plan when nothing is scheduled
         // and pg_cron is absent, or errors when scheduling is requested without it.
         let present = self.pg_cron_present().await?;
-        let stmts = plan_cron_sync(jobs, present)?;
+        let stmts = plan_cron_sync(self.bookkeeping.project(), jobs, present)?;
+        // On the pool, each statement its own transaction — never an open
+        // batch's: the unschedule sets its own isolation, which only a
+        // transaction's first statement may.
         for s in stmts {
-            self.execute_script(&s).await?;
+            sqlx::raw_sql(&s)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| DbdError::Config(format!("SQL execution failed: {e}")))?;
         }
         Ok(())
     }
@@ -2713,7 +2928,7 @@ mod tests {
         // Targeted imports resolve the target to its own schema (e.g. `activity`).
         // The procedure only ever exists in `staging`, so the CALL must be pinned
         // there — not to `activity`, which has no such procedure (Defect A).
-        let sql = jsonb_import_call_sql("activity.assistant_events");
+        let sql = jsonb_import_call_sql(&jsonb_import_tmp("p"), "activity.assistant_events");
         assert!(
             sql.contains("CALL dbd.import_jsonb_to_table("),
             "CALL must target the staging procedure, got: {sql}"
@@ -2728,9 +2943,10 @@ mod tests {
     fn jsonb_call_passes_schema_qualified_source_table() {
         // The source (staging temp) table must be fully-qualified so the
         // procedure's `from <source>` resolves regardless of search_path (Defect B).
-        let sql = jsonb_import_call_sql("staging.assistant_events");
+        let staging = jsonb_import_tmp("p");
+        let sql = jsonb_import_call_sql(&staging, "staging.assistant_events");
         assert!(
-            sql.contains(&format!("'{JSONB_IMPORT_TMP}'")),
+            sql.contains(&format!("'{staging}'")),
             "source must be the qualified temp table, got: {sql}"
         );
         assert!(
@@ -2741,21 +2957,23 @@ mod tests {
 
     #[test]
     fn jsonb_temp_table_is_schema_qualified_and_dbd_namespaced() {
+        let staging = jsonb_import_tmp("p");
         assert!(
-            JSONB_IMPORT_TMP.starts_with(&format!("{JSONB_IMPORT_SCHEMA}.")),
-            "temp table must be qualified with the import schema: {JSONB_IMPORT_TMP}"
+            staging.starts_with(&format!("{JSONB_IMPORT_SCHEMA}.")),
+            "temp table must be qualified with the import schema: {staging}"
         );
         // dbd's own schema holds no user table, so nothing can be clobbered.
         assert_eq!(
             JSONB_IMPORT_SCHEMA, "dbd",
-            "temp table must be dbd-namespaced to avoid clobbering user tables: {JSONB_IMPORT_TMP}"
+            "temp table must be dbd-namespaced to avoid clobbering user tables: {staging}"
         );
     }
 
     #[test]
     fn jsonb_call_escapes_single_quotes_in_target() {
-        let sql = jsonb_import_call_sql("weird.o'brien");
+        let sql = jsonb_import_call_sql(&jsonb_import_tmp("o'proj"), "weird.o'brien");
         assert!(sql.contains("weird.o''brien"), "single quotes must be escaped: {sql}");
+        assert!(sql.contains("import_tmp:o''proj"), "and in the source: {sql}");
     }
 
     // ── pg_cron refresh-job planning ──────────────────────────────────────────
@@ -2769,8 +2987,11 @@ mod tests {
 
     #[test]
     fn refresh_job_sql_concurrent_contains_expected_parts() {
-        let sql = refresh_job_sql("analytics.daily_sales", "0 2 * * *", true);
-        assert!(sql.contains("dbd:refresh:analytics.daily_sales"), "job name: {sql}");
+        let sql = refresh_job_sql("proj", "analytics.daily_sales", "0 2 * * *", true);
+        assert!(
+            sql.contains("dbd-refresh:proj:analytics.daily_sales"),
+            "job name: {sql}"
+        );
         assert!(
             sql.contains("REFRESH MATERIALIZED VIEW CONCURRENTLY \"analytics\".\"daily_sales\""),
             "concurrent refresh command: {sql}"
@@ -2780,7 +3001,7 @@ mod tests {
 
     #[test]
     fn refresh_job_sql_non_concurrent_omits_concurrently() {
-        let sql = refresh_job_sql("analytics.x", "0 3 * * *", false);
+        let sql = refresh_job_sql("proj", "analytics.x", "0 3 * * *", false);
         assert!(
             sql.contains("REFRESH MATERIALIZED VIEW \"analytics\".\"x\""),
             "non-concurrent refresh command: {sql}"
@@ -2791,9 +3012,9 @@ mod tests {
     #[test]
     fn refresh_job_sql_escapes_single_quotes() {
         // Contrived name/schedule carrying single quotes — all literals escaped.
-        let sql = refresh_job_sql("analytics.o'brien", "0 2 * * *'; DROP", true);
+        let sql = refresh_job_sql("o'proj", "analytics.o'brien", "0 2 * * *'; DROP", true);
         assert!(
-            sql.contains("dbd:refresh:analytics.o''brien"),
+            sql.contains("dbd-refresh:o''proj:analytics.o''brien"),
             "job name escaped: {sql}"
         );
         assert!(
@@ -2805,7 +3026,7 @@ mod tests {
 
     #[test]
     fn refresh_job_sql_unqualified_falls_back_to_public() {
-        let sql = refresh_job_sql("solo", "0 0 * * *", false);
+        let sql = refresh_job_sql("proj", "solo", "0 0 * * *", false);
         assert!(
             sql.contains("\"public\".\"solo\""),
             "unqualified name uses public: {sql}"
@@ -2814,18 +3035,22 @@ mod tests {
 
     #[test]
     fn unschedule_stale_sql_with_keep_list_is_valid() {
-        let keep = vec!["dbd:refresh:a.one".to_string(), "dbd:refresh:b.two".to_string()];
-        let sql = unschedule_stale_sql(&keep);
-        assert!(sql.contains("LIKE 'dbd:refresh:%'"), "prefix filter: {sql}");
-        assert!(sql.contains("'dbd:refresh:a.one'"), "keeps a.one: {sql}");
-        assert!(sql.contains("'dbd:refresh:b.two'"), "keeps b.two: {sql}");
+        let keep = vec!["dbd-refresh:p:a.one".to_string(), "dbd-refresh:p:b.two".to_string()];
+        let sql = unschedule_stale_sql("p", &keep, &["dbd:refresh:a.one".to_string()]);
+        assert!(
+            sql.contains("left(jobname, length('dbd-refresh:p:')) = 'dbd-refresh:p:'"),
+            "owner prefix filter: {sql}"
+        );
+        assert!(sql.contains("'dbd-refresh:p:a.one'"), "keeps a.one: {sql}");
+        assert!(sql.contains("'dbd-refresh:p:b.two'"), "keeps b.two: {sql}");
         assert!(sql.contains("<> ALL(ARRAY["), "uses <> ALL(ARRAY[...]): {sql}");
+        assert!(sql.contains("= ANY(ARRAY['dbd:refresh:a.one']"), "legacy job: {sql}");
     }
 
     #[test]
     fn unschedule_stale_sql_empty_keep_list_is_valid() {
-        let sql = unschedule_stale_sql(&[]);
-        assert!(sql.contains("LIKE 'dbd:refresh:%'"), "prefix filter: {sql}");
+        let sql = unschedule_stale_sql("p", &[], &[]);
+        assert!(sql.contains("= 'dbd-refresh:p:'"), "owner prefix filter: {sql}");
         // Empty list must still produce valid SQL via a typed empty array.
         assert!(sql.contains("ARRAY[]::text[]"), "typed empty array: {sql}");
     }
@@ -2834,14 +3059,14 @@ mod tests {
     fn plan_cron_sync_empty_scheduled_no_pg_cron_is_noop() {
         // No matviews scheduled and no pg_cron → nothing to do (safe on non-cron DBs).
         let jobs = vec![("analytics.x".to_string(), mv(None, false))];
-        let plan = plan_cron_sync(&jobs, false).unwrap();
+        let plan = plan_cron_sync("proj", &jobs, false).unwrap();
         assert!(plan.is_empty(), "expected empty plan, got: {plan:?}");
     }
 
     #[test]
     fn plan_cron_sync_scheduled_without_pg_cron_errors() {
         let jobs = vec![("analytics.x".to_string(), mv(Some("0 2 * * *"), false))];
-        let err = plan_cron_sync(&jobs, false).unwrap_err();
+        let err = plan_cron_sync("proj", &jobs, false).unwrap_err();
         assert!(
             err.to_string().contains("pg_cron"),
             "error should mention pg_cron: {err}"
@@ -2857,20 +3082,20 @@ mod tests {
             ("analytics.unscheduled".to_string(), mv(None, false)),
             ("analytics.abc".to_string(), mv(Some("*/5 * * * *"), false)),
         ];
-        let plan = plan_cron_sync(&jobs, true).unwrap();
+        let plan = plan_cron_sync("proj", &jobs, true).unwrap();
 
         // 2 schedule statements + 1 unschedule statement.
         assert_eq!(plan.len(), 3, "expected 2 schedules + 1 unschedule: {plan:?}");
 
         // Sorted by name: "analytics.abc" before "analytics.daily_sales".
         assert!(
-            plan[0].contains("dbd:refresh:analytics.abc"),
+            plan[0].contains("dbd-refresh:proj:analytics.abc"),
             "first (sorted): {}",
             plan[0]
         );
         assert!(!plan[0].contains("CONCURRENTLY"), "abc is non-concurrent: {}", plan[0]);
         assert!(
-            plan[1].contains("dbd:refresh:analytics.daily_sales"),
+            plan[1].contains("dbd-refresh:proj:analytics.daily_sales"),
             "second (sorted): {}",
             plan[1]
         );
@@ -2888,17 +3113,68 @@ mod tests {
             "last is unschedule: {unschedule}"
         );
         assert!(
-            unschedule.contains("'dbd:refresh:analytics.abc'"),
+            unschedule.contains("'dbd-refresh:proj:analytics.abc'"),
             "keeps abc: {unschedule}"
         );
         assert!(
-            unschedule.contains("'dbd:refresh:analytics.daily_sales'"),
+            unschedule.contains("'dbd-refresh:proj:analytics.daily_sales'"),
             "keeps daily_sales: {unschedule}"
         );
         assert!(
-            !unschedule.contains("analytics.unscheduled"),
+            !unschedule.contains("'dbd-refresh:proj:analytics.unscheduled'"),
             "must NOT keep the unscheduled matview: {unschedule}"
         );
+        assert!(
+            unschedule.contains("'dbd:refresh:analytics.unscheduled'"),
+            "drops the legacy job of every declared matview: {unschedule}"
+        );
+    }
+
+    /// A dbd before owner-named jobs unscheduled every `dbd:refresh:%` job it
+    /// was not given, so an owner-named job inside that namespace would be
+    /// taken by any project sharing the database that has not upgraded — H4
+    /// again. And a legacy name, `dbd:refresh:<schema>.<name>`, with a `:` in
+    /// its schema would read as another owner's. Owner-named jobs live in
+    /// `dbd-refresh:`, which neither ever reaches.
+    #[test]
+    fn a_tagged_job_name_is_outside_the_namespace_an_older_dbd_sweeps() {
+        let long = "x".repeat(60);
+        for owner in ["a", "b", "b:app", long.as_str()] {
+            for view in ["app.daily", "b:app.daily", "a:b.mv"] {
+                let name = refresh_job_name(owner, view);
+                assert!(!name.starts_with("dbd:refresh:"), "{name}");
+                assert!(name.starts_with("dbd-refresh:"), "{name}");
+            }
+        }
+    }
+
+    /// Every job name fits the 63 bytes pg_cron 1.3 and 1.4 keep, and stays
+    /// distinct: two owners, or two views, never share one.
+    #[test]
+    fn a_refresh_job_name_fits_63_bytes_and_stays_distinct() {
+        let owners = [
+            "a".to_string(),
+            "customer-analytics-platform".to_string(),
+            "x".repeat(52),
+            format!("{}1", "x".repeat(52)),
+            "é".repeat(40),
+        ];
+        let views = [
+            "app.one".to_string(),
+            "analytics.daily_sales_mv".to_string(),
+            format!("app.{}", "v".repeat(70)),
+            format!("app.{}w", "v".repeat(70)),
+            format!("app.{}", "ü".repeat(40)),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for owner in &owners {
+            for view in &views {
+                let name = refresh_job_name(owner, view);
+                assert!(name.len() <= 63, "{} bytes: {name}", name.len());
+                assert!(name.starts_with(&refresh_job_prefix(owner)), "{name}");
+                assert!(seen.insert(name.clone()), "shared: {name}");
+            }
+        }
     }
 
     #[test]
@@ -2906,7 +3182,7 @@ mod tests {
         // pg_cron present, nothing scheduled → still emit the cleanup unschedule so
         // previously-scheduled dbd jobs get dropped.
         let jobs = vec![("analytics.x".to_string(), mv(None, false))];
-        let plan = plan_cron_sync(&jobs, true).unwrap();
+        let plan = plan_cron_sync("proj", &jobs, true).unwrap();
         assert_eq!(plan.len(), 1, "expected only the unschedule statement: {plan:?}");
         assert!(
             plan[0].contains("cron.unschedule"),

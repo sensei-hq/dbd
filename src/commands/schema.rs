@@ -22,6 +22,92 @@ fn warn_if_no_authored_ddl(design: &Design, project_dir: &Path) {
     }
 }
 
+/// `dbd inspect --shared`: what shares the database — each project, what it
+/// owns and uses, and which record nothing of it yet — and what would refuse
+/// this design there, exiting non-zero over any (#7).
+pub async fn cmd_inspect_shared(
+    config: &Path,
+    env: &str,
+    project_dir: &Path,
+    database_url: Option<&str>,
+) -> Result<()> {
+    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
+    let adapter = get_adapter(config, database_url).await?;
+    let shared = design.shared_database(&*adapter).await?;
+    let project = &design.config().project.name;
+    for line in format_shared_database(&shared, project) {
+        output::always(&line);
+    }
+    if !shared.conflicts.is_empty() {
+        anyhow::bail!(
+            "{} {} for project '{project}' in this database",
+            shared.conflicts.len(),
+            if shared.conflicts.len() == 1 {
+                "conflict"
+            } else {
+                "conflicts"
+            }
+        );
+    }
+    Ok(())
+}
+
+/// [`cmd_inspect_shared`]'s report, a line each.
+fn format_shared_database(shared: &dbd_core::design::SharedDatabase, project: &str) -> Vec<String> {
+    const SHOWN: usize = 10;
+    let mut lines = vec!["Projects in this database:".to_string()];
+    if shared.projects.is_empty() {
+        lines.push("  none".to_string());
+    }
+    for p in &shared.projects {
+        let record = match (&p.env, p.version) {
+            (Some(env), Some(version)) => format!(" ({env}, v{version})"),
+            _ => " (no record)".to_string(),
+        };
+        // A project the database records that records no uses has not run a
+        // dbd keeping the registry — what `init --from-db` and `merge` refuse
+        // over — whatever it holds.
+        if p.env.is_some() && !p.recording {
+            lines.push(format!(
+                "  {}{record} — records nothing of what it owns and uses: it has not run a dbd that keeps \
+                 the registry",
+                p.name
+            ));
+            if p.owns.is_empty() {
+                continue;
+            }
+        }
+        let mut owned: Vec<String> = p
+            .owns
+            .iter()
+            .take(SHOWN)
+            .map(|o| format!("{} {}.{}", o.namespace, o.schema, o.name))
+            .collect();
+        if p.owns.len() > SHOWN {
+            owned.push(format!("and {} more", p.owns.len() - SHOWN));
+        }
+        lines.push(format!(
+            "  {}{record} — owns {}: {}",
+            p.name,
+            p.owns.len(),
+            owned.join(", ")
+        ));
+        if !p.schemas.is_empty() {
+            lines.push(format!("    uses schemas: {}", p.schemas.join(", ")));
+        }
+        for u in &p.uses {
+            lines.push(format!("    uses {} through {}", u.target, u.via));
+        }
+    }
+    if shared.conflicts.is_empty() {
+        lines.push(format!("No conflicts for project '{project}'."));
+    } else {
+        lines.push(format!("Conflicts for project '{project}':"));
+        lines.extend(shared.conflicts.iter().map(|c| format!("  {c}")));
+    }
+    lines
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn cmd_inspect(
     config: &Path,
@@ -825,11 +911,13 @@ pub async fn cmd_apply(
     dry_run: bool,
     with_policies: bool,
     allow_scope_change: bool,
+    ownership: &super::OwnershipChange,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
+    let design = ownership
+        .applied_to(Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?);
     warn_if_no_authored_ddl(&design, project_dir);
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
 
@@ -856,7 +944,11 @@ pub async fn cmd_apply(
         if let Some(adapter) = &adapter {
             let marks = design.database_marks(&**adapter).await?;
             Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
-            design.check_apply_guards(&marks)?;
+            design.check_run_guards(&**adapter, &marks).await?;
+            // The real run claims the design's entities; its preview refuses
+            // what that claim would, and names what it would adopt (#7).
+            design.check_ownership(&**adapter).await?;
+            super::announce_adoptions(&design, &**adapter, true).await?;
         }
 
         // Built before anything is printed: it refuses where the run does — a
@@ -897,6 +989,7 @@ pub async fn cmd_apply(
     // pinned to (unless the operator opted in to re-point it).
     let marks = design.database_marks(&*adapter).await?;
     Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
+    super::announce_adoptions(&design, &*adapter, false).await?;
 
     // Said before the run, not in its summary: a run that fails never prints
     // one, and a skipped hook is often why it failed. Always shown, whatever
@@ -1064,6 +1157,7 @@ pub async fn cmd_refresh(
         "Refreshing another scope's materialized views would read tables this database was not built with.",
     )
     .await?;
+    design.check_ownership(&*adapter).await?;
 
     for entity in selected {
         let resolved = design.config().materialized_views.resolve(&entity.name);
@@ -1106,6 +1200,7 @@ pub async fn cmd_policies(
         // of policies the run refuses to apply promised something it won't do.
         if let Some(adapter) = super::dry_run_adapter(config, database_url).await? {
             super::check_pinned_scope(&*adapter, &design, &resolved, POLICY_CONSEQUENCE).await?;
+            design.check_ownership(&*adapter).await?;
         }
         // The real run's filter, so the preview never lists a policy the scope
         // skips — and says which ones it skips, as the real run does.
@@ -1137,6 +1232,7 @@ pub async fn cmd_policies(
     // The scope guard every other writing command runs. Policies do not re-pin
     // the database, so there is no `--allow-scope-change` to offer.
     super::check_pinned_scope(&*adapter, &design, &resolved, POLICY_CONSEQUENCE).await?;
+    design.check_ownership(&*adapter).await?;
     let report = dbd_core::design::apply_policies(
         &*adapter,
         project_dir,
@@ -1213,6 +1309,36 @@ pub fn cmd_format(config: &Path, project_dir: &Path, check: bool, verbosity: Ver
 mod tests {
     use super::*;
     use crate::commands::testutil;
+
+    /// A project the database records that keeps no record of its uses is
+    /// named so, claims or none: it is what `init --from-db` and `merge` refuse
+    /// over, and the report is where a user looks to see why (#7).
+    #[test]
+    fn the_shared_report_names_a_project_that_records_no_uses_whatever_it_holds() {
+        let shared = dbd_core::design::SharedDatabase {
+            projects: vec![dbd_core::design::SharedProject {
+                name: "legacy".to_string(),
+                env: Some("dev".to_string()),
+                version: Some(1),
+                recording: false,
+                owns: vec![dbd_core::adapter::OwnedObject {
+                    namespace: "relation".to_string(),
+                    schema: "app".to_string(),
+                    name: "things".to_string(),
+                    kind: "table".to_string(),
+                }],
+                ..Default::default()
+            }],
+            conflicts: Vec::new(),
+        };
+        let lines = format_shared_database(&shared, "newcomer");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("legacy") && l.contains("records nothing")),
+            "{lines:?}"
+        );
+    }
 
     fn hint(entity: &str, column: &str, values: &[&str]) -> dbd_core::design::EnumHint {
         dbd_core::design::EnumHint {
@@ -1717,6 +1843,7 @@ mod tests {
             /*dry_run*/ true,
             /*with_policies*/ false,
             /*allow_scope_change*/ false,
+            &crate::commands::OwnershipChange::default(),
             None,
             None,
             Verbosity::Normal,
@@ -1846,6 +1973,7 @@ mod tests {
             /*dry_run*/ true,
             /*with_policies*/ false,
             /*allow_scope_change*/ false,
+            &crate::commands::OwnershipChange::default(),
             Some("config_only"),
             None,
             Verbosity::Normal,

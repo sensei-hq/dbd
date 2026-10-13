@@ -400,6 +400,7 @@ pub async fn cmd_deploy(
     no_cache: bool,
     clear_cache: bool,
     allow_scope_change: bool,
+    ownership: &super::OwnershipChange,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
@@ -422,8 +423,10 @@ pub async fn cmd_deploy(
         anyhow::bail!("No {} found in {}", config_name.display(), project_dir.display());
     }
 
-    let mut design = Design::from_config_with_dir(&config_path, env, Some(&project_dir))
-        .context("Failed to load design from source")?;
+    let mut design = ownership.applied_to(
+        Design::from_config_with_dir(&config_path, env, Some(&project_dir))
+            .context("Failed to load design from source")?,
+    );
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
     // What the scope builds, not what the design declares: a scoped deploy
     // never touches the rest, so the whole-design tally described a run that
@@ -449,7 +452,11 @@ pub async fn cmd_deploy(
         if let Some(adapter) = &adapter {
             let marks = design.database_marks(&**adapter).await?;
             Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
-            design.check_apply_guards(&marks)?;
+            design.check_run_guards(&**adapter, &marks).await?;
+            // The real run claims the design's entities; its preview refuses
+            // what that claim would, and names what it would adopt (#7).
+            design.check_ownership(&**adapter).await?;
+            super::announce_adoptions(&design, &**adapter, true).await?;
         }
         // The migrations its apply phase executes first, built before anything
         // is printed: it refuses where the run does — an unresolved `-- TODO`
@@ -519,6 +526,7 @@ pub async fn cmd_deploy(
     let adapter = get_adapter(&config_path, database_url).await?;
     let marks = design.database_marks(&*adapter).await?;
     Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
+    super::announce_adoptions(&design, &*adapter, false).await?;
 
     // Said before the run, not in its summary: a deploy that fails never
     // prints one, and a skipped hook is often why it failed.
@@ -584,13 +592,15 @@ pub async fn cmd_reconcile(
     database_url: Option<&str>,
     dry_run: bool,
     allow_destructive: bool,
-    prune: bool,
+    prune: dbd_core::Prune,
     allow_scope_change: bool,
+    ownership: &super::OwnershipChange,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
+    let design = ownership
+        .applied_to(Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?);
 
     if design.config().project.released {
         anyhow::bail!(
@@ -649,7 +659,7 @@ pub(crate) async fn reconcile_with_adapter(
     resolved: &dbd_core::ResolvedScope,
     dry_run: bool,
     allow_destructive: bool,
-    prune: bool,
+    prune: dbd_core::Prune,
     allow_scope_change: bool,
     verbosity: Verbosity,
 ) -> Result<()> {
@@ -660,6 +670,7 @@ pub(crate) async fn reconcile_with_adapter(
     // plan alone, having no pin to read.)
     let marks = design.database_marks(adapter).await?;
     Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
+    super::announce_adoptions(design, adapter, dry_run).await?;
 
     // The hooks the run skips, said before it — a run that fails prints no
     // summary, and a skipped hook is often why it failed.
@@ -679,7 +690,7 @@ pub(crate) async fn reconcile_with_adapter(
             )
             .await
             .context("Reconcile planning failed")?;
-        print_reconcile_plan(&plan, prune, verbosity);
+        print_reconcile_plan(&plan, prune != dbd_core::Prune::Off, verbosity);
         // The run goes on to the apply hooks and the grants; a preview of it
         // that stops at the schema changes leaves them out.
         for hook in design.apply_hooks_to_run(Some(resolved))? {
@@ -726,7 +737,7 @@ pub(crate) async fn reconcile_with_adapter(
         output::always(&format!("⚠ {w}"));
     }
     // Orphaned tables left untouched (only pruned with --prune).
-    if !prune && !plan.dropped.is_empty() {
+    if prune == dbd_core::Prune::Off && !plan.dropped.is_empty() {
         output::always(&format!(
             "{} orphaned table(s) not in the design were left untouched (re-run with --prune to drop):",
             plan.dropped.len()
@@ -1070,6 +1081,7 @@ mod tests {
             /*no_cache*/ true,
             /*clear_cache*/ false,
             /*allow_scope_change*/ false,
+            &crate::commands::OwnershipChange::default(),
             None,
             None,
             Verbosity::Normal,
@@ -1095,6 +1107,7 @@ mod tests {
             /*no_cache*/ true,
             /*clear_cache*/ false,
             /*allow_scope_change*/ false,
+            &crate::commands::OwnershipChange::default(),
             None,
             None,
             Verbosity::Normal,
@@ -1204,8 +1217,9 @@ mod tests {
             None,
             /*dry_run*/ true,
             /*allow_destructive*/ false,
-            /*prune*/ false,
+            dbd_core::Prune::Off,
             /*allow_scope_change*/ false,
+            &crate::commands::OwnershipChange::default(),
             None,
             None,
             Verbosity::Normal,
@@ -1232,7 +1246,7 @@ mod tests {
             &resolved,
             /*dry_run*/ true,
             /*allow_destructive*/ false,
-            /*prune*/ false,
+            dbd_core::Prune::Off,
             /*allow_scope_change*/ false,
             Verbosity::Normal,
         )
@@ -1259,7 +1273,7 @@ mod tests {
             &resolved,
             /*dry_run*/ true,
             /*allow_destructive*/ false,
-            /*prune*/ false,
+            dbd_core::Prune::Off,
             /*allow_scope_change*/ true,
             Verbosity::Normal,
         )
@@ -1281,6 +1295,7 @@ mod tests {
             /*no_cache*/ true,
             /*clear_cache*/ true,
             /*allow_scope_change*/ false,
+            &crate::commands::OwnershipChange::default(),
             None,
             None,
             Verbosity::Normal,
@@ -1304,6 +1319,7 @@ mod tests {
             /*no_cache*/ true,
             /*clear_cache*/ false,
             /*allow_scope_change*/ false,
+            &crate::commands::OwnershipChange::default(),
             None,
             None,
             Verbosity::Normal,
@@ -1326,6 +1342,7 @@ mod tests {
             /*no_cache*/ true,
             /*clear_cache*/ false,
             /*allow_scope_change*/ false,
+            &crate::commands::OwnershipChange::default(),
             None,
             None,
             Verbosity::Normal,
@@ -1357,6 +1374,7 @@ mod tests {
             /*no_cache*/ true,
             /*clear_cache*/ false,
             /*allow_scope_change*/ false,
+            &crate::commands::OwnershipChange::default(),
             Some("incomplete_auto"),
             None,
             Verbosity::Normal,

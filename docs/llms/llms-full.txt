@@ -526,9 +526,12 @@ NOT EXISTS`); no schemas/enums/functions/sequences/roles; files are
 flat (`ddl/table/<name>.ddl`) and `design.yaml` carries `schemas: []`. (`dbd inspect` on a SQLite
 project may emit benign schema-qualification warnings; the DDL is valid and applies.)
 
-`init --from-db` **refuses** to run against a **dbd-managed** database (`dbd.meta`, or a legacy
-`_dbd_meta`, in any schema → use `dbd merge`), and refuses in a directory that already has a
-`design.yaml` (use `merge`). The
+`init --from-db` **refuses** to run against a database dbd manages **for the project it is
+creating** (its row in `dbd.meta`, or a legacy `_dbd_meta`, in any schema → use `dbd merge`), and
+refuses in a directory that already has a `design.yaml` (use `merge`). Another project's row is no
+bar: it onboards beside it, leaving out what other projects own (named) and declaring `external:`
+what it depends on of theirs — refused while a project there has not run a dbd that records what
+it owns. The
 generated `design.yaml` writes the connection as the literal `$DATABASE_URL` env reference —
 **secrets never land in the repo**.
 
@@ -536,6 +539,9 @@ generated `design.yaml` writes the connection as the literal `$DATABASE_URL` env
 
 Sync a database (or `--from-dbml <file>`) into the **current** project — same introspection and
 emitter as `init --from-db`, but never creates `design.yaml` and edits only its `project.version`.
+
+`merge` leaves out what other projects own in the database, naming each, and warns about what to
+declare `external:`.
 
 ```sh
 dbd merge postgres://user:pass@host/db   # sync into the current project
@@ -669,7 +675,13 @@ dbd inspect --verbose
 dbd inspect --fix              # auto-format DDL files in place while validating
 dbd inspect --scope hub        # report dependency gaps for a scope (exit 1 under report policy)
 dbd inspect --scope hub --fix  # format only the files the scope builds
+dbd inspect --shared -d $DATABASE_URL   # what shares the database; exit 1 over a conflict of this design's
 ```
+
+`--shared` reports each project the database records — env and version, what it owns, the schemas
+it uses and what of others' it uses — which have not run a dbd that records what they own, and
+what would refuse this design there (another project's entity, a reused owner name), exiting 1
+over any. See **Sharing a database** below.
 
 `-n` must name an entity the design has (`no entity named 'X'`) and, under `--scope`, one the
 scope builds (`X is outside scope 'S'`) — `apply`, `graph`, `export` and `refresh` refuse a `-n`
@@ -730,7 +742,14 @@ Applies all entities in dependency order. Handles pending migrations automatical
 dbd apply
 dbd apply -n config.lookups
 dbd apply --dry-run
+dbd apply --adopt-from billing       # take over what the design declares that 'billing' owns
+dbd apply --allow-ownership-change   # run as this name although its entities here are all undeclared
 ```
+
+Beside other projects, `apply` claims every entity its whole design declares and is refused —
+before its first hook, dry run included — for one another project owns
+(`relation app.orders is owned by "billing"; owners sharing a database must not declare the same
+entity`) or under an owner name whose entities it declares none of. See **Sharing a database**.
 
 Apply order is ONE dependency sort across all entity types. Each type has a band
 it is never placed before — schema, extension, role, sequence, enum, table, view,
@@ -823,7 +842,8 @@ with none configured the dry run is offline and says pending migrations cannot b
 **Refused before anything runs** (the run and, given a database, its dry run): a project
 older than the database — `version guard: the database is at v3, but this project is at v2`
 (`… records no version` for an unversioned design) — since applying it would re-apply older
-DDL over a newer schema; no override, check out a newer revision. Before 0.25 it said
+DDL over a newer schema; no override (but `--allow-ownership-change`, taking over a reused
+owner name, passes it — the version is the previous design's), check out a newer revision. Before 0.25 it said
 "Already up to date (v3)". And a `-e dev` run on a database marked prod (the environment
 guard — see Global options).
 
@@ -831,7 +851,7 @@ On a database with no recorded version that is already built (dbd applied it wit
 version, or the design's objects are there), apply records the version and says
 `vN recorded on a database that was already built but had no version`, not "Fresh install".
 
-After entities apply, `dbd apply` (and `dbd deploy`) records a `dbd:hash` drift stamp in `dbd.matview_stamps` for any materialized view it just created, and for one already in the database with no stamp whose deployed query and index keys are the design's (so a brownfield project diffs clean; one that differs stays unstamped) — the matview's own `COMMENT` stays the author's (a dbd before 0.25 kept the stamp as the comment; on upgrade the heal in the next `apply`/`deploy`/`reconcile`/`reset` copies it into `dbd.matview_stamps` before the file's own `COMMENT ON` can erase it) — and syncs pg_cron refresh jobs (`dbd:refresh:<schema>.<name>`) to match `materialized_views:` — see [dbd refresh](#dbd-refresh) and the `materialized_views` config. Matview DDL should be idempotent (`create materialized view if not exists …` + `create [unique] index if not exists …`).
+After entities apply, `dbd apply` (and `dbd deploy`) records a `dbd:hash` drift stamp in `dbd.matview_stamps` for any materialized view it just created, and for one already in the database with no stamp whose deployed query and index keys are the design's (so a brownfield project diffs clean; one that differs stays unstamped) — the matview's own `COMMENT` stays the author's (a dbd before 0.25 kept the stamp as the comment; on upgrade the heal in the next `apply`/`deploy`/`reconcile`/`reset` copies it into `dbd.matview_stamps` before the file's own `COMMENT ON` can erase it) — and syncs the project's own pg_cron refresh jobs (`dbd-refresh:<project>:<schema>.<name>`) to match `materialized_views:` — see [dbd refresh](#dbd-refresh) and the `materialized_views` config. Matview DDL should be idempotent (`create materialized view if not exists …` + `create [unique] index if not exists …`).
 
 **Scope guard.** Every successful `apply`/`deploy`/`reconcile` **pins** the database to the scope it applied, recorded in the bookkeeping table's `scope` column (`dbd.meta.scope` on Postgres/Supabase, `_dbd_meta.scope` on SQLite). A later `apply`/`deploy`/`reconcile`/`reset`/`import`/`export`/`refresh`/`policies` that requests a *different* scope than the pin is refused ("Error: Safety guard: scope guard: this database is pinned to scope 'X', but you requested 'Y'") — an exact match, so a database pinned to `all` refuses `export --scope hub` — preventing a mistyped or forgotten `--scope` from building a divergent schema or loading, reading, refreshing or securing tables the database was never given; so are `reconcile --dry-run`, and the `apply`, `deploy`, `import`, `policies` and `reset` dry runs when a database is configured. `diff` and `migrate --status`, which write nothing, note the pin instead (``note: this database is pinned to scope 'hub'; this diff compares scope 'all', so what 'hub' does not build reads as missing — `--scope hub` compares what it was built with.``). Pass `--allow-scope-change` on `apply`/`deploy`/`reconcile` to re-point the database to the new scope; on `reset` it (and `--force`) only bypasses — reset does not re-pin; `import`, `export`, `refresh` and `policies` take no bypass flag, since none re-pins (the message names the way through: the pinned scope, or `dbd apply --scope <new> --allow-scope-change` first). The guard is the CLI's: `Design::apply`/`deploy`/`reconcile`/`reset`/`import_data` and `design::apply_policies` do not check it — embedders call `Design::check_scope_guard(&marks, scope, allow)` with `Design::database_marks(adapter)`. (The environment and version guards are the library's own.) The pin read is this project's record or, after a `project.name` rename, the one its old name left — see [Safety model](#safety-model). Databases created before this feature are unpinned and pin on their next write.
 
@@ -891,8 +911,8 @@ CRLF and a BOM are handled. On PostgreSQL that is `COPY t (cols…) FROM STDIN W
 csv)` with the header taken off first. (Before 0.25 Postgres skipped the header and loaded
 by position, and SQLite split on commas and trimmed.) A `.json` file is a JSON array of
 records or JSON Lines (decided by its first character; on Convex an array only); `.jsonl`
-is JSON Lines. On PostgreSQL JSON records are staged as bound `jsonb` values in
-`dbd.import_tmp` and moved by `dbd.import_jsonb_to_table`, which the load installs itself
+is JSON Lines. On PostgreSQL JSON records are staged as bound `json` values in the project's
+own `dbd."import_tmp:<project>"` and moved by `dbd.import_jsonb_to_table`, which the load installs itself
 in dbd's own `dbd` schema — no other schema is created — so an ad-hoc JSON import works
 on a fresh database (a database an earlier dbd imported JSON into keeps a
 `staging.import_jsonb_to_table`; drop it if unused). Data files are read as UTF-8.
@@ -1069,6 +1089,7 @@ dbd deploy --scope hub -d $HUB_URL          # deploy only the hub subset
 dbd deploy --scope hub --deps include -d $HUB_URL   # auto-include dependencies
 dbd deploy --no-cache --source owner/repo/path -d $URL     # re-download this source
 dbd deploy --clear-cache --source owner/repo/path -d $URL  # wipe the whole cache first
+dbd deploy --adopt-from billing -d $URL                     # as on apply
 ```
 
 GitHub sources are cached under `~/.cache/dbd` (macOS: `~/Library/Caches/dbd`).
@@ -1110,6 +1131,7 @@ dbd reconcile --dry-run -v -d $DATABASE_URL           # preview + show the colum
 dbd reconcile -d $DATABASE_URL                        # apply (create + alter)
 dbd reconcile --allow-destructive -d $DATABASE_URL    # also drop columns/constraints
 dbd reconcile --prune -d $DATABASE_URL                # also drop orphaned tables
+dbd reconcile --prune-unowned -d $DATABASE_URL        # and those nobody owns another project might
 ```
 
 Add `-v` to a `--dry-run` to print the generated `ALTER` SQL beneath each altered
@@ -1133,7 +1155,11 @@ removes an enum **value** (see below) — without it the run refuses, listing ea
 entity (`app.people: drops column nickname`) and nothing else (before 0.25 it listed every
 altered table, ones that had only gained a column included);
 `--prune` drops a whole **orphaned table** (in a managed schema, no longer in the
-design). Without `--prune`, orphans are reported and left in place. Under
+design) that this project owns, or that nobody owns in a schema no other project uses;
+another project's table is never dropped, and one nobody owns where another project might is
+kept and named (`unowned: app.tmp_report — not dropped because app is shared with "billing"
+(--prune-unowned drops it)`). `--prune-unowned`, which implies `--prune`, drops those too,
+naming each. Without `--prune`, orphans are reported and left in place. Under
 `--scope`, a table the design declares outside the scope is never an orphan — a
 scope narrows what is applied, not what the project owns (true from 0.24.1;
 earlier releases dropped those tables under `--scope --prune`, #40). On a
@@ -1647,7 +1673,7 @@ Both set `pass_filenames: false` because `dbd format` scans the project itself. 
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.25.1
+  rev: v0.26.0
   hooks:
     - id: dbd-format
 ```
@@ -1677,7 +1703,14 @@ dbd reset --extensions       # also DROP EXTENSION for configured extensions
 dbd reset --clean            # = --schemas --extensions
 dbd reset --target postgres  # postgres | supabase | sqlite (default: the design's target key)
 dbd reset --scope hub --dry-run   # only the objects the 'hub' scope occupies
+dbd reset --allow-ownership-change  # run as this name although its entities here are all undeclared
 ```
+
+Beside other projects, a reset drops only what its design declares and is refused, `--force` or
+not, when another project depends on any of it; another project's `prod` record refuses an
+unforced reset too. `--schemas`, `--extensions` and a full reset's roles keep what another project
+has or uses, naming each (`schema app kept: it holds table app.invoices ("billing").`). See
+**Sharing a database**.
 
 `--target <postgres|supabase|sqlite>` selects the reset — and which schemas are protected from
 `DROP SCHEMA` under `--schemas`. It defaults to the design's target key (the first `target:`
@@ -1935,7 +1968,7 @@ let graph = design.graph(None, None)?;
 
 | Target | Adapter | URL form | Extensions | Roles | SQL exec | Import | Migrations |
 |--------|---------|----------|------------|-------|----------|--------|------------|
-| PostgreSQL | sqlx-postgres | `postgres://user:pass@host:5432/db` | yes | yes | yes | COPY streaming (CSV/TSV, into the columns the header names); JSON/JSONL staged as `jsonb` in `dbd.import_tmp`, moved by `dbd.import_jsonb_to_table` | `dbd.migrations` (dedicated `dbd` schema) |
+| PostgreSQL | sqlx-postgres | `postgres://user:pass@host:5432/db` | yes | yes | yes | COPY streaming (CSV/TSV, into the columns the header names); JSON/JSONL staged as `json` in the project's `dbd."import_tmp:<project>"`, moved by `dbd.import_jsonb_to_table` | `dbd.migrations` (dedicated `dbd` schema) |
 | Supabase | sqlx-postgres (same adapter; the `supabase` key exposes `public`, protects Supabase schemas from prune/reset, adds PostgREST grants) | `postgres://…` (with `target: supabase`) | yes | yes | yes | COPY streaming | `dbd.migrations` (dedicated `dbd` schema) |
 | SQLite | sqlx-sqlite | `sqlite://./app.db`, `sqlite::memory:`, `file:/abs/path` | no (errors) | no (errors) | yes | multi-row `INSERT ... VALUES (?,?),(?,?), ...` batches in one tx (CSV/TSV/JSON/JSONL) | `_dbd_migrations` (SQLite syntax) |
 | Convex | codegen | `convex:` (→ `./convex`; quote it in YAML), `convex://./out`, append `?deploy=true` to auto-deploy | no (errors) | no (errors) | no — `apply` writes `<dir>/schema.ts` | per-table via `npx convex import --table <name> --replace -y <file>` (always replaces — `truncate: false` has no effect; a `.json` must be an array); whole-deployment export via `npx convex export` (CLI has no per-table flag) | sidecar `<dir>/.dbd_state.json` |
@@ -1989,6 +2022,56 @@ API: `Design::write_ref_cache(adapter, source)` / `Design::resolve_unknown_refs_
 
 ---
 
+## Sharing a database
+
+Several projects can deploy into one database. Each entity has one owner — the project whose
+design declares it — recorded in `dbd.objects` (what each owner holds) and `dbd.uses` (what each
+uses: schemas, extensions, roles, other owners' entities); on SQLite `_dbd_objects`/`_dbd_uses`,
+an entity there being its name, schema-less and without regard to case. No run changes or drops
+another project's entity:
+
+- **Claim.** A run claims every entity its whole design declares (not its scope); declaring one
+  another project holds is refused before anything runs, dry runs, `diff`, `import`, `refresh`
+  and `policies` included. An `apply` in one transaction claims last, in it; `reconcile`, `reset`
+  and `DBD_NO_TX` applies claim before their first write. A project's first run on this dbd claims
+  what it declares that exists and nobody owns.
+- **Prune.** `reconcile --prune` drops (a) a table this project owns and no longer declares, (b) one
+  nobody owns in a schema no other project uses. One nobody owns where another project might —
+  a schema another project uses, or any while a project has not upgraded — is kept, named, unless
+  `--prune-unowned`. Another project's tables are hidden from `reconcile` and `diff`.
+- **Uses guard.** Before anything is dropped — a table, column, constraint, index, enum value,
+  schema or extension, by `reconcile`, a migration (`TRUNCATE … CASCADE` too) or `reset` — dbd asks
+  what a `CASCADE` would reach and what other projects recorded using; anything another project
+  depends on refuses the run, dry run included (`app.orders.total is used by "billing" (view
+  billing.v_totals); remove that use first`). A dependent nobody owns counts where a project might
+  own it (`… (owned by nobody; maybe by "billing")`).
+- **Reset** keeps a schema (`--schemas`) holding anything not this project's or another project
+  uses, an extension (`--extensions`) another project uses or depends on, and a role another
+  project uses, with its grants; each named. Any project's `prod` record refuses an unforced reset.
+- **Write lock.** Every `apply` (a `deploy`'s phases each), `reconcile`, `reset`, `import`,
+  `policies` run and grant holds the database's dbd write lock — an advisory lock on
+  `hashtext('dbd:write')`, taken with `pg_try_advisory_lock[_shared]`, polled every 100ms:
+  exclusive for a reset, a reconcile and an apply running migrations, shared for the rest.
+  `refresh` takes none. A run waits at most 5 minutes
+  (`dbd: waiting for the write lock` in `pg_stat_activity`), then fails.
+- **Name reuse.** A design under an owner name holding live entities it declares none of is
+  refused (`owner "shop" here owns 1 entity (relation app.orders); this design declares none of
+  them …`); `--allow-ownership-change` (apply, deploy, reconcile, reset) lets it run as that owner,
+  passing the version guard but not the environment guard.
+- **Transfer.** `--adopt-from <owner>` (apply, deploy, reconcile) takes over what the design
+  declares that `<owner>` holds, in the claim's transaction, printing `adopting relation app.orders
+  from "shop"` (a dry run: `[dry-run] would adopt …`); a third owner's entity still refuses the run.
+  The giver's next run neither owns nor prunes it.
+- **`dbd inspect --shared`** reports each project, what it owns and uses, and this design's
+  conflicts; non-zero over any. Library: `Design::shared_database`.
+- **Onboarding.** `init --from-db` refuses only a database dbd manages for the project it creates;
+  it and `merge` leave out other projects' entities, naming each, declaring `external:` what the
+  new project depends on. Both refuse while a project has not run a dbd that records what it owns.
+- **Limits.** Objects hook scripts create are unowned; roles are server-wide; an `apply` in one
+  transaction runs `apply.before` hooks before its claim.
+
+Full guide: https://dbd.sensei-hq.com/guide/sharing-a-database
+
 ## Safety model
 
 The bookkeeping table records project name, environment, and version. On Postgres/Supabase this is
@@ -1996,9 +2079,11 @@ The bookkeeping table records project name, environment, and version. On Postgre
 PostgREST's default `db-schemas` (so it's unreachable via the API), and it's excluded from
 reverse-engineering/`merge`/DBML/`diagram`/introspection and protected from `dbd reset`
 (`--schemas`/`--clean` never drop it). Existing databases heal automatically — on the next
-`apply`/`deploy`/`reconcile`/`reset`, dbd relocates legacy `public._dbd_meta`/`public._dbd_migrations`
-(and any scoped-apply strays in other schemas) into `dbd.meta`/`dbd.migrations` and drops the
-originals; no user action required. On SQLite it's `_dbd_meta`/`_dbd_migrations` (SQLite has no
+`apply`/`deploy`/`reconcile`/`reset`, dbd relocates the project's own rows of legacy
+`public._dbd_meta`/`public._dbd_migrations` (and any scoped-apply strays in other schemas) into
+`dbd.meta`/`dbd.migrations`; another project's rows stay, and so does a legacy table holding any
+(that project may still be on an older dbd, and reads its record there until it heals), while an
+emptied one is dropped; no user action required. On SQLite it's `_dbd_meta`/`_dbd_migrations` (SQLite has no
 schemas, so the prefix is the namespace). Convex keeps migrations + meta in a JSON sidecar next to
 `schema.ts`.
 
@@ -2007,6 +2092,8 @@ schemas, so the prefix is the namespace). Convex keeps migrations + meta in a JS
 | dev, version 0 | allowed | allowed |
 | dev, version >= 1 (`versioned at vN`) | blocked | allowed |
 | prod (or a legacy `production` row), any version | blocked | allowed |
+| another project's row prod (or an env dbd does not know) | blocked | allowed |
+| another project depends on what it drops | blocked | blocked |
 | fresh (no table) | allowed | allowed |
 
 The environment is the one recorded by the last write, which can promote dev to
@@ -2026,20 +2113,26 @@ project read a prod database as one dbd had never seen: `reset` with no `--force
 its tables, a `-e dev` run passed the environment guard, an older revision the version
 guard, another scope the pin. Now, when this project has no row but the database holds any of its tables,
 views, materialized views, enums or sequences, the other projects' rows are the marks every
-guard reads — each refusal names the project that set them and says to set `project.name`
-back (`This database holds this design's objects but no record of project 'shop2'; it
+guard reads (unless the registry holds claims under this name, or what it holds there is being
+adopted — neither is a rename) — each refusal names the project that set them and says to set
+`project.name` back (`This database holds this design's objects but no record of project 'shop2'; it
 records project 'shop'. dbd keys its record on project.name, so a renamed project.name is
 the likely cause — if this design was 'shop', set project.name back to 'shop'.`). Two
-projects sharing a database each read their own row, and a project the database holds
-nothing of is held to no other's. Still a limit: a renamed project whose run trips no guard
-is recorded beside the old row, which stays; and a renamed design ahead of the old row's
-version is planned as a fresh install, so its pending migrations do not run — set
+projects sharing a database each read their own row — except that any project's prod mark
+refuses an unforced `reset` — and a project the database holds nothing of is held to no
+other's. Where the old name holds its entities in the registry, the renamed design is refused
+for them, the refusal naming the rename (set `project.name` back, or `--adopt-from <old
+name>`). Still a limit, in a database from before the registry: a renamed project whose run
+trips no guard is recorded beside the old row, which stays; and a renamed design ahead of the
+old row's version is planned as a fresh install, so its pending migrations do not run — set
 `project.name` back before upgrading.
 
 A project older than the database it is applied to — `project.version` behind the
 database's, or none against a versioned database — is refused by `apply`, `deploy` and
 their dry runs (`version guard: the database is at v3, but this project is at v2.`), since
-re-applying older DDL over a newer schema is never right; there is no override.
+re-applying older DDL over a newer schema is never right; there is no override, but for a
+design `--allow-ownership-change` lets take over a reused owner name (the version recorded is the
+previous design's).
 
 ---
 

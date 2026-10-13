@@ -6,7 +6,7 @@
 //
 // Regenerate: DBD_REGEN_DOC_EXAMPLES=1 cargo test --test doc_examples
 //
-// docs-digest: 0xc8821ea62887608d
+// docs-digest: 0x2ec357c7da47a4a8
 #![allow(dead_code, unused_imports, non_snake_case)]
 
 // README.md — block 0
@@ -1226,6 +1226,50 @@ async fn doc_docs_guide_12_embedding_md_16() -> dbd_core::Result<()> {
     let project_dir = std::path::Path::new(".");
     #[allow(unused_variables)]
     let path = std::path::Path::new("design.yaml");
+    use dbd_core::design::Progress;
+
+    let design = dbd_core::Design::from_config(path, "prod")?
+        // Take over what this design declares that the project 'billing' holds.
+        .adopting_from("billing");
+    let adapter = dbd_core::connect(database_url, &design.config().project.name).await?;
+
+    // What shares the database, and what would refuse this design there.
+    let shared = design.shared_database(&*adapter).await?;
+    for project in &shared.projects {
+        println!("{} owns {}", project.name, project.owns.len());
+    }
+    for conflict in &shared.conflicts {
+        eprintln!("{conflict}");
+    }
+
+    // The CLI says these before the run; the library adopts without a word.
+    for held in design.adoptions(&*adapter).await? {
+        println!(
+            "adopting {}.{} from {}",
+            held.object.schema, held.object.name, held.owner
+        );
+    }
+    design.apply(&*adapter, None, false, None, Progress::none()).await?;
+    Ok(())
+}
+
+// docs/guide/12-embedding.md — block 17
+#[allow(unused, clippy::all)]
+async fn doc_docs_guide_12_embedding_md_17() -> dbd_core::Result<()> {
+    #[allow(unused_variables)]
+    let sql: &str = "";
+    #[allow(unused_variables)]
+    let database_url: &str = "";
+    #[allow(unused_variables)]
+    let db_url: &str = "";
+    #[allow(unused_variables)]
+    let db_version: u32 = 0;
+    #[allow(unused_variables)]
+    let entities: Vec<dbd_core::Entity> = Vec::new();
+    #[allow(unused_variables)]
+    let project_dir = std::path::Path::new(".");
+    #[allow(unused_variables)]
+    let path = std::path::Path::new("design.yaml");
     use dbd_core::Design;
 
     let design = Design::from_config(path, "prod")?;
@@ -1244,9 +1288,9 @@ async fn doc_docs_guide_12_embedding_md_16() -> dbd_core::Result<()> {
     Ok(())
 }
 
-// docs/guide/12-embedding.md — block 17
+// docs/guide/12-embedding.md — block 18
 #[allow(unused, clippy::all)]
-async fn doc_docs_guide_12_embedding_md_17() -> dbd_core::Result<()> {
+async fn doc_docs_guide_12_embedding_md_18() -> dbd_core::Result<()> {
     #[allow(unused_variables)]
     let sql: &str = "";
     #[allow(unused_variables)]

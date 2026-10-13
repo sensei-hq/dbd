@@ -1893,3 +1893,31 @@ fn a_trigger_merge_from_dbml_keeps_still_resolves_on_its_path() {
     assert!(file.contains("\"extra\""), "the document's change is written: {file}");
     assert!(edge(dir), "and after it, still: {file}");
 }
+
+/// Two SQLite projects sharing a file: `merge` from one proceeds, and leaves
+/// out — naming it — the other's table, as it does on Postgres (#7).
+#[test]
+fn a_sqlite_merge_beside_another_project_leaves_out_its_tables() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("shared.db");
+    let url = format!("sqlite://{}", file.display());
+    for (name, table) in [("lite_a", "a"), ("lite_b", "b")] {
+        let dir = tmp.path().join(name);
+        write(
+            &dir,
+            "design.yaml",
+            &format!("project:\n  name: {name}\nsource:\n  dialect: sqlite\nschemas: []\n"),
+        );
+        write(
+            &dir,
+            &format!("ddl/table/{table}.ddl"),
+            &format!("CREATE TABLE IF NOT EXISTS {table} (id INTEGER PRIMARY KEY);\n"),
+        );
+        let o = dbd(&dir, &["-e", "dev", "apply", "-d", &url]);
+        assert!(o.status.success(), "{name}'s apply: {}{}", stdout(&o), stderr(&o));
+    }
+    let o = dbd(&tmp.path().join("lite_a"), &["-e", "dev", "merge", "--dry-run", &url]);
+    let said = format!("{}{}", stdout(&o), stderr(&o));
+    assert!(o.status.success(), "merge: {said}");
+    assert!(said.contains("left out") && said.contains("b (\"lite_b\")"), "{said}");
+}

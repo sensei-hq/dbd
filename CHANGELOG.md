@@ -9,6 +9,303 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.26.0] — 2026-10-13
+
+**Several projects can share one database.** dbd now records which project
+owns each entity — in `dbd.objects` and `dbd.uses`, `_dbd_objects` and
+`_dbd_uses` on SQLite — and no run changes or drops another project's: a
+design declaring one is refused before anything runs, `reconcile --prune`
+leaves it alone, a drop another project depends on is refused naming the use,
+and a reset keeps what other projects have or use. Entities move between
+projects with `--adopt-from`, `dbd inspect --shared` shows what shares a
+database, and a second project onboards beside the first with `init
+--from-db`. The new guide, [sharing a database](https://dbd.sensei-hq.com/guide/sharing-a-database),
+covers it all. The first phase of [#7] — fixes to the bookkeeping, refresh jobs
+and imports that projects sharing a database undid for each other — ships with
+it.
+
+**Upgrading.** No migration step is needed: a project's first run on 0.26
+claims what its design declares that exists and nobody owns. Until every
+project in a database has run 0.26, dbd cannot tell their entities from
+nobody's, so `--prune` keeps unowned tables there, and `init --from-db` and
+`merge` refuse. Behaviour that changes for a single project too:
+
+- a reset, a reconcile and an apply running migrations hold the database's
+  dbd write lock exclusively, so other dbd runs on that database wait for them,
+  five minutes at most, and they for those;
+- `init --from-db` refuses only a database that records the project it
+  creates — another project's record is no longer a bar;
+- a reset is refused, `--force` or not, when another project depends on what
+  it drops, and unforced while any project's record says prod.
+
+The library API changes are listed under Library API: `Design::reconcile`
+takes `impl Into<Prune>`, and several `DatabaseAdapter` methods gained
+parameters.
+
+### Added
+
+- **Each entity in a shared database has one owner** (#7, phase 2). A
+  project's `apply`, `deploy`, `reconcile` and `reset` claim every entity its
+  whole design declares — tables, views, materialized views, sequences, enums,
+  functions and procedures, and the composite, domain and range types (with a
+  range's multirange) a file creates beside them; the whole design, not the
+  scope it runs under — in
+  `dbd.objects`. A project declaring an entity another project holds is
+  refused before its first hook or statement, naming each: `relation
+  app.orders is owned by "shop"; owners sharing a database must not declare
+  the same entity`. A dry run, `diff`, `import`, `refresh` and `policies` —
+  the CLI's `--dry-run` previews included — refuse the same way and claim
+  nothing.
+
+  When a run claims depends on whether its work can roll back. An `apply` in
+  one transaction claims as its last step, in that transaction, so the claim
+  commits with the work or not at all, and a run that fails or is killed
+  claims nothing; a version adding enum values commits part-way, and the run
+  claims before that commit too. `reconcile`, `reset` and an `apply` under
+  `DBD_NO_TX` commit as they go, so they claim before their first write —
+  an apply's `apply.before` hooks included — and keep the claim if they then
+  fail. Of two projects racing to claim one
+  entity, the first owns it and the other is refused before it writes.
+
+  An entity is owned as Postgres names it: every `CREATE` in its file names
+  one — a `DO` block's included, so the quoted `"public"."Role"` dbd writes is
+  `Role` — in the schema it states, else its search path, an unquoted name
+  folded to lower case. One no statement names — a file dbd cannot read, a
+  name built in dynamic SQL — is claimed by its path, folded, since a reset
+  still drops it. Everything Postgres names as a relation or a
+  type is one namespace, so a table and an enum of one name are one entity.
+  Entities a project already has are claimed on its first run; what no design
+  declares stays unowned. A claim waits at most 5 seconds for another
+  session's write to the registry, then fails naming it. A renamed project's
+  objects stay with its old name, so even a forced `reset` of the renamed
+  design is refused for them.
+- **A project records what it uses**: the schemas its entities live in, its
+  extensions and roles, and each reference one of its entities makes to
+  another project's — `relation:app.orders`, through `view billing.v_orders`
+  — in `dbd.uses`, afresh by every `apply`, `deploy` and `reconcile` that
+  succeeds; a run that fails keeps the uses it had. A call is a use of a routine, anything else of a relation.
+  A column of another project's enum, or a default drawing on its sequence, is
+  a use without being declared `external`, however `nextval`'s string spells
+  it. A name written bare is looked up as Postgres looks it up: a read is of
+  the first relation on the search path that exists; a call, which Postgres
+  also resolves by its arguments, is a use of every routine on the path it
+  could reach.
+- **`reconcile --prune` prunes by ownership** (#7, phase 2). Another
+  project's table is never dropped, and `reconcile` and `diff` no longer
+  report it as drift. `--prune` drops a table this project owns and no longer
+  declares, and one nobody owns in a schema no other project uses. One nobody
+  owns in a schema another project uses — or any, while a project the
+  database records has not upgraded dbd — is kept and named: `unowned:
+  app.tmp_report — not dropped because app is shared with "billing"
+  (--prune-unowned drops it)`. `reconcile --prune-unowned` drops those too,
+  naming each. A prune claims what it drops in the transaction that drops it,
+  so a table another project claims meanwhile is kept, naming it, and a run
+  that fails keeps no such claim; a table the design creates under a spelling
+  its path does not share is never pruned; and removing an enum
+  value that a column of another project's table holds is refused, dry run
+  included, naming the column and its owner. A successful `apply`, `deploy`
+  or `reconcile` releases what its
+  project no longer declares once it is gone — pruned, or dropped by a
+  migration or by hand; until then it stays the project's. A prune's `DROP`
+  now quotes the table it names: `app."Report"` written unquoted dropped the
+  `app.report` beside it.
+- **What another project depends on is guarded** (#7, phase 2). Before
+  `reconcile` drops a column, constraint, index or enum value, or `apply` runs
+  a migration that drops a table, column, constraint, index, schema or
+  extension — inside a `DO` block too — dbd asks Postgres's dependency graph
+  what a `CASCADE` would reach, part by part: a view, an inheriting table or
+  partition, a foreign key, a column of the type or an array of it. It also
+  asks the uses other projects recorded, which see into function bodies —
+  recorded whoever owned the target then, a table file's trigger function's
+  included. A migration dbd cannot parse is refused where another project
+  shares the database; a `TRUNCATE … CASCADE` is refused when it would
+  empty another project's table — the one truncated, a partition or child of
+  it, or one whose foreign key points at any of those. Anything another project
+  depends on refuses
+  the run, before any write and dry run included: `app.orders.total is used by
+  "billing" (view billing.v_totals); remove that use first`. A `--prune`
+  keeps such a table, naming the use, where its `CASCADE` took the other
+  project's view with it.
+- **`reset` drops only what is its own to drop** (#7, phase 2). It drops the
+  entities its design declares, `CASCADE`, behind the same guard: one another
+  project depends on refuses the reset before it drops anything, `--force`
+  or not — `app.orders is used by "billing" (view billing.v_orders); remove
+  that use first`. `--schemas` keeps a schema holding anything not the
+  project's — another project's entity, one nobody owns, an extension
+  another project needs — or that another project uses, and refuses to drop
+  one holding something of the project's another project depends on, an
+  entity its design no longer declares included; an extension the design
+  installs in a schema of its own is its own. `--extensions` keeps an
+  extension another project uses or depends on — a column of its type — and
+  a full reset keeps a role another project uses. Each is named after what
+  the reset dropped: `schema app kept: it holds table app.invoices
+  ("billing").` A role kept for another project keeps its grants. A
+  `supabase` target resets the same way. `reset --dry-run` asks the same
+  database, and shows the same script and the same lines. A database any
+  project marked prod — or recorded with an env dbd does not know — is prod
+  for every project in it: another project's unforced reset is refused,
+  where only its own mark refused it.
+- **Runs of different projects no longer interleave with a drop** (#7,
+  phase 2). A reset read what other projects had, then dropped `CASCADE`:
+  another project's apply committing in between had its table taken by
+  `DROP SCHEMA … CASCADE`, and both runs reported success; a prune, or a
+  migration's `DROP TABLE … CASCADE`, took a view committed over the table
+  the same way. Every writing `apply`, `reconcile`, `reset`, `import`,
+  `policies` and grant — a `deploy`'s phases each — now holds the database's
+  dbd write lock (an advisory lock on `hashtext('dbd:write')`, in a session of its own):
+  shared to build, so those of different projects still run side by side;
+  exclusive for a reset, a reconcile and an apply running migrations. A run
+  waits for the lock at most 5 minutes, asking again every 100ms, its session
+  named `dbd: waiting for the write lock` meanwhile. The session turns off
+  `idle_session_timeout`, a run that finds its lock lost when it releases it
+  fails, and a run dropped part-way gives the lock up.
+- **A project reusing another's name is refused** (#7, phase 2). A design
+  arriving under an owner name that holds entities in the database, and
+  declaring none of them, took over that project's version and history, and
+  its first prune dropped what it never declared. It is refused at claim
+  time, dry runs, `diff` and `reset` included — `owner "shop" here owns 1
+  entity (relation app.orders); this design declares none of them` — counting
+  only what still exists, and before the version guard, which reads the
+  previous design's record. `--allow-ownership-change` (on `apply`, `deploy`,
+  `reconcile` and `reset`) lets a new design run as that owner, passing the
+  version guard — the version recorded is the previous design's — though
+  not the environment guard.
+- **`--adopt-from <owner>` moves entities between projects** (#7, phase 2).
+  On `apply`, `deploy` and `reconcile`, it takes over the entities the design
+  declares that `<owner>` holds, in the claim's own transaction, printing
+  each — `adopting relation app.widgets from "clilive"`; a dry run says what
+  it would — once the run's ownership checks pass. One a third project holds
+  still refuses the run, and nothing is adopted. A reconcile adopting plans
+  the adopted table as its own. The giver's next run neither owns nor prunes
+  it, and declaring it still is refused; and neither the adoption nor a run
+  that adopted and then failed reads as a rename of the giver.
+- **`dbd inspect --shared` reports what shares a database** (#7, phase 2):
+  each project it records — env and version, what it owns, the schemas it
+  uses and what of others' it uses through what of its own — which record
+  nothing of what they own yet, and what would refuse this design there: an
+  entity another project owns, or an owner name it reuses. It exits non-zero
+  over any conflict.
+- **A second project can onboard beside the first** (#7, phase 2). `init
+  --from-db` refused any database with dbd bookkeeping; it now refuses only one
+  dbd manages for this project (`merge` syncs that), and leaves out what other
+  projects own, naming each — as `merge` now does, where it took another
+  project's entities into this one, and says whose a file's entity is rather
+  than calling the file an orphan. What the new project depends on of another's
+  — a foreign key's table, what a view reads — is declared `external:`, so its
+  references resolve. Both are refused while a project the database records has
+  not run a dbd that records what it owns and uses: its entities cannot be told
+  from nobody's.
+- **SQLite keeps the same ownership registry** (#7, phase 2), in
+  `_dbd_objects` and `_dbd_uses`: a second project sharing a SQLite file is
+  refused a table the first owns, a reset cannot drop another's table, name
+  reuse and `--adopt-from` work as on Postgres, `inspect --shared` reads it, and
+  `init --from-db` and `merge` leave another project's tables out. A SQLite
+  object is its name, whatever schema its path names and whatever its case.
+  A SQLite reset is guarded by the uses owners record and the foreign keys
+  that reference a table: a table another project's view reads is not
+  dropped.
+- **A guide to sharing a database** —
+  [sharing a database](https://dbd.sensei-hq.com/guide/sharing-a-database)
+  (`docs/guide/14-sharing-a-database.md`): owners and the registry, what each
+  command does beside other projects, moving entities and names, `inspect
+  --shared`, onboarding and SQLite. The commands reference, `llms.txt`,
+  `llms-full.txt` and the skill cover the new flags and rules.
+- **The uses guard sees further** (#7, phase 2). A dependent nobody owns —
+  a project's not yet recording its uses — is guarded where a project might
+  own it, by `--prune`'s rule: in a schema another project uses, or anywhere
+  while a project does not record its uses (`view billing.v_orders (owned by
+  nobody; maybe by "billing")`); elsewhere a `CASCADE` takes it as before. A
+  schema is guarded from its collations, text search objects, operators and
+  conversions too: `DROP SCHEMA … CASCADE` took another project's column
+  collated by one.
+
+### Library API
+
+- `DatabaseAdapter` gains `claim_objects` and `record_uses` (defaults that
+  do nothing, so an adapter that does not override them builds unchanged),
+  with the `adapter::OwnedObject`, `HeldObject` and `Use` they take and
+  return; and `Design::check_ownership` refuses a design declaring an entity
+  another project owns.
+- `Design::reconcile` takes `prune: impl Into<Prune>` — `Prune::Off`, `On`
+  or `Unowned`; a `bool` still reads as `Off` or `On`. `DatabaseAdapter` gains
+  `ownership` and `release_objects` (defaults: nothing owned, nothing
+  released), with the `adapter::Ownership` the first returns.
+- `DatabaseAdapter::dependents` (default: none) reports other owners'
+  dependences on what a run drops, with `adapter::Guarded`, `GuardedPart`
+  and `Dependence`. `ReconcilePlan::dropped_parts` lists what a plan drops
+  from an existing table or enum, part by part (`DroppedPart`,
+  `DroppedKind`).
+- `Entity::refs` keeps a schema-qualified type or sequence reference that
+  resolves to nothing — another project's, an extension's — marked
+  `unresolved` and unwarned, where it was dropped. A bare one is still dropped
+  as a built-in. A sequence a `nextval` default names is read as Postgres
+  reads the string — `nextval('App.Seq')` refers to `app.seq` — and a type or
+  sequence reference reaches the sequence or enum whose mixed-case path names
+  it, folded (`Order_No.ddl`).
+- `ResetComplete::kept` names what a reset left for other projects, one line
+  each, and `Design::reset_preview` returns the script a reset would run and
+  that summary, asked of the database. `DatabaseAdapter` gains `users_of` and
+  `not_owned_in_schema` (defaults: none), with the `adapter::SchemaMember`
+  the second returns; and `lock_writes`, `unlock_writes` and
+  `abandon_writes` (defaults: no lock), which `Design::apply`, `reconcile`,
+  `reset`, `import_data`, `apply_grants` and `design::apply_policies` hold
+  around a run.
+  `Dependence::owner` is an `Option` — `None` for a dependent nobody owns —
+  and `Dependence::schema` names the dependent's schema.
+- `Design::adopting_from`, `allowing_ownership_change`, `adoptions` and
+  `check_run_guards` — the guards `apply` checks, name reuse first — and
+  `check_reset_run_guards`, a reset's;
+  `Design::shared_database` (`SharedDatabase`, `SharedProject`, `SharedUse`)
+  and `design::leave_out_other_owners`; `DatabaseAdapter::registry`
+  (`adapter::Registry`, `RecordedUse`; default empty), `keeps_registry`
+  (default false; Postgres and SQLite keep one) and `same_object` (whether two
+  keys name one object);
+  `DatabaseAdapter::claim_objects` takes `adopt_from`, and the adapter gains
+  `owned_objects` (default: nothing held).
+
+### Fixed
+
+Projects sharing one database no longer undo each other's bookkeeping, refresh
+jobs or imports — the first phase of [#7], fixes that were wrong with a single
+project too.
+
+- **A heal folds only its own project's legacy bookkeeping.** Upgrading one
+  project folded every project's rows out of a legacy `_dbd_meta` and
+  `_dbd_migrations` into `dbd.*` and dropped the tables — so a project still on
+  an older dbd lost its record and read the database as fresh. A heal now
+  moves the project's own rows; another project's stay, and so does a legacy
+  table while it holds any, unaltered. A project not yet healed reads its own
+  record there, so its guards still see a database it marked prod. The heal
+  locks a legacy table before reading it, reading committed whatever the
+  database's isolation default, so a row an older dbd commits meanwhile is
+  seen, not dropped with the table; it locks them in the order an older
+  dbd's batch writes them, so the two never deadlock; it waits at most 5
+  seconds for another session's write, then fails naming the table; and one
+  heal runs at a time, so two projects' first runs no longer collide creating
+  the `dbd` schema. An emptied table is dropped, or kept if Postgres refuses
+  (a view over it). A table the project's role cannot read — another
+  project's — is passed over, by reads too; one it can read but not take that
+  holds its own row is refused, naming the table.
+- **A pg_cron refresh job is named for its project** —
+  `dbd-refresh:<project>:<schema>.<name>` — and a sync unschedules only its own
+  project's. It unscheduled every `dbd:refresh:` job it was not given, so each
+  project's apply took the other's jobs; the new namespace is out of reach of
+  a project sharing the database that has not upgraded, whose sweep still
+  takes `dbd:refresh:%`. A name fits the 63 bytes pg_cron 1.3 and 1.4 keep (a
+  hash ends a longer one), and a `:` or `%` in a project's name is encoded, so
+  one project's name cannot reach another's jobs. A job an older dbd named
+  `dbd:refresh:<schema>.<name>` is replaced for a matview the project
+  declares, and unscheduled, by any project, once the view it refreshes no
+  longer exists — read from the catalog, so a schema the role cannot use
+  fails nothing; concurrent syncs take turns.
+- **Each project stages its JSON imports in its own table**,
+  `dbd."import_tmp:<project>"`. Every load dropped and recreated one
+  `dbd.import_tmp`, so two projects importing at once emptied each other's
+  staged rows. A name past Postgres's 63-byte limit, which it would cut short
+  and so merge with another, ends in a hash of the whole name.
+
+[#7]: https://github.com/sensei-hq/dbd/issues/7
+
 ## [0.25.1] — 2026-10-12
 
 **Two fixes for refusals that left no way through.** `reconcile` failed on every
