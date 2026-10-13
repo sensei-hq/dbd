@@ -1,22 +1,22 @@
 # Checkpoint
 
-**Slice:** #7 Phase 2, slice 7 (`inspect --shared`, onboarding) on
-`feat/ownership-inspect`, from `feat/ownership` (slices 1–6: PRs #50–#54).
+**Slice:** #7 Phase 2, slice 8 (SQLite parity) on `feat/ownership-sqlite`, from
+`feat/ownership` (slices 1–7: PRs #50–#55).
 
 ## Done
 
-- Slices 1–6 in `feat/ownership` (`953cdbe9`): registry, claim, uses; prune;
-  uses guard; reset rules and write lock; name reuse and `--adopt-from`.
-- Slice 7 implemented (`48c5dbdc`): `inspect --shared` (projects, owns, uses,
-  conflicts; non-zero over a conflict); `init --from-db`/`merge` leave out other
-  owners' entities, refuse while a project records no uses.
-- Embedded 295/295, `cli_live` 59/59, workspace 2007/0, clippy, fmt, doc clean.
+- Slices 1–7 in `feat/ownership` (`01631bb3`): registry, claim, uses; prune;
+  uses guard; reset rules and write lock; name reuse, `--adopt-from`;
+  `inspect --shared`, onboarding beside other projects.
+- Slice 8 implemented (`94e59e45`): SQLite `_dbd_objects`/`_dbd_uses`, T18.
+- Embedded 295/295, `cli_live` 61/61, workspace 2013/0, clippy, fmt, doc clean.
 
 ## Next
 
-    gh pr create --base feat/ownership --head feat/ownership-inspect
-    # review, fixes test-first, CI, local merge; slice 8: SQLite parity
-    # (_dbd_objects/_dbd_uses, T18); then the docs slice
+    gh pr create --base feat/ownership --head feat/ownership-sqlite
+    # review, CI, local merge; then the docs slice (guides 03/04, a sharing
+    # guide, llms.txt/llms-full.txt, both SKILL.md, site mirrors,
+    # dbd-pattern-verifier); then feat/ownership → develop
 
 ## Open
 

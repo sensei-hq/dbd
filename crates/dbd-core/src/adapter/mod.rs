@@ -594,6 +594,13 @@ pub trait DatabaseAdapter: Send + Sync {
         false
     }
 
+    /// Whether two registry keys name one object in this database (#7):
+    /// Postgres's namespace, schema and name; SQLite's namespace and name,
+    /// whatever schema a path gave it, without regard to case.
+    fn same_object(&self, a: &OwnedObject, b: &OwnedObject) -> bool {
+        a.namespace == b.namespace && a.schema == b.schema && a.name == b.name
+    }
+
     /// Record `uses` as everything `owner` uses, replacing what it used before
     /// (#7) — an `entity` use whoever owns its target, or nobody yet. Like a
     /// claim, in the open batch transaction when there is one. Adapters

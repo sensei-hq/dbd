@@ -336,7 +336,11 @@ unowned entity might be its own. The prune report names the owners still to
 upgrade, and `--prune-unowned` drops such entities anyway, each named.
 
 **SQLite** uses the same model in its single namespace (`_dbd_objects`,
-`_dbd_uses`), with no special case. **Convex** is one deployment per project and
+`_dbd_uses`), with no special case: an object is its namespace and name, without
+regard to case — SQLite has no schemas, so `auth.users` is the table `users` —
+and exists when `sqlite_master` names it as a table or view. It has no catalog
+of dependencies, so its uses guard has what owners record and the foreign keys
+that reference a table; its reset runs the guard on what it drops. **Convex** is one deployment per project and
 is unchanged.
 
 ### Where it runs

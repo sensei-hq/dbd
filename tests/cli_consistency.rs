@@ -1894,11 +1894,10 @@ fn a_trigger_merge_from_dbml_keeps_still_resolves_on_its_path() {
     assert!(edge(dir), "and after it, still: {file}");
 }
 
-/// SQLite keeps no ownership registry yet: two projects sharing a file are no
-/// reason to refuse a `merge` with advice that cannot help — run the other's
-/// apply — as it was refused once the registry checks came in (#7).
+/// Two SQLite projects sharing a file: `merge` from one proceeds, and leaves
+/// out — naming it — the other's table, as it does on Postgres (#7).
 #[test]
-fn a_sqlite_merge_beside_another_project_is_not_refused_over_a_registry_it_lacks() {
+fn a_sqlite_merge_beside_another_project_leaves_out_its_tables() {
     let tmp = tempfile::tempdir().unwrap();
     let file = tmp.path().join("shared.db");
     let url = format!("sqlite://{}", file.display());
@@ -1918,5 +1917,7 @@ fn a_sqlite_merge_beside_another_project_is_not_refused_over_a_registry_it_lacks
         assert!(o.status.success(), "{name}'s apply: {}{}", stdout(&o), stderr(&o));
     }
     let o = dbd(&tmp.path().join("lite_a"), &["-e", "dev", "merge", "--dry-run", &url]);
-    assert!(o.status.success(), "merge: {}{}", stdout(&o), stderr(&o));
+    let said = format!("{}{}", stdout(&o), stderr(&o));
+    assert!(o.status.success(), "merge: {said}");
+    assert!(said.contains("left out") && said.contains("b (\"lite_b\")"), "{said}");
 }
