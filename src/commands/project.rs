@@ -109,7 +109,13 @@ pub fn cmd_dbml(
     Ok(())
 }
 
-pub fn cmd_doctor(config: &Path, fix: bool, verbosity: Verbosity) -> Result<()> {
+pub fn cmd_doctor(
+    config: &Path,
+    source_dir: &Path,
+    module: Option<&str>,
+    fix: bool,
+    verbosity: Verbosity,
+) -> Result<()> {
     if !config.exists() {
         anyhow::bail!("Config file not found: {}", config.display());
     }
@@ -118,18 +124,60 @@ pub fn cmd_doctor(config: &Path, fix: bool, verbosity: Verbosity) -> Result<()> 
     let content = safe_read(project_dir, config)?;
 
     let config_issues = dbd_core::doctor::detect_old_format(&content);
-    let stale_files = dbd_core::doctor::detect_stale_files(project_dir);
-    let plural_dirs = dbd_core::doctor::detect_plural_ddl_dirs(project_dir);
-    // Misfiled view/matview DDL — detection only; the fix is a manual move.
-    let mismatches = dbd_core::doctor::detect_ddl_type_mismatches(project_dir);
-    // Extension/schema files the scanner does not read — detection only; the
-    // fix is a design.yaml entry, named for each.
-    let parsed_config = dbd_core::config::read(config).ok();
-    let declared_files = dbd_core::doctor::detect_declared_kind_files(project_dir, parsed_config.as_ref());
+    // A workspace's files are each module's, in its folder under --source, as
+    // every other command reads them (#7). A design.yaml this dbd cannot read
+    // — one written for an older dbd, what doctor exists to migrate — is
+    // audited as a project's.
+    let parsed = dbd_core::config::read(config);
+    let unreadable = parsed.as_ref().err().map(|e| e.to_string());
+    let parsed_config = parsed.ok();
+    let folders: Vec<std::path::PathBuf> = match &parsed_config {
+        Some(_) => super::file_folders(config, source_dir, module)?
+            .into_iter()
+            .map(|(_, dir)| dir)
+            .collect(),
+        None if module.is_some() => {
+            anyhow::bail!(
+                "--module: {} does not read as a design.yaml: {}",
+                config.display(),
+                unreadable.unwrap_or_default()
+            );
+        }
+        None => vec![project_dir.to_path_buf()],
+    };
+    // A design.yaml declaring `modules:` is not one an older dbd wrote — it
+    // had none — so what reads as old in it is fixed by hand: migrating it
+    // would rebuild it without its modules.
+    let workspace_manifest =
+        serde_yaml::from_str::<serde_yaml::Value>(&content).is_ok_and(|v| v.get("modules").is_some());
+    // What reads as neither today's design.yaml nor an older one is said, not
+    // audited clean.
+    let unreadable = unreadable.filter(|_| config_issues.is_empty());
+    let (mut stale_files, mut plural_dirs, mut mismatches, mut declared_files) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for dir in &folders {
+        stale_files.extend(dbd_core::doctor::detect_stale_files(dir));
+        plural_dirs.extend(dbd_core::doctor::detect_plural_ddl_dirs(dir));
+        // Misfiled view/matview DDL — detection only; the fix is a manual move.
+        mismatches.extend(dbd_core::doctor::detect_ddl_type_mismatches(dir));
+        // Extension/schema files the scanner does not read — detection only;
+        // the fix is a design.yaml entry, named for each.
+        declared_files.extend(dbd_core::doctor::detect_declared_kind_files(
+            dir,
+            parsed_config.as_ref(),
+        ));
+    }
 
-    let auto_fixable = config_issues.len() + stale_files.len() + plural_dirs.len();
-    let by_hand = mismatches.len() + declared_files.len();
+    let config_fixable = if workspace_manifest { 0 } else { config_issues.len() };
+    let auto_fixable = config_fixable + stale_files.len() + plural_dirs.len();
+    let by_hand = mismatches.len()
+        + declared_files.len()
+        + (config_issues.len() - config_fixable)
+        + usize::from(unreadable.is_some());
     let total_issues = auto_fixable + by_hand;
+    if let Some(error) = &unreadable {
+        output::always(&format!("design.yaml does not read: {error}"));
+    }
 
     // doctor counts issues, not entities: the shared entity summary printed
     // "0 entities — no issues" here on a project full of tables.
@@ -156,7 +204,12 @@ pub fn cmd_doctor(config: &Path, fix: bool, verbosity: Verbosity) -> Result<()> 
     }
 
     let mut fixed = 0;
-    if !config_issues.is_empty() {
+    if !config_issues.is_empty() && workspace_manifest {
+        output::always(
+            "\ndesign.yaml declares modules:, so its old entries (above) are fixed by hand — migrating it \
+             would rebuild it without its modules.",
+        );
+    } else if !config_issues.is_empty() {
         fix_config_migration(config, project_dir, &content, verbosity)?;
         fixed += config_issues.len();
     }
@@ -572,7 +625,7 @@ async fn preflight_deploy(targets: &[super::Target], run: &DeployRun<'_>) -> Res
             design.deploy(&*adapter, true, Some(&resolved), |_| {}).await?;
             anyhow::Ok(())
         };
-        check.await.with_context(|| target.label().unwrap_or_default())?;
+        target.labelled(check.await)?;
     }
     Ok(())
 }
@@ -772,11 +825,28 @@ pub async fn cmd_reconcile(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let targets: Vec<super::Target> =
-        super::targets(config, env, project_dir, scope, deps, module, None, super::Order::Build)?
-            .into_iter()
-            .map(|target| target.map_design(|design| ownership.applied_to(design)))
-            .collect();
+    let targets: Vec<super::Target> = super::targets(
+        config,
+        env,
+        project_dir,
+        scope,
+        deps,
+        module,
+        None,
+        super::Order::Reconcile,
+    )?
+    .into_iter()
+    .map(|target| target.map_design(|design| ownership.applied_to(design)))
+    .collect();
+    // A released module changes by snapshot and `dbd apply`: the one asked for
+    // — the project, or the module `--module` names — is refused before
+    // anything connects; others the run would take in are left out.
+    for target in &targets {
+        refuse_a_released_reconcile(&target.design)?;
+    }
+    if targets.is_empty() {
+        anyhow::bail!("Every module this run selects is released — `reconcile` is disabled for them.");
+    }
     if targets.len() > 1 && !dry_run {
         // Before the first module writes, each module's reconcile checked as
         // its dry run checks it — so a refusal any module's would meet comes
@@ -802,7 +872,7 @@ pub async fn cmd_reconcile(
                     .refuse_destructive(allow_destructive)?;
                 anyhow::Ok(())
             };
-            check.await.with_context(|| target.label().unwrap_or_default())?;
+            target.labelled(check.await)?;
         }
     }
     for (i, target) in targets.into_iter().enumerate() {
@@ -828,10 +898,16 @@ pub async fn cmd_reconcile(
 /// migrations; `reconcile` is the pre-release workflow.
 fn refuse_a_released_reconcile(design: &Design) -> Result<()> {
     if design.config().project.released {
-        anyhow::bail!(
-            "Project is released — `reconcile` is disabled. \
-             Capture changes with `dbd snapshot`, then migrate with `dbd apply`."
-        );
+        match design.module() {
+            Some(module) => anyhow::bail!(
+                "Module {module} is released — `reconcile` is disabled for it. Capture its changes with \
+                 `dbd snapshot --module {module}`, then migrate with `dbd apply`."
+            ),
+            None => anyhow::bail!(
+                "Project is released — `reconcile` is disabled. \
+                 Capture changes with `dbd snapshot`, then migrate with `dbd apply`."
+            ),
+        }
     }
     Ok(())
 }
@@ -1085,52 +1161,76 @@ pub fn cmd_release(
     config: &Path,
     env: &str,
     project_dir: &Path,
+    module: Option<&str>,
     name: Option<&str>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
-
-    if design.config().project.released {
-        anyhow::bail!("Project is already released.");
+    // Each module releases on its own: the one named, or every module not
+    // released yet — each at its own version, its baseline in its folder.
+    // Every one is checked before any is written: a release refused for one
+    // module leaves design.yaml as it was.
+    let targets = super::targets(
+        config,
+        env,
+        project_dir,
+        Some("all"),
+        None,
+        module,
+        None,
+        super::Order::Alone,
+    )?;
+    let whole_workspace = module.is_none() && targets.iter().any(|t| t.module.is_some());
+    let mut releases = Vec::new();
+    for target in targets {
+        if whole_workspace && target.design.config().project.released {
+            output::info(
+                verbosity,
+                &format!(
+                    "module {} is already released.",
+                    target.module.as_deref().unwrap_or_default()
+                ),
+            );
+            continue;
+        }
+        let release = target.labelled(check_release(&target.design, &target.dir))?;
+        releases.push((target, release));
     }
+    if whole_workspace && releases.is_empty() {
+        anyhow::bail!("Every module is already released.");
+    }
+    for (i, (target, release)) in releases.into_iter().enumerate() {
+        let (design, dir) = target.enter(i == 0);
+        write_release(&design, config, &dir, release, name, verbosity)?;
+    }
+    Ok(())
+}
 
+/// What a release of one design does, decided before anything is written.
+enum Release {
+    /// No snapshot yet: a baseline at the design's version.
+    Baseline { version: u32 },
+    /// Its snapshots are its history: released at the latest.
+    AtLatest { version: u32 },
+}
+
+/// Decide [`cmd_release`] for one design, refusing what it would refuse —
+/// writing nothing.
+fn check_release(design: &Design, project_dir: &Path) -> Result<Release> {
+    if design.config().project.released {
+        anyhow::bail!(match design.module() {
+            Some(module) => format!("Module {module} is already released."),
+            None => "Project is already released.".to_string(),
+        });
+    }
     let error_count = design.entities().iter().filter(|e| !e.errors.is_empty()).count();
     if error_count > 0 {
         anyhow::bail!("Design has {error_count} entity error(s); fix them before releasing (run `dbd inspect`).");
     }
-
-    if dbd_core::snapshot::has_snapshots(project_dir) {
-        return release_at_latest_snapshot(&design, config, project_dir, name, verbosity);
+    if !dbd_core::snapshot::has_snapshots(project_dir) {
+        return Ok(Release::Baseline {
+            version: design.config().project.version(),
+        });
     }
-
-    let version = design.config().project.version();
-    let desc = name.unwrap_or("baseline release");
-    dbd_core::snapshot::create_baseline_snapshot(design.entities(), project_dir, config, desc, version)
-        .context("Failed to create baseline snapshot")?;
-    dbd_core::config::set_released(config, true).context("Failed to set released flag")?;
-
-    output::always(&format!(
-        "✓ Released v{version} — baseline snapshot written; `reconcile` is now disabled."
-    ));
-    output::info(
-        verbosity,
-        "Next changes: edit the design → `dbd snapshot` → `dbd apply`.",
-    );
-    Ok(())
-}
-
-/// Release a project whose snapshots already exist, at the version they reached.
-///
-/// Released at version N means the design *is* snapshot N, so a change no
-/// snapshot captured is refused rather than shipped unversioned: `dbd snapshot`
-/// records it, and the release then lands on that version.
-fn release_at_latest_snapshot(
-    design: &Design,
-    config: &Path,
-    project_dir: &Path,
-    name: Option<&str>,
-    verbosity: Verbosity,
-) -> Result<()> {
     let latest = dbd_core::snapshot::latest_snapshot(project_dir)
         .context("Failed to read the latest snapshot")?
         .context("snapshots/ lists a version but none could be read")?;
@@ -1142,9 +1242,13 @@ fn release_at_latest_snapshot(
     if let Some(declared) = design.config().project.version
         && declared != version
     {
+        let field = match design.module() {
+            Some(module) => format!("modules.{module}.version"),
+            None => "project.version".to_string(),
+        };
         anyhow::bail!(
-            "design.yaml says project.version {declared}, but the latest snapshot is v{version} — \
-             set project.version to {version} (or restore the missing snapshots) before releasing."
+            "design.yaml says {field} {declared}, but the latest snapshot is v{version} — \
+             set {field} to {version} (or restore the missing snapshots) before releasing."
         );
     }
 
@@ -1156,15 +1260,46 @@ fn release_at_latest_snapshot(
              capture them with `dbd snapshot`, then run `dbd release` again."
         );
     }
+    Ok(Release::AtLatest { version })
+}
 
-    dbd_core::config::set_released(config, true).context("Failed to set released flag")?;
-    output::always(&format!(
-        "✓ Released v{version} — the existing snapshots are its history, so no baseline was written; \
-         `reconcile` is now disabled."
-    ));
-    if name.is_some() {
-        // `--name` describes the baseline snapshot, and there is none to write.
-        output::warn("--name not used: this project's baseline snapshot already exists.");
+/// Write the release [`check_release`] decided.
+fn write_release(
+    design: &Design,
+    config: &Path,
+    project_dir: &Path,
+    release: Release,
+    name: Option<&str>,
+    verbosity: Verbosity,
+) -> Result<()> {
+    match release {
+        Release::Baseline { version } => {
+            let desc = name.unwrap_or("baseline release");
+            dbd_core::snapshot::create_baseline_snapshot_of(
+                design.entities(),
+                project_dir,
+                config,
+                design.module(),
+                desc,
+                version,
+            )
+            .context("Failed to create baseline snapshot")?;
+            dbd_core::config::set_released_of(config, design.module(), true).context("Failed to set released flag")?;
+            output::always(&format!(
+                "✓ Released v{version} — baseline snapshot written; `reconcile` is now disabled."
+            ));
+        }
+        Release::AtLatest { version } => {
+            dbd_core::config::set_released_of(config, design.module(), true).context("Failed to set released flag")?;
+            output::always(&format!(
+                "✓ Released v{version} — the existing snapshots are its history, so no baseline was written; \
+                 `reconcile` is now disabled."
+            ));
+            if name.is_some() {
+                // `--name` describes the baseline snapshot, and there is none to write.
+                output::warn("--name not used: this project's baseline snapshot already exists.");
+            }
+        }
     }
     output::info(
         verbosity,
@@ -1292,14 +1427,21 @@ mod tests {
     #[test]
     fn doctor_bails_when_config_missing() {
         let missing = std::path::Path::new("/definitely/not/here/design.yaml");
-        let err = cmd_doctor(missing, false, Verbosity::Normal).unwrap_err();
+        let err = cmd_doctor(missing, Path::new("."), None, false, Verbosity::Normal).unwrap_err();
         assert!(err.to_string().contains("not found"), "got: {err}");
     }
 
     /// Doctor is read-only without `--fix` and returns Ok on the fixture.
     #[test]
     fn doctor_runs_read_only_on_fixture() {
-        cmd_doctor(&testutil::fixture_config(), false, Verbosity::Normal).unwrap();
+        cmd_doctor(
+            &testutil::fixture_config(),
+            &testutil::fixtures(),
+            None,
+            false,
+            Verbosity::Normal,
+        )
+        .unwrap();
     }
 
     /// `init` scaffolds a project into an empty directory.
@@ -1367,8 +1509,8 @@ mod tests {
     fn release_writes_baseline_then_refuses_second() {
         let proj = testutil::copy_fixture_project();
         let cfg = proj.path().join("design.yaml");
-        cmd_release(&cfg, "dev", proj.path(), Some("v1"), Verbosity::Normal).unwrap();
-        let err = cmd_release(&cfg, "dev", proj.path(), None, Verbosity::Normal).unwrap_err();
+        cmd_release(&cfg, "dev", proj.path(), None, Some("v1"), Verbosity::Normal).unwrap();
+        let err = cmd_release(&cfg, "dev", proj.path(), None, None, Verbosity::Normal).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("already released") || msg.contains("Snapshots already exist"),
@@ -1397,7 +1539,8 @@ mod tests {
         let proj = brownfield_project();
         let cfg = proj.path().join("design.yaml");
 
-        cmd_release(&cfg, "dev", proj.path(), None, Verbosity::Normal).expect("a brownfield project can be released");
+        cmd_release(&cfg, "dev", proj.path(), None, None, Verbosity::Normal)
+            .expect("a brownfield project can be released");
 
         let config = dbd_core::config::read(&cfg).unwrap();
         assert!(config.project.released, "the project is marked released");
@@ -1422,7 +1565,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = cmd_release(&cfg, "dev", proj.path(), None, Verbosity::Normal)
+        let err = cmd_release(&cfg, "dev", proj.path(), None, None, Verbosity::Normal)
             .expect_err("an uncaptured change must not be released as v1");
         assert!(err.to_string().contains("dbd snapshot"), "names the way out: {err}");
         assert!(
@@ -1443,7 +1586,7 @@ mod tests {
         .unwrap();
         let cfg = proj.path().join("design.yaml");
 
-        let err = cmd_release(&cfg, "dev", proj.path(), None, Verbosity::Normal).unwrap_err();
+        let err = cmd_release(&cfg, "dev", proj.path(), None, None, Verbosity::Normal).unwrap_err();
         assert!(err.to_string().contains("entity error"), "got: {err}");
     }
 
@@ -1453,7 +1596,7 @@ mod tests {
     async fn reconcile_refuses_when_project_released() {
         let proj = testutil::copy_fixture_project();
         let cfg = proj.path().join("design.yaml");
-        cmd_release(&cfg, "dev", proj.path(), Some("v1"), Verbosity::Normal).unwrap();
+        cmd_release(&cfg, "dev", proj.path(), None, Some("v1"), Verbosity::Normal).unwrap();
 
         let err = cmd_reconcile(
             &cfg,
@@ -1663,7 +1806,14 @@ mod tests {
         let config = write_legacy_project(tmp.path());
         let original = std::fs::read_to_string(&config).unwrap();
 
-        cmd_doctor(&config, /*fix*/ false, Verbosity::Normal).unwrap();
+        cmd_doctor(
+            &config,
+            config.parent().unwrap(),
+            None,
+            /*fix*/ false,
+            Verbosity::Normal,
+        )
+        .unwrap();
 
         // Report-only: nothing on disk changes.
         assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
@@ -1681,7 +1831,14 @@ mod tests {
         let config = write_legacy_project(tmp.path());
         let original = std::fs::read_to_string(&config).unwrap();
 
-        cmd_doctor(&config, /*fix*/ true, Verbosity::Normal).unwrap();
+        cmd_doctor(
+            &config,
+            config.parent().unwrap(),
+            None,
+            /*fix*/ true,
+            Verbosity::Normal,
+        )
+        .unwrap();
 
         // Backup preserves the original content.
         let backup = tmp.path().join("design.yaml.bak");

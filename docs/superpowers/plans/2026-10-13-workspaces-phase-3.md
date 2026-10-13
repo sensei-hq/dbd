@@ -142,6 +142,36 @@ Taken in slice 3:
   runs that module. `init` and `install` do not walk up, and a design
   without modules is not looked for above.
 
+Taken in slice 4:
+
+- A module's version and release state are written in its block,
+  `modules.<name>.version` / `released`, edited in place as `project.*` is
+  (comments and layout kept; a module written `{}` becomes a block; a
+  flow-style block with keys falls back to rewriting the file):
+  `config::update_version_of` / `set_released_of`. Its snapshots and
+  migrations are in its folder: `snapshot::create_snapshot_of` /
+  `create_baseline_snapshot_of`, which name the module (`Design::module`).
+- An edit in place must read as the file did with that one key set — every
+  other value as it was — or the file is rewritten whole.
+- `snapshot` and `release` go over every module, or `--module` alone, never
+  a scope (a snapshot records the design). A `release` checks every module
+  it releases before writing any; a whole-workspace `release` skips the
+  modules already released and refuses only when none is left.
+  `snapshot --list`, `format` and `doctor` go over each module's folder —
+  or `--module`'s, or the folder dbd runs in — without loading designs
+  (`Workspace::folders`, which refuses a folder that is not there); `doctor`
+  audits a design.yaml it cannot parse as a project's, as before.
+- A released module changes by snapshot and `dbd apply`: `reconcile` refuses
+  the module asked for if it is released, and leaves out — saying so — a
+  released module the run takes in otherwise, a dependency included. It is
+  left out before the manifest's hooks attach (`Workspace::select_except`,
+  `Order::Reconcile`), so they run around the modules reconciled.
+- A module's name must read as a string to YAML 1.2 and 1.1 alike: `2024`,
+  `true`, `null`, `no`, `on`, `y`, `1_000` and `0x1f` are refused.
+- `doctor` does not migrate a design.yaml that declares `modules:` — the
+  migration would rebuild it without them; its old entries are fixed by hand.
+  A design.yaml it cannot read is named as an issue, with the error.
+
 ## Slices
 
 Each is red tests first, then the implementation, a focused review, CI, and a

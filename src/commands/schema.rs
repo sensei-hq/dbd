@@ -1037,7 +1037,7 @@ async fn preflight_apply(targets: &[super::Target], run: &ApplyRun<'_>) -> Resul
                 .await?;
             anyhow::Ok(())
         };
-        check.await.with_context(|| target.label().unwrap_or_default())?;
+        target.labelled(check.await)?;
     }
     Ok(())
 }
@@ -1359,7 +1359,7 @@ pub async fn cmd_policies(
                 design.check_ownership(&*adapter).await?;
                 anyhow::Ok(())
             };
-            check.await.with_context(|| target.label().unwrap_or_default())?;
+            target.labelled(check.await)?;
         }
     }
     let mut code = 0;
@@ -1473,7 +1473,13 @@ async fn policies_design(
     Ok(policy_phase_exit_code(&report))
 }
 
-pub fn cmd_format(config: &Path, project_dir: &Path, check: bool, verbosity: Verbosity) -> Result<()> {
+pub fn cmd_format(
+    config: &Path,
+    project_dir: &Path,
+    module: Option<&str>,
+    check: bool,
+    verbosity: Verbosity,
+) -> Result<()> {
     let format_config = if config.exists() {
         let design_config = dbd_core::config::read(config)?;
         design_config.format
@@ -1481,14 +1487,15 @@ pub fn cmd_format(config: &Path, project_dir: &Path, check: bool, verbosity: Ver
         dbd_core::config::FormatConfig::default()
     };
 
-    let files = dbd_core::scanner::scan_ddl(project_dir)?;
+    // A workspace's DDL is each module's, in its folder (#7).
     let mut changed = 0;
-
-    for file in &files {
-        if format_in_place(project_dir, file, &format_config, !check)? {
-            changed += 1;
-            let verb = if check { "would reformat" } else { "formatted" };
-            output::info(verbosity, &format!("  {verb}: {}", file.display()));
+    for (_, dir) in super::file_folders(config, project_dir, module)? {
+        for file in &dbd_core::scanner::scan_ddl(&dir)? {
+            if format_in_place(&dir, file, &format_config, !check)? {
+                changed += 1;
+                let verb = if check { "would reformat" } else { "formatted" };
+                output::info(verbosity, &format!("  {verb}: {}", file.display()));
+            }
         }
     }
 
@@ -2079,7 +2086,7 @@ mod tests {
     fn format_write_mode_on_temp_copy() {
         let proj = testutil::copy_fixture_project();
         let cfg = proj.path().join("design.yaml");
-        cmd_format(&cfg, proj.path(), /*check*/ false, Verbosity::Normal).unwrap();
+        cmd_format(&cfg, proj.path(), None, /*check*/ false, Verbosity::Normal).unwrap();
     }
 
     /// `format --check` on an already-formatted project reports "all
@@ -2091,8 +2098,8 @@ mod tests {
         let proj = testutil::copy_fixture_project();
         let cfg = proj.path().join("design.yaml");
         // Normalize first so the check pass finds zero diffs.
-        cmd_format(&cfg, proj.path(), /*check*/ false, Verbosity::Normal).unwrap();
-        cmd_format(&cfg, proj.path(), /*check*/ true, Verbosity::Normal).unwrap();
+        cmd_format(&cfg, proj.path(), None, /*check*/ false, Verbosity::Normal).unwrap();
+        cmd_format(&cfg, proj.path(), None, /*check*/ true, Verbosity::Normal).unwrap();
     }
 
     /// `inspect --name` filters the report to a single, warning-free entity —
@@ -2386,7 +2393,14 @@ mod tests {
         let missing_config = tmp.path().join("design.yaml");
         assert!(!missing_config.exists());
 
-        cmd_format(&missing_config, tmp.path(), /*check*/ false, Verbosity::Normal).unwrap();
+        cmd_format(
+            &missing_config,
+            tmp.path(),
+            None,
+            /*check*/ false,
+            Verbosity::Normal,
+        )
+        .unwrap();
 
         let formatted = std::fs::read_to_string(tmp.path().join("ddl/table/public/thing.ddl")).unwrap();
         assert_ne!(formatted, "create table public.thing(id int,name text);");
@@ -2416,6 +2430,7 @@ mod tests {
         cmd_format(
             &tmp.path().join("design.yaml"),
             tmp.path(),
+            None,
             /*check*/ false,
             Verbosity::Normal,
         )

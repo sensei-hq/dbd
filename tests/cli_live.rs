@@ -3662,3 +3662,104 @@ async fn shared_and_status_go_over_every_module_whatever_the_default_scope() {
         );
     }
 }
+
+/// Each module has its own history: a snapshot of core alone versions core,
+/// and the apply runs core's migration — shared, at its own version, is not
+/// touched.
+#[tokio::test]
+async fn a_module_migrates_on_its_own_version() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    shop_workspace(dir);
+    let o = dbd(dir, &url, &["snapshot", "-n", "baseline"]);
+    assert!(o.status.success(), "snapshot: {}", combined(&o));
+    let o = dbd(dir, &url, &["deploy"]);
+    assert!(o.status.success(), "deploy: {}", combined(&o));
+
+    std::fs::write(
+        dir.join("core/ddl/table/app/orders.ddl"),
+        "set search_path to app;\ncreate table if not exists orders (\n  id integer primary key\n, \
+         currency text references currencies (code)\n, note text\n);\n",
+    )
+    .unwrap();
+    let o = dbd(dir, &url, &["snapshot", "--module", "core", "-n", "a note"]);
+    assert!(o.status.success(), "snapshot core: {}", combined(&o));
+    assert!(dir.join("core/migrations/002").exists(), "{}", combined(&o));
+
+    let o = dbd(dir, &url, &["apply"]);
+    assert!(o.status.success(), "apply: {}", combined(&o));
+    let owners = owners_listed(dir, &url);
+    assert!(
+        owners.iter().any(|o| o.starts_with("shop/core (prod, v2)")),
+        "{owners:?}"
+    );
+    assert!(
+        owners.iter().any(|o| o.starts_with("shop/shared (prod, v1)")),
+        "{owners:?}"
+    );
+    let out = dir.join("out");
+    let o = dbd(dir, &url, &["export", "--module", "core", "-o", out.to_str().unwrap()]);
+    assert!(o.status.success(), "export: {}", combined(&o));
+    let orders = std::fs::read_to_string(out.join("app/orders.csv")).unwrap();
+    assert!(
+        orders.lines().next().unwrap_or_default().contains("note"),
+        "the migration ran: {orders}"
+    );
+}
+
+/// A released module changes by snapshot and apply; reconcile leaves it out,
+/// and reconciles the modules depending on it.
+#[tokio::test]
+async fn reconcile_leaves_a_released_dependency_out() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    shop_workspace(dir);
+    let o = dbd(dir, &url, &["release", "--module", "shared"]);
+    assert!(o.status.success(), "release shared: {}", combined(&o));
+    let o = dbd(dir, &url, &["deploy"]);
+    assert!(o.status.success(), "deploy: {}", combined(&o));
+
+    let o = dbd(dir, &url, &["reconcile", "--module", "core"]);
+    let said = combined(&o);
+    assert!(o.status.success(), "{said}");
+    assert!(
+        said.contains("module core (shop/core)") && said.contains("shared"),
+        "{said}"
+    );
+
+    let o = dbd(dir, &url, &["reconcile", "--module", "shared"]);
+    assert!(!o.status.success(), "shared is released: {}", combined(&o));
+}
+
+/// A released module reconcile leaves out does not take the manifest's hooks
+/// with it: they run around the modules the run reconciles.
+#[tokio::test]
+async fn reconcile_runs_the_manifests_hooks_around_what_it_reconciles() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    shop_workspace(dir);
+    let manifest = std::fs::read_to_string(dir.join("design.yaml")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        format!("{manifest}\napply:\n  before: [hooks/ws-before.sql]\n  after: [hooks/ws-after.sql]\n"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("hooks")).unwrap();
+    std::fs::write(dir.join("hooks/ws-before.sql"), "select 1;\n").unwrap();
+    std::fs::write(dir.join("hooks/ws-after.sql"), "select 1;\n").unwrap();
+    let o = dbd(dir, &url, &["deploy"]);
+    assert!(o.status.success(), "deploy: {}", combined(&o));
+    let o = dbd(dir, &url, &["release", "--module", "shared"]);
+    assert!(o.status.success(), "release shared: {}", combined(&o));
+
+    let o = dbd(dir, &url, &["reconcile", "--dry-run"]);
+    let said = combined(&o);
+    assert!(o.status.success(), "{said}");
+    assert!(
+        said.contains("run apply.before hooks/ws-before.sql") && said.contains("run apply.after hooks/ws-after.sql"),
+        "{said}"
+    );
+}

@@ -16,19 +16,22 @@
 
 ## Next
 
-Slice 4 (per-module history): `snapshot`, `release` and `apply`'s migrations
-per module (writing `modules.<name>.version`/`released`), and `format` and
-`doctor` over the modules. Branch `feat/workspaces-history`, red tests first.
+Slice 4 PR #64 (`feat/workspaces-history` → `feat/workspaces`): review and
+re-review findings fixed (ef53788e), the plan updated. Next: full suites, CI,
+merge; then slice 5 (viewer grouping and outputs: dbml, diagram, graph,
+combine, emit).
+
+    gh pr checks 64
 
 ## Open
 
+- `dbd init --dry-run` writes design.yaml and the scaffold (pre-existing, not
+  #7) — reported, not filed.
 - Issue #60: reconcile re-emits a mixed-case or quoted `nextval('App.Seq')`
   default every run — probe pg_get_expr before fixing.
 - Declined: best-effort batch rollback error; dropping the old `dbd.import_tmp`;
   migrating a branch build's `dbd.uses` CHECK (no `owner`) — rebuild those.
-- A bare type of another project's is no use (dropped as a built-in).
-- An apply in one transaction runs `apply.before` hooks before its claim
-  (documented in the spec). `dbd.objects` still allows namespace `type`, unused.
+- One-transaction apply runs `apply.before` before its claim (in the spec).
 - Delete by hand: `/tmp/dbd-mut` (+ `git worktree prune`), `/tmp/dbd-mut-target`,
   `/tmp/dbd-idx.*`, `/tmp/dbd-review2*`, `/tmp/dbd-lockreview*`.
 

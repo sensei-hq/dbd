@@ -101,6 +101,10 @@ fn runs_a_workspace(command: &Commands) -> bool {
             | Commands::Refresh { .. }
             | Commands::Migrate { .. }
             | Commands::Reset { .. }
+            | Commands::Snapshot { .. }
+            | Commands::Release { .. }
+            | Commands::Format { .. }
+            | Commands::Doctor { .. }
             | Commands::Install { .. }
     )
 }
@@ -151,6 +155,10 @@ pub(super) enum Order {
     Alone,
     /// A reset: in reverse, `--module` alone.
     Reset,
+    /// A reconcile: as [`Order::Build`], leaving out — and saying so — a
+    /// released module other than the one `--module` names, which changes
+    /// by snapshot and `dbd apply`.
+    Reconcile,
 }
 
 /// One design a command runs: the project's, or one module of a workspace.
@@ -168,6 +176,15 @@ impl Target {
         Self {
             design: f(self.design),
             ..self
+        }
+    }
+
+    /// `result`, its error said to be this module's — a project's own is
+    /// left as it is.
+    pub fn labelled<T>(&self, result: Result<T>) -> Result<T> {
+        match self.label() {
+            Some(label) => result.context(label),
+            None => result,
         }
     }
 
@@ -284,6 +301,38 @@ pub(super) fn format_policy_line(policies: &dbd_core::design::PolicyReport) -> S
     )
 }
 
+/// The folders a command going over a project's files reads (#7): each
+/// module's of a workspace — or `module`'s alone — labelled for the module,
+/// or the project's own. Refuses a module the workspace does not declare.
+pub(super) fn file_folders(
+    config: &Path,
+    project_dir: &Path,
+    module: Option<&str>,
+) -> Result<Vec<(Option<String>, PathBuf)>> {
+    let folders = if config.exists() {
+        Workspace::folders(config, project_dir)?
+    } else {
+        Vec::new()
+    };
+    if folders.is_empty() {
+        return Ok(vec![(None, project_dir.to_path_buf())]);
+    }
+    if let Some(wanted) = module
+        && !folders.iter().any(|(m, _)| m == wanted)
+    {
+        let declared: Vec<&str> = folders.iter().map(|(m, _)| m.as_str()).collect();
+        anyhow::bail!(
+            "no module \"{wanted}\" — design.yaml's modules: are {}",
+            declared.join(", ")
+        );
+    }
+    Ok(folders
+        .into_iter()
+        .filter(|(m, _)| module.is_none_or(|wanted| m == wanted))
+        .map(|(name, dir)| (Some(name), dir))
+        .collect())
+}
+
 /// Warn when a run's design has no DDL of its own. For a project it is the
 /// tell-tale of a wrong `--source`: the config path (`-c`) and the ddl/ scan
 /// root (`--source`) are independent, so an absolute `-c` with a defaulted
@@ -342,10 +391,26 @@ pub(super) fn targets(
             modules
         }
         (Order::Reset, _) => workspace.selected_to_reset(module)?,
+        (Order::Reconcile, _) => {
+            let released = |m: &dbd_core::design::Module| {
+                m.design().config().project.released && m.name().is_some() && m.name() != module
+            };
+            let (kept, left_out) = workspace.select_except(module, released)?;
+            for name in left_out {
+                output::info(
+                    Verbosity::Normal,
+                    &format!(
+                        "module {name} is released — it changes by `dbd snapshot` and `dbd apply`; reconcile \
+                         leaves it out."
+                    ),
+                );
+            }
+            kept
+        }
     };
     // A run that builds or reads goes over its modules as one design goes over
     // its entities: what one requires of another is in the run's scope.
-    if matches!(order, Order::Build) {
+    if matches!(order, Order::Build | Order::Reconcile) {
         dbd_core::design::check_scope_gaps(&modules, scope, deps)?;
     }
     Ok(modules
@@ -529,10 +594,9 @@ pub async fn run(
 
         Commands::Snapshot { list, name } => {
             if *list {
-                migration::cmd_snapshot_list(project_dir, verbosity);
-                return Ok(());
+                return migration::cmd_snapshot_list(config, project_dir, module, verbosity);
             }
-            migration::cmd_snapshot_create(config, env, project_dir, name.as_deref(), verbosity)
+            migration::cmd_snapshot_create(config, env, project_dir, module, name.as_deref(), verbosity)
         }
 
         Commands::Migrate { status } => {
@@ -613,7 +677,7 @@ pub async fn run(
             verbosity,
         ),
 
-        Commands::Doctor { fix } => project::cmd_doctor(config, *fix, verbosity),
+        Commands::Doctor { fix } => project::cmd_doctor(config, project_dir, module, *fix, verbosity),
 
         Commands::Init {
             name,
@@ -728,7 +792,7 @@ pub async fn run(
             .await
         }
 
-        Commands::Format { check } => schema::cmd_format(config, project_dir, *check, verbosity),
+        Commands::Format { check } => schema::cmd_format(config, project_dir, module, *check, verbosity),
 
         Commands::Policies { dry_run } => {
             schema::cmd_policies(
@@ -792,7 +856,9 @@ pub async fn run(
             .await
         }
 
-        Commands::Release { name } => project::cmd_release(config, env, project_dir, name.as_deref(), verbosity),
+        Commands::Release { name } => {
+            project::cmd_release(config, env, project_dir, module, name.as_deref(), verbosity)
+        }
 
         Commands::Install { project, dry_run } => install::cmd_install(*project, *dry_run, project_dir, verbosity),
     }

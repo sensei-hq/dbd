@@ -742,44 +742,119 @@ pub fn read(path: &Path) -> Result<DesignConfig> {
 
 /// Update the `project.version` field in a design.yaml file.
 pub fn update_version(config_path: &Path, version: u32) -> Result<()> {
-    set_project_key(config_path, "version", &version.to_string(), |c| {
-        c.project.version == Some(version)
-    })
+    update_version_of(config_path, None, version)
 }
 
 /// Set the `project.released` flag in a design.yaml file.
 pub fn set_released(config_path: &Path, released: bool) -> Result<()> {
-    set_project_key(config_path, "released", &released.to_string(), |c| {
-        c.project.released == released
-    })
+    set_released_of(config_path, None, released)
 }
 
-/// Set one scalar `key` under `project:`, editing that line in place.
+/// Update the version of `module` — `modules.<module>.version` — or, with
+/// `None`, of the project, `project.version` (#7): a workspace's modules each
+/// have their own.
+pub fn update_version_of(config_path: &Path, module: Option<&str>, version: u32) -> Result<()> {
+    set_key(config_path, module, "version", &version.to_string())
+}
+
+/// Set the release flag of `module` — `modules.<module>.released` — or, with
+/// `None`, of the project (#7).
+pub fn set_released_of(config_path: &Path, module: Option<&str>, released: bool) -> Result<()> {
+    set_key(config_path, module, "released", &released.to_string())
+}
+
+/// Set one scalar `key` under `project:`, or under `modules.<module>`,
+/// editing that line in place.
 ///
 /// design.yaml is hand-written: re-serialising it through serde dropped every
 /// comment, blank line and flow-style list each time `dbd snapshot` bumped the
-/// version. The edit touches one line (or adds one at the end of the
-/// `project:` block); the result is re-parsed and must say what was asked, and
-/// a layout the line edit cannot handle — a flow-style `project: {…}` — falls
-/// back to the old whole-file rewrite rather than guessing.
-fn set_project_key(config_path: &Path, key: &str, value: &str, took: impl Fn(&DesignConfig) -> bool) -> Result<()> {
+/// version. The edit touches one line (or adds one at the end of the block);
+/// the result must read as the file did with that one key set — every other
+/// value as it was — and a layout the line edit gets wrong, or cannot handle,
+/// falls back to the whole-file rewrite rather than guessing.
+fn set_key(config_path: &Path, module: Option<&str>, key: &str, value: &str) -> Result<()> {
     // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     let content = std::fs::read_to_string(config_path)
         .map_err(|e| DbdError::Config(format!("Cannot read {}: {}", config_path.display(), e)))?;
-    let edited = edit_project_key(&content, key, value)
-        .filter(|out| serde_yaml::from_str::<DesignConfig>(out).is_ok_and(|c| took(&c)));
+    let mut expected: serde_yaml::Value = serde_yaml::from_str(&content)?;
+    let parsed: serde_yaml::Value = serde_yaml::from_str(value)?;
+    let block = match module {
+        None => &mut expected["project"],
+        Some(module) => &mut expected["modules"][module],
+    };
+    if block.is_null() {
+        *block = serde_yaml::Value::Mapping(Default::default());
+    }
+    block[key] = parsed;
+    let edited = match module {
+        None => edit_project_key(&content, key, value),
+        Some(module) => edit_module_key(&content, module, key, value),
+    }
+    .filter(|out| serde_yaml::from_str::<serde_yaml::Value>(out).is_ok_and(|v| v == expected));
     let output = match edited {
         Some(out) => out,
-        None => {
-            let mut doc: serde_yaml::Value = serde_yaml::from_str(&content)?;
-            let parsed: serde_yaml::Value = serde_yaml::from_str(value)?;
-            doc["project"][key] = parsed;
-            serde_yaml::to_string(&doc)?
-        }
+        None => serde_yaml::to_string(&expected)?,
     };
     // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     std::fs::write(config_path, output)?;
     Ok(())
+}
+
+/// `content` with `key: value` set in `module`'s block under a block-style
+/// `modules:` mapping, everything else byte for byte. A module written `{}`
+/// becomes a block of that one key; one written in flow style with keys, or
+/// a `modules:` not in block style, is `None` — left to the whole-file
+/// rewrite.
+fn edit_module_key(content: &str, module: &str, key: &str, value: &str) -> Option<String> {
+    let lines: Vec<&str> = content.split_inclusive('\n').collect();
+    let code = |l: &str| l.split('#').next().unwrap_or("").trim_end().to_string();
+    let indent_of = |l: &str| l.len() - l.trim_start_matches(' ').len();
+    let blank = |l: &str| l.trim().is_empty() || l.trim_start().starts_with('#');
+    let header = lines.iter().position(|l| code(l) == "modules:")?;
+    let end = (header + 1..lines.len())
+        .find(|&i| !blank(lines[i]) && !lines[i].starts_with([' ', '\t']))
+        .unwrap_or(lines.len());
+    let step = lines[header + 1..end]
+        .iter()
+        .find(|l| !blank(l))
+        .map(|l| indent_of(l))?;
+    let prefix = format!("{}{module}:", " ".repeat(step));
+    let at = (header + 1..end).find(|&i| lines[i].starts_with(&prefix) && indent_of(lines[i]) == step)?;
+    let rest = code(&lines[at][prefix.len()..]);
+    let newline = |l: &str| if l.ends_with('\n') { "" } else { "\n" };
+    let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+    if rest.trim() == "{}" {
+        let comment = lines[at].find(" #").map(|p| lines[at][p..].trim_end().to_string());
+        out[at] = format!(
+            "{prefix}{}\n{}{key}: {value}\n",
+            comment.map(|c| format!(" {}", c.trim_start())).unwrap_or_default(),
+            " ".repeat(step * 2)
+        );
+        return Some(out.concat());
+    }
+    if !rest.trim().is_empty() {
+        return None;
+    }
+    let block_end = (at + 1..end)
+        .find(|&i| !blank(lines[i]) && indent_of(lines[i]) <= step)
+        .unwrap_or(end);
+    let child = lines[at + 1..block_end]
+        .iter()
+        .find(|l| !blank(l))
+        .map(|l| indent_of(l))
+        .unwrap_or(step * 2);
+    let key_prefix = format!("{}{key}:", " ".repeat(child));
+    if let Some(i) = (at + 1..block_end).find(|&i| lines[i].starts_with(&key_prefix)) {
+        let comment = lines[i].find(" #").map(|p| lines[i][p..].trim_end().to_string());
+        let eol = if lines[i].ends_with('\n') { "\n" } else { "" };
+        out[i] = format!("{key_prefix} {value}{}{eol}", comment.unwrap_or_default());
+    } else {
+        let last = (at..block_end).rev().find(|&i| !blank(lines[i]))?;
+        let pad = newline(&out[last]).to_string();
+        out[last].push_str(&pad);
+        out.insert(last + 1, format!("{key_prefix} {value}\n"));
+    }
+    Some(out.concat())
 }
 
 /// `content` with `key: value` set inside the block-style `project:` mapping,
