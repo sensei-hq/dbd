@@ -85,8 +85,9 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   asks the uses other projects recorded, which see into function bodies —
   recorded whoever owned the target then, a table file's trigger function's
   included. A migration dbd cannot parse is refused where another project
-  shares the database; a `TRUNCATE … CASCADE` is refused only for another
-  project's table referencing the truncated one. Anything another project
+  shares the database; a `TRUNCATE … CASCADE` is refused when it would
+  empty another project's table — the one truncated, a partition or child of
+  it, or one whose foreign key points at any of those. Anything another project
   depends on refuses
   the run, before any write and dry run included: `app.orders.total is used by
   "billing" (view billing.v_totals); remove that use first`. A `--prune`

@@ -211,8 +211,9 @@ a whole schema; an extension's members. Each dependent is walked as itself — a
 column as its column, a constraint, default, trigger or policy as itself — so a
 part reaches only what depends on the part; a view's rewrite rule stands for
 the whole view, and a generated column's expression leads to its column. A
-`TRUNCATE … CASCADE` reaches only the tables whose foreign keys point at the
-truncated one: it empties them and drops nothing. Each is named by its owning
+`TRUNCATE … CASCADE` reaches what it empties and drops nothing: the table, the
+partitions and inheriting tables of what it empties, and every table whose
+foreign key points at what it empties. Each is named by its owning
 relation, type or routine. For a part
 of a table, `dbd.uses` adds only the uses recorded through routine bodies,
 which the catalog does not track. It runs before any write, dry runs
@@ -228,8 +229,9 @@ included:
   `DROP CONSTRAINT`, a `TRUNCATE … CASCADE` — with a bare name on the path the
   migration runs on, and refuses the run when another owner depends on any of
   it. A script dbd cannot parse is refused where another project is recorded:
-  what it drops is unknown. A design not read as Postgres — SQLite's — keeps
-  migrations in its own dialect, which this guard does not judge.
+  what it drops is unknown. A design not read as Postgres — SQLite's — may keep
+  migrations in its own dialect: a script libpg_query cannot read is passed
+  over there, and what it can read is guarded as any other's.
 
 This is the contract between owners. It plays the role an API plays between
 services.
