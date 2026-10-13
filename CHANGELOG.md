@@ -9,6 +9,39 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.26.0] — 2026-10-13
+
+**Several projects can share one database.** dbd now records which project
+owns each entity — in `dbd.objects` and `dbd.uses`, `_dbd_objects` and
+`_dbd_uses` on SQLite — and no run changes or drops another project's: a
+design declaring one is refused before anything runs, `reconcile --prune`
+leaves it alone, a drop another project depends on is refused naming the use,
+and a reset keeps what other projects have or use. Entities move between
+projects with `--adopt-from`, `dbd inspect --shared` shows what shares a
+database, and a second project onboards beside the first with `init
+--from-db`. The new guide, [sharing a database](docs/guide/14-sharing-a-database.md),
+covers it all. The first phase of [#7] — fixes to the bookkeeping, refresh jobs
+and imports that projects sharing a database undid for each other — ships with
+it.
+
+**Upgrading.** No migration step is needed: a project's first run on 0.26
+claims what its design declares that exists and nobody owns. Until every
+project in a database has run 0.26, dbd cannot tell their entities from
+nobody's, so `--prune` keeps unowned tables there, and `init --from-db` and
+`merge` refuse. Behaviour that changes for a single project too:
+
+- a reset, a reconcile and an apply running migrations hold the database's
+  dbd write lock exclusively, so other dbd runs on that database wait for them,
+  five minutes at most, and they for those;
+- `init --from-db` refuses only a database that records the project it
+  creates — another project's record is no longer a bar;
+- a reset is refused, `--force` or not, when another project depends on what
+  it drops, and unforced while any project's record says prod.
+
+The library API changes are listed under Library API: `Design::reconcile`
+takes `impl Into<Prune>`, and several `DatabaseAdapter` methods gained
+parameters.
+
 ### Added
 
 - **Each entity in a shared database has one owner** (#7, phase 2). A
