@@ -1,22 +1,22 @@
 # Checkpoint
 
-**Slice:** #7 Phase 2, slice 6 (name reuse + transfer) on `feat/ownership-transfer`,
-from `feat/ownership` (slices 1–5: PRs #50–#53). Phase 1 is on `develop`, unreleased.
+**Slice:** #7 Phase 2, slice 7 (`inspect --shared`, onboarding) on
+`feat/ownership-inspect`, from `feat/ownership` (slices 1–6: PRs #50–#54).
 
 ## Done
 
-- Slices 1–5 in `feat/ownership` (`91f00335`): registry, claim, uses; prune by
-  ownership; the uses guard; reset rules and the dbd write lock.
-- Slice 6 implemented (`039def68`, docs `ec3112a6`): name reuse refused at claim
-  time (`--allow-ownership-change`); `--adopt-from <owner>` adopts in the claim's
-  transaction, printed; adopted objects are no rename sign.
-- Embedded 284/284, `cli_live` 51/51, workspace 2007/0, clippy, fmt, doc clean.
+- Slices 1–6 in `feat/ownership` (`953cdbe9`): registry, claim, uses; prune;
+  uses guard; reset rules and write lock; name reuse and `--adopt-from`.
+- Slice 7 implemented (`48c5dbdc`): `inspect --shared` (projects, owns, uses,
+  conflicts; non-zero over a conflict); `init --from-db`/`merge` leave out other
+  owners' entities, refuse while a project records no uses.
+- Embedded 295/295, `cli_live` 59/59, workspace 2007/0, clippy, fmt, doc clean.
 
 ## Next
 
-    gh pr create --base feat/ownership --head feat/ownership-transfer
-    # focused review, fixes test-first, CI green, local --no-ff merge; then
-    # slice 7: `inspect --shared`, init/merge skipping other owners
+    gh pr create --base feat/ownership --head feat/ownership-inspect
+    # review, fixes test-first, CI, local merge; slice 8: SQLite parity
+    # (_dbd_objects/_dbd_uses, T18); then the docs slice
 
 ## Open
 
