@@ -7,16 +7,18 @@ Phase 1 is on `develop`, unreleased.
 ## Done
 
 - Slices 1–4 in `feat/ownership`: registry, claim, uses; prune by ownership;
-  the uses guard (pg_depend as a CASCADE reaches + dbd.uses) on reconcile's
-  drops and apply's migrations.
-- Embedded 238/238, `cli_live` 48/48, workspace 2005/0, clippy, fmt, doc clean.
+  the uses guard on reconcile's drops and apply's migrations.
+- Slice 5 implemented (`97d866e7`, docs `732ff4d1`): any project's prod mark
+  refuses an unforced reset; entity and dropped-schema uses guard; `--schemas`,
+  `--extensions` and roles keep what other projects have, use or depend on,
+  named on `ResetComplete.kept`; `reset_preview` for `--dry-run`.
+- Embedded 249/249, `cli_live` 49/49, workspace 2006/0, clippy, fmt, doc clean.
 
 ## Next
 
-    # slice 5: reset drops only own (claims first — done in slice 1); its
-    # CASCADE behind the uses guard; --schemas only for a schema holding no
-    # other owner's and no unowned entity; --extensions and roles skip what
-    # another owner uses; the prod guard refuses while any owner is prod.
+    gh pr create --base feat/ownership --head feat/ownership-reset
+    # then focused review, fixes test-first, CI green, local --no-ff merge;
+    # slice 6: name reuse (--allow-ownership-change) + transfer (--adopt-from)
 
 ## Open
 
@@ -28,7 +30,8 @@ Phase 1 is on `develop`, unreleased.
 - A bare type of another project's is no use (dropped as a built-in).
 - An apply in one transaction runs `apply.before` hooks before its claim
   (documented in the spec). `dbd.objects` still allows namespace `type`, unused.
-- Docs slice (end of Phase 2) must cover `--prune-unowned` in the guides.
+- Docs slice (end of Phase 2) must cover `--prune-unowned` and reset's kept
+  lines in the guides.
 - Phase 1 is releasable as 0.25.2 when asked.
 
 ## Known limits
