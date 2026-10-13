@@ -163,7 +163,14 @@ Taken in slice 4:
   audits a design.yaml it cannot parse as a project's, as before.
 - A released module changes by snapshot and `dbd apply`: `reconcile` refuses
   the module asked for if it is released, and leaves out — saying so — a
-  released module the run takes in otherwise, a dependency included.
+  released module the run takes in otherwise, a dependency included. It is
+  left out before the manifest's hooks attach (`Workspace::select_except`,
+  `Order::Reconcile`), so they run around the modules reconciled.
+- A module's name must read as a string to YAML 1.2 and 1.1 alike: `2024`,
+  `true`, `null`, `no`, `on`, `y`, `1_000` and `0x1f` are refused.
+- `doctor` does not migrate a design.yaml that declares `modules:` — the
+  migration would rebuild it without them; its old entries are fixed by hand.
+  A design.yaml it cannot read is named as an issue, with the error.
 
 ## Slices
 
