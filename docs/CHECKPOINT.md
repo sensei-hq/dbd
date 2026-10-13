@@ -1,23 +1,20 @@
 # Checkpoint
 
-**Slice:** #7 Phase 2, slice 5 (reset rules) on `feat/ownership-reset`, from
-`feat/ownership` (slices 1–4: PRs #50–#52). Phase 1 is on `develop`, unreleased.
+**Slice:** #7 Phase 2, slice 6 (name reuse + transfer) on `feat/ownership-transfer`,
+from `feat/ownership` (slices 1–5: PRs #50–#53). Phase 1 is on `develop`, unreleased.
 
 ## Done
 
-- Slice 5 (PR #53): reset keeps/refuses for other projects, `ResetComplete.kept`,
-  `reset_preview`. Two review rounds fixed test-first: the dbd write lock
-  (`dbd:write`; exclusive for reset/reconcile/migrating apply, shared for
-  apply/import/policies/grants; polls, survives idle timeouts, gives way on
-  cancel); the guard sees what nobody owns (prune's rule), composites, a
-  schema's collations, arrays and row types; supabase; kept roles' grants.
-- Embedded 278/278, `cli_live` 49/49, workspace 2006/0, clippy, fmt, doc clean.
+- Slices 1–5 in `feat/ownership` (`91f00335`): registry, claim, uses; prune by
+  ownership; the uses guard; reset rules and the dbd write lock.
 
 ## Next
 
-    gh pr checks 53 --watch
-    # CI green → local --no-ff merge into feat/ownership; then slice 6:
-    # name reuse (--allow-ownership-change) + transfer (--adopt-from)
+    # slice 6: a design under an owner name that holds entities here, declaring
+    # none of them, is refused at claim time (--allow-ownership-change
+    # overrides); --adopt-from <owner> takes over, printed, what the design
+    # declares that <owner> holds — the giver's next run neither owns nor
+    # prunes it. Red tests first (spec T14, T15).
 
 ## Open
 
