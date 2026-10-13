@@ -6,17 +6,17 @@
 ## Done
 
 - Slice 5 (PR #53): reset keeps/refuses for other projects, `ResetComplete.kept`,
-  `reset_preview`. Review round 1 fixed test-first: the dbd write lock
-  (`dbd:write` advisory; exclusive for reset, reconcile, migrating apply);
-  the guard sees what nobody owns (prune's rule) and a schema's collations;
-  supabase resets; kept roles keep grants; path-key guard; unknown env = prod.
-- Embedded 266/266, `cli_live` 49/49, workspace 2006/0, clippy, fmt, doc clean.
+  `reset_preview`. Two review rounds fixed test-first: the dbd write lock
+  (`dbd:write`; exclusive for reset/reconcile/migrating apply, shared for
+  apply/import/policies/grants; polls, survives idle timeouts, gives way on
+  cancel); the guard sees what nobody owns (prune's rule), composites, a
+  schema's collations, arrays and row types; supabase; kept roles' grants.
+- Embedded 278/278, `cli_live` 49/49, workspace 2006/0, clippy, fmt, doc clean.
 
 ## Next
 
-    git push; gh pr checks 53 --watch
-    # focused re-review of the write lock + guard reach, fixes test-first,
-    # CI green, local --no-ff merge into feat/ownership; then slice 6:
+    gh pr checks 53 --watch
+    # CI green → local --no-ff merge into feat/ownership; then slice 6:
     # name reuse (--allow-ownership-change) + transfer (--adopt-from)
 
 ## Open
@@ -31,7 +31,8 @@
   (documented in the spec). `dbd.objects` still allows namespace `type`, unused.
 - Docs slice (end of Phase 2) must cover `--prune-unowned`, reset's kept
   lines and the write lock's waits in the guides.
-- Delete by hand: `/tmp/dbd-mut` (+ `git worktree prune`), `/tmp/dbd-mut-target`, `/tmp/dbd-idx.*`.
+- Delete by hand: `/tmp/dbd-mut` (+ `git worktree prune`), `/tmp/dbd-mut-target`,
+  `/tmp/dbd-idx.*`, `/tmp/dbd-review2*`, `/tmp/dbd-lockreview*`.
 - Phase 1 is releasable as 0.25.2 when asked.
 
 ## Known limits
