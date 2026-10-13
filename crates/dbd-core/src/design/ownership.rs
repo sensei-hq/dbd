@@ -501,6 +501,17 @@ impl Design {
         plan: &super::ExecutionPlan,
     ) -> Result<()> {
         use crate::adapter::{Guarded, GuardedPart};
+        // A design not read as Postgres has migrations in its own dialect —
+        // SQLite's, say — which this guard, reading Postgres, cannot judge.
+        let postgres =
+            crate::parser::ParserChoice::resolve(&self.config.source.dialect, self.config.source.parser.as_deref())
+                .is_ok_and(|parser| parser == crate::parser::ParserChoice::PgQuery);
+        if !postgres {
+            return Ok(());
+        }
+        // An unreadable script is refused only where there is someone else to
+        // protect: another project recorded in the database.
+        let mut others: Option<bool> = None;
         let mut guarded: Vec<(Guarded, String)> = Vec::new();
         for step in &plan.steps {
             let (entity, path) = match step {
@@ -525,6 +536,13 @@ impl Design {
                 continue;
             };
             if let Err(e) = pg_query::parse(&sql) {
+                let others = match others {
+                    Some(others) => others,
+                    None => *others.insert(!adapter.other_projects_meta().await?.is_empty()),
+                };
+                if !others {
+                    continue;
+                }
                 return Err(DbdError::Config(format!(
                     "{}: dbd cannot read this migration ({e}), so cannot tell what it drops that \
                      another project depends on — fix the script",
@@ -558,6 +576,7 @@ impl Design {
                     GuardedPart::Column(column) => format!("{schema}.{name}.{column}"),
                     GuardedPart::Constraint(c) => format!("{schema}.{name} constraint {c}"),
                     GuardedPart::Index(i) => format!("{schema}.{name} index {i}"),
+                    GuardedPart::Truncate => format!("{schema}.{name}, truncated with CASCADE,"),
                 };
                 let g = Guarded {
                     object: OwnedObject {

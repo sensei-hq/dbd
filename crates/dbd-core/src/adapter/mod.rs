@@ -101,6 +101,9 @@ pub enum GuardedPart {
     Column(String),
     Constraint(String),
     Index(String),
+    /// A `TRUNCATE … CASCADE`: it empties the tables whose foreign keys point
+    /// at the entity, and drops nothing.
+    Truncate,
 }
 
 /// Another owner's dependence on a [`Guarded`] entity (#7).

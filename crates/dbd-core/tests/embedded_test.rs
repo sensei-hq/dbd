@@ -13314,13 +13314,19 @@ async fn an_enum_value_another_projects_array_column_holds_is_refused() {
     );
 }
 
-/// A migration dbd cannot read is one it cannot clear: the guard read
-/// nothing in it and let it through, dry run included (#7).
+/// A migration dbd cannot read is one it cannot clear where another project
+/// shares the database: the guard read nothing in it and let it through, dry
+/// run included (#7).
 #[tokio::test]
 async fn a_migration_dbd_cannot_read_is_refused() {
     let (_pg, url) = start_pg().await;
     let shop = connect(&url, "shop").await.unwrap();
-    let sd = tempfile::tempdir().unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    named_project(bd.path(), "billing", "", &ORDERS_OWNER_FILES[1..])
+        .apply(&*billing, None, false, None, Progress::none())
+        .await
+        .expect("billing's apply");
     let dir = sd.path();
     released_shop(
         dir,

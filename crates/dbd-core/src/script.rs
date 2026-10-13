@@ -281,8 +281,8 @@ fn first_token_at(piece: &str) -> usize {
 /// or domain (`relation`), of a function, procedure or routine (`routine`), of
 /// a schema (`schema`, everything in it) or of an extension (`extension`),
 /// whole; a `DROP INDEX`, an index; an `ALTER TABLE`'s `DROP COLUMN` or `DROP
-/// CONSTRAINT`, a part; and a `TRUNCATE … CASCADE`'s tables, whole, since it
-/// empties every table that refers to them. The statements a `DO` block runs
+/// CONSTRAINT`, a part; and a `TRUNCATE … CASCADE`'s tables, as truncated —
+/// it empties every table that refers to them. The statements a `DO` block runs
 /// count. Each as `(namespace, schema, name, part)`; the schema is the one the
 /// statement states, else the script's own `SET search_path` before it, else
 /// `None`. Empty for a script that does not parse.
@@ -334,15 +334,21 @@ fn collect_drops(
             }
         };
         match node {
+            // The first schema the path names: `"$user"` is the connecting
+            // role's, which no script names.
             NodeEnum::VariableSetStmt(set) if set.name.eq_ignore_ascii_case("search_path") => {
-                *path = set.args.iter().find_map(|a| match a.node.as_ref() {
-                    Some(NodeEnum::AConst(c)) => match c.val.as_ref() {
-                        Some(pg_query::protobuf::a_const::Val::Sval(s)) => Some(s.sval.clone()),
+                *path = set
+                    .args
+                    .iter()
+                    .filter_map(|a| match a.node.as_ref() {
+                        Some(NodeEnum::AConst(c)) => match c.val.as_ref() {
+                            Some(pg_query::protobuf::a_const::Val::Sval(s)) => Some(s.sval.clone()),
+                            _ => None,
+                        },
+                        Some(NodeEnum::String(s)) => Some(s.sval.clone()),
                         _ => None,
-                    },
-                    Some(NodeEnum::String(s)) => Some(s.sval.clone()),
-                    _ => None,
-                });
+                    })
+                    .find(|schema| schema != "$user");
             }
             NodeEnum::DropStmt(d) => {
                 let kind = d.remove_type();
@@ -398,7 +404,7 @@ fn collect_drops(
                         } else {
                             Some(rv.schemaname.clone())
                         };
-                        drops.push(("relation", schema, rv.relname.clone(), GuardedPart::Whole));
+                        drops.push(("relation", schema, rv.relname.clone(), GuardedPart::Truncate));
                     }
                 }
             }

@@ -735,6 +735,7 @@ impl Bookkeeping {
                 GuardedPart::Column(c) => ("column", c.as_str()),
                 GuardedPart::Constraint(c) => ("constraint", c.as_str()),
                 GuardedPart::Index(n) => ("index", n.as_str()),
+                GuardedPart::Truncate => ("truncate", ""),
             };
             let mut seen: std::collections::BTreeSet<(String, String)> = sqlx::query_as(DEPENDENTS_SQL)
                 .bind(&g.object.namespace)
@@ -763,7 +764,10 @@ impl Bookkeeping {
             .fetch_all(&self.pool)
             .await
             .map_err(read)?;
-            seen.extend(uses);
+            // A truncate drops nothing a use could name.
+            if part != "truncate" {
+                seen.extend(uses);
+            }
             found.extend(
                 seen.into_iter()
                     .map(|(owner, via)| crate::adapter::Dependence { guarded: i, owner, via }),
@@ -1202,13 +1206,16 @@ async fn release_in(
 /// dependency graph; a constraint, with the index behind a primary key, unique
 /// or exclusion constraint (a foreign key's is the referenced table's, which
 /// dropping it leaves alone); an index; every overload of a routine; all of a
-/// schema, or of an extension. Walks `pg_depend` dependent by dependent, each
-/// as itself — a column as its column, a constraint, default, trigger or
+/// schema; an extension's members. Walks `pg_depend` dependent by dependent,
+/// each as itself — a column as its column, a constraint, default, trigger or
 /// policy as itself — so a part reaches what depends on the part and not on
 /// its table; a view's rewrite rule stands for the whole view, which is what
-/// depends on the view. Each dependent is named by its owning relation, type
-/// or routine. Rows: the other owner, and the dependent as `kind
-/// schema.name`.
+/// depends on the view, and a generated column's expression leads to the
+/// column it is part of. A `truncate` reaches only the tables whose foreign
+/// keys point at the entity, through each other, and walks no further: it
+/// empties them, and drops nothing. Each dependent is named by its owning
+/// relation, type or routine. Rows: the other owner, and the dependent as
+/// `kind schema.name`.
 const DEPENDENTS_SQL: &str = "\
 WITH RECURSIVE \
 rel AS (SELECT c.oid, c.reltype FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -1218,6 +1225,11 @@ typ AS (SELECT t.oid, t.typarray FROM pg_type t JOIN pg_namespace n ON n.oid = t
 inh(child) AS ( \
   SELECT i.inhrelid FROM pg_inherits i JOIN rel ON i.inhparent = rel.oid WHERE $4 = 'column' \
   UNION SELECT i.inhrelid FROM pg_inherits i JOIN inh ON i.inhparent = inh.child \
+), \
+fk(child) AS ( \
+  SELECT k.conrelid FROM pg_constraint k JOIN rel ON k.confrelid = rel.oid \
+  WHERE $4 = 'truncate' AND k.contype = 'f' AND k.conrelid <> rel.oid \
+  UNION SELECT k.conrelid FROM pg_constraint k JOIN fk ON k.confrelid = fk.child WHERE k.contype = 'f' \
 ), \
 start(classid, objid, objsubid) AS ( \
   SELECT 'pg_class'::regclass::oid, rel.oid, 0 FROM rel WHERE $4 = 'whole' \
@@ -1247,19 +1259,28 @@ start(classid, objid, objsubid) AS ( \
             WHERE $1 = 'schema' AND n.nspname = $2 AND t.typrelid = 0 AND t.typelem = 0 \
   UNION ALL SELECT 'pg_proc'::regclass::oid, p.oid, 0 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
             WHERE $1 = 'schema' AND n.nspname = $2 \
-  UNION ALL SELECT 'pg_extension'::regclass::oid, e.oid, 0 FROM pg_extension e \
+  UNION ALL SELECT d.classid, d.objid, d.objsubid FROM pg_extension e \
+            JOIN pg_depend d ON d.refclassid = 'pg_extension'::regclass AND d.refobjid = e.oid AND d.deptype = 'e' \
             WHERE $1 = 'extension' AND e.extname = $3 \
+  UNION ALL SELECT 'pg_class'::regclass::oid, fk.child, 0 FROM fk \
 ), \
 walk(classid, objid, objsubid) AS ( \
   SELECT classid, objid, objsubid FROM start \
   UNION \
-  SELECT CASE WHEN d.classid = 'pg_rewrite'::regclass THEN 'pg_class'::regclass::oid ELSE d.classid END, \
-         CASE WHEN d.classid = 'pg_rewrite'::regclass \
-              THEN (SELECT r.ev_class FROM pg_rewrite r WHERE r.oid = d.objid) ELSE d.objid END, \
-         CASE WHEN d.classid = 'pg_rewrite'::regclass THEN 0 ELSE d.objsubid END \
-  FROM walk w \
-  JOIN pg_depend d ON d.refclassid = w.classid AND d.refobjid = w.objid \
-                  AND (w.objsubid = 0 OR d.refobjsubid = w.objsubid) AND d.deptype IN ('n', 'a') \
+  SELECT x.classid, x.objid, x.objsubid FROM walk w \
+  CROSS JOIN LATERAL ( \
+    SELECT CASE WHEN d.classid = 'pg_rewrite'::regclass THEN 'pg_class'::regclass::oid ELSE d.classid END, \
+           CASE WHEN d.classid = 'pg_rewrite'::regclass \
+                THEN (SELECT r.ev_class FROM pg_rewrite r WHERE r.oid = d.objid) ELSE d.objid END, \
+           CASE WHEN d.classid = 'pg_rewrite'::regclass THEN 0 ELSE d.objsubid END \
+    FROM pg_depend d \
+    WHERE d.refclassid = w.classid AND d.refobjid = w.objid \
+      AND (w.objsubid = 0 OR d.refobjsubid = w.objsubid) AND d.deptype IN ('n', 'a') \
+    UNION ALL \
+    SELECT d.refclassid, d.refobjid, d.refobjsubid FROM pg_depend d \
+    WHERE w.classid = 'pg_attrdef'::regclass AND d.classid = w.classid AND d.objid = w.objid AND d.deptype = 'i' \
+  ) x(classid, objid, objsubid) \
+  WHERE $4 <> 'truncate' \
 ), \
 owning(classid, objid) AS ( \
   SELECT CASE WHEN w.classid IN ('pg_constraint'::regclass, 'pg_trigger'::regclass, 'pg_attrdef'::regclass, \
