@@ -847,14 +847,20 @@ impl OwnershipChange {
 }
 
 /// Say, before a run, each entity it takes over with `--adopt-from` — or,
-/// previewing, would. Always shown: an adoption is never silent (#7).
+/// previewing, would. Always shown: an adoption is never silent (#7). Only
+/// once the run's ownership checks pass: a run refused adopts nothing.
 pub(super) async fn announce_adoptions(
     design: &dbd_core::Design,
     adapter: &dyn dbd_core::DatabaseAdapter,
     dry_run: bool,
 ) -> Result<()> {
+    let adoptions = design.adoptions(adapter).await?;
+    if adoptions.is_empty() {
+        return Ok(());
+    }
+    design.check_ownership(adapter).await?;
     let verb = if dry_run { "[dry-run] would adopt" } else { "adopting" };
-    for held in design.adoptions(adapter).await? {
+    for held in adoptions {
         output::always(&format!(
             "{verb} {} {}.{} from \"{}\"",
             held.object.namespace, held.object.schema, held.object.name, held.owner

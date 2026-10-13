@@ -94,6 +94,12 @@ impl Design {
         if marks.own.is_some() {
             return Ok(marks);
         }
+        // Claims under this project's name are its own: it has run here, and
+        // is no project renamed from another — one that adopted, then failed
+        // before it wrote its record, included (#7).
+        if !adapter.owned_objects(self.owner()).await?.is_empty() {
+            return Ok(marks);
+        }
         let others = adapter.other_projects_meta().await?;
         if !others.is_empty() && self.database_holds_objects(adapter).await? {
             marks.others = others;

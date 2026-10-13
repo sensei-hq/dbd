@@ -858,7 +858,7 @@ pub async fn cmd_apply(
         if let Some(adapter) = &adapter {
             let marks = design.database_marks(&**adapter).await?;
             Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
-            design.check_apply_guards(&marks)?;
+            design.check_run_guards(&**adapter, &marks).await?;
             // The real run claims the design's entities; its preview refuses
             // what that claim would, and names what it would adopt (#7).
             design.check_ownership(&**adapter).await?;

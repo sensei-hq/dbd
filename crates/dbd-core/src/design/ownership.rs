@@ -168,6 +168,31 @@ impl Design {
         Ok(held.into_iter().filter(|h| &h.owner == from).collect())
     }
 
+    /// What the owner holds that still exists, when this design declares none
+    /// of it — a reused name — else `None`.
+    async fn held_undeclared(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        declared: &[OwnedObject],
+    ) -> Result<Option<Vec<OwnedObject>>> {
+        let held = adapter.owned_objects(self.owner()).await?;
+        let declares_any = held.iter().any(|h| {
+            declared
+                .iter()
+                .any(|d| d.namespace == h.namespace && d.schema == h.schema && d.name == h.name)
+        });
+        Ok((!held.is_empty() && !declares_any).then_some(held))
+    }
+
+    /// Whether this design reuses an owner's name — and is allowed to: the
+    /// guards then read the previous design's record. Refuses a reuse not
+    /// allowed (see [`Self::check_name_reuse`]).
+    pub(crate) async fn reuses_owner_name(&self, adapter: &dyn DatabaseAdapter) -> Result<bool> {
+        let declared = self.declared_objects();
+        self.check_name_reuse(adapter, &declared).await?;
+        Ok(self.allow_ownership_change && self.held_undeclared(adapter, &declared).await?.is_some())
+    }
+
     /// Refuse a design arriving under an owner name that holds entities here
     /// and declaring none of them — another project under a reused name, which
     /// took over the owner's version and history, and whose first prune would
@@ -177,15 +202,9 @@ impl Design {
         if self.allow_ownership_change {
             return Ok(());
         }
-        let held = adapter.owned_objects(self.owner()).await?;
-        let declares_any = held.iter().any(|h| {
-            declared
-                .iter()
-                .any(|d| d.namespace == h.namespace && d.schema == h.schema && d.name == h.name)
-        });
-        if held.is_empty() || declares_any {
+        let Some(held) = self.held_undeclared(adapter, declared).await? else {
             return Ok(());
-        }
+        };
         const SHOWN: usize = 5;
         let mut named: Vec<String> = held
             .iter()
@@ -197,7 +216,8 @@ impl Design {
         }
         Err(DbdError::Config(format!(
             "owner \"{}\" here owns {} {} ({}); this design declares none of them — another project under \
-             the same name? If this design is that owner now, run with --allow-ownership-change",
+             the same name? If this design is that owner now, run apply, deploy, reconcile or reset with \
+             --allow-ownership-change",
             self.owner(),
             held.len(),
             if held.len() == 1 { "entity" } else { "entities" },
@@ -417,9 +437,21 @@ impl Design {
             schema_users: found.schema_users,
             ..LiveOwnership::default()
         };
+        // What the run adopts is its own to plan against: the claim that moves
+        // it comes before the run writes.
+        let adopted: std::collections::HashSet<(String, String)> = match &self.adopt_from {
+            Some(_) => self
+                .adoptions(adapter)
+                .await?
+                .into_iter()
+                .filter(|h| h.object.namespace == "relation")
+                .map(|h| (h.object.schema, h.object.name))
+                .collect(),
+            None => std::collections::HashSet::new(),
+        };
         for (key, owner) in keys.into_iter().zip(found.owners) {
             match owner {
-                Some(owner) if owner == self.owner() => {
+                Some(owner) if owner == self.owner() || adopted.contains(&key) => {
                     owned.mine.insert(key);
                 }
                 Some(owner) => {

@@ -452,7 +452,7 @@ pub async fn cmd_deploy(
         if let Some(adapter) = &adapter {
             let marks = design.database_marks(&**adapter).await?;
             Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
-            design.check_apply_guards(&marks)?;
+            design.check_run_guards(&**adapter, &marks).await?;
             // The real run claims the design's entities; its preview refuses
             // what that claim would, and names what it would adopt (#7).
             design.check_ownership(&**adapter).await?;
@@ -526,6 +526,7 @@ pub async fn cmd_deploy(
     let adapter = get_adapter(&config_path, database_url).await?;
     let marks = design.database_marks(&*adapter).await?;
     Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
+    super::announce_adoptions(&design, &*adapter, false).await?;
 
     // Said before the run, not in its summary: a deploy that fails never
     // prints one, and a skipped hook is often why it failed.
