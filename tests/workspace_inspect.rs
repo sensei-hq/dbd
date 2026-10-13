@@ -295,3 +295,66 @@ fn init_and_merge_point_a_workspace_at_split() {
         assert!(text.contains("dbd split"), "{args:?}: {text}");
     }
 }
+
+/// A SQLite workspace reloads its modules' data as a SQLite project does:
+/// what the run reloads is emptied together — a table named in another case
+/// than its file's, and a table before the one it references — again and
+/// again.
+#[test]
+fn a_sqlite_workspace_reloads_its_modules_data() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write(
+        dir,
+        "design.yaml",
+        &format!(
+            "project:\n  name: lite\nsource:\n  dialect: sqlite\ntarget:\n  sqlite:\n    url: sqlite://{}\n\
+             schemas: []\nmodules:\n  shared: {{}}\n  core:\n    depends_on: [shared]\n",
+            dir.join("app.db").display()
+        ),
+    );
+    write(
+        dir,
+        "shared/ddl/table/aaa.ddl",
+        "CREATE TABLE IF NOT EXISTS aaa (id INTEGER PRIMARY KEY);\n",
+    );
+    write(dir, "shared/import/aaa.csv", "id\n1\n");
+    write(
+        dir,
+        "core/ddl/table/tags.ddl",
+        "CREATE TABLE IF NOT EXISTS Tags (name TEXT);\n",
+    );
+    write(dir, "core/import/tags.csv", "name\na\nb\n");
+    write(
+        dir,
+        "core/ddl/table/parent.ddl",
+        "CREATE TABLE IF NOT EXISTS parent (id INTEGER PRIMARY KEY);\n",
+    );
+    write(
+        dir,
+        "core/ddl/table/kid.ddl",
+        "CREATE TABLE IF NOT EXISTS kid (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent (id));\n",
+    );
+    write(dir, "core/import/parent.csv", "id\n1\n");
+    write(dir, "core/import/kid.csv", "id,pid\n1,1\n");
+
+    let o = dbd(dir, &["deploy"]);
+    assert!(o.status.success(), "deploy: {}", text(&o));
+    for run in ["import", "re-import"] {
+        let o = dbd(dir, &["import"]);
+        assert!(o.status.success(), "{run}: {}", text(&o));
+        let out = dir.join(run);
+        let o = dbd(dir, &["export", "-o", out.to_str().unwrap()]);
+        assert!(o.status.success(), "export after the {run}: {}", text(&o));
+        assert_eq!(
+            fs::read_to_string(out.join("Tags.csv")).unwrap(),
+            "name\na\nb\n",
+            "{run}"
+        );
+        assert_eq!(
+            fs::read_to_string(out.join("kid.csv")).unwrap(),
+            "id,pid\n1,1\n",
+            "{run}"
+        );
+    }
+}
