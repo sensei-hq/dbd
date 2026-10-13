@@ -608,19 +608,24 @@ impl Design {
     }
 
     /// Refuse a reset, unless forced, while another project's record marks the
-    /// database prod (#7): it is prod for every project in it.
+    /// database prod (#7): it is prod for every project in it. An env dbd does
+    /// not know is no proof it is not, and refuses too.
     pub(crate) async fn check_reset_prod_elsewhere(&self, adapter: &dyn DatabaseAdapter) -> Result<()> {
         let prod = adapter.other_projects_meta().await?.into_iter().find(|m| {
-            m.project != self.owner() && crate::config::normalize_env(Some(&m.env)).is_ok_and(|env| env == "prod")
+            m.project != self.owner() && !matches!(crate::config::normalize_env(Some(&m.env)).as_deref(), Ok("dev"))
         });
-        match prod {
-            Some(row) => Err(DbdError::SafetyGuard(format!(
-                "reset is blocked — project '{}' marked this database prod, and it is prod for every project \
-                 in it. Use --force to override.",
-                row.project
-            ))),
-            None => Ok(()),
-        }
+        let Some(row) = prod else {
+            return Ok(());
+        };
+        let marked = match crate::config::normalize_env(Some(&row.env)) {
+            Ok(_) => "marked this database prod".to_string(),
+            Err(_) => format!("recorded env '{}', which dbd does not know and reads as prod", row.env),
+        };
+        Err(DbdError::SafetyGuard(format!(
+            "reset is blocked — project '{}' {marked}, and a database is prod for every project in it. \
+             Use --force to override.",
+            row.project
+        )))
     }
 
     /// What a reset of this owner's must leave, or refuse, for other owners
@@ -639,20 +644,31 @@ impl Design {
         use crate::adapter::{Guarded, GuardedPart};
         let mut keep = ResetKeep::default();
 
-        // What the reset drops by name: every key of every entity it drops.
-        let keyed = self.entity_keys();
-        let guarded: Vec<(Guarded, String)> = keyed
+        // What the reset drops by name: each entity as its `DROP` names it —
+        // `DROP TABLE "app"."orders"` — and not the rest of what its file
+        // creates, which the reset leaves: an enum beside the table stays.
+        let guarded: Vec<(Guarded, String)> = self
+            .entities
             .iter()
-            .filter(|(e, _)| drop.entities.contains(&e.name))
-            .flat_map(|(_, keys)| keys.iter())
-            .map(|k| {
-                (
+            .filter(|e| drop.entities.contains(&e.name))
+            .filter_map(|e| {
+                let (namespace, kind) = owned_kind(e.entity_type)?;
+                let schema = e.schema.clone().unwrap_or_else(|| "public".to_string());
+                let (_, name) = crate::entity::split_qualified_name(&e.name);
+                let label = format!("{schema}.{name}");
+                let object = OwnedObject {
+                    namespace: namespace.to_string(),
+                    schema,
+                    name,
+                    kind: kind.to_string(),
+                };
+                Some((
                     Guarded {
-                        object: k.clone(),
+                        object,
                         part: GuardedPart::Whole,
                     },
-                    format!("{}.{}", k.schema, k.name),
-                )
+                    label,
+                ))
             })
             .collect();
         let uses = self.uses_of(adapter, &guarded).await?;
@@ -899,7 +915,11 @@ fn quoted(names: &[String]) -> String {
 pub(crate) struct ResetKeep {
     pub(crate) schemas: Vec<String>,
     pub(crate) extensions: Vec<String>,
+    /// Roles kept for another project here: neither dropped nor revoked.
     pub(crate) roles: Vec<String>,
+    /// Roles kept because another database holds them: their grants here are
+    /// revoked, and they are not dropped.
+    pub(crate) held_elsewhere: Vec<String>,
     /// One line each: `schema app kept: it holds table app.invoices ("billing")`.
     pub(crate) notes: Vec<String>,
 }

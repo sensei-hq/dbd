@@ -204,7 +204,7 @@ impl Design {
         keep: &[String],
     ) -> Result<Option<String>> {
         let keep = super::ownership::ResetKeep {
-            roles: keep.to_vec(),
+            held_elsewhere: keep.to_vec(),
             ..Default::default()
         };
         Ok(self
@@ -257,23 +257,22 @@ impl Design {
         scope: Option<&ResolvedScope>,
     ) -> Result<(super::ownership::ResetKeep, Vec<KeptRole>)> {
         let roles_kept = self.roles_kept_by_reset(adapter, target, scope).await?;
-        let mut keep = if target == "postgres" {
-            let drops = self.reset_drops(drop_schemas, drop_extensions, scope)?;
-            self.reset_ownership(adapter, &drops).await?
-        } else {
+        // SQLite's reset drops its own tables and views, without `CASCADE`;
+        // `postgres` and `supabase` are both Postgres.
+        let mut keep = if target == "sqlite" {
             super::ownership::ResetKeep::default()
+        } else {
+            let drops = self.reset_drops(target, drop_schemas, drop_extensions, scope)?;
+            self.reset_ownership(adapter, &drops).await?
         };
-        for kept in &roles_kept {
-            if !keep.roles.contains(&kept.role) {
-                keep.roles.push(kept.role.clone());
-            }
-        }
+        keep.held_elsewhere = roles_kept.iter().map(|k| k.role.clone()).collect();
         Ok((keep, roles_kept))
     }
 
-    /// What a postgres reset would drop by name, before anything is kept.
+    /// What a Postgres reset would drop by name, before anything is kept.
     fn reset_drops(
         &self,
+        target: &str,
         drop_schemas: bool,
         drop_extensions: bool,
         scope: Option<&ResolvedScope>,
@@ -282,7 +281,7 @@ impl Design {
         let schemas = if drop_schemas {
             self.reset_target_schemas(scope)?
                 .into_iter()
-                .filter(|s| !script::schema_is_protected(s, "postgres"))
+                .filter(|s| !script::schema_is_protected(s, target))
                 .collect()
         } else {
             Vec::new()
@@ -402,7 +401,15 @@ impl Design {
         keep: &super::ownership::ResetKeep,
     ) -> Result<ResetPlan> {
         let is_subset = matches!(scope, Some(s) if !s.is_all);
-        let roles = self.reset_roles(scope);
+        // A role kept for another project here keeps its grants too — that
+        // project relies on them — so the script leaves it alone. One kept for
+        // another database has this database's grants revoked (see
+        // `script::build_reset_script_keeping`).
+        let roles: Vec<crate::config::RoleEntry> = self
+            .reset_roles(scope)
+            .into_iter()
+            .filter(|r| !keep.roles.contains(&r.name))
+            .collect();
 
         // Data-model entities to drop individually (scope-filtered), in the
         // builder's reverse dependency order.
@@ -433,7 +440,7 @@ impl Design {
             .into_iter()
             .filter(|e| !keep.extensions.contains(e))
             .collect();
-        let keep = &keep.roles;
+        let keep = &keep.held_elsewhere;
 
         if drop_extensions {
             objects.extend(extensions.iter().map(|e| (EntityType::Extension, e.clone())));
