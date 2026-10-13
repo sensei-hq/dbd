@@ -14,13 +14,13 @@
 
 ## Next
 
-Slice 3 on `feat/workspaces-scopes`: red tests committed (1bd5201a) —
-`crates/dbd-core/tests/workspace_scopes.rs`, CLI scopes and walking up, a live
-scope-pin test. Implement: `ScopeSpec.modules`, each manifest scope projected
-onto each module at load, `Workspace::under_scope`, the guard no longer
-refusing `--scope`, the walk up from a module folder.
+Slice 3 on `feat/workspaces-scopes`: implemented (d44d4950) — module-selecting
+scopes projected per module, `Workspace::under_scope`, walking up from a module
+folder (`Workspace::locate`); plan updated. Next: full suites, PR into
+`feat/workspaces`, adversarial review, CI, merge; then slice 4 (per-module
+history: snapshot, release, migrations, format, doctor).
 
-    cargo test -p dbd-core --test workspace_scopes && cargo test --test workspace_inspect
+    gh pr checks <slice 3 PR>
 
 ## Open
 

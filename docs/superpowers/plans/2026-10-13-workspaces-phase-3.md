@@ -54,9 +54,8 @@ Taken in slice 1:
   registry keys it (T19); and a reference into a module outside the
   `depends_on` closure (T20) — to any entity another module's file declares,
   roles included, or creates beside it.
-- A module's design has no `scopes:`: scopes select over the workspace
-  (slice 3). Until then a command that reads `--scope` or `--deps` refuses it
-  on a workspace (one that ignores it, `migrate`, warns as before).
+- A module's design has no `scopes:` of its own: scopes select over the
+  workspace (slice 3).
 - `Workspace::config` is the manifest as written — its `apply:` hooks, which
   run around the whole workspace, and its `scopes:`.
 
@@ -107,6 +106,27 @@ Taken in slice 2:
   (slice 4), `combine`, `emit`, `graph`, `dbml` and `diagram` (slice 5).
   `init` and `merge` onboard a project into one design and refuse a
   workspace, pointing at `dbd split` (slice 6).
+
+Taken in slice 3:
+
+- `scopes.<name>.modules: [...]` selects modules, each with every module it
+  depends on, whole; `includes:` selects entities of modules the scope does
+  not select whole (those modules' dependencies whole, as `--module` takes
+  them); `excludes:` leaves entities of selected modules out; a scope naming
+  no module and including nothing selects every module. `extensions:` and
+  `deps:` are each module's.
+- Each manifest scope is projected onto each module it selects as the
+  workspace loads, set in the module's config under the scope's name — so
+  every command resolves, guards and pins the scope per module unchanged.
+  `Workspace::under_scope(scope)` narrows the run to the scope's modules;
+  no `--scope` is the `default` scope when the manifest has one, else every
+  module; `all` is every module. `--module` within a scope must be one of
+  its modules. Refused at load: a scope naming an undeclared module, an item
+  no module declares, and `modules:` in a design without modules.
+- Run inside a module's folder — no design.yaml of its own — dbd walks up to
+  the nearest design.yaml declaring `modules:` (`Workspace::locate`) and runs
+  that module, unless `--module` says otherwise; `init` and `install` do not
+  walk up, and a design without modules is not looked for above.
 
 ## Slices
 
