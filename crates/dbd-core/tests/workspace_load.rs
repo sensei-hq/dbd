@@ -162,6 +162,30 @@ fn modules_load_in_depends_on_order_ties_in_declared_order() {
     assert_eq!(names, ["a", "c", "b", "d"]);
 }
 
+/// Of the modules whose dependencies are in place, the one `modules:` lists
+/// first goes next — not the one a dependent happens to name first.
+#[test]
+fn of_the_modules_ready_to_load_the_first_listed_loads_first() {
+    for (modules, expected) in [
+        ("  a:\n    depends_on: [c]\n  b: {}\n  c: {}\n", ["b", "c", "a"]),
+        ("  x:\n    depends_on: [b, a]\n  a: {}\n  b: {}\n", ["a", "b", "x"]),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            root,
+            "design.yaml",
+            &format!("project:\n  name: p\n\nmodules:\n{modules}"),
+        );
+        for m in ["a", "b", "c", "x"] {
+            std::fs::create_dir_all(root.join(m)).unwrap();
+        }
+        let workspace = load(root).expect("load");
+        let names: Vec<&str> = workspace.modules().iter().filter_map(|m| m.name()).collect();
+        assert_eq!(names, expected, "{modules}");
+    }
+}
+
 #[test]
 fn a_module_path_defaults_to_its_name_and_may_be_set() {
     let tmp = tempfile::tempdir().unwrap();
@@ -179,28 +203,28 @@ fn a_module_path_defaults_to_its_name_and_may_be_set() {
     assert_eq!(dirs, [root.join("shared"), root.join("db/core")]);
 }
 
-/// A module at `.` holds the root's `ddl/` — the folders a module holds are
-/// its own wherever they are.
+/// A module's folder is its own — what it takes with it if it moves to a
+/// repository of its own — so it is neither the project's folder, which holds
+/// the manifest and every other module, nor inside another module's.
 #[test]
-fn a_module_may_be_rooted_at_the_project_folder() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path();
-    write(
-        root,
-        "design.yaml",
-        "project:\n  name: p\n\nschemas:\n  - app\n\nmodules:\n  core:\n    path: .\n  extra: {}\n",
-    );
-    write(
-        root,
-        "ddl/table/app/orders.ddl",
-        &table("orders", "id integer primary key"),
-    );
-    std::fs::create_dir_all(root.join("extra")).unwrap();
-
-    let workspace = load(root).expect("load");
-    let core = &workspace.modules()[0];
-    assert_eq!(core.design().project_dir(), root);
-    assert_eq!(kind_of(core.design(), "app.orders"), Some(EntityType::Table));
+fn a_module_folder_is_neither_the_projects_nor_inside_anothers() {
+    for (modules, folders, said) in [
+        (
+            "  core:\n    path: .\n  extra: {}\n",
+            &["extra"][..],
+            "the project's own folder",
+        ),
+        (
+            "  core: {}\n  extra:\n    path: core/extra\n",
+            &["core", "core/extra"][..],
+            "inside",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        workspace_with(tmp.path(), modules, folders);
+        let err = load_err(tmp.path());
+        assert!(err.contains(said), "{modules}: {err}");
+    }
 }
 
 /// Each module releases on its own: its version, its release state and its
@@ -239,6 +263,71 @@ fn a_modules_version_release_and_hooks_are_its_own() {
         shared.apply.before.is_empty(),
         "the manifest's hooks are not a module's"
     );
+
+    let manifest: Vec<&str> = workspace.config().apply.before.iter().map(|s| s.script()).collect();
+    assert_eq!(manifest, ["root.sql"], "the workspace keeps its manifest's");
+}
+
+/// The manifest's `external:` entries are every module's.
+#[test]
+fn the_manifests_externals_are_known_to_every_module() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    shop(root);
+    let manifest = std::fs::read_to_string(root.join("design.yaml")).unwrap();
+    write(
+        root,
+        "design.yaml",
+        &format!("{manifest}\nexternal:\n  - name: auth.users\n"),
+    );
+
+    let workspace = load(root).expect("load");
+    for module in workspace.modules() {
+        assert_eq!(
+            kind_of(module.design(), "auth.users"),
+            Some(EntityType::External),
+            "{}",
+            module.owner()
+        );
+    }
+}
+
+/// What each module knows of the others comes out the same on every load.
+#[test]
+fn a_workspace_loads_the_same_every_time() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    shop(root);
+    for t in ["a", "b", "c", "d", "e", "f", "g", "h"] {
+        write(
+            root,
+            &format!("shared/ddl/table/app/{t}.ddl"),
+            &table(t, "id integer primary key"),
+        );
+    }
+
+    let names = || -> Vec<String> {
+        let workspace = load(root).expect("load");
+        workspace.modules()[1]
+            .design()
+            .entities()
+            .iter()
+            .map(|e| e.name.clone())
+            .collect()
+    };
+    let first = names();
+    for _ in 0..4 {
+        assert_eq!(names(), first);
+    }
+}
+
+#[test]
+fn a_design_without_modules_keeps_its_config_as_the_workspaces() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(root, "design.yaml", "project:\n  name: shop\n");
+    let workspace = load(root).expect("load");
+    assert_eq!(workspace.config().project.name, "shop");
 }
 
 #[test]
@@ -391,6 +480,18 @@ fn a_root_folder_no_module_holds_is_refused() {
     }
 }
 
+/// `dbd init` keeps its empty folders in git with a `.gitkeep`; one left at
+/// the root holds nothing a module would lose.
+#[test]
+fn a_root_folder_holding_only_dotfiles_is_no_bar() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    workspace_with(root, "  core: {}\n", &["core"]);
+    write(root, "ddl/view/.gitkeep", "");
+    write(root, "import/.gitkeep", "");
+    load(root).expect("a .gitkeep holds nothing a module would lose");
+}
+
 #[test]
 fn an_empty_root_folder_is_no_bar() {
     let tmp = tempfile::tempdir().unwrap();
@@ -435,6 +536,32 @@ fn an_entity_one_module_creates_from_a_file_of_another_name_overlaps_too() {
 
     let err = load_err(root);
     assert!(err.contains("relation app.currencies"), "{err}");
+}
+
+/// SQLite knows a table by its name alone: `users` and `main/users` are one.
+#[test]
+fn on_sqlite_two_modules_declaring_one_table_under_two_schemas_overlap() {
+    for dialect in ["sqlite", "sqlite3", "SQLite"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            root,
+            "design.yaml",
+            &format!("project:\n  name: p\n\nsource:\n  dialect: {dialect}\n\nmodules:\n  a: {{}}\n  b: {{}}\n"),
+        );
+        write(
+            root,
+            "a/ddl/table/users.ddl",
+            "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY);\n",
+        );
+        write(
+            root,
+            "b/ddl/table/main/users.ddl",
+            "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY);\n",
+        );
+        let err = load_err(root);
+        assert!(err.contains("declared by more than one module"), "{dialect}: {err}");
+    }
 }
 
 // ── T20: references follow depends_on ───────────────────────────────────────
@@ -520,5 +647,132 @@ fn a_reference_no_module_declares_stays_a_warning() {
             .any(|w| w.contains("Unresolved reference: app.ghosts")),
         "{:?}",
         orders.warnings
+    );
+}
+
+/// A role is no module's to own, but one module's file declares it all the
+/// same: another module reaches it through `depends_on`, and only so.
+#[test]
+fn a_role_another_module_declares_is_reached_through_depends_on() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(root, "shared/ddl/role/app_admin.ddl", "create role app_admin;\n");
+    write(
+        root,
+        "core/ddl/role/app_ro.ddl",
+        "create role app_ro;\ngrant app_admin to app_ro;\n",
+    );
+
+    write(
+        root,
+        "design.yaml",
+        "project:\n  name: p\n\nmodules:\n  shared: {}\n  core:\n    depends_on: [shared]\n",
+    );
+    let workspace = load(root).expect("load");
+    let app_ro = workspace.modules()[1]
+        .design()
+        .entities()
+        .iter()
+        .find(|e| e.name == "app_ro")
+        .unwrap();
+    assert!(app_ro.warnings.is_empty(), "{:?}", app_ro.warnings);
+    assert!(
+        app_ro.refs.iter().any(|r| r.name == "app_admin" && !r.unresolved),
+        "{:?}",
+        app_ro.refs
+    );
+
+    write(
+        root,
+        "design.yaml",
+        "project:\n  name: p\n\nmodules:\n  shared: {}\n  core: {}\n",
+    );
+    let err = load_err(root);
+    assert!(err.contains("dependency gap") && err.contains("app_admin"), "{err}");
+}
+
+/// A path cannot quote, so `OrderStatus.ddl` declares the type Postgres folds
+/// to `orderstatus` — and a reference reaches it folded from another module
+/// as from its own.
+#[test]
+fn a_folded_reference_reaches_another_modules_enum() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "shared/ddl/enum/app/OrderStatus.ddl",
+        "set search_path to app;\n\ncreate type orderstatus as enum ('new', 'paid');\n",
+    );
+    write(
+        root,
+        "core/ddl/table/app/orders.ddl",
+        &table("orders", "id integer primary key\n, status app.orderstatus"),
+    );
+
+    write(
+        root,
+        "design.yaml",
+        "project:\n  name: p\n\nschemas:\n  - app\n\nmodules:\n  shared: {}\n  core:\n    depends_on: [shared]\n",
+    );
+    let workspace = load(root).expect("load");
+    let orders = workspace.modules()[1]
+        .design()
+        .entities()
+        .iter()
+        .find(|e| e.name == "app.orders")
+        .unwrap();
+    assert!(
+        orders.refs.iter().any(|r| r.name == "app.OrderStatus" && !r.unresolved),
+        "{:?}",
+        orders.refs
+    );
+
+    write(
+        root,
+        "design.yaml",
+        "project:\n  name: p\n\nschemas:\n  - app\n\nmodules:\n  shared: {}\n  core: {}\n",
+    );
+    let err = load_err(root);
+    assert!(
+        err.contains("dependency gap") && err.contains("app.OrderStatus"),
+        "{err}"
+    );
+}
+
+/// What another module's file creates beside its entity — a type a table
+/// file creates — is that module's (T19 says so), so reaching it is a
+/// dependency on that module.
+#[test]
+fn a_type_another_modules_file_creates_is_reached_through_depends_on() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "shared/ddl/table/app/orders.ddl",
+        "set search_path to app;\n\ncreate type order_status as enum ('new', 'paid');\n\n\
+         create table if not exists orders (id integer primary key, status order_status);\n",
+    );
+    write(
+        root,
+        "core/ddl/table/app/items.ddl",
+        &table("items", "id integer primary key\n, status app.order_status"),
+    );
+
+    write(
+        root,
+        "design.yaml",
+        "project:\n  name: p\n\nschemas:\n  - app\n\nmodules:\n  shared: {}\n  core:\n    depends_on: [shared]\n",
+    );
+    load(root).expect("a dependency's type is reachable");
+
+    write(
+        root,
+        "design.yaml",
+        "project:\n  name: p\n\nschemas:\n  - app\n\nmodules:\n  shared: {}\n  core: {}\n",
+    );
+    let err = load_err(root);
+    assert!(
+        err.contains("dependency gap") && err.contains("app.order_status"),
+        "{err}"
     );
 }

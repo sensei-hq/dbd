@@ -80,18 +80,24 @@ fn inspect_validates_every_module() {
     );
 }
 
+/// An error in any module fails the run — the first module's included, though
+/// a clean module is inspected after it.
 #[test]
 fn inspect_fails_on_an_error_in_any_module() {
     let tmp = tempfile::tempdir().unwrap();
     shop(tmp.path());
-    write(tmp.path(), "core/ddl/table/app/broken.ddl", "");
+    write(tmp.path(), "shared/ddl/table/app/broken.ddl", "");
 
     let out = dbd(tmp.path(), &["inspect"]);
     let text = text(&out);
     assert!(!out.status.success(), "{text}");
-    let core = text.find("module core (shop/core)").expect(&text);
+    let shared = text.find("module shared (shop/shared)").expect(&text);
     let broken = text.find("broken.ddl").expect(&text);
-    assert!(broken > core, "the error is reported under its module:\n{text}");
+    let core = text.find("module core (shop/core)").expect(&text);
+    assert!(
+        shared < broken && broken < core,
+        "the error is reported under its module:\n{text}"
+    );
 }
 
 /// T19.
@@ -146,6 +152,14 @@ fn inspect_of_a_named_entity_inspects_it_in_its_module() {
     assert!(text.contains("module core (shop/core)"), "{text}");
     assert!(!text.contains("module shared"), "only the module declaring it:\n{text}");
 
+    // A dependency's entity is known to its dependents too — as theirs to
+    // reference, not to inspect.
+    let out = dbd(tmp.path(), &["inspect", "-n", "app.currencies"]);
+    let text = self::text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("module shared (shop/shared)"), "{text}");
+    assert!(!text.contains("module core"), "only the module declaring it:\n{text}");
+
     let out = dbd(tmp.path(), &["inspect", "-n", "app.nothing"]);
     assert!(!out.status.success(), "{}", self::text(&out));
 }
@@ -157,10 +171,16 @@ fn inspect_refuses_a_scope_on_a_workspace() {
     let tmp = tempfile::tempdir().unwrap();
     shop(tmp.path());
 
-    let out = dbd(tmp.path(), &["inspect", "--scope", "default"]);
+    // `all` is a scope every design has, so only the refusal fails the run.
+    let out = dbd(tmp.path(), &["inspect", "--scope", "all"]);
     let text = text(&out);
     assert!(!out.status.success(), "{text}");
     assert!(text.contains("--scope") && text.contains("modules:"), "{text}");
+
+    let out = dbd(tmp.path(), &["inspect", "--deps", "include"]);
+    let text = self::text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("--deps") && text.contains("modules:"), "{text}");
 }
 
 /// The other commands do not run a workspace yet; each refuses it rather
@@ -170,8 +190,32 @@ fn a_command_that_does_not_run_a_workspace_refuses_it() {
     let tmp = tempfile::tempdir().unwrap();
     shop(tmp.path());
 
-    let out = dbd(tmp.path(), &["apply", "--dry-run"]);
+    // `format`, `doctor` and `snapshot --list` read the project without
+    // loading a design, and reported a workspace's empty root clean.
+    for args in [
+        &["apply", "--dry-run"][..],
+        &["format", "--check"],
+        &["doctor"],
+        &["snapshot", "--list"],
+    ] {
+        let out = dbd(tmp.path(), args);
+        let text = text(&out);
+        assert!(!out.status.success(), "{args:?}: {text}");
+        assert!(text.contains("modules:"), "{args:?}: {text}");
+    }
+}
+
+/// A module's folder is relative to the project directory (`--source`), as
+/// `ddl/` is — not to wherever `-c` puts design.yaml.
+#[test]
+fn module_folders_are_found_under_the_source_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    shop(tmp.path());
+    fs::create_dir_all(tmp.path().join("config")).unwrap();
+    fs::rename(tmp.path().join("design.yaml"), tmp.path().join("config/design.yaml")).unwrap();
+
+    let out = dbd(tmp.path(), &["-c", "config/design.yaml", "inspect"]);
     let text = text(&out);
-    assert!(!out.status.success(), "{text}");
-    assert!(text.contains("modules:"), "{text}");
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("module core (shop/core)"), "{text}");
 }
