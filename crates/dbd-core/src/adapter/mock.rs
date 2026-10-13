@@ -275,6 +275,7 @@ impl DatabaseAdapter for MockAdapter {
         owner: &str,
         objects: &[super::OwnedObject],
         write: bool,
+        _adopt_from: Option<&str>,
     ) -> Result<Vec<super::HeldObject>> {
         if write {
             self.claims

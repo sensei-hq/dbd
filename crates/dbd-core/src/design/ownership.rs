@@ -74,7 +74,7 @@ impl Design {
     /// it gives a table, a view and a materialized view a row type, so none of
     /// them can share a name with an enum, a composite, a domain or a range.
     /// Routines are owned by name, their overloads one entity.
-    fn entity_keys(&self) -> Vec<(&Entity, Vec<OwnedObject>)> {
+    pub(super) fn entity_keys(&self) -> Vec<(&Entity, Vec<OwnedObject>)> {
         // Read as the loader reads the design: `supabase`, and anything else
         // libpg_query parses, is Postgres.
         let postgres =
@@ -133,6 +133,76 @@ impl Design {
                 (e, keys)
             })
             .collect()
+    }
+
+    /// Take over, as this design's runs claim, the entities it declares that
+    /// `owner` holds — moving entities between projects kept in separate
+    /// repositories (`--adopt-from`, #7). Only `owner`'s: one a third owner
+    /// holds still refuses the run. The giver's next run no longer owns them,
+    /// so it neither declares them — it is refused if it still does — nor
+    /// prunes them.
+    pub fn adopting_from(mut self, owner: impl Into<String>) -> Self {
+        self.adopt_from = Some(owner.into());
+        self
+    }
+
+    /// Let this design run as an owner that holds entities in the database it
+    /// declares none of: a new design for the project, not another project
+    /// under its name (`--allow-ownership-change`, #7). What the owner held
+    /// stays its own — this design's — and a prune drops it as undeclared.
+    pub fn allowing_ownership_change(mut self) -> Self {
+        self.allow_ownership_change = true;
+        self
+    }
+
+    /// What this design would adopt in the database `adapter` reaches: what it
+    /// declares that the owner it adopts from holds — none without
+    /// [`Self::adopting_from`]. Reads only.
+    pub async fn adoptions(&self, adapter: &dyn DatabaseAdapter) -> Result<Vec<HeldObject>> {
+        let Some(from) = &self.adopt_from else {
+            return Ok(Vec::new());
+        };
+        let held = adapter
+            .claim_objects(self.owner(), &self.declared_objects(), false, None)
+            .await?;
+        Ok(held.into_iter().filter(|h| &h.owner == from).collect())
+    }
+
+    /// Refuse a design arriving under an owner name that holds entities here
+    /// and declaring none of them — another project under a reused name, which
+    /// took over the owner's version and history, and whose first prune would
+    /// drop what it never declared (#7, H3). Only what still exists counts;
+    /// [`Self::allowing_ownership_change`] lifts it.
+    async fn check_name_reuse(&self, adapter: &dyn DatabaseAdapter, declared: &[OwnedObject]) -> Result<()> {
+        if self.allow_ownership_change {
+            return Ok(());
+        }
+        let held = adapter.owned_objects(self.owner()).await?;
+        let declares_any = held.iter().any(|h| {
+            declared
+                .iter()
+                .any(|d| d.namespace == h.namespace && d.schema == h.schema && d.name == h.name)
+        });
+        if held.is_empty() || declares_any {
+            return Ok(());
+        }
+        const SHOWN: usize = 5;
+        let mut named: Vec<String> = held
+            .iter()
+            .take(SHOWN)
+            .map(|o| format!("{} {}.{}", o.namespace, o.schema, o.name))
+            .collect();
+        if held.len() > SHOWN {
+            named.push(format!("and {} more", held.len() - SHOWN));
+        }
+        Err(DbdError::Config(format!(
+            "owner \"{}\" here owns {} {} ({}); this design declares none of them — another project under \
+             the same name? If this design is that owner now, run with --allow-ownership-change",
+            self.owner(),
+            held.len(),
+            if held.len() == 1 { "entity" } else { "entities" },
+            named.join(", ")
+        )))
     }
 
     /// Refuse, naming each, a design declaring an entity another owner holds
@@ -261,13 +331,14 @@ impl Design {
         if mode == Preflight::Write {
             adapter.heal_bookkeeping().await?;
         }
+        let declared = self.declared_objects();
         let held = adapter
-            .claim_objects(self.owner(), &self.declared_objects(), false)
+            .claim_objects(self.owner(), &declared, false, self.adopt_from.as_deref())
             .await?;
         if !held.is_empty() {
             return Err(DbdError::Config(held_refusal(&held)));
         }
-        Ok(())
+        self.check_name_reuse(adapter, &declared).await
     }
 
     /// Claim the design's entities and record what it uses, in the run's own
@@ -296,10 +367,13 @@ impl Design {
     }
 
     /// Claim the design's entities — in the open batch when there is one —
-    /// refusing, naming each, those another owner holds.
+    /// refusing, naming each, those another owner holds, and a design reusing
+    /// an owner's name. What it adopts it takes over in the same claim.
     pub(crate) async fn claim(&self, adapter: &dyn DatabaseAdapter) -> Result<()> {
+        let declared = self.declared_objects();
+        self.check_name_reuse(adapter, &declared).await?;
         let held = adapter
-            .claim_objects(self.owner(), &self.declared_objects(), true)
+            .claim_objects(self.owner(), &declared, true, self.adopt_from.as_deref())
             .await?;
         if !held.is_empty() {
             return Err(DbdError::Config(held_refusal(&held)));
@@ -403,7 +477,7 @@ impl Design {
                 return Ok(());
             }
             // A claim takes all of them or none; the held ones out, again.
-            let held = adapter.claim_objects(self.owner(), &candidates, true).await?;
+            let held = adapter.claim_objects(self.owner(), &candidates, true, None).await?;
             if held.is_empty() {
                 return Ok(());
             }

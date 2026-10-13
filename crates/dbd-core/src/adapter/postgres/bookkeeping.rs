@@ -568,6 +568,7 @@ impl Bookkeeping {
         owner: &str,
         objects: &[crate::adapter::OwnedObject],
         write: bool,
+        adopt_from: Option<&str>,
     ) -> Result<Vec<crate::adapter::HeldObject>> {
         if !write {
             let exists: Option<String> = sqlx::query_scalar("SELECT to_regclass('dbd.objects')::text")
@@ -582,13 +583,13 @@ impl Bookkeeping {
                 .acquire()
                 .await
                 .map_err(|e| DbdError::Config(format!("ownership read failed: {e}")))?;
-            return held_objects(&mut conn, owner, objects).await;
+            return held_objects(&mut conn, owner, objects, adopt_from).await;
         }
         match tx {
-            Some(tx) => self.claim_in(tx, owner, objects).await,
+            Some(tx) => self.claim_in(tx, owner, objects, adopt_from).await,
             None => {
                 let mut own = self.registry_tx("claim").await?;
-                let held = self.claim_in(&mut own, owner, objects).await?;
+                let held = self.claim_in(&mut own, owner, objects, adopt_from).await?;
                 if held.is_empty() {
                     own.commit()
                         .await
@@ -628,11 +629,29 @@ impl Bookkeeping {
         tx: &mut Transaction<'static, Postgres>,
         owner: &str,
         objects: &[crate::adapter::OwnedObject],
+        adopt_from: Option<&str>,
     ) -> Result<Vec<crate::adapter::HeldObject>> {
         let column = |f: fn(&crate::adapter::OwnedObject) -> &str| -> Vec<String> {
             objects.iter().map(|o| f(o).to_string()).collect()
         };
         bounded_wait(tx, "dbd.objects", true).await?;
+        // What is adopted changes hands first, in the claim's transaction: a
+        // claim refused for a third owner's entity rolls the adoption back.
+        if let Some(from) = adopt_from {
+            sqlx::query(
+                "UPDATE dbd.objects o SET owner = $4, claimed_at = now() \
+                 FROM unnest($1::text[], $2::text[], $3::text[]) AS d(namespace, schema, name) \
+                 WHERE o.namespace = d.namespace AND o.schema = d.schema AND o.name = d.name AND o.owner = $5",
+            )
+            .bind(column(|o| &o.namespace))
+            .bind(column(|o| &o.schema))
+            .bind(column(|o| &o.name))
+            .bind(owner)
+            .bind(from)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| registry_error(&e, "dbd.objects", "adopt"))?;
+        }
         sqlx::query(
             "INSERT INTO dbd.objects (namespace, schema, name, kind, owner) \
                SELECT d.namespace, d.schema, d.name, d.kind, $5 \
@@ -648,9 +667,46 @@ impl Bookkeeping {
         .execute(&mut **tx)
         .await
         .map_err(|e| registry_error(&e, "dbd.objects", "claim"))?;
-        let held = held_objects(tx, owner, objects).await?;
+        let held = held_objects(tx, owner, objects, None).await?;
         bounded_wait(tx, "dbd.objects", false).await?;
         Ok(held)
+    }
+
+    /// What `owner` holds in `dbd.objects` that still exists in the catalog.
+    pub(super) async fn owned_objects(&self, owner: &str) -> Result<Vec<crate::adapter::OwnedObject>> {
+        let read = |e: sqlx::Error| DbdError::Config(format!("ownership read failed: {e}"));
+        let registry: Option<String> = sqlx::query_scalar("SELECT to_regclass('dbd.objects')::text")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(read)?;
+        if registry.is_none() {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT o.namespace, o.schema, o.name, o.kind FROM dbd.objects o WHERE o.owner = $1 \
+               AND CASE o.namespace \
+                 WHEN 'routine' THEN EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+                                             WHERE n.nspname = o.schema AND p.proname = o.name) \
+                 ELSE EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                              WHERE n.nspname = o.schema AND c.relname = o.name) \
+                   OR EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
+                              WHERE n.nspname = o.schema AND t.typname = o.name) \
+               END \
+             ORDER BY o.namespace, o.schema, o.name",
+        )
+        .bind(owner)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(read)?;
+        Ok(rows
+            .into_iter()
+            .map(|(namespace, schema, name, kind)| crate::adapter::OwnedObject {
+                namespace,
+                schema,
+                name,
+                kind,
+            })
+            .collect())
     }
 
     /// Replace `owner`'s rows in `dbd.uses` with `uses` — in `tx`, the run's
@@ -1360,6 +1416,7 @@ async fn held_objects(
     conn: &mut sqlx::PgConnection,
     owner: &str,
     objects: &[crate::adapter::OwnedObject],
+    adopting_from: Option<&str>,
 ) -> Result<Vec<crate::adapter::HeldObject>> {
     let column = |f: fn(&crate::adapter::OwnedObject) -> &str| -> Vec<String> {
         objects.iter().map(|o| f(o).to_string()).collect()
@@ -1368,12 +1425,13 @@ async fn held_objects(
         "SELECT o.namespace, o.schema, o.name, o.kind, o.owner FROM dbd.objects o \
          JOIN unnest($1::text[], $2::text[], $3::text[]) AS d(namespace, schema, name) \
            ON o.namespace = d.namespace AND o.schema = d.schema AND o.name = d.name \
-         WHERE o.owner <> $4 ORDER BY o.namespace, o.schema, o.name",
+         WHERE o.owner <> $4 AND o.owner IS DISTINCT FROM $5 ORDER BY o.namespace, o.schema, o.name",
     )
     .bind(column(|o| &o.namespace))
     .bind(column(|o| &o.schema))
     .bind(column(|o| &o.name))
     .bind(owner)
+    .bind(adopting_from)
     .fetch_all(conn)
     .await
     .map_err(|e| registry_error(&e, "dbd.objects", "ownership read"))?;

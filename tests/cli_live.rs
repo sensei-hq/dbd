@@ -2589,7 +2589,7 @@ async fn apply_under_a_reused_owner_name_needs_allow_ownership_change() {
     let second = tempfile::tempdir().unwrap();
     std::fs::write(
         second.path().join("design.yaml"),
-        "project:\n  name: clilive\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+        "project:\n  name: clilive\n  version: 1\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
     )
     .unwrap();
     std::fs::create_dir_all(second.path().join("ddl/table/app")).unwrap();

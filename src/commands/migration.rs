@@ -15,6 +15,8 @@ pub(crate) struct ResetOptions {
     pub drop_schemas: bool,
     pub drop_extensions: bool,
     pub allow_scope_change: bool,
+    /// `--allow-ownership-change` (#7).
+    pub allow_ownership_change: bool,
 }
 
 /// The targets `reset` has a script for — what `--target` accepts.
@@ -100,8 +102,10 @@ pub async fn cmd_reset(
         drop_schemas,
         drop_extensions,
         allow_scope_change,
+        allow_ownership_change,
     } = opts;
-    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
+    let design = super::OwnershipChange::new(None, allow_ownership_change)
+        .applied_to(Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?);
     let resolved = design.resolve_scope(scope, deps)?;
     let (kept, total) = design.scope_counts(&resolved)?;
     output::scope_filtered(&resolved, kept, total);
@@ -555,6 +559,7 @@ mod tests {
                 drop_schemas: false,
                 drop_extensions: false,
                 allow_scope_change: false,
+                allow_ownership_change: false,
             },
             None,
             None,
@@ -597,6 +602,7 @@ mod tests {
                 drop_schemas: false,
                 drop_extensions: false,
                 allow_scope_change: false,
+                allow_ownership_change: false,
             },
             None,
             None,

@@ -15361,17 +15361,10 @@ async fn adopting_from_an_owner_takes_over_what_the_design_declares() {
     )
     .await;
 
-    let giver = Design::from_config_with_dir(
-        &named_project(bd.path(), "billing", "", ORDERS_OWNER_FILES)
-            .project_dir()
-            .join("design.yaml"),
-        "dev",
-        Some(bd.path()),
-    )
-    .unwrap();
+    // billing's design no longer declares app.orders.
     std::fs::remove_file(bd.path().join(ORDERS_OWNER_FILES[0].0)).unwrap();
-    let giver = Design::from_config_with_dir(&bd.path().join("design.yaml"), "dev", Some(bd.path())).unwrap_or(giver);
-    giver
+    Design::from_config_with_dir(&bd.path().join("design.yaml"), "dev", Some(bd.path()))
+        .unwrap()
         .reconcile(&*billing, false, false, true, None, Progress::none())
         .await
         .expect("billing's prune");
