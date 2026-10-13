@@ -14165,6 +14165,216 @@ async fn a_reset_is_refused_while_another_projects_record_has_an_env_dbd_does_no
     assert_table_exists(&*shop, "app", "orders").await;
 }
 
+/// A `supabase` target is Postgres: its reset drops `CASCADE` as a
+/// `postgres` one does, behind the same guard (#7).
+#[tokio::test]
+async fn a_supabase_reset_is_refused_when_another_project_depends_on_what_it_drops() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let design = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1]);
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    billing_reading(
+        bd.path(),
+        &[(
+            "ddl/view/billing/v_orders.ddl",
+            "create or replace view billing.v_orders as select id from app.orders;\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    let err = design
+        .reset(&*shop, "supabase", true, false, false, None)
+        .await
+        .expect_err("billing's view reads app.orders")
+        .to_string();
+    assert!(err.contains("app.orders is used by \"billing\""), "{err}");
+    assert_catalog(
+        &*shop,
+        true,
+        "SELECT 1 FROM pg_views WHERE schemaname = 'billing' AND viewname = 'v_orders'",
+        "billing's view",
+    )
+    .await;
+}
+
+/// A role kept for another project keeps what that project relies on: its
+/// grants on the schema they share, and on that project's tables (#7).
+#[tokio::test]
+async fn a_reset_keeps_the_grants_of_a_role_it_keeps_for_another_project() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let with_grants = "target:\n  postgres:\n    url: $DATABASE_URL\n    roles:\n      - name: shared_reader\n\
+                       \x20   grants:\n      app:\n        shared_reader: [usage, select]\n";
+    let design = named_project(sd.path(), "shop", with_grants, &ORDERS_OWNER_FILES[..1]);
+    let theirs = named_project(bd.path(), "billing", with_grants, &ORDERS_OWNER_FILES[1..]);
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    design.apply_grants(&*shop, None).await.expect("shop's grants");
+    theirs
+        .apply(&*billing, None, false, None, Progress::none())
+        .await
+        .expect("billing's apply");
+    theirs.apply_grants(&*billing, None).await.expect("billing's grants");
+
+    let summary = design
+        .reset(&*shop, "postgres", true, false, false, None)
+        .await
+        .expect("shop's reset");
+    assert!(
+        summary.kept.iter().any(|k| k.contains("role shared_reader")),
+        "{:?}",
+        summary.kept
+    );
+    assert_catalog(
+        &*shop,
+        true,
+        "SELECT 1 WHERE has_schema_privilege('shared_reader', 'app', 'USAGE') \
+         AND has_table_privilege('shared_reader', 'app.invoices', 'SELECT')",
+        "shared_reader's grants billing relies on",
+    )
+    .await;
+}
+
+/// `DROP SCHEMA … CASCADE` takes a collation in the schema, and every column
+/// collated by it: a column of another project's is what depends on the
+/// schema, as much as a view over its table (#7).
+#[tokio::test]
+async fn a_reset_with_schemas_is_refused_when_another_projects_column_uses_a_collation_in_it() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let design = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1]);
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    shop.execute_script("CREATE COLLATION app.ci FROM \"C\";")
+        .await
+        .unwrap();
+    billing_reading(
+        bd.path(),
+        &[(
+            "ddl/table/billing/customers.ddl",
+            "create table if not exists billing.customers (id int primary key, email text collate app.ci);\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    let err = design
+        .reset(&*shop, "postgres", true, true, false, None)
+        .await
+        .expect_err("billing's column is collated by app.ci, which DROP SCHEMA app CASCADE takes")
+        .to_string();
+    assert!(err.contains("schema app") && err.contains("billing.customers"), "{err}");
+    assert_catalog(
+        &*shop,
+        true,
+        "SELECT 1 FROM information_schema.columns WHERE table_schema = 'billing' \
+         AND table_name = 'customers' AND column_name = 'email'",
+        "billing.customers.email",
+    )
+    .await;
+}
+
+/// A range type's constructor functions are the range's, and the range the
+/// design's: they keep no schema from `--schemas` (#7).
+#[tokio::test]
+async fn a_reset_drops_a_schema_holding_its_own_range_type() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    let design = named_project(
+        sd.path(),
+        "shop",
+        "",
+        &[(
+            "ddl/table/app/orders.ddl",
+            "set search_path to app;\ncreate type floatrange as range (subtype = float8);\n\
+             create table if not exists orders (id int primary key, span floatrange);\n",
+        )],
+    );
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+
+    let summary = design
+        .reset(&*shop, "postgres", true, true, false, None)
+        .await
+        .expect("shop's reset");
+    assert!(summary.kept.is_empty(), "{:?}", summary.kept);
+    assert_catalog(
+        &*shop,
+        false,
+        "SELECT 1 FROM pg_namespace WHERE nspname = 'app'",
+        "schema app",
+    )
+    .await;
+}
+
+/// A reset drops each entity by its path: an enum its table's file creates
+/// beside the table stays. Another project's column of that enum is no use of
+/// anything the reset drops, and refused even a forced one (#7).
+#[tokio::test]
+async fn a_reset_is_not_refused_for_a_use_of_what_it_leaves() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let design = named_project(
+        sd.path(),
+        "shop",
+        "",
+        &[(
+            "ddl/table/app/orders.ddl",
+            "set search_path to app;\ncreate type colour as enum ('red', 'blue');\n\
+             create table if not exists orders (id int primary key, colour colour);\n",
+        )],
+    );
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    billing_reading(
+        bd.path(),
+        &[(
+            "ddl/table/billing/invoices.ddl",
+            "create table if not exists billing.invoices (id int primary key, colour app.colour);\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    design
+        .reset(&*shop, "postgres", true, false, false, None)
+        .await
+        .expect("the reset drops app.orders alone, which billing does not use");
+    assert_table_absent(&*shop, "app", "orders").await;
+    assert_catalog(
+        &*shop,
+        true,
+        "SELECT 1 FROM information_schema.columns WHERE table_schema = 'billing' \
+         AND table_name = 'invoices' AND column_name = 'colour'",
+        "billing.invoices.colour",
+    )
+    .await;
+}
+
 /// A design may install an extension into a schema of its own. The
 /// extension's members are the extension's, and the extension the design's:
 /// `--schemas` drops the schema, and the extension with it, as it did (#7).
