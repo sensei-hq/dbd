@@ -142,6 +142,23 @@ Taken in slice 3:
   runs that module. `init` and `install` do not walk up, and a design
   without modules is not looked for above.
 
+Taken in slice 4:
+
+- A module's version and release state are written in its block,
+  `modules.<name>.version` / `released`, edited in place as `project.*` is
+  (comments and layout kept; a module written `{}` becomes a block; a
+  flow-style block with keys falls back to rewriting the file):
+  `config::update_version_of` / `set_released_of`. Its snapshots and
+  migrations are in its folder: `snapshot::create_snapshot_of` /
+  `create_baseline_snapshot_of`, which name the module (`Design::module`).
+- `snapshot` and `release` go over every module, or `--module` alone, never
+  a scope (a snapshot records the design); a whole-workspace `release` skips
+  the modules already released and refuses only when none is left.
+  `snapshot --list`, `format` and `doctor` go over each module's folder
+  (`Workspace::folders`, without loading designs).
+- `reconcile` refuses a run holding a released module before anything
+  connects, naming it; the other modules reconcile with `--module`.
+
 ## Slices
 
 Each is red tests first, then the implementation, a focused review, CI, and a

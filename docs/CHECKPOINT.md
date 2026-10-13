@@ -16,12 +16,10 @@
 
 ## Next
 
-Slice 4 on `feat/workspaces-history`: red tests committed (670bfe6b). Implement:
-`config::update_version_of`/`set_released_of` (edit `modules.<name>.*` in
-place), `create_snapshot`/`create_baseline_snapshot` taking the module,
-`Design::module`, and `snapshot`, `release`, `format`, `doctor` over modules.
-
-    cargo test -p dbd-core --test workspace_history && cargo test --test workspace_history
+Slice 4 on `feat/workspaces-history`: implemented (fee3ce4d) — per-module
+versions and releases written in place, snapshots and migrations per module
+folder, snapshot/release/format/doctor over modules. Next: full suites, PR into
+`feat/workspaces`, review, CI, merge; then slice 5 (viewer and outputs).
 
 ## Open
 
