@@ -342,7 +342,7 @@ left to you (drop + recreate, or the snapshot/migrate workflow).
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.25.1
+  rev: v0.26.0
   hooks:
     - id: dbd-format
 ```
