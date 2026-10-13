@@ -22,6 +22,86 @@ fn warn_if_no_authored_ddl(design: &Design, project_dir: &Path) {
     }
 }
 
+/// `dbd inspect --shared`: what shares the database — each project, what it
+/// owns and uses, and which record nothing of it yet — and what would refuse
+/// this design there, exiting non-zero over any (#7).
+pub async fn cmd_inspect_shared(
+    config: &Path,
+    env: &str,
+    project_dir: &Path,
+    database_url: Option<&str>,
+) -> Result<()> {
+    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
+    let adapter = get_adapter(config, database_url).await?;
+    let shared = design.shared_database(&*adapter).await?;
+    let project = &design.config().project.name;
+    for line in format_shared_database(&shared, project) {
+        output::always(&line);
+    }
+    if !shared.conflicts.is_empty() {
+        anyhow::bail!(
+            "{} {} for project '{project}' in this database",
+            shared.conflicts.len(),
+            if shared.conflicts.len() == 1 {
+                "conflict"
+            } else {
+                "conflicts"
+            }
+        );
+    }
+    Ok(())
+}
+
+/// [`cmd_inspect_shared`]'s report, a line each.
+fn format_shared_database(shared: &dbd_core::design::SharedDatabase, project: &str) -> Vec<String> {
+    const SHOWN: usize = 10;
+    let mut lines = vec!["Projects in this database:".to_string()];
+    if shared.projects.is_empty() {
+        lines.push("  none".to_string());
+    }
+    for p in &shared.projects {
+        let record = match (&p.env, p.version) {
+            (Some(env), Some(version)) => format!(" ({env}, v{version})"),
+            _ => " (no record)".to_string(),
+        };
+        if !p.recording && p.owns.is_empty() {
+            lines.push(format!(
+                "  {}{record} — records nothing of what it owns: it has not run a dbd that keeps the registry",
+                p.name
+            ));
+            continue;
+        }
+        let mut owned: Vec<String> = p
+            .owns
+            .iter()
+            .take(SHOWN)
+            .map(|o| format!("{} {}.{}", o.namespace, o.schema, o.name))
+            .collect();
+        if p.owns.len() > SHOWN {
+            owned.push(format!("and {} more", p.owns.len() - SHOWN));
+        }
+        lines.push(format!(
+            "  {}{record} — owns {}: {}",
+            p.name,
+            p.owns.len(),
+            owned.join(", ")
+        ));
+        if !p.schemas.is_empty() {
+            lines.push(format!("    uses schemas: {}", p.schemas.join(", ")));
+        }
+        for u in &p.uses {
+            lines.push(format!("    uses {} through {}", u.target, u.via));
+        }
+    }
+    if shared.conflicts.is_empty() {
+        lines.push(format!("No conflicts for project '{project}'."));
+    } else {
+        lines.push(format!("Conflicts for project '{project}':"));
+        lines.extend(shared.conflicts.iter().map(|c| format!("  {c}")));
+    }
+    lines
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn cmd_inspect(
     config: &Path,

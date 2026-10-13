@@ -672,6 +672,64 @@ impl Bookkeeping {
         Ok(held)
     }
 
+    /// Everything `dbd.objects` holds that still exists in the catalog, with
+    /// its owner, and everything `dbd.uses` records.
+    pub(super) async fn registry(&self) -> Result<crate::adapter::Registry> {
+        let read = |e: sqlx::Error| DbdError::Config(format!("registry read failed: {e}"));
+        let tables: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT to_regclass('dbd.objects')::text, to_regclass('dbd.uses')::text")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(read)?;
+        let mut registry = crate::adapter::Registry::default();
+        if tables.0.is_some() {
+            let rows: Vec<(String, String, String, String, String)> = sqlx::query_as(
+                "SELECT o.owner, o.namespace, o.schema, o.name, o.kind FROM dbd.objects o \
+                 WHERE CASE o.namespace \
+                   WHEN 'routine' THEN EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+                                               WHERE n.nspname = o.schema AND p.proname = o.name) \
+                   ELSE EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                                WHERE n.nspname = o.schema AND c.relname = o.name) \
+                     OR EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
+                                WHERE n.nspname = o.schema AND t.typname = o.name) \
+                 END \
+                 ORDER BY o.owner, o.namespace, o.schema, o.name",
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(read)?;
+            registry.claims = rows
+                .into_iter()
+                .map(|(owner, namespace, schema, name, kind)| crate::adapter::HeldObject {
+                    object: crate::adapter::OwnedObject {
+                        namespace,
+                        schema,
+                        name,
+                        kind,
+                    },
+                    owner,
+                })
+                .collect();
+        }
+        if tables.1.is_some() {
+            let rows: Vec<(String, String, String, String)> =
+                sqlx::query_as("SELECT owner, kind, target, via FROM dbd.uses ORDER BY owner, kind, target, via")
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(read)?;
+            registry.uses = rows
+                .into_iter()
+                .map(|(owner, kind, target, via)| crate::adapter::RecordedUse {
+                    owner,
+                    kind,
+                    target,
+                    via,
+                })
+                .collect();
+        }
+        Ok(registry)
+    }
+
     /// What `owner` holds in `dbd.objects` that still exists in the catalog.
     pub(super) async fn owned_objects(&self, owner: &str) -> Result<Vec<crate::adapter::OwnedObject>> {
         let read = |e: sqlx::Error| DbdError::Config(format!("ownership read failed: {e}"));

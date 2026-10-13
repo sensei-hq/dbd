@@ -115,6 +115,34 @@ pub(crate) fn merge_decision(managed: Option<u32>, project_version: u32) -> Merg
     }
 }
 
+/// What the database holds for this project to reverse-engineer: `entities`
+/// less what other projects own there, each named as it is left out (#7).
+async fn leave_out_other_owners(
+    adapter: &dyn dbd_core::DatabaseAdapter,
+    project: &str,
+    entities: Vec<dbd_core::Entity>,
+) -> Result<Vec<dbd_core::Entity>> {
+    let (kept, left) = dbd_core::design::leave_out_other_owners(adapter, project, entities).await?;
+    if !left.is_empty() {
+        let named: Vec<String> = left
+            .iter()
+            .map(|h| {
+                format!(
+                    "{} {}.{} (\"{}\")",
+                    h.object.namespace, h.object.schema, h.object.name, h.owner
+                )
+            })
+            .collect();
+        crate::output::warn(&format!(
+            "left out {} {} other projects own here: {}",
+            left.len(),
+            if left.len() == 1 { "entity" } else { "entities" },
+            named.join(", ")
+        ));
+    }
+    Ok(kept)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn cmd_init_from_db(
     project_dir: &Path,
@@ -149,21 +177,26 @@ pub async fn cmd_init_from_db(
         .map(String::from)
         .unwrap_or_else(|| db_name_from_conn(&conn).unwrap_or_else(|| "project".into()));
 
-    // Version-safety gate: `init --from-db` is only for databases NOT managed by
-    // dbd. Detect a `_dbd_meta` table in any schema and refuse if found.
+    // Version-safety gate: `init --from-db` is only for a project the database
+    // does not manage — `merge` syncs one it does. Another project's record is
+    // no bar: a second project onboards beside it, leaving out what that one
+    // owns (#7).
     let adapter = dbd_core::connect(&conn, &project_name)
         .await
         .context("failed to connect to the database")?;
-    if let Some(d) = adapter.reverse_managed_version().await? {
+    if let Some(meta) = adapter.get_project_meta().await? {
         bail!(
-            "database is managed by dbd (version {d}); `dbd init --from-db` is only for \
-             databases not managed by dbd — use `dbd merge` from the project's repository instead"
+            "database is managed by dbd for project '{project_name}' (version {}); `dbd init --from-db` \
+             is only for a project the database does not manage — use `dbd merge` from the project's \
+             repository instead",
+            meta.version
         );
     }
 
     // A fresh project has no design.yaml yet, so use the default format settings —
     // matching what `dbd format` would later apply with a freshly-scaffolded config.
-    let mut entities = adapter.introspect().await.context("introspection failed")?;
+    let entities = adapter.introspect().await.context("introspection failed")?;
+    let mut entities = leave_out_other_owners(&*adapter, &project_name, entities).await?;
     // Roles are cluster-global and gated behind the `--roles` opt-in: append them
     // only when asked (introspect_roles is NOT part of introspect()).
     if roles {
@@ -422,7 +455,8 @@ pub async fn cmd_merge(
             );
         }
         MergeDecision::Snapshot => {
-            let mut entities = adapter.introspect().await.context("introspection failed")?;
+            let entities = adapter.introspect().await.context("introspection failed")?;
+            let mut entities = leave_out_other_owners(&*adapter, &project_name, entities).await?;
             // Roles are cluster-global and gated behind the `--roles` opt-in: append
             // them only when asked (introspect_roles is NOT part of introspect()).
             if roles {

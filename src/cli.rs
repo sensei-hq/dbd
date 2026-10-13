@@ -93,6 +93,11 @@ pub enum Commands {
         /// catalog (uses the -d/--database connection)
         #[arg(long = "from-db")]
         from_db: bool,
+        /// Report what shares the database — each project, what it owns and
+        /// uses — and what would refuse this design there, exiting non-zero
+        /// over any (uses the -d/--database connection)
+        #[arg(long, conflicts_with_all = ["name", "fix", "from_db"])]
+        shared: bool,
     },
     /// Apply DDL scripts to database
     Apply {

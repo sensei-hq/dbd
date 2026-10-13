@@ -26,7 +26,7 @@ mod reset;
 mod scope;
 
 pub use marks::DatabaseMarks;
-pub use ownership::Prune;
+pub use ownership::{Prune, SharedDatabase, SharedProject, SharedUse, leave_out_other_owners};
 pub use plan::{ApplyStrategy, ExecutionPlan, ExecutionStep, build_execution_plan};
 pub use reset::{KeptRole, ResetComplete};
 

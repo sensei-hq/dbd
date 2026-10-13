@@ -225,6 +225,61 @@ impl Design {
         )))
     }
 
+    /// What shares the database `adapter` reaches, read from its records and
+    /// its ownership registry: each project, what it owns and uses, and which
+    /// record nothing of it yet; and what would refuse this design there (#7,
+    /// `dbd inspect --shared`). Reads only.
+    pub async fn shared_database(&self, adapter: &dyn DatabaseAdapter) -> Result<SharedDatabase> {
+        let registry = adapter.registry().await?;
+        let mut projects: std::collections::BTreeMap<String, SharedProject> = std::collections::BTreeMap::new();
+        let meta = adapter
+            .get_project_meta()
+            .await?
+            .into_iter()
+            .chain(adapter.other_projects_meta().await?);
+        for m in meta {
+            let p = projects.entry(m.project.clone()).or_default();
+            p.env = Some(m.env);
+            p.version = Some(m.version);
+        }
+        for h in registry.claims {
+            projects.entry(h.owner).or_default().owns.push(h.object);
+        }
+        for u in registry.uses {
+            let p = projects.entry(u.owner).or_default();
+            match u.kind.as_str() {
+                "owner" => p.recording = true,
+                "schema" => p.schemas.push(u.target),
+                "entity" => p.uses.push(SharedUse {
+                    target: u.target,
+                    via: u.via,
+                }),
+                _ => {}
+            }
+        }
+        let projects = projects
+            .into_iter()
+            .map(|(name, p)| SharedProject { name, ..p })
+            .collect();
+
+        let declared = self.declared_objects();
+        let mut conflicts: Vec<String> = adapter
+            .claim_objects(self.owner(), &declared, false, self.adopt_from.as_deref())
+            .await?
+            .iter()
+            .map(|h| {
+                format!(
+                    "{} {}.{} is owned by \"{}\"",
+                    h.object.namespace, h.object.schema, h.object.name, h.owner
+                )
+            })
+            .collect();
+        if let Err(e) = self.check_name_reuse(adapter, &declared).await {
+            conflicts.push(e.to_string());
+        }
+        Ok(SharedDatabase { projects, conflicts })
+    }
+
     /// Refuse, naming each, a design declaring an entity another owner holds
     /// in this database — the check every command that claims nothing runs
     /// before it touches the database: `refresh`, `policies`, `import`, a dry
@@ -1020,6 +1075,117 @@ impl Design {
         }
         plan.warnings.extend(kept);
     }
+}
+
+/// What shares a database (#7) — see [`Design::shared_database`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SharedDatabase {
+    /// Every project the database records or holds entities for, by name.
+    pub projects: Vec<SharedProject>,
+    /// What would refuse this design here, one line each.
+    pub conflicts: Vec<String>,
+}
+
+/// One project in a shared database (#7).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SharedProject {
+    pub name: String,
+    /// Its record — `None` for an owner with claims and no record.
+    pub env: Option<String>,
+    pub version: Option<u32>,
+    /// Whether it records what it owns and uses — a dbd that keeps the
+    /// registry has run for it. One that does not owns nothing known.
+    pub recording: bool,
+    /// What it holds that still exists.
+    pub owns: Vec<OwnedObject>,
+    /// The schemas it uses.
+    pub schemas: Vec<String>,
+    /// What of others' it uses, and through what of its own.
+    pub uses: Vec<SharedUse>,
+}
+
+/// A use one project makes of another's entity (#7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedUse {
+    /// `relation:app.orders`.
+    pub target: String,
+    /// `view billing.v_orders`.
+    pub via: String,
+}
+
+/// `entities` less what another owner than `owner` holds in the database
+/// `adapter` reaches, and what was left out, with its owner — for reverse
+/// engineering beside other projects (#7): `init --from-db` and `merge` took
+/// them as this project's. Refused while a project the database records does
+/// not record what it owns: its entities cannot be told from nobody's.
+pub async fn leave_out_other_owners(
+    adapter: &dyn DatabaseAdapter,
+    owner: &str,
+    entities: Vec<Entity>,
+) -> Result<(Vec<Entity>, Vec<HeldObject>)> {
+    let registry = adapter.registry().await?;
+    let recording: std::collections::BTreeSet<&str> = registry
+        .uses
+        .iter()
+        .filter(|u| u.kind == "owner")
+        .map(|u| u.owner.as_str())
+        .collect();
+    let silent: Vec<String> = adapter
+        .other_projects_meta()
+        .await?
+        .into_iter()
+        .map(|m| m.project)
+        .filter(|p| p != owner && !recording.contains(p.as_str()))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if !silent.is_empty() {
+        return Err(DbdError::Config(format!(
+            "{} here {} no record of what {} — {} entities cannot be told from nobody's. Run {} apply or \
+             reconcile with this dbd first",
+            quoted(&silent),
+            if silent.len() == 1 { "keeps" } else { "keep" },
+            if silent.len() == 1 { "it owns" } else { "they own" },
+            if silent.len() == 1 { "its" } else { "their" },
+            if silent.len() == 1 { "its" } else { "their" },
+        )));
+    }
+    let held: std::collections::HashMap<(&str, &str, &str), &HeldObject> = registry
+        .claims
+        .iter()
+        .filter(|h| h.owner != owner)
+        .map(|h| {
+            (
+                (
+                    h.object.namespace.as_str(),
+                    h.object.schema.as_str(),
+                    h.object.name.as_str(),
+                ),
+                h,
+            )
+        })
+        .collect();
+    let mut kept = Vec::new();
+    let mut left = Vec::new();
+    for e in entities {
+        let namespace = match e.entity_type {
+            EntityType::Function | EntityType::Procedure => "routine",
+            EntityType::Schema | EntityType::Extension | EntityType::Role => {
+                kept.push(e);
+                continue;
+            }
+            _ => "relation",
+        };
+        let (schema, name) = crate::entity::split_qualified_name(&e.name);
+        let schema = schema
+            .or_else(|| e.schema.clone())
+            .unwrap_or_else(|| crate::reconcile::DEFAULT_SCHEMA.to_string());
+        match held.get(&(namespace, schema.as_str(), name.as_str())) {
+            Some(h) => left.push((*h).clone()),
+            None => kept.push(e),
+        }
+    }
+    Ok((kept, left))
 }
 
 /// Run `work` holding the database's dbd write lock (#7), released however
