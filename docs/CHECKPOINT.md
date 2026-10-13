@@ -14,10 +14,12 @@
 
 ## Next
 
-Slice 3 (scopes over modules): `scopes.<name>.modules: [...]` selects modules
-and their dependencies, alongside entity selection; running inside a module
-folder finds the workspace root by walking up and selects that module.
-Branch `feat/workspaces-scopes`, red tests first.
+Slice 3 PR #63 (`feat/workspaces-scopes` → `feat/workspaces`): both review
+rounds fixed (f930d147, 08d366d8) and the plan updated. Next: full suites, CI,
+merge; then slice 4 (per-module history: snapshot, release, migrations; format
+and doctor over modules).
+
+    gh pr checks 63
 
 ## Open
 

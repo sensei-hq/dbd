@@ -34,7 +34,26 @@ async fn main() {
     let verbosity = Verbosity::from_flag(args.verbose);
 
     // --source defines the project root. Everything is relative to it.
-    let project_dir = PathBuf::from(&args.source);
+    let mut project_dir = PathBuf::from(&args.source);
+    let mut source = args.source.clone();
+    let mut module = args.module.clone();
+
+    // Run inside a module's folder, which holds no design.yaml of its own, the
+    // workspace is found by walking up, as Cargo finds its — and the run is
+    // that module's (#7). `init` and `install` set up where they are run.
+    let walks_up = !matches!(args.command, cli::Commands::Init { .. } | cli::Commands::Install { .. });
+    if walks_up
+        && args.config.is_relative()
+        && !project_dir.join(&args.config).exists()
+        && !dbd_core::github::is_github_source(&args.source)
+        && let Some((root, found)) = dbd_core::Workspace::locate(&project_dir, &args.config)
+    {
+        source = root.display().to_string();
+        project_dir = root;
+        if module.is_none() {
+            module = found;
+        }
+    }
 
     // Config file is always inside the project directory.
     let config = project_dir.join(&args.config);
@@ -45,10 +64,10 @@ async fn main() {
         &args.environment,
         args.database.as_deref(),
         &project_dir,
-        &args.source,
+        &source,
         args.scope.as_deref(),
         args.deps.map(Into::into),
-        args.module.as_deref(),
+        module.as_deref(),
         verbosity,
     )
     .await

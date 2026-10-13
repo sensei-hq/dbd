@@ -20,7 +20,16 @@ pub async fn cmd_inspect_shared(
     module: Option<&str>,
 ) -> Result<()> {
     let mut reports = Vec::new();
-    for target in super::targets(config, env, project_dir, module, None, super::Order::Build)? {
+    for target in super::targets(
+        config,
+        env,
+        project_dir,
+        Some("all"),
+        None,
+        module,
+        None,
+        super::Order::Build,
+    )? {
         let adapter = get_adapter(config, database_url, target.design.owner()).await?;
         let shared = target.design.shared_database(&*adapter).await?;
         reports.push((target, shared));
@@ -148,7 +157,7 @@ pub async fn cmd_inspect(
     // Each module of a workspace in `depends_on` order — with `-n`, the one
     // declaring that entity. The workspace's own checks (T19, T20) ran as it
     // loaded.
-    let targets = super::targets(config, env, project_dir, module, name, super::Order::Build)?;
+    let targets = super::targets(config, env, project_dir, scope, deps, module, name, super::Order::Build)?;
     let mut blocking = 0;
     for (i, target) in targets.into_iter().enumerate() {
         let in_module = target.module.is_some();
@@ -978,10 +987,11 @@ pub async fn cmd_apply(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let targets: Vec<super::Target> = super::targets(config, env, project_dir, module, name, super::Order::Build)?
-        .into_iter()
-        .map(|target| target.map_design(|design| ownership.applied_to(design)))
-        .collect();
+    let targets: Vec<super::Target> =
+        super::targets(config, env, project_dir, scope, deps, module, name, super::Order::Build)?
+            .into_iter()
+            .map(|target| target.map_design(|design| ownership.applied_to(design)))
+            .collect();
     let run = ApplyRun {
         config,
         database_url,
@@ -1264,7 +1274,7 @@ pub async fn cmd_refresh(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let targets = super::targets(config, env, project_dir, module, name, super::Order::Build)?;
+    let targets = super::targets(config, env, project_dir, scope, deps, module, name, super::Order::Build)?;
     for (i, target) in targets.into_iter().enumerate() {
         let (design, _) = target.enter(i == 0);
         refresh_design(design, config, database_url, name, scope, deps, verbosity).await?;
@@ -1337,7 +1347,7 @@ pub async fn cmd_policies(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let targets = super::targets(config, env, project_dir, module, None, super::Order::Build)?;
+    let targets = super::targets(config, env, project_dir, scope, deps, module, None, super::Order::Build)?;
     if targets.len() > 1 && !dry_run {
         // Each module's guards before any module's policies apply (#7).
         for target in &targets {

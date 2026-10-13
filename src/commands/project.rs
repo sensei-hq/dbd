@@ -424,12 +424,20 @@ pub async fn cmd_deploy(
         anyhow::bail!("No {} found in {}", config_name.display(), project_dir.display());
     }
 
-    let targets: Vec<super::Target> =
-        super::targets(&config_path, env, &project_dir, module, None, super::Order::Build)
-            .context("Failed to load design from source")?
-            .into_iter()
-            .map(|target| target.map_design(|design| ownership.applied_to(design)))
-            .collect();
+    let targets: Vec<super::Target> = super::targets(
+        &config_path,
+        env,
+        &project_dir,
+        scope,
+        deps,
+        module,
+        None,
+        super::Order::Build,
+    )
+    .context("Failed to load design from source")?
+    .into_iter()
+    .map(|target| target.map_design(|design| ownership.applied_to(design)))
+    .collect();
     let (targets, emptied) = super::emptied_together(targets, None, scope, deps)?;
     let run = DeployRun {
         config_path: &config_path,
@@ -764,10 +772,11 @@ pub async fn cmd_reconcile(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let targets: Vec<super::Target> = super::targets(config, env, project_dir, module, None, super::Order::Build)?
-        .into_iter()
-        .map(|target| target.map_design(|design| ownership.applied_to(design)))
-        .collect();
+    let targets: Vec<super::Target> =
+        super::targets(config, env, project_dir, scope, deps, module, None, super::Order::Build)?
+            .into_iter()
+            .map(|target| target.map_design(|design| ownership.applied_to(design)))
+            .collect();
     if targets.len() > 1 && !dry_run {
         // Before the first module writes, each module's reconcile checked as
         // its dry run checks it — so a refusal any module's would meet comes

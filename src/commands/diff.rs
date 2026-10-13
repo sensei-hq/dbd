@@ -69,7 +69,7 @@ pub async fn cmd_diff(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let targets = super::targets(config, env, project_dir, module, None, super::Order::Build)?;
+    let targets = super::targets(config, env, project_dir, scope, deps, module, None, super::Order::Build)?;
     let mut diffs: Vec<(Option<String>, String, SchemaDiff)> = Vec::new();
     for (i, target) in targets.into_iter().enumerate() {
         let module = target.module.clone();

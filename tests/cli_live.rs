@@ -3591,3 +3591,74 @@ async fn a_workspace_import_refused_at_the_emptying_claims_nothing_emptied() {
     let currencies = std::fs::read_to_string(out.join("app/currencies.csv")).unwrap();
     assert!(currencies.contains("EUR"), "nothing was emptied: {currencies}");
 }
+
+/// A scope's run builds the modules it selects, and pins each, as a project's
+/// run pins it: another scope's run of a module it pinned is refused.
+#[tokio::test]
+async fn a_workspace_scope_pins_each_module_it_runs() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    shop_workspace(dir);
+    let manifest = std::fs::read_to_string(dir.join("design.yaml")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        format!("{manifest}\nscopes:\n  dojo:\n    modules: [dojo]\n"),
+    )
+    .unwrap();
+
+    let o = dbd(dir, &url, &["deploy", "--scope", "dojo"]);
+    assert!(o.status.success(), "deploy --scope dojo: {}", combined(&o));
+    let owners = owners_listed(dir, &url);
+    assert!(
+        owners.iter().any(|o| o.starts_with("shop/shared"))
+            && owners.iter().any(|o| o.starts_with("shop/dojo"))
+            && !owners.iter().any(|o| o.starts_with("shop/core")),
+        "{owners:?}"
+    );
+
+    let o = dbd(dir, &url, &["apply"]);
+    assert!(!o.status.success(), "shared is pinned to dojo: {}", combined(&o));
+    assert!(combined(&o).contains("scope guard"), "{}", combined(&o));
+    let o = dbd(dir, &url, &["apply", "--scope", "dojo"]);
+    assert!(o.status.success(), "{}", combined(&o));
+
+    // Every module the scope ran is pinned, not the first alone: re-point
+    // shared, and dojo still refuses.
+    let o = dbd(dir, &url, &["apply", "--module", "shared", "--allow-scope-change"]);
+    assert!(o.status.success(), "{}", combined(&o));
+    let o = dbd(dir, &url, &["apply"]);
+    let said = combined(&o);
+    assert!(!o.status.success(), "dojo is pinned to dojo: {said}");
+    assert!(
+        said.contains("module dojo (shop/dojo)") && said.contains("pinned to scope 'dojo'"),
+        "{said}"
+    );
+}
+
+/// `inspect --shared` and `migrate --status` read the whole database: every
+/// module, whatever the `default` scope selects.
+#[tokio::test]
+async fn shared_and_status_go_over_every_module_whatever_the_default_scope() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    shop_workspace(dir);
+    let manifest = std::fs::read_to_string(dir.join("design.yaml")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        format!("{manifest}\nscopes:\n  default:\n    modules: [dojo]\n"),
+    )
+    .unwrap();
+    let o = dbd(dir, &url, &["deploy"]);
+    assert!(o.status.success(), "deploy: {}", combined(&o));
+    for args in [&["inspect", "--shared"][..], &["migrate", "--status"]] {
+        let o = dbd(dir, &url, args);
+        assert!(o.status.success(), "{args:?}: {}", combined(&o));
+        assert!(
+            stdout(&o).contains("module core (shop/core)"),
+            "{args:?}: {}",
+            combined(&o)
+        );
+    }
+}

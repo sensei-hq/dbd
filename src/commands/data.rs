@@ -109,7 +109,7 @@ pub async fn cmd_import_dry_run(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let targets = super::targets(config, env, project_dir, module, name, super::Order::Build)?;
+    let targets = super::targets(config, env, project_dir, scope, deps, module, name, super::Order::Build)?;
     for (i, target) in targets.into_iter().enumerate() {
         let (design, _) = target.enter(i == 0);
         import_dry_run_design(design, config, database_url, name, file, scope, deps, verbosity).await?;
@@ -237,7 +237,7 @@ pub async fn cmd_import(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let targets = super::targets(config, env, project_dir, module, name, super::Order::Build)?;
+    let targets = super::targets(config, env, project_dir, scope, deps, module, name, super::Order::Build)?;
     let (targets, emptied) = super::emptied_together(targets, name, scope, deps)?;
     if targets.len() > 1 && file.is_none() {
         preflight_import(&targets, config, database_url, name, scope, deps).await?;
@@ -399,7 +399,7 @@ pub async fn cmd_export(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let targets = super::targets(config, env, project_dir, module, name, super::Order::Alone)?;
+    let targets = super::targets(config, env, project_dir, scope, deps, module, name, super::Order::Alone)?;
     for (i, target) in targets.into_iter().enumerate() {
         let (design, _) = target.enter(i == 0);
         export_design(

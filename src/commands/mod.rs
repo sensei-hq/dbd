@@ -108,17 +108,10 @@ fn runs_a_workspace(command: &Commands) -> bool {
 /// Refuse what a run cannot select (#7): a workspace in a command that does not
 /// run one yet — loading it as one design is refused by `Design::from_config`,
 /// but `format`, `doctor` and `snapshot --list` read the project without
-/// loading one, and reported a workspace's empty root clean; `--scope` or
-/// `--deps` over a workspace, until scopes select modules; and `--module` on a
-/// design without modules. A config dbd cannot read is left to the command to
-/// report.
-fn check_workspace_selection(
-    command: &Commands,
-    config: &Path,
-    scope: Option<&str>,
-    deps: Option<dbd_core::config::DepsPolicy>,
-    module: Option<&str>,
-) -> Result<()> {
+/// loading one, and reported a workspace's empty root clean; and `--module` on
+/// a design without modules. A config dbd cannot read is left to the command
+/// to report.
+fn check_workspace_selection(command: &Commands, config: &Path, module: Option<&str>) -> Result<()> {
     if matches!(command, Commands::Install { .. }) {
         return Ok(());
     }
@@ -143,9 +136,6 @@ fn check_workspace_selection(
             "{} declares modules: — this command does not run a design with modules: yet",
             config.display()
         );
-    }
-    if command_honors_scope(command) && (scope.is_some() || deps.is_some()) {
-        anyhow::bail!("--scope and --deps do not select over a design with modules: yet — run without them");
     }
     Ok(())
 }
@@ -315,17 +305,24 @@ pub(super) fn warn_if_no_authored_ddl(design: &Design, dir: &Path, in_module: bo
 }
 
 /// The designs a run goes over (#7): the project's — or, for a workspace, each
-/// module `module` selects in `order` — narrowed with `name` to the module
-/// declaring that entity.
+/// module `scope` and `module` select in `order` — narrowed with `name` to
+/// the module declaring that entity. Each module resolves `scope` (with
+/// `deps`) as its own, and a run that builds or reads is refused a gap between
+/// them.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn targets(
     config: &Path,
     env: &str,
     project_dir: &Path,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
     module: Option<&str>,
     name: Option<&str>,
     order: Order,
 ) -> Result<Vec<Target>> {
-    let workspace = Workspace::load(config, env, Some(project_dir)).context("Failed to load design")?;
+    let workspace = Workspace::load(config, env, Some(project_dir))
+        .context("Failed to load design")?
+        .under_scope_of(scope, module)?;
     let has_modules = workspace.has_modules();
     let modules = match (order, name) {
         (Order::Build, Some(n)) if has_modules => workspace.select_declaring(module, n)?,
@@ -346,6 +343,11 @@ pub(super) fn targets(
         }
         (Order::Reset, _) => workspace.selected_to_reset(module)?,
     };
+    // A run that builds or reads goes over its modules as one design goes over
+    // its entities: what one requires of another is in the run's scope.
+    if matches!(order, Order::Build) {
+        dbd_core::design::check_scope_gaps(&modules, scope, deps)?;
+    }
     Ok(modules
         .into_iter()
         .map(|m| Target {
@@ -379,7 +381,7 @@ pub async fn run(
              For other commands, clone the repository and pass its local path to --source."
         );
     }
-    check_workspace_selection(command, config, scope, deps, module)?;
+    check_workspace_selection(command, config, module)?;
     match command {
         Commands::Inspect { shared: true, .. } => {
             schema::cmd_inspect_shared(config, env, project_dir, database_url, module).await
