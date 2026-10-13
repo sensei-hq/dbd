@@ -473,9 +473,10 @@ async fn an_unparseable_design_exits_non_zero() {
 ///
 /// The guard matters more than the happy path here: without it, reverse
 /// engineering a managed database would overwrite the project that created it
-/// with a round-tripped copy of itself.
+/// with a round-tripped copy of itself. It is the project's own record that
+/// refuses: another project may onboard beside it (#7).
 #[tokio::test]
-async fn init_from_db_refuses_a_database_dbd_manages() {
+async fn init_from_db_refuses_a_database_dbd_manages_for_the_project() {
     let (_pg, url) = start_pg().await;
     let src = tempfile::tempdir().unwrap();
     project(src.path());
@@ -484,7 +485,7 @@ async fn init_from_db_refuses_a_database_dbd_manages() {
     let out = tempfile::tempdir().unwrap();
     let o = Command::cargo_bin("dbd")
         .unwrap()
-        .args(["init", "--from-db", "-d", &url])
+        .args(["init", "--from-db", "-d", &url, "--name", "clilive"])
         .current_dir(out.path())
         .output()
         .expect("dbd failed to run");
@@ -2742,4 +2743,138 @@ async fn deploy_reconcile_and_reset_take_allow_ownership_change() {
         let allowed = dbd(reuser.path(), &url, &[args, &["--allow-ownership-change"]].concat());
         assert!(allowed.status.success(), "{args:?}: {}", combined(&allowed));
     }
+}
+
+/// `init --from-db` in a database another project manages onboards a second
+/// project: it refused on any bookkeeping, and had it not, it took the first
+/// project's entities as the second's. What another project owns is left out,
+/// and named (#7, H9).
+#[tokio::test]
+async fn init_from_db_onboards_a_second_project_without_the_firsts_entities() {
+    let (_pg, url) = start_pg().await;
+    let first = tempfile::tempdir().unwrap();
+    project(first.path());
+    assert!(dbd(first.path(), &url, &["apply"]).status.success());
+    dbd_core::connect(&url, "setup")
+        .await
+        .unwrap()
+        .execute_script("CREATE TABLE app.loose (id int PRIMARY KEY);")
+        .await
+        .unwrap();
+
+    let second = tempfile::tempdir().unwrap();
+    let o = Command::cargo_bin("dbd")
+        .unwrap()
+        .args(["init", "--from-db", "-d", &url, "--name", "second"])
+        .current_dir(second.path())
+        .output()
+        .expect("dbd failed to run");
+    let said = combined(&o);
+    assert!(o.status.success(), "{said}");
+    assert!(second.path().join("ddl/table/app/loose.ddl").exists(), "{said}");
+    assert!(!second.path().join("ddl/table/app/widgets.ddl").exists(), "{said}");
+    assert!(!second.path().join("ddl/view/app/named.ddl").exists(), "{said}");
+    assert!(
+        said.contains("relation app.widgets") && said.contains("\"clilive\""),
+        "{said}"
+    );
+}
+
+/// While a project the database records keeps no record of what it owns, its
+/// entities cannot be told from nobody's: `init --from-db` is refused, naming
+/// it (#7).
+#[tokio::test]
+async fn init_from_db_is_refused_while_a_project_here_records_no_uses() {
+    let (_pg, url) = start_pg().await;
+    let first = tempfile::tempdir().unwrap();
+    project(first.path());
+    assert!(dbd(first.path(), &url, &["apply"]).status.success());
+    dbd_core::connect(&url, "setup")
+        .await
+        .unwrap()
+        .execute_script("INSERT INTO dbd.meta (project, env, version) VALUES ('oldie', 'prod', 1);")
+        .await
+        .unwrap();
+
+    let second = tempfile::tempdir().unwrap();
+    let o = Command::cargo_bin("dbd")
+        .unwrap()
+        .args(["init", "--from-db", "-d", &url, "--name", "second"])
+        .current_dir(second.path())
+        .output()
+        .expect("dbd failed to run");
+    let said = combined(&o);
+    assert!(!o.status.success(), "{said}");
+    assert!(said.contains("\"oldie\""), "{said}");
+    assert!(!second.path().join("design.yaml").exists(), "{said}");
+}
+
+/// `merge` read every schema, and took another project's entities into this
+/// one. What another project owns is left out, and named (#7, H9).
+#[tokio::test]
+async fn merge_leaves_out_what_another_project_owns() {
+    let (_pg, url) = start_pg().await;
+    let first = tempfile::tempdir().unwrap();
+    project(first.path());
+    assert!(dbd(first.path(), &url, &["apply"]).status.success());
+
+    let second = tempfile::tempdir().unwrap();
+    std::fs::write(
+        second.path().join("design.yaml"),
+        "project:\n  name: second\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(second.path().join("ddl/table/app")).unwrap();
+    std::fs::write(
+        second.path().join("ddl/table/app/gadgets.ddl"),
+        "create table if not exists app.gadgets (id integer primary key);\n",
+    )
+    .unwrap();
+    let applied = dbd(second.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+
+    let merged = dbd(second.path(), &url, &["merge"]);
+    let said = combined(&merged);
+    assert!(merged.status.success(), "{said}");
+    assert!(second.path().join("ddl/table/app/gadgets.ddl").exists(), "{said}");
+    assert!(!second.path().join("ddl/table/app/widgets.ddl").exists(), "{said}");
+    assert!(
+        said.contains("relation app.widgets") && said.contains("\"clilive\""),
+        "{said}"
+    );
+}
+
+/// `inspect --shared` reports what shares the database, and exits non-zero
+/// over a conflict of this design's (#7).
+#[tokio::test]
+async fn inspect_shared_reports_the_projects_and_fails_on_a_conflict() {
+    let (_pg, url) = start_pg().await;
+    let first = tempfile::tempdir().unwrap();
+    project(first.path());
+    assert!(dbd(first.path(), &url, &["apply"]).status.success());
+
+    let clean = dbd(first.path(), &url, &["inspect", "--shared"]);
+    let said = combined(&clean);
+    assert!(clean.status.success(), "{said}");
+    assert!(
+        said.contains("clilive") && said.contains("relation app.widgets"),
+        "{said}"
+    );
+
+    let taker = tempfile::tempdir().unwrap();
+    std::fs::write(
+        taker.path().join("design.yaml"),
+        "project:\n  name: taker\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(taker.path().join("ddl/table/app")).unwrap();
+    std::fs::copy(
+        first.path().join("ddl/table/app/widgets.ddl"),
+        taker.path().join("ddl/table/app/widgets.ddl"),
+    )
+    .unwrap();
+    let conflicted = dbd(taker.path(), &url, &["inspect", "--shared"]);
+    let said = combined(&conflicted);
+    assert!(!conflicted.status.success(), "{said}");
+    assert!(said.contains("relation app.widgets is owned by \"clilive\""), "{said}");
 }
