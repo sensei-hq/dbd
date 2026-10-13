@@ -6,18 +6,18 @@
 ## Done
 
 - Slice 1 merged (PR #61): `Workspace::load` — a module is a `Design` owned by
-  `<project>/<module>`; the `modules:` block validated; T19 overlaps and T20
-  gaps refuse the load; `dbd inspect` per module; other commands refuse a
-  workspace until they run one.
+  `<project>/<module>`; the `modules:` block validated; T19/T20 refuse the load.
+- Slice 2 merged (PR #62): a workspace runs module by module as each module's
+  owner (T21); `--module`; the manifest's hooks around the run; every module
+  checked before any writes; reset whole-or-nothing in reverse; deploy schema
+  then data; import empties together; `export` per module.
 
 ## Next
 
-Slice 2 PR #62 (`feat/workspaces-run` → `feat/workspaces`): every review round
-fixed — last: a failed import claims emptied tables only when it emptied them
-(dabb0bdf). Next: full suites, CI, merge into `feat/workspaces`; then slice 3
-(scopes over modules, walking up from a module folder).
-
-    gh pr checks 62
+Slice 3 (scopes over modules): `scopes.<name>.modules: [...]` selects modules
+and their dependencies, alongside entity selection; running inside a module
+folder finds the workspace root by walking up and selects that module.
+Branch `feat/workspaces-scopes`, red tests first.
 
 ## Open
 
