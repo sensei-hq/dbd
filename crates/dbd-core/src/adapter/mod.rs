@@ -74,8 +74,9 @@ pub struct CatalogData {
 /// namespaces, so two owners can never hold things that could collide.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct OwnedObject {
-    /// `relation` (tables, views, materialized views, sequences), `type`
-    /// (enums) or `routine` (functions and procedures, by name).
+    /// `relation` (tables, views, materialized views, sequences, and every
+    /// type — enum, composite, domain, range) or `routine` (functions and
+    /// procedures, by name).
     pub namespace: String,
     pub schema: String,
     pub name: String,

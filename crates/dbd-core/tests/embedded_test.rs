@@ -15924,10 +15924,11 @@ async fn a_renamed_projects_refusal_says_to_set_the_name_back() {
 }
 
 /// A full reset leaves nothing of the project, so it forgets its record — and
-/// now its claims of what is gone and the uses it recorded too: a retired
-/// project's dead view went on refusing another project's drop (#7).
+/// now the uses it recorded too: a reset project's dropped view went on
+/// refusing another project's drop of what it read. Nothing it dropped is
+/// listed as held (#7).
 #[tokio::test]
-async fn a_full_reset_forgets_the_projects_claims_and_uses() {
+async fn a_full_reset_forgets_the_projects_uses() {
     let (_pg, url) = start_pg().await;
     let shop = connect(&url, "shop").await.unwrap();
     let billing = connect(&url, "billing").await.unwrap();

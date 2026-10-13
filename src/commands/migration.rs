@@ -271,9 +271,7 @@ pub(crate) async fn check_reset_guards(
 ) -> Result<()> {
     let marks = design.database_marks(adapter).await?;
     Design::check_scope_guard(&marks, &resolved.name, force || allow_scope_change)?;
-    if !force {
-        design.check_reset_guard(&marks)?;
-    }
+    design.check_reset_run_guards(adapter, &marks, force).await?;
     Ok(())
 }
 

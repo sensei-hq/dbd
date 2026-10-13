@@ -407,9 +407,49 @@ impl Design {
             .claim_objects(self.owner(), &declared, false, self.adopt_from.as_deref())
             .await?;
         if !held.is_empty() {
-            return Err(DbdError::Config(held_refusal(&held)));
+            return Err(self.held_error(adapter, &held, &declared).await?);
         }
         self.check_name_reuse(adapter, &declared).await
+    }
+
+    /// The refusal over what other owners hold — and, when this project has
+    /// no record here while one holder does, and this design declares
+    /// everything that holder owns, the likely cause: a renamed
+    /// `project.name` (#7).
+    async fn held_error(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        held: &[HeldObject],
+        declared: &[OwnedObject],
+    ) -> Result<DbdError> {
+        let mut refusal = held_refusal(held);
+        if adapter.get_project_meta().await?.is_none() {
+            let recorded: std::collections::BTreeSet<String> = adapter
+                .other_projects_meta()
+                .await?
+                .into_iter()
+                .map(|m| m.project)
+                .collect();
+            let holders: std::collections::BTreeSet<&str> = held
+                .iter()
+                .map(|h| h.owner.as_str())
+                .filter(|o| recorded.contains(*o))
+                .collect();
+            if let [holder] = holders.into_iter().collect::<Vec<_>>()[..] {
+                let theirs = adapter.owned_objects(holder).await?;
+                if theirs
+                    .iter()
+                    .all(|t| declared.iter().any(|d| adapter.same_object(d, t)))
+                {
+                    refusal.push_str(&format!(
+                        ". This project has no record here, and this design declares everything '{holder}' \
+                         owns — a renamed project.name is the likely cause: if this design was '{holder}', set \
+                         project.name back to '{holder}', or take its entities over with --adopt-from {holder}"
+                    ));
+                }
+            }
+        }
+        Ok(DbdError::Config(refusal))
     }
 
     /// Claim the design's entities and record what it uses, in the run's own
@@ -447,7 +487,7 @@ impl Design {
             .claim_objects(self.owner(), &declared, true, self.adopt_from.as_deref())
             .await?;
         if !held.is_empty() {
-            return Err(DbdError::Config(held_refusal(&held)));
+            return Err(self.held_error(adapter, &held, &declared).await?);
         }
         Ok(())
     }
