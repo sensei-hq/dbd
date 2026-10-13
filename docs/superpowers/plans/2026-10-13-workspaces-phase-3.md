@@ -124,9 +124,12 @@ Taken in slice 3:
   its modules. Refused at load: a scope naming an undeclared module, an item
   no module declares, and `modules:` in a design without modules.
 - An include selects the modules with entities it names (a bare schema alone
-  selects none: every module has the manifest's schemas). A scope leaving out
-  of one module what another it selects requires is refused as a gap when it
-  is chosen — not when the workspace loads, so other scopes still run.
+  selects none: every module has the manifest's schemas; one no module knows
+  is refused). What one module of a run requires and the run's scope leaves
+  out of another is refused as a gap (`check_scope_gaps`), over the modules
+  the run goes over, each resolving the scope and `--deps` as the commands
+  do — checked when the run starts, not when the workspace loads, so other
+  scopes and runs not going over that module still run.
 - With no `--scope`, a module asked for — `--module`, or the folder dbd runs
   in — that the `default` scope leaves out runs on its own with its
   dependencies (`Workspace::under_scope_of`), each module resolving its own
