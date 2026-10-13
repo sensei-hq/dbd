@@ -1,23 +1,21 @@
 # Checkpoint
 
 **Slice:** #7 Phase 3 (workspaces and modules), integration branch
-`feat/workspaces` from `develop`. Phases 1 and 2 shipped in v0.26.0.
+`feat/workspaces`. Phases 1 and 2 shipped in v0.26.0.
 
 ## Done
 
-- v0.26.0 released: crates.io published, `main` merged (PR #59). Issue #60 filed
-  for the reconcile `nextval()` drift.
-- Phase 3 plan: `docs/superpowers/plans/2026-10-13-workspaces-phase-3.md` — a
-  module is a `Design` owned by `<project>/<module>`, rooted at its folder.
+- Slice 1 merged (PR #61): `Workspace::load` — a module is a `Design` owned by
+  `<project>/<module>`; the `modules:` block validated; T19 overlaps and T20
+  gaps refuse the load; `dbd inspect` per module; other commands refuse a
+  workspace until they run one.
 
 ## Next
 
-Slice 1 PR #61 (`feat/workspaces-load` → `feat/workspaces`): two review rounds
-fixed (2534f002, a34dc1b3), plan/spec updated (9ceacd0f). Waiting on CI, then
-merge into `feat/workspaces` locally; then slice 2 (running a workspace:
-per-module runs and adapters, `--module`, manifest hooks around the run, T21).
-
-    gh pr checks 61
+Slice 2 (running a workspace): per-module runs and adapters for apply, deploy,
+reconcile, diff, import, export, policies, refresh, migrate --status, reset
+(reverse), inspect --shared; `--module` (+ dependencies); manifest `apply:`
+hooks around the run; T21. Branch `feat/workspaces-run`, red tests first.
 
 ## Open
 
