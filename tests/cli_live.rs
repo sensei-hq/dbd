@@ -3662,3 +3662,40 @@ async fn shared_and_status_go_over_every_module_whatever_the_default_scope() {
         );
     }
 }
+
+/// Each module has its own history: a snapshot of core alone versions core,
+/// and the apply runs core's migration — shared, at its own version, is not
+/// touched.
+#[tokio::test]
+async fn a_module_migrates_on_its_own_version() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    shop_workspace(dir);
+    let o = dbd(dir, &url, &["snapshot", "-n", "baseline"]);
+    assert!(o.status.success(), "snapshot: {}", combined(&o));
+    let o = dbd(dir, &url, &["deploy"]);
+    assert!(o.status.success(), "deploy: {}", combined(&o));
+
+    std::fs::write(
+        dir.join("core/ddl/table/app/orders.ddl"),
+        "set search_path to app;\ncreate table if not exists orders (\n  id integer primary key\n, \
+         currency text references currencies (code)\n, note text\n);\n",
+    )
+    .unwrap();
+    let o = dbd(dir, &url, &["snapshot", "--module", "core", "-n", "a note"]);
+    assert!(o.status.success(), "snapshot core: {}", combined(&o));
+    assert!(dir.join("core/migrations/002").exists(), "{}", combined(&o));
+
+    let o = dbd(dir, &url, &["apply"]);
+    assert!(o.status.success(), "apply: {}", combined(&o));
+    let owners = owners_listed(dir, &url);
+    assert!(
+        owners.iter().any(|o| o.starts_with("shop/core (prod, v2)")),
+        "{owners:?}"
+    );
+    assert!(
+        owners.iter().any(|o| o.starts_with("shop/shared (prod, v1)")),
+        "{owners:?}"
+    );
+}

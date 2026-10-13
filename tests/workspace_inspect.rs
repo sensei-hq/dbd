@@ -204,15 +204,13 @@ fn inspect_inspects_the_modules_a_scope_selects() {
 }
 
 /// The commands that do not run a workspace yet refuse it rather than run
-/// the manifest as a design with no DDL. `format`, `doctor` and `snapshot
-/// --list` read the project without loading a design, and reported a
-/// workspace's empty root clean.
+/// the manifest as a design with no DDL.
 #[test]
 fn a_command_that_does_not_run_a_workspace_refuses_it() {
     let tmp = tempfile::tempdir().unwrap();
     shop(tmp.path());
 
-    for args in [&["format", "--check"][..], &["doctor"], &["snapshot", "--list"]] {
+    for args in [&["graph"][..], &["combine"], &["dbml"]] {
         let out = dbd(tmp.path(), args);
         let text = text(&out);
         assert!(!out.status.success(), "{args:?}: {text}");
