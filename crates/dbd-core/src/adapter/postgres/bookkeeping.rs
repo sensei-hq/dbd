@@ -1188,63 +1188,95 @@ async fn release_in(
 }
 
 /// What depends on one guarded entity, owned by another owner: `$1..$3` the
-/// entity's namespace, schema and name; `$4` what of it goes — `whole`,
+/// entity's namespace — `relation`, `routine`, or `schema` or `extension` for
+/// the whole of one — schema and name; `$4` what of it goes — `whole`,
 /// `column`, `constraint` or `index` — and `$5` that part's name; `$6` the
-/// owner asking. Walks `pg_depend` from the entity (a table with its row type,
-/// a column, a constraint with the index behind it, an index, every overload of
-/// a routine) through each dependent's owning relation or routine — a view's
-/// rewrite rule stands for the view, a constraint, trigger, default or policy
-/// for its table — so a dependent's own dependents are reached, as a `CASCADE`
-/// reaches them. Rows: the other owner, and the dependent as `kind
+/// owner asking.
+///
+/// Starts where a drop starts: a table with its row type and that type's
+/// array; a type and its array; a column, with the same column of every table
+/// inheriting it — dropped with it, through inheritance rather than the
+/// dependency graph; a constraint, with the index behind a primary key, unique
+/// or exclusion constraint (a foreign key's is the referenced table's, which
+/// dropping it leaves alone); an index; every overload of a routine; all of a
+/// schema, or of an extension. Walks `pg_depend` dependent by dependent, each
+/// as itself — a column as its column, a constraint, default, trigger or
+/// policy as itself — so a part reaches what depends on the part and not on
+/// its table; a view's rewrite rule stands for the whole view, which is what
+/// depends on the view. Each dependent is named by its owning relation, type
+/// or routine. Rows: the other owner, and the dependent as `kind
 /// schema.name`.
 const DEPENDENTS_SQL: &str = "\
 WITH RECURSIVE \
 rel AS (SELECT c.oid, c.reltype FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
         WHERE $1 = 'relation' AND n.nspname = $2 AND c.relname = $3), \
-typ AS (SELECT t.oid FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
+typ AS (SELECT t.oid, t.typarray FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
         WHERE $1 = 'relation' AND n.nspname = $2 AND t.typname = $3 AND t.typrelid = 0), \
+inh(child) AS ( \
+  SELECT i.inhrelid FROM pg_inherits i JOIN rel ON i.inhparent = rel.oid WHERE $4 = 'column' \
+  UNION SELECT i.inhrelid FROM pg_inherits i JOIN inh ON i.inhparent = inh.child \
+), \
 start(classid, objid, objsubid) AS ( \
   SELECT 'pg_class'::regclass::oid, rel.oid, 0 FROM rel WHERE $4 = 'whole' \
   UNION ALL SELECT 'pg_type'::regclass::oid, rel.reltype, 0 FROM rel WHERE $4 = 'whole' AND rel.reltype <> 0 \
+  UNION ALL SELECT 'pg_type'::regclass::oid, t.typarray, 0 FROM rel JOIN pg_type t ON t.oid = rel.reltype \
+            WHERE $4 = 'whole' AND t.typarray <> 0 \
   UNION ALL SELECT 'pg_type'::regclass::oid, typ.oid, 0 FROM typ WHERE $4 = 'whole' \
+  UNION ALL SELECT 'pg_type'::regclass::oid, typ.typarray, 0 FROM typ WHERE $4 = 'whole' AND typ.typarray <> 0 \
   UNION ALL SELECT 'pg_class'::regclass::oid, rel.oid, a.attnum FROM rel \
             JOIN pg_attribute a ON a.attrelid = rel.oid \
             WHERE $4 = 'column' AND a.attname = $5 AND NOT a.attisdropped \
+  UNION ALL SELECT 'pg_class'::regclass::oid, inh.child, a.attnum FROM inh \
+            JOIN pg_attribute a ON a.attrelid = inh.child \
+            WHERE a.attname = $5 AND NOT a.attisdropped AND NOT a.attislocal \
   UNION ALL SELECT 'pg_constraint'::regclass::oid, k.oid, 0 FROM rel \
             JOIN pg_constraint k ON k.conrelid = rel.oid WHERE $4 = 'constraint' AND k.conname = $5 \
   UNION ALL SELECT 'pg_class'::regclass::oid, k.conindid, 0 FROM rel \
             JOIN pg_constraint k ON k.conrelid = rel.oid \
-            WHERE $4 = 'constraint' AND k.conname = $5 AND k.conindid <> 0 \
+            WHERE $4 = 'constraint' AND k.conname = $5 AND k.contype IN ('p', 'u', 'x') AND k.conindid <> 0 \
   UNION ALL SELECT 'pg_class'::regclass::oid, i.oid, 0 FROM pg_class i JOIN pg_namespace n ON n.oid = i.relnamespace \
             WHERE $4 = 'index' AND $1 = 'relation' AND n.nspname = $2 AND i.relname = $5 AND i.relkind IN ('i', 'I') \
   UNION ALL SELECT 'pg_proc'::regclass::oid, p.oid, 0 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
             WHERE $1 = 'routine' AND n.nspname = $2 AND p.proname = $3 \
+  UNION ALL SELECT 'pg_class'::regclass::oid, c.oid, 0 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+            WHERE $1 = 'schema' AND n.nspname = $2 AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S', 'c') \
+  UNION ALL SELECT 'pg_type'::regclass::oid, t.oid, 0 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
+            WHERE $1 = 'schema' AND n.nspname = $2 AND t.typrelid = 0 AND t.typelem = 0 \
+  UNION ALL SELECT 'pg_proc'::regclass::oid, p.oid, 0 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+            WHERE $1 = 'schema' AND n.nspname = $2 \
+  UNION ALL SELECT 'pg_extension'::regclass::oid, e.oid, 0 FROM pg_extension e \
+            WHERE $1 = 'extension' AND e.extname = $3 \
 ), \
 walk(classid, objid, objsubid) AS ( \
   SELECT classid, objid, objsubid FROM start \
   UNION \
-  SELECT x.classid, x.objid, 0 FROM walk w \
+  SELECT CASE WHEN d.classid = 'pg_rewrite'::regclass THEN 'pg_class'::regclass::oid ELSE d.classid END, \
+         CASE WHEN d.classid = 'pg_rewrite'::regclass \
+              THEN (SELECT r.ev_class FROM pg_rewrite r WHERE r.oid = d.objid) ELSE d.objid END, \
+         CASE WHEN d.classid = 'pg_rewrite'::regclass THEN 0 ELSE d.objsubid END \
+  FROM walk w \
   JOIN pg_depend d ON d.refclassid = w.classid AND d.refobjid = w.objid \
                   AND (w.objsubid = 0 OR d.refobjsubid = w.objsubid) AND d.deptype IN ('n', 'a') \
-  CROSS JOIN LATERAL ( \
-    SELECT CASE WHEN d.classid IN ('pg_rewrite'::regclass, 'pg_constraint'::regclass, 'pg_trigger'::regclass, \
-                                   'pg_attrdef'::regclass, 'pg_policy'::regclass) \
-                THEN 'pg_class'::regclass::oid ELSE d.classid END AS classid, \
-           CASE d.classid \
-             WHEN 'pg_rewrite'::regclass THEN (SELECT r.ev_class FROM pg_rewrite r WHERE r.oid = d.objid) \
-             WHEN 'pg_constraint'::regclass THEN (SELECT k.conrelid FROM pg_constraint k WHERE k.oid = d.objid) \
-             WHEN 'pg_trigger'::regclass THEN (SELECT t.tgrelid FROM pg_trigger t WHERE t.oid = d.objid) \
-             WHEN 'pg_attrdef'::regclass THEN (SELECT a.adrelid FROM pg_attrdef a WHERE a.oid = d.objid) \
-             WHEN 'pg_policy'::regclass THEN (SELECT p.polrelid FROM pg_policy p WHERE p.oid = d.objid) \
-             ELSE d.objid END AS objid \
-  ) x \
-  WHERE x.objid IS NOT NULL AND x.objid <> 0 \
+), \
+owning(classid, objid) AS ( \
+  SELECT CASE WHEN w.classid IN ('pg_constraint'::regclass, 'pg_trigger'::regclass, 'pg_attrdef'::regclass, \
+                                 'pg_policy'::regclass) THEN 'pg_class'::regclass::oid ELSE w.classid END, \
+         CASE w.classid \
+           WHEN 'pg_constraint'::regclass THEN (SELECT k.conrelid FROM pg_constraint k WHERE k.oid = w.objid) \
+           WHEN 'pg_trigger'::regclass THEN (SELECT t.tgrelid FROM pg_trigger t WHERE t.oid = w.objid) \
+           WHEN 'pg_attrdef'::regclass THEN (SELECT a.adrelid FROM pg_attrdef a WHERE a.oid = w.objid) \
+           WHEN 'pg_policy'::regclass THEN (SELECT p.polrelid FROM pg_policy p WHERE p.oid = w.objid) \
+           ELSE w.objid END \
+  FROM walk w \
+  UNION \
+  SELECT 'pg_type'::regclass::oid, k.contypid FROM walk w JOIN pg_constraint k \
+         ON w.classid = 'pg_constraint'::regclass AND k.oid = w.objid AND k.conrelid = 0 AND k.contypid <> 0 \
 ), \
 found(namespace, schema, name, kind) AS ( \
   SELECT 'relation', n.nspname, c.relname, \
          CASE c.relkind WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' WHEN 'S' THEN 'sequence' \
                         WHEN 'f' THEN 'foreign table' WHEN 'c' THEN 'type' ELSE 'table' END \
-  FROM walk w JOIN pg_class c0 ON w.classid = 'pg_class'::regclass AND c0.oid = w.objid \
+  FROM owning w JOIN pg_class c0 ON w.classid = 'pg_class'::regclass AND c0.oid = w.objid \
   JOIN pg_class c ON c.oid = CASE WHEN c0.relkind IN ('i', 'I') \
                                   THEN (SELECT x.indrelid FROM pg_index x WHERE x.indexrelid = c0.oid) \
                                   ELSE c0.oid END \
@@ -1253,12 +1285,12 @@ found(namespace, schema, name, kind) AS ( \
   SELECT 'relation', n.nspname, COALESCE(c.relname, t.typname), \
          CASE WHEN c.oid IS NULL THEN 'type' WHEN c.relkind = 'v' THEN 'view' \
               WHEN c.relkind = 'm' THEN 'materialized view' ELSE 'table' END \
-  FROM walk w JOIN pg_type t ON w.classid = 'pg_type'::regclass AND t.oid = w.objid \
+  FROM owning w JOIN pg_type t ON w.classid = 'pg_type'::regclass AND t.oid = w.objid \
   LEFT JOIN pg_class c ON c.oid = t.typrelid \
   JOIN pg_namespace n ON n.oid = COALESCE(c.relnamespace, t.typnamespace) \
   UNION \
   SELECT 'routine', n.nspname, p.proname, CASE p.prokind WHEN 'p' THEN 'procedure' ELSE 'function' END \
-  FROM walk w JOIN pg_proc p ON w.classid = 'pg_proc'::regclass AND p.oid = w.objid \
+  FROM owning w JOIN pg_proc p ON w.classid = 'pg_proc'::regclass AND p.oid = w.objid \
   JOIN pg_namespace n ON n.oid = p.pronamespace \
 ) \
 SELECT DISTINCT o.owner, f.kind || ' ' || f.schema || '.' || f.name \
