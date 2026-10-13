@@ -9,6 +9,7 @@ use crate::output::{self, Verbosity};
 /// The boolean flags that drive `dbd reset`, grouped so callers construct them
 /// by name. This prevents a transposition of, e.g., `allow_scope_change` (which
 /// would silently disable the scope guard) into an adjacent positional bool slot.
+#[derive(Clone, Copy)]
 pub(crate) struct ResetOptions {
     pub dry_run: bool,
     pub force: bool,
@@ -92,6 +93,39 @@ pub async fn cmd_reset(
     database_url: Option<&str>,
     target: Option<&str>,
     opts: ResetOptions,
+    module: Option<&str>,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
+    verbosity: Verbosity,
+) -> Result<()> {
+    // A workspace's modules in reverse: each before the modules it depends on.
+    let targets = super::targets(config, env, project_dir, module, None, super::Order::Reset)?;
+    let ownership = super::OwnershipChange::new(None, opts.allow_ownership_change);
+    for (i, reset) in targets.into_iter().enumerate() {
+        let (design, _) = reset.enter(i == 0);
+        reset_design(
+            ownership.applied_to(design),
+            config,
+            database_url,
+            target,
+            opts,
+            scope,
+            deps,
+            verbosity,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// [`cmd_reset`] for one design: the project's, or one module's.
+#[allow(clippy::too_many_arguments)]
+async fn reset_design(
+    design: Design,
+    config: &Path,
+    database_url: Option<&str>,
+    target: Option<&str>,
+    opts: ResetOptions,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
@@ -102,10 +136,8 @@ pub async fn cmd_reset(
         drop_schemas,
         drop_extensions,
         allow_scope_change,
-        allow_ownership_change,
+        allow_ownership_change: _,
     } = opts;
-    let design = super::OwnershipChange::new(None, allow_ownership_change)
-        .applied_to(Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?);
     let resolved = design.resolve_scope(scope, deps)?;
     let (kept, total) = design.scope_counts(&resolved)?;
     output::scope_filtered(&resolved, kept, total);
@@ -126,7 +158,7 @@ pub async fn cmd_reset(
         // What the real run keeps — the roles another database holds, and what
         // other projects in this one have or use (#7) — is asked of the same
         // database, so the preview lists no drop the run will not perform.
-        let (sql, preview) = match super::dry_run_adapter(config, database_url).await? {
+        let (sql, preview) = match super::dry_run_adapter(config, database_url, design.owner()).await? {
             Some(adapter) => {
                 check_reset_guards(&*adapter, &design, &resolved, force, allow_scope_change).await?;
                 // The real reset claims the design's entities first (#7).
@@ -148,7 +180,7 @@ pub async fn cmd_reset(
         return Ok(());
     }
 
-    let adapter = get_adapter(config, database_url).await?;
+    let adapter = get_adapter(config, database_url, design.owner()).await?;
     let summary = reset_with_adapter(
         &*adapter,
         &design,
@@ -280,10 +312,26 @@ pub async fn cmd_migrate_status(
     env: &str,
     database_url: Option<&str>,
     project_dir: &Path,
+    module: Option<&str>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
-    let adapter = get_adapter(config, database_url).await?;
+    let targets = super::targets(config, env, project_dir, module, None, super::Order::Build)?;
+    for (i, target) in targets.into_iter().enumerate() {
+        let (design, dir) = target.enter(i == 0);
+        migrate_status_design(design, config, database_url, &dir, verbosity).await?;
+    }
+    Ok(())
+}
+
+/// [`cmd_migrate_status`] for one design: the project's, or one module's.
+async fn migrate_status_design(
+    design: Design,
+    config: &Path,
+    database_url: Option<&str>,
+    project_dir: &Path,
+    verbosity: Verbosity,
+) -> Result<()> {
+    let adapter = get_adapter(config, database_url, design.owner()).await?;
     // The versions are the whole project's; a database pinned to a scope was
     // built with that scope's entities alone, and said nothing of it.
     let unscoped = design.resolve_scope(None, None)?;
@@ -561,6 +609,7 @@ mod tests {
             },
             None,
             None,
+            None,
             Verbosity::Normal,
         )
         .await
@@ -602,6 +651,7 @@ mod tests {
                 allow_scope_change: false,
                 allow_ownership_change: false,
             },
+            None,
             None,
             None,
             Verbosity::Normal,

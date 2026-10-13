@@ -64,11 +64,31 @@ pub async fn cmd_diff(
     database_url: Option<&str>,
     json: bool,
     exit_code: bool,
+    module: Option<&str>,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
+    let targets = super::targets(config, env, project_dir, module, None, super::Order::Build)?;
+    for (i, target) in targets.into_iter().enumerate() {
+        let (design, _) = target.enter(i == 0);
+        diff_design(design, config, database_url, json, exit_code, scope, deps, verbosity).await?;
+    }
+    Ok(())
+}
+
+/// [`cmd_diff`] for one design: the project's, or one module's.
+#[allow(clippy::too_many_arguments)]
+async fn diff_design(
+    design: Design,
+    config: &Path,
+    database_url: Option<&str>,
+    json: bool,
+    exit_code: bool,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
+    verbosity: Verbosity,
+) -> Result<()> {
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
     // On stderr under --json: stdout is the document, and a pipeline parses it.
     let (kept, total) = design.scope_counts(&resolved)?;
@@ -77,7 +97,7 @@ pub async fn cmd_diff(
         Some(line) => output::always(&line),
         None => {}
     }
-    let adapter = get_adapter(config, database_url).await?;
+    let adapter = get_adapter(config, database_url, design.owner()).await?;
     if let Some((pinned, by)) = super::other_scope_pin(&*adapter, &design, &resolved).await? {
         let note = format!(
             "note: this database is pinned to scope '{pinned}'{by}; this diff compares scope '{}', so what \

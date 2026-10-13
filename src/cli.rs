@@ -77,6 +77,11 @@ pub struct Cli {
     /// Dependency policy override: report | include
     #[arg(long, global = true, value_enum)]
     pub deps: Option<DepsArg>,
+
+    /// In a workspace (a design.yaml with modules:), run this module and the
+    /// modules it depends on — `reset`, this module alone
+    #[arg(long, global = true)]
+    pub module: Option<String>,
 }
 
 #[derive(Subcommand)]

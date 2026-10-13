@@ -627,6 +627,17 @@ pub struct Design {
     /// declares none of — `--allow-ownership-change` (#7). See
     /// [`Design::allowing_ownership_change`].
     allow_ownership_change: bool,
+    /// The workspace manifest's `apply:` hooks a run attaches to the first and
+    /// last module it runs, read from the project folder (#7). See
+    /// [`Workspace::select`].
+    outer_hooks: Option<OuterHooks>,
+}
+
+/// A workspace manifest's `apply:` hooks, and the folder their paths are
+/// relative to — attached to a module's design for a run (#7).
+pub(crate) struct OuterHooks {
+    pub(crate) dir: PathBuf,
+    pub(crate) apply: config::ApplyConfig,
 }
 
 /// The phrase [`warn_if_no_search_path`] reports with, so
@@ -987,6 +998,7 @@ impl Design {
             dialect: dialect_label,
             adopt_from: None,
             allow_ownership_change: false,
+            outer_hooks: None,
         })
     }
 
@@ -1060,6 +1072,67 @@ impl Design {
             search_path: self.script_search_path(),
             entities: &self.entities,
         }
+    }
+
+    /// Each list of `kind` apply hooks a run executes, in the order it runs
+    /// them, with where its paths are read: the workspace manifest's
+    /// `apply.before` a run attaches ahead of the design's own, its
+    /// `apply.after` behind (#7 — see [`Workspace::select`]).
+    fn apply_hook_lists(&self, kind: hooks::HookKind) -> Vec<(hooks::HookSource<'_>, &[config::ScriptEntry])> {
+        let own = match kind {
+            hooks::HookKind::Before => &self.config.apply.before[..],
+            hooks::HookKind::After => &self.config.apply.after[..],
+        };
+        let own = (self.hook_source(), own);
+        let outer = self.outer_hooks.as_ref().map(|outer| {
+            let source = hooks::HookSource {
+                dir: &outer.dir,
+                search_path: self.script_search_path(),
+                entities: &self.entities,
+            };
+            match kind {
+                hooks::HookKind::Before => (source, &outer.apply.before[..]),
+                hooks::HookKind::After => (source, &outer.apply.after[..]),
+            }
+        });
+        match kind {
+            hooks::HookKind::Before => outer.into_iter().chain([own]).collect(),
+            hooks::HookKind::After => [own].into_iter().chain(outer).collect(),
+        }
+    }
+
+    /// What a run's `kind` apply hooks would do — every list decided before
+    /// any of them runs, so a hook file missing from one aborts the phase
+    /// before a hook of another has run.
+    pub(in crate::design) fn plan_apply_hooks(
+        &self,
+        kind: hooks::HookKind,
+        scope: Option<(&str, &std::collections::HashSet<String>)>,
+    ) -> Result<hooks::HookPlan> {
+        let mut plan = hooks::HookPlan::default();
+        for (source, entries) in self.apply_hook_lists(kind) {
+            let list = hooks::plan_hooks(source, entries, kind, scope)?;
+            plan.runnable.extend(list.runnable);
+            plan.warnings.extend(list.warnings);
+        }
+        Ok(plan)
+    }
+
+    /// Run a run's `kind` apply hooks, as [`Self::plan_apply_hooks`] decides.
+    pub(in crate::design) async fn run_apply_hooks<S, D, C>(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        kind: hooks::HookKind,
+        scope: Option<(&str, &std::collections::HashSet<String>)>,
+        dry_run: bool,
+        progress: &mut Progress<S, D, C>,
+    ) -> Result<hooks::HookOutcome>
+    where
+        S: FnMut(&str),
+        D: FnMut(&str, Option<&str>),
+    {
+        let plan = self.plan_apply_hooks(kind, scope)?;
+        hooks::run_planned(adapter, plan, self.script_search_path(), dry_run, progress).await
     }
 
     /// Access the parsed config.

@@ -38,8 +38,9 @@ impl From<bool> for Prune {
 }
 
 impl Design {
-    /// The owner this design's runs claim as: its project's name.
-    pub(crate) fn owner(&self) -> &str {
+    /// The owner this design's runs claim as, and connect to a database as:
+    /// its project's name — `<project>/<module>` for a module of a workspace.
+    pub fn owner(&self) -> &str {
         &self.config.project.name
     }
 

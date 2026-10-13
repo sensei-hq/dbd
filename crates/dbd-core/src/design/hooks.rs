@@ -320,6 +320,23 @@ where
     D: FnMut(&str, Option<&str>),
 {
     let plan = plan_hooks(source, entries, kind, scope)?;
+    run_planned(adapter, plan, source.search_path, dry_run, progress).await
+}
+
+/// Execute what [`plan_hooks`] decided, in order, every script on
+/// `search_path` — the half of [`run_hooks`] that runs, for a phase planned
+/// from more than one list (see `Design::run_apply_hooks`).
+pub(in crate::design) async fn run_planned<S, D, C>(
+    adapter: &dyn DatabaseAdapter,
+    plan: HookPlan,
+    search_path: Option<&[PathEntry]>,
+    dry_run: bool,
+    progress: &mut super::Progress<S, D, C>,
+) -> Result<HookOutcome>
+where
+    S: FnMut(&str),
+    D: FnMut(&str, Option<&str>),
+{
     let mut outcome = HookOutcome {
         ran: 0,
         warnings: plan.warnings,
@@ -330,7 +347,7 @@ where
         let result = if dry_run {
             Ok(())
         } else {
-            adapter.execute_project_script(sql, source.search_path).await
+            adapter.execute_project_script(sql, search_path).await
         };
         super::report_step_result(&desc, &mut progress.on_done, result)?;
         outcome.ran += 1;

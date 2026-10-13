@@ -104,15 +104,35 @@ pub async fn cmd_import_dry_run(
     database_url: Option<&str>,
     name: Option<&str>,
     file: Option<&Path>,
+    module: Option<&str>,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
+    let targets = super::targets(config, env, project_dir, module, name, super::Order::Build)?;
+    for (i, target) in targets.into_iter().enumerate() {
+        let (design, _) = target.enter(i == 0);
+        import_dry_run_design(design, config, database_url, name, file, scope, deps, verbosity).await?;
+    }
+    Ok(())
+}
+
+/// [`cmd_import_dry_run`] for one design: the project's, or one module's.
+#[allow(clippy::too_many_arguments)]
+async fn import_dry_run_design(
+    design: Design,
+    config: &Path,
+    database_url: Option<&str>,
+    name: Option<&str>,
+    file: Option<&Path>,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
+    verbosity: Verbosity,
+) -> Result<()> {
     // The guards, whenever a database is configured to ask — and the database
     // asked, which the plan below is ordered by as the import's is.
     let guard = async |resolved: &dbd_core::ResolvedScope| -> Result<Option<Box<dyn dbd_core::DatabaseAdapter>>> {
-        let adapter = super::dry_run_adapter(config, database_url).await?;
+        let adapter = super::dry_run_adapter(config, database_url, design.owner()).await?;
         if let Some(adapter) = &adapter {
             check_import_guards(&**adapter, &design, resolved).await?;
         }
@@ -212,12 +232,31 @@ pub async fn cmd_import(
     database_url: Option<&str>,
     name: Option<&str>,
     file: Option<&Path>,
+    module: Option<&str>,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
+    let targets = super::targets(config, env, project_dir, module, name, super::Order::Build)?;
+    for (i, target) in targets.into_iter().enumerate() {
+        let (design, _) = target.enter(i == 0);
+        import_design(design, config, database_url, name, file, scope, deps, verbosity).await?;
+    }
+    Ok(())
+}
 
+/// [`cmd_import`] for one design: the project's, or one module's.
+#[allow(clippy::too_many_arguments)]
+async fn import_design(
+    design: Design,
+    config: &Path,
+    database_url: Option<&str>,
+    name: Option<&str>,
+    file: Option<&Path>,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
+    verbosity: Verbosity,
+) -> Result<()> {
     // `--file` without `--name` is rejected before a connection is attempted, so
     // the error is about the flags rather than the database.
     if file.is_some() && name.is_none() {
@@ -230,7 +269,7 @@ pub async fn cmd_import(
         design.check_import_plan(name)?;
     }
 
-    let adapter = get_adapter(config, database_url).await?;
+    let adapter = get_adapter(config, database_url, design.owner()).await?;
     import_with_adapter(&*adapter, &design, name, file, scope, deps, verbosity).await
 }
 
@@ -321,16 +360,48 @@ pub async fn cmd_export(
     name: Option<&str>,
     format: &str,
     output: Option<&Path>,
+    module: Option<&str>,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
+    let targets = super::targets(config, env, project_dir, module, name, super::Order::Build)?;
+    for (i, target) in targets.into_iter().enumerate() {
+        let (design, _) = target.enter(i == 0);
+        export_design(
+            design,
+            config,
+            database_url,
+            name,
+            format,
+            output,
+            scope,
+            deps,
+            verbosity,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// [`cmd_export`] for one design: the project's, or one module's.
+#[allow(clippy::too_many_arguments)]
+async fn export_design(
+    design: Design,
+    config: &Path,
+    database_url: Option<&str>,
+    name: Option<&str>,
+    format: &str,
+    output: Option<&Path>,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
+    verbosity: Verbosity,
+) -> Result<()> {
     let resolved = design.resolve_scope(scope, deps)?;
     // A `-n` that selects nothing is refused before connecting: the mistake is
     // in the command line, and an error about the database would hide it.
     export_selection(&design, &resolved, name)?;
-    let adapter = get_adapter(config, database_url).await?;
+    let adapter = get_adapter(config, database_url, design.owner()).await?;
     export_with_adapter(&*adapter, &design, &resolved, name, format, output, verbosity).await
 }
 
@@ -693,6 +764,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Verbosity::Verbose,
         )
         .await
@@ -710,6 +782,7 @@ mod tests {
             None,
             Some("lookups"),
             Some(Path::new("data/x.csv")),
+            None,
             None,
             None,
             Verbosity::Normal,
@@ -731,6 +804,7 @@ mod tests {
             Some(Path::new("data/x.csv")),
             None,
             None,
+            None,
             Verbosity::Normal,
         )
         .await
@@ -747,6 +821,7 @@ mod tests {
             None,
             None,
             Some(Path::new("data/x.csv")),
+            None,
             None,
             None,
             Verbosity::Normal,
@@ -903,6 +978,7 @@ mod tests {
             None,
             Some("config.lookups"),
             Some(Path::new("data/lookups.csv")),
+            None,
             None,
             None,
             Verbosity::Normal,
