@@ -14037,6 +14037,118 @@ async fn a_reset_waits_for_another_projects_apply_in_flight() {
     );
 }
 
+/// Billing's view over `app.old`, its apply holding its transaction open after
+/// creating it — and the poll that waits until it is held there.
+fn slow_billing_reading_old(dir: &std::path::Path) -> Design {
+    billing_reading(
+        dir,
+        &[(
+            "ddl/view/billing/v_old.ddl",
+            "create or replace view billing.v_old as select id from app.old;\n\
+             do $$ begin perform pg_sleep(2); end $$;\n",
+        )],
+    )
+}
+
+async fn await_sleeping(adapter: &dyn dbd_core::DatabaseAdapter) {
+    let sleeping = "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event = 'PgSleep') \
+                    THEN RAISE EXCEPTION 'not yet'; END IF; END $$";
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while adapter.execute_script(sleeping).await.is_err() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the apply never reached its sleep"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+/// A prune reads the uses, then drops `CASCADE`: another project's apply
+/// committing a view over the table in between lost it to the drop. A
+/// reconcile waits for the projects writing to the database, as a reset does
+/// (#7).
+#[tokio::test]
+async fn a_prune_waits_for_another_projects_apply_in_flight() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let old = (
+        "ddl/table/app/old.ddl",
+        "create table if not exists app.old (id int);\n",
+    );
+    named_project(sd.path(), "shop", "", &[ORDERS_OWNER_FILES[0], old])
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    std::fs::remove_file(sd.path().join(old.0)).unwrap();
+    let design = Design::from_config_with_dir(&sd.path().join("design.yaml"), "dev", Some(sd.path())).unwrap();
+    let slow = slow_billing_reading_old(bd.path());
+
+    let (billed, pruned) = tokio::join!(slow.apply(&*billing, None, false, None, Progress::none()), async {
+        await_sleeping(&*shop).await;
+        design
+            .reconcile(&*shop, false, false, true, None, Progress::none())
+            .await
+    });
+    billed.expect("billing's apply");
+    pruned.expect("shop's prune");
+    assert_table_exists(&*shop, "app", "old").await;
+    assert_catalog(
+        &*shop,
+        true,
+        "SELECT 1 FROM pg_views WHERE schemaname = 'billing' AND viewname = 'v_old'",
+        "billing's view",
+    )
+    .await;
+}
+
+/// The same race through a migration's `DROP TABLE … CASCADE`: an apply
+/// running migrations waits for the projects writing to the database, and
+/// guards what they built (#7).
+#[tokio::test]
+async fn a_migration_waits_for_another_projects_apply_in_flight() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let dir = sd.path();
+    let yaml = "project:\n  name: shop\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+    let old = "ddl/table/app/old.ddl";
+    cut_version(
+        dir,
+        yaml,
+        &[
+            ORDERS_OWNER_FILES[0],
+            (
+                old,
+                "set search_path to app;\ncreate table if not exists old (id integer primary key);\n",
+            ),
+        ],
+        &[],
+        "v1",
+    );
+    released(dir)
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    cut_version(dir, yaml, &[], &[old], "v2 drops old");
+    let design = released(dir);
+    let slow = slow_billing_reading_old(bd.path());
+
+    let (billed, migrated) = tokio::join!(slow.apply(&*billing, None, false, None, Progress::none()), async {
+        await_sleeping(&*shop).await;
+        design.apply(&*shop, None, false, None, Progress::none()).await
+    });
+    billed.expect("billing's apply");
+    let err = migrated.expect_err("billing's view reads app.old").to_string();
+    assert!(
+        err.contains("app.old is used by \"billing\" (view billing.v_old)"),
+        "{err}"
+    );
+    assert_table_exists(&*shop, "app", "old").await;
+}
+
 /// A project not yet on a dbd that records its uses claims nothing: its
 /// column of an extension's type depends on nobody's entity. `--extensions`
 /// dropped the extension `CASCADE`, and the column with it — while the same
