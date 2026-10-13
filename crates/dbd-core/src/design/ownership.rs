@@ -848,6 +848,21 @@ impl Design {
     }
 }
 
+/// Run `work` holding the database's dbd write lock (#7), released however
+/// `work` ends — see [`DatabaseAdapter::lock_writes`].
+pub(crate) async fn with_write_lock<T>(
+    adapter: &dyn DatabaseAdapter,
+    exclusive: bool,
+    work: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    adapter.lock_writes(exclusive).await?;
+    let done = work.await;
+    let released = adapter.unlock_writes().await;
+    let value = done?;
+    released?;
+    Ok(value)
+}
+
 /// `"a", "b"`.
 fn quoted(names: &[String]) -> String {
     names.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", ")

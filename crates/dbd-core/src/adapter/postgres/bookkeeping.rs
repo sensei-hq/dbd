@@ -24,6 +24,9 @@ use crate::error::{DbdError, Result};
 pub(super) struct Bookkeeping {
     pool: PgPool,
     project: String,
+    /// The database's dbd write lock while this adapter holds it: how many
+    /// runs nested in it, and the session holding it.
+    write_lock: tokio::sync::Mutex<(usize, Option<sqlx::PgConnection>)>,
 }
 
 impl Bookkeeping {
@@ -53,7 +56,74 @@ impl Bookkeeping {
             PRIMARY KEY (owner, kind, target, via) );";
 
     pub(super) fn new(pool: PgPool, project: String) -> Self {
-        Self { pool, project }
+        Self {
+            pool,
+            project,
+            write_lock: tokio::sync::Mutex::new((0, None)),
+        }
+    }
+
+    /// Take the database's dbd write lock (#7) — `pg_advisory_lock` on
+    /// `dbd:write`, shared or exclusive — in a session of its own, held until
+    /// [`Self::unlock_writes`]. A session lock, not a transaction's: a run
+    /// commits as it goes, and holds it across. The session is out of the
+    /// pool, so a run that never unlocks — dropped part-way — returns no
+    /// locked connection to it, and closing the session releases the lock.
+    /// A nested call shares the lock already held. Waits at most
+    /// [`WRITE_LOCK_TIMEOUT`].
+    pub(super) async fn lock_writes(&self, exclusive: bool) -> Result<()> {
+        let mut held = self.write_lock.lock().await;
+        if held.0 > 0 {
+            held.0 += 1;
+            return Ok(());
+        }
+        let failed = |e: sqlx::Error| DbdError::Config(format!("taking the dbd write lock failed: {e}"));
+        let mut session = self.pool.acquire().await.map_err(failed)?.detach();
+        sqlx::query(&format!("SET lock_timeout = '{WRITE_LOCK_TIMEOUT}'"))
+            .execute(&mut session)
+            .await
+            .map_err(failed)?;
+        let lock = if exclusive {
+            "SELECT pg_advisory_lock(hashtext('dbd:write'))"
+        } else {
+            "SELECT pg_advisory_lock_shared(hashtext('dbd:write'))"
+        };
+        if let Err(e) = sqlx::query(lock).execute(&mut session).await {
+            use sqlx::Connection;
+            let _ = session.close().await;
+            return Err(if sqlstate(&e).as_deref() == Some("55P03") {
+                DbdError::Config(format!(
+                    "waited {WRITE_LOCK_TIMEOUT} for another dbd run writing to this database to finish; \
+                     try again once it has"
+                ))
+            } else {
+                failed(e)
+            });
+        }
+        *held = (1, Some(session));
+        Ok(())
+    }
+
+    /// Release the lock [`Self::lock_writes`] took, once the outermost run
+    /// that took it is done: closing its session releases it.
+    pub(super) async fn unlock_writes(&self) -> Result<()> {
+        use sqlx::Connection;
+        let mut held = self.write_lock.lock().await;
+        match held.0 {
+            0 => return Ok(()),
+            1 => held.0 = 0,
+            _ => {
+                held.0 -= 1;
+                return Ok(());
+            }
+        }
+        match held.1.take() {
+            Some(session) => session
+                .close()
+                .await
+                .map_err(|e| DbdError::Config(format!("releasing the dbd write lock failed: {e}"))),
+            None => Ok(()),
+        }
     }
 
     /// The project this bookkeeping is kept for.
@@ -1162,6 +1232,11 @@ impl Bookkeeping {
 /// How long a heal waits for a lock — another heal, or a writer on a legacy
 /// table — before it gives up and says which.
 const HEAL_LOCK_TIMEOUT: &str = "5s";
+
+/// How long a run waits for the database's dbd write lock — for another
+/// project's run to finish — before it gives up. A run holds it from its
+/// first write to its last, an apply's data load included.
+const WRITE_LOCK_TIMEOUT: &str = "5min";
 
 /// `"schema"."relname"`, each part quoted.
 fn quoted_table(schema: &str, relname: &str) -> String {

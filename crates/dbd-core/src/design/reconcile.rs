@@ -384,6 +384,31 @@ impl Design {
         allow_destructive: bool,
         prune: impl Into<ownership::Prune>,
         scope: Option<&ResolvedScope>,
+        progress: Progress<S, D, C>,
+    ) -> Result<crate::reconcile::ReconcilePlan>
+    where
+        S: FnMut(&str),
+        D: FnMut(&str, Option<&str>),
+        C: FnMut(crate::reconcile::ReconcileComplete),
+    {
+        // A real run holds the database's dbd write lock, shared, as an apply
+        // does (#7).
+        let run = self.reconcile_run(adapter, dry_run, allow_destructive, prune.into(), scope, progress);
+        if dry_run {
+            return run.await;
+        }
+        ownership::with_write_lock(adapter, false, run).await
+    }
+
+    /// [`Design::reconcile`]'s run, under the write lock when it writes.
+    #[allow(clippy::too_many_arguments)]
+    async fn reconcile_run<S, D, C>(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        dry_run: bool,
+        allow_destructive: bool,
+        prune: ownership::Prune,
+        scope: Option<&ResolvedScope>,
         mut progress: Progress<S, D, C>,
     ) -> Result<crate::reconcile::ReconcilePlan>
     where
@@ -396,8 +421,6 @@ impl Design {
             plan_exclusion_convergence, plan_fk_convergence, plan_index_convergence, plan_reconcile,
             raw_snapshot_from_entities,
         };
-        let prune: ownership::Prune = prune.into();
-
         // Batch adapters (e.g. Convex) have no live SQL schema to diff.
         if adapter.prefers_batch_apply() {
             return Err(DbdError::Config(

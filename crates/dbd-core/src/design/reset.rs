@@ -47,6 +47,23 @@ impl Design {
         drop_extensions: bool,
         scope: Option<&ResolvedScope>,
     ) -> Result<ResetComplete> {
+        // The database's dbd write lock, exclusive, from its first read to its
+        // last drop: what it reads of other projects stays true until it has
+        // dropped — no other project's run writes between (#7).
+        let run = self.reset_run(adapter, target, force, drop_schemas, drop_extensions, scope);
+        super::ownership::with_write_lock(adapter, true, run).await
+    }
+
+    /// [`Design::reset`]'s run, under the write lock.
+    async fn reset_run(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        target: &str,
+        force: bool,
+        drop_schemas: bool,
+        drop_extensions: bool,
+        scope: Option<&ResolvedScope>,
+    ) -> Result<ResetComplete> {
         // The guards first, as `apply` runs them — they read the marks without
         // healing, and a renamed project is best told it was renamed. Then
         // heal and claim the design's entities, refusing a design declaring

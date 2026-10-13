@@ -10992,6 +10992,17 @@ async fn await_lock_wait(adapter: &dyn dbd_core::DatabaseAdapter, table: &str) {
     }
 }
 
+/// Wait — at most 30s — until some session waits for dbd's write lock.
+async fn await_write_lock_wait(adapter: &dyn dbd_core::DatabaseAdapter) {
+    let probe = "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND NOT granted) \
+                 THEN RAISE EXCEPTION 'no wait'; END IF; END $$";
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while adapter.execute_script(probe).await.is_err() {
+        assert!(std::time::Instant::now() < deadline, "nothing waited on the write lock");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 /// Lock `app.blocker` in a session of its own, holding a slow billing open
 /// until the returned adapter rolls back.
 async fn hold_blocker(url: &str) -> Box<dyn dbd_core::DatabaseAdapter> {
@@ -11007,9 +11018,9 @@ async fn hold_blocker(url: &str) -> Box<dyn dbd_core::DatabaseAdapter> {
 /// Two projects declare one table nobody owns yet, and one is mid-apply. The
 /// other's reset found it unowned, waited on the apply's lock, and dropped it
 /// once the apply had claimed it — another project's table, gone, and the
-/// reset reporting success. A run that writes as it goes claims before its
-/// first write: the first to claim owns the table, and the other is refused
-/// (#7).
+/// reset reporting success. A reset waits for the runs writing to the
+/// database before it reads anything: the apply finishes, owning the table,
+/// and the reset is refused (#7).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reset_cannot_drop_what_another_project_claims_while_it_runs() {
     let (_pg, url) = start_pg().await;
@@ -11033,7 +11044,7 @@ async fn a_reset_cannot_drop_what_another_project_claims_while_it_runs() {
     );
 
     // shop starts once billing is held mid-run, and billing goes on once
-    // shop's drop is waiting on it.
+    // shop's reset is waiting for it.
     let (applied, reset, ()) = tokio::time::timeout(std::time::Duration::from_secs(60), async {
         tokio::join!(
             billing.apply(&*b, None, false, None, Progress::none()),
@@ -11043,7 +11054,7 @@ async fn a_reset_cannot_drop_what_another_project_claims_while_it_runs() {
             },
             async {
                 await_lock_wait(&*setup, "blocker").await;
-                await_lock_wait(&*setup, "orders").await;
+                await_write_lock_wait(&*setup).await;
                 holder.rollback_batch().await.unwrap();
             }
         )
@@ -11051,18 +11062,19 @@ async fn a_reset_cannot_drop_what_another_project_claims_while_it_runs() {
     .await
     .expect("neither run may hang");
 
-    // shop claimed while billing was still building: billing is refused, and
-    // what shop's reset dropped was its own.
-    let err = applied
-        .expect_err("app.orders is shop's by the time billing claims")
+    // billing claimed as it finished, before shop's reset read anything:
+    // the reset is refused, and billing's table stands.
+    applied.expect("billing's apply");
+    let err = reset
+        .expect_err("app.orders is billing's by the time shop's reset claims")
         .to_string();
-    assert!(err.contains("relation app.orders is owned by \"shop\""), "{err}");
-    reset.expect("shop's reset");
+    assert!(err.contains("relation app.orders is owned by \"billing\""), "{err}");
+    assert_table_exists(&*setup, "app", "orders").await;
     assert_catalog(
         &*setup,
         true,
-        &owned_by("relation", "app", "orders", "table", "shop"),
-        "shop's app.orders",
+        &owned_by("relation", "app", "orders", "table", "billing"),
+        "billing's app.orders",
     )
     .await;
 }

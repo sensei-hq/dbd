@@ -2602,6 +2602,14 @@ ORDER BY 1, 2, 4, 5"#;
         self.bookkeeping.version().await
     }
 
+    async fn lock_writes(&self, exclusive: bool) -> Result<()> {
+        self.bookkeeping.lock_writes(exclusive).await
+    }
+
+    async fn unlock_writes(&self) -> Result<()> {
+        self.bookkeeping.unlock_writes().await
+    }
+
     async fn apply_migration(&self, version: u32, sql: &str, description: &str, checksum: &str) -> Result<()> {
         if !sql.is_empty() {
             self.execute_script(sql).await?;
