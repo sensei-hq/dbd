@@ -276,3 +276,48 @@ fn doctor_audits_a_config_it_cannot_parse() {
     assert!(out.status.success(), "{text}");
     assert!(text.contains("project.database"), "{text}");
 }
+
+/// `doctor --fix` migrates a design.yaml written for an older dbd — which had
+/// no modules. One declaring `modules:` is not that file: what reads as old
+/// in it is left to fix by hand, and the file keeps its modules.
+#[test]
+fn doctor_does_not_migrate_a_workspace_away() {
+    let tmp = tempfile::tempdir().unwrap();
+    shop(tmp.path());
+    let manifest = manifest(tmp.path());
+    fs::write(
+        tmp.path().join("design.yaml"),
+        format!("{manifest}\nroles:\n  - name: reader\n"),
+    )
+    .unwrap();
+    let out = dbd(tmp.path(), &["doctor", "--fix"]);
+    let said = text(&out);
+    let config = fs::read_to_string(tmp.path().join("design.yaml")).unwrap();
+    assert!(
+        config.contains("modules:") && config.contains("  core:"),
+        "{said}\n{config}"
+    );
+    assert!(said.contains("by hand"), "{said}");
+}
+
+/// A design.yaml no command can read is named by doctor, not audited clean —
+/// and `--module` over it is refused.
+#[test]
+fn doctor_names_a_config_it_cannot_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    shop(tmp.path());
+    let manifest = manifest(tmp.path());
+    fs::write(
+        tmp.path().join("design.yaml"),
+        manifest.replace("    depends_on: [shared]\n", "    depend_on: [shared]\n"),
+    )
+    .unwrap();
+    let out = dbd(tmp.path(), &["doctor"]);
+    let said = text(&out);
+    assert!(
+        !said.contains("No issues found") && said.contains("depend_on"),
+        "{said}"
+    );
+    let out = dbd(tmp.path(), &["--module", "core", "doctor"]);
+    assert!(!out.status.success(), "{}", text(&out));
+}

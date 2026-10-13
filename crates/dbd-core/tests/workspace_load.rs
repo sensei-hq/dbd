@@ -418,7 +418,15 @@ fn two_modules_sharing_a_folder_are_refused() {
 /// folder: a separator in it would make both ambiguous.
 #[test]
 fn a_module_name_that_cannot_name_an_owner_is_refused() {
-    for name in ["\"a/b\"", "\"..\"", "\"with space\""] {
+    for name in [
+        "\"a/b\"",
+        "\"..\"",
+        "\"with space\"",
+        "\"2024\"",
+        "\"true\"",
+        "\"null\"",
+        "\"NO\"",
+    ] {
         let tmp = tempfile::tempdir().unwrap();
         workspace_with(tmp.path(), &format!("  {name}: {{}}\n"), &[]);
         let err = load_err(tmp.path());

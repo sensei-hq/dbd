@@ -3732,3 +3732,34 @@ async fn reconcile_leaves_a_released_dependency_out() {
     let o = dbd(dir, &url, &["reconcile", "--module", "shared"]);
     assert!(!o.status.success(), "shared is released: {}", combined(&o));
 }
+
+/// A released module reconcile leaves out does not take the manifest's hooks
+/// with it: they run around the modules the run reconciles.
+#[tokio::test]
+async fn reconcile_runs_the_manifests_hooks_around_what_it_reconciles() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    shop_workspace(dir);
+    let manifest = std::fs::read_to_string(dir.join("design.yaml")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        format!("{manifest}\napply:\n  before: [hooks/ws-before.sql]\n  after: [hooks/ws-after.sql]\n"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("hooks")).unwrap();
+    std::fs::write(dir.join("hooks/ws-before.sql"), "select 1;\n").unwrap();
+    std::fs::write(dir.join("hooks/ws-after.sql"), "select 1;\n").unwrap();
+    let o = dbd(dir, &url, &["deploy"]);
+    assert!(o.status.success(), "deploy: {}", combined(&o));
+    let o = dbd(dir, &url, &["release", "--module", "shared"]);
+    assert!(o.status.success(), "release shared: {}", combined(&o));
+
+    let o = dbd(dir, &url, &["reconcile", "--dry-run"]);
+    let said = combined(&o);
+    assert!(o.status.success(), "{said}");
+    assert!(
+        said.contains("run apply.before hooks/ws-before.sql") && said.contains("run apply.after hooks/ws-after.sql"),
+        "{said}"
+    );
+}
