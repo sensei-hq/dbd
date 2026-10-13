@@ -3553,3 +3553,41 @@ async fn a_workspace_reset_keeps_for_later_modules_what_they_still_hold() {
         combined(&o)
     );
 }
+
+/// An import refused at the emptying — Postgres empties tables together or
+/// not at all — emptied nothing, and says so rather than that it left tables
+/// to reload.
+#[tokio::test]
+async fn a_workspace_import_refused_at_the_emptying_claims_nothing_emptied() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    shop_workspace(dir);
+    let o = dbd(dir, &url, &["deploy", "-e", "dev"]);
+    assert!(o.status.success(), "deploy: {}", combined(&o));
+    std::fs::write(dir.join("eur.csv"), "code\nEUR\n").unwrap();
+    let o = dbd(
+        dir,
+        &url,
+        &["import", "-e", "dev", "-n", "app.currencies", "-f", "eur.csv"],
+    );
+    assert!(o.status.success(), "seeding: {}", combined(&o));
+
+    // shared reloads its currencies, and the tables holding keys to them
+    // reload nothing: the emptying is refused whole.
+    std::fs::create_dir_all(dir.join("shared/import/app")).unwrap();
+    std::fs::write(dir.join("shared/import/app/currencies.csv"), "code\nUSD\n").unwrap();
+    let o = dbd(dir, &url, &["import", "-e", "dev"]);
+    assert!(!o.status.success(), "{}", combined(&o));
+    assert!(!combined(&o).contains("the import emptied"), "{}", combined(&o));
+
+    let out = dir.join("out");
+    let o = dbd(
+        dir,
+        &url,
+        &["export", "--module", "shared", "-o", out.to_str().unwrap()],
+    );
+    assert!(o.status.success(), "export: {}", combined(&o));
+    let currencies = std::fs::read_to_string(out.join("app/currencies.csv")).unwrap();
+    assert!(currencies.contains("EUR"), "nothing was emptied: {currencies}");
+}
