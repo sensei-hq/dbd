@@ -138,9 +138,9 @@ pub struct Use {
     pub kind: String,
     /// The schema, extension or role's name; for an `entity`,
     /// `namespace:schema.name` — `relation:app.orders` — with the name split
-    /// at its first dot as dbd splits one. An entity use is recorded only
-    /// where another owner holds the target, and not at all when nobody else
-    /// does.
+    /// at its first dot as dbd splits one. An entity use is recorded whoever
+    /// owns its target, or nobody yet: the uses guard asks the registry when
+    /// it runs.
     pub target: String,
     /// For an `entity`, the owner's own entity that makes the reference —
     /// `view billing.v_invoices`; empty otherwise.
@@ -510,11 +510,10 @@ pub trait DatabaseAdapter: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Record `uses` as everything `owner` uses, replacing what it used before.
-    /// An `entity` use is recorded only where another owner holds the target,
-    /// in that owner's namespace (#7). Like a claim, in the open batch
-    /// transaction when there is one. Adapters without a registry record
-    /// nothing.
+    /// Record `uses` as everything `owner` uses, replacing what it used before
+    /// (#7) — an `entity` use whoever owns its target, or nobody yet. Like a
+    /// claim, in the open batch transaction when there is one. Adapters
+    /// without a registry record nothing.
     async fn record_uses(&self, owner: &str, uses: &[Use]) -> Result<()> {
         let _ = (owner, uses);
         Ok(())

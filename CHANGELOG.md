@@ -78,10 +78,14 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   `app.report` beside it.
 - **What another project depends on is guarded** (#7, phase 2). Before
   `reconcile` drops a column, constraint, index or enum value, or `apply` runs
-  a migration that drops a table or column, dbd asks Postgres's dependency
-  graph — what a `CASCADE` would reach: a view, an inheriting table, a
-  foreign key, a column of the type — and the uses other projects recorded,
-  which see into function bodies. Anything another project depends on refuses
+  a migration that drops a table, column, constraint, index, schema or
+  extension — inside a `DO` block too — dbd asks Postgres's dependency graph
+  what a `CASCADE` would reach, part by part: a view, an inheriting table or
+  partition, a foreign key, a column of the type or an array of it. It also
+  asks the uses other projects recorded, which see into function bodies —
+  recorded whoever owned the target then, a table file's trigger function's
+  included. A migration dbd cannot parse is refused. Anything another
+  project depends on refuses
   the run, before any write and dry run included: `app.orders.total is used by
   "billing" (view billing.v_totals); remove that use first`. A `--prune`
   keeps such a table, naming the use, where its `CASCADE` took the other

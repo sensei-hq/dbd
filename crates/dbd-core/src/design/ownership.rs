@@ -146,12 +146,13 @@ impl Design {
     /// Everything the design uses without owning it (#7): the schemas its
     /// entities live in and the ones it declares, its extensions and roles —
     /// shared with any other owner — and each reference any of its entities
-    /// makes to an entity it does not declare, which the registry records only
-    /// where another owner holds the target. A call is of a routine, anything
-    /// else of a relation. `via` names the referring entity; overloads in
-    /// several files each record their own references. A name written bare
-    /// that dbd could not find carries the search path Postgres looks it up
-    /// along.
+    /// makes to an entity it does not declare — recorded whoever owns the
+    /// target, the uses guard asking the registry when it runs. A call is of a
+    /// routine, anything else of a relation. `via` names the referring entity;
+    /// overloads in several files each record their own references, and a
+    /// routine another entity's file creates records its body's. A name
+    /// written bare that dbd could not find carries the search path Postgres
+    /// looks it up along.
     pub(crate) fn declared_uses(&self) -> Vec<Use> {
         let keyed = self.entity_keys();
         let owned: std::collections::HashSet<String> = keyed
