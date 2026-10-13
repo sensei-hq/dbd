@@ -156,9 +156,13 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   --from-db` refused any database with dbd bookkeeping; it now refuses only one
   dbd manages for this project (`merge` syncs that), and leaves out what other
   projects own, naming each — as `merge` now does, where it took another
-  project's entities into this one. Both are refused while a project the
-  database records keeps no record of what it owns: its entities cannot be told
-  from nobody's.
+  project's entities into this one, and says whose a file's entity is rather
+  than calling the file an orphan. What the new project depends on of another's
+  — a foreign key's table, what a view reads — is declared `external:`, so its
+  references resolve. Both are refused while a project the database records has
+  not run a dbd that records what it owns and uses: its entities cannot be told
+  from nobody's. A SQLite database keeps no registry yet, so neither leaves
+  anything out there, and `init --from-db` refuses one dbd manages, as before.
 - **The uses guard sees further** (#7, phase 2). A dependent nobody owns —
   a project's not yet recording its uses — is guarded where a project might
   own it, by `--prune`'s rule: in a schema another project uses, or anywhere
@@ -205,7 +209,8 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   `check_run_guards` — the guards `apply` checks, name reuse first;
   `Design::shared_database` (`SharedDatabase`, `SharedProject`, `SharedUse`)
   and `design::leave_out_other_owners`; `DatabaseAdapter::registry`
-  (`adapter::Registry`, `RecordedUse`; default empty);
+  (`adapter::Registry`, `RecordedUse`; default empty) and `keeps_registry`
+  (default false);
   `DatabaseAdapter::claim_objects` takes `adopt_from`, and the adapter gains
   `owned_objects` (default: nothing held).
 

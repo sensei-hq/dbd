@@ -315,9 +315,13 @@ entity another owner holds, a reused owner name — and exits non-zero over any.
 
 **Onboarding** (H9). `init --from-db` refuses only a database dbd manages for
 the project it is creating; another project's record is no bar. It and `merge`
-leave out what other owners hold, naming each. While a project the database
-records keeps no record of what it owns, both refuse: its entities cannot be
-told from nobody's.
+leave out what other owners hold, naming each, and declare `external:` — or,
+for `merge`, name — what the project keeps that depends on one: a foreign key's
+table, what a view reads, found as a drop's `CASCADE` would reach it. While a
+project the database records has not run a dbd that records what it owns and
+uses, both refuse: its entities cannot be told from nobody's. A database that
+keeps no registry leaves nothing out, and `init --from-db` refuses one dbd
+manages.
 
 **Backfill.** The first upgraded run of each owner claims the declared entities
 that already exist and nobody owns. Undeclared live entities stay unowned. On a
