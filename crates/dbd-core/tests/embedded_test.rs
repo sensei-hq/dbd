@@ -12359,6 +12359,32 @@ async fn a_prune_keeps_a_table_the_design_creates_under_another_spelling() {
     .await;
 }
 
+/// `--prune-unowned` drops what nobody owns, a table another it drops
+/// depends on included: what depends on it goes in the same run (#7).
+#[tokio::test]
+async fn prune_unowned_drops_a_table_only_another_pruned_table_depends_on() {
+    let (_pg, url) = start_pg().await;
+    let (shop, sd) = shop_and_billing_share_app(&url).await;
+    shop.execute_script(
+        "CREATE TABLE app.legacy_customers (id int PRIMARY KEY); \
+         CREATE TABLE app.legacy_orders (id int, customer int REFERENCES app.legacy_customers (id));",
+    )
+    .await
+    .unwrap();
+
+    let plan = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1])
+        .reconcile(&*shop, false, false, dbd_core::Prune::Unowned, None, Progress::none())
+        .await
+        .expect("shop's prune");
+    assert_table_absent(&*shop, "app", "legacy_customers").await;
+    assert_table_absent(&*shop, "app", "legacy_orders").await;
+    assert!(
+        !plan.warnings.iter().any(|w| w.contains("is used by")),
+        "{:?}",
+        plan.warnings
+    );
+}
+
 /// A prune claims what it drops in the transaction that drops it: a run that
 /// failed before its prune left claims on unowned tables `--prune-unowned`
 /// was going to drop, and a later plain `--prune` dropped them as its own,
@@ -14686,6 +14712,221 @@ async fn a_reset_is_not_refused_for_a_use_of_what_it_leaves() {
         "billing.invoices.colour",
     )
     .await;
+}
+
+/// A composite type nobody owns is an entity, as an enum is: it keeps its
+/// schema from `--schemas` (#7).
+#[tokio::test]
+async fn a_reset_keeps_a_schema_holding_a_composite_type_nobody_owns() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    let design = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1]);
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    shop.execute_script("CREATE TYPE app.addr AS (street text);")
+        .await
+        .unwrap();
+
+    let summary = design
+        .reset(&*shop, "postgres", true, true, false, None)
+        .await
+        .expect("shop's reset");
+    assert_eq!(summary.kept, ["schema app kept: it holds type app.addr"]);
+    assert_schema_exists(&*shop, "app").await;
+}
+
+/// Nor is a composite type nobody owns passed over as a dependent: `DROP
+/// TABLE … CASCADE` drops its column of the table's row type (#7).
+#[tokio::test]
+async fn a_reset_is_refused_when_a_composite_type_nobody_owns_has_a_column_of_what_it_drops() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    let design = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1]);
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    shop.execute_script(
+        "INSERT INTO dbd.meta (project, env, version) VALUES ('billing', 'dev', 0); \
+         CREATE SCHEMA billing; CREATE TYPE billing.wrapped AS (o app.orders);",
+    )
+    .await
+    .unwrap();
+
+    let err = design
+        .reset(&*shop, "postgres", true, false, false, None)
+        .await
+        .expect_err("billing records no uses, and the type may be its")
+        .to_string();
+    assert!(err.contains("type billing.wrapped"), "{err}");
+    assert_table_exists(&*shop, "app", "orders").await;
+}
+
+/// What the design declares is its own before it claims it — a guard reads
+/// first, and a preview never claims. Its own view over its own table, built
+/// before the registry, was "used by nobody, maybe billing" and refused the
+/// preview of a reset the run performs (#7).
+#[tokio::test]
+async fn a_reset_preview_counts_what_the_design_declares_as_its_own_before_it_claims() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    write_project(
+        bd.path(),
+        "project:\n  name: billing\nsource:\n  dialect: postgresql\nschemas:\n  - app\n  - billing\n",
+        &[(
+            "ddl/table/billing/ledger.ddl",
+            "create table if not exists billing.ledger (id int primary key);\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+    // Built before the registry: shop's, claimed by nobody.
+    shop.execute_script(
+        "CREATE TABLE app.orders (id int PRIMARY KEY); CREATE VIEW app.v_orders AS SELECT id FROM app.orders;",
+    )
+    .await
+    .unwrap();
+    let design = named_project(
+        sd.path(),
+        "shop",
+        "",
+        &[
+            ORDERS_OWNER_FILES[0],
+            (
+                "ddl/view/app/v_orders.ddl",
+                "create or replace view app.v_orders as select id from app.orders;\n",
+            ),
+        ],
+    );
+
+    let (sql, _) = design
+        .reset_preview(&*shop, "postgres", true, false, false, None)
+        .await
+        .expect("the view is shop's own");
+    assert!(
+        sql.unwrap_or_default()
+            .contains("DROP TABLE IF EXISTS \"app\".\"orders\"")
+    );
+}
+
+/// `DROP SCHEMA … CASCADE` takes a column of an array of the schema's enum —
+/// one the reset does not drop by name — as surely as one of the enum (#7).
+#[tokio::test]
+async fn a_reset_with_schemas_is_refused_when_a_column_of_its_array_type_depends_on_it() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    let design = named_project(
+        sd.path(),
+        "shop",
+        "",
+        &[(
+            "ddl/table/app/orders.ddl",
+            "set search_path to app;\ncreate type status as enum ('open', 'shut');\n\
+             create table if not exists orders (id int primary key, status status);\n",
+        )],
+    );
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    shop.execute_script(
+        "INSERT INTO dbd.meta (project, env, version) VALUES ('billing', 'dev', 0); \
+         CREATE SCHEMA billing; CREATE TABLE billing.t (c app.status[]);",
+    )
+    .await
+    .unwrap();
+
+    let err = design
+        .reset(&*shop, "postgres", true, true, false, None)
+        .await
+        .expect_err("billing.t.c goes with schema app")
+        .to_string();
+    assert!(err.contains("schema app") && err.contains("table billing.t"), "{err}");
+    assert_catalog(
+        &*shop,
+        true,
+        "SELECT 1 FROM information_schema.columns WHERE table_schema = 'billing' AND table_name = 't' \
+         AND column_name = 'c'",
+        "billing.t.c",
+    )
+    .await;
+}
+
+/// An undeclared partition of the design's own table goes with it: it keeps
+/// no schema from `--schemas` (#7).
+#[tokio::test]
+async fn a_reset_drops_a_schema_holding_a_partition_of_its_own_table() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    let design = named_project(
+        sd.path(),
+        "shop",
+        "",
+        &[(
+            "ddl/table/app/events.ddl",
+            "set search_path to app;\ncreate table if not exists events (id int, at date) partition by range (at);\n",
+        )],
+    );
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    shop.execute_script(
+        "CREATE TABLE app.events_2024 PARTITION OF app.events FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');",
+    )
+    .await
+    .unwrap();
+
+    let summary = design
+        .reset(&*shop, "postgres", true, true, false, None)
+        .await
+        .expect("shop's reset");
+    assert!(summary.kept.is_empty(), "{:?}", summary.kept);
+    assert_catalog(
+        &*shop,
+        false,
+        "SELECT 1 FROM pg_namespace WHERE nspname = 'app'",
+        "schema app",
+    )
+    .await;
+}
+
+/// A `supabase` reset drops no role, so names none it kept (#7).
+#[tokio::test]
+async fn a_supabase_reset_names_no_role_it_never_drops() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let with_role = "target:\n  postgres:\n    url: $DATABASE_URL\n    roles:\n      - name: shared_reader\n";
+    let design = named_project(sd.path(), "shop", with_role, &ORDERS_OWNER_FILES[..1]);
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    named_project(bd.path(), "billing", with_role, &ORDERS_OWNER_FILES[1..])
+        .apply(&*billing, None, false, None, Progress::none())
+        .await
+        .expect("billing's apply");
+
+    let summary = design
+        .reset(&*shop, "supabase", true, false, false, None)
+        .await
+        .expect("shop's reset");
+    assert!(
+        !summary.kept.iter().any(|k| k.starts_with("role ")),
+        "{:?}",
+        summary.kept
+    );
 }
 
 /// A design may install an extension into a schema of its own. The
