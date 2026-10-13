@@ -831,22 +831,40 @@ impl Design {
             }
         }
 
-        // Orphans: live matviews in a managed schema, absent from the design. No
-        // hash needed, so this reuses the already-fetched `live_entities`.
-        for e in live_entities {
-            if e.entity_type != EntityType::MaterializedView {
+        // Orphans: live matviews in a managed schema, absent from the design —
+        // and not another owner's, which is neither drift nor an orphan here
+        // (#7). No hash needed, so this reuses the already-fetched
+        // `live_entities`.
+        let candidates: Vec<(&Entity, crate::adapter::OwnedObject)> = live_entities
+            .iter()
+            .filter(|e| e.entity_type == EntityType::MaterializedView)
+            .filter_map(|e| {
+                let schema = {
+                    let s = e.schema.clone().unwrap_or_default();
+                    if s.is_empty() { DEFAULT_SCHEMA.to_string() } else { s }
+                };
+                (managed_schemas.contains(&schema) && !design_mv_names.contains(e.name.as_str())).then(|| {
+                    let name = crate::entity::split_qualified_name(&e.name).1;
+                    let key = crate::adapter::OwnedObject {
+                        namespace: "relation".to_string(),
+                        schema,
+                        name,
+                        kind: String::new(),
+                    };
+                    (e, key)
+                })
+            })
+            .collect();
+        let keys: Vec<crate::adapter::OwnedObject> = candidates.iter().map(|(_, k)| k.clone()).collect();
+        let owners = adapter.ownership(self.owner(), &keys).await?.owners;
+        for (i, (e, _)) in candidates.iter().enumerate() {
+            if owners.get(i).cloned().flatten().is_some_and(|o| o != self.owner()) {
                 continue;
             }
-            let schema = {
-                let s = e.schema.clone().unwrap_or_default();
-                if s.is_empty() { DEFAULT_SCHEMA.to_string() } else { s }
-            };
-            if managed_schemas.contains(&schema) && !design_mv_names.contains(e.name.as_str()) {
-                drift.push(MatviewDrift {
-                    name: e.name.clone(),
-                    kind: MatviewDriftKind::Orphan,
-                });
-            }
+            drift.push(MatviewDrift {
+                name: e.name.clone(),
+                kind: MatviewDriftKind::Orphan,
+            });
         }
 
         drift.sort_by(|a, b| a.name.cmp(&b.name));

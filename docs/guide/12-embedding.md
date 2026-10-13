@@ -236,7 +236,9 @@ project's record or, when it has none and the database holds any of the
 design's tables, views, materialized views, enums or sequences, every other
 project's record — the mark a renamed `project.name` left, since the record is
 keyed on the name. A refusal over another project's record names it.
-`check_apply_guards(&marks)` runs both:
+`apply` runs `check_run_guards(adapter, &marks)`: first a design reusing an
+owner's name (see [Share a database](#share-a-database)), then both of these —
+`check_apply_guards(&marks)` is the two alone:
 
 - **Is this run's env allowed here?** `Design::check_env_guard(&marks, env)`
   refuses a run whose env is not prod against a database marked prod. A dev run
@@ -250,7 +252,9 @@ keyed on the name. A refusal over another project's record names it.
   `project.version` is behind the version the database records (an
   unversioned design counts as 0). The plan would otherwise come out current
   and re-apply the older DDL over the newer schema. Neither guard has an
-  override.
+  override — except that a design `allowing_ownership_change()` lets take
+  over a reused owner name passes the version guard: the version recorded is
+  the previous design's.
 
 `pending_migration_preview(adapter, name, scope)` lists the migration steps the
 run would take against that database, from the version it records, under the
@@ -397,6 +401,10 @@ for stmt in &plan.altered {
     println!("-- {}\n{}", stmt.entity_name, stmt.sql);
 }
 ```
+
+`reconcile`'s `prune` takes `impl Into<Prune>`: `false` and `true`, or
+`Prune::Unowned` — `--prune-unowned`, which also drops what nobody owns that
+another project might.
 
 `diff_live` is `dbd diff`: read-only, returning a `SchemaDiff` (`changes`,
 `warnings`, `advisories`, `matview_drift`; `is_empty()` when in sync).
@@ -675,6 +683,60 @@ if let Some(survey) = dbd_core::survey(project_dir)? {
 }
 ```
 
+## Share a database
+
+Several projects can deploy into one database, each entity owned by the one
+whose design declares it (see [sharing a database](14-sharing-a-database.md)).
+The library enforces it: `apply`, `deploy`, `reconcile` and `reset` claim what
+the design declares and refuse what another project owns or depends on, and
+`check_ownership(adapter)` is the read-only check the dry runs, `diff`,
+`import_data` and `apply_policies` make.
+
+```rust
+use dbd_core::design::Progress;
+
+let design = dbd_core::Design::from_config(path, "prod")?
+    // Take over what this design declares that the project 'billing' holds.
+    .adopting_from("billing");
+let adapter = dbd_core::connect(database_url, &design.config().project.name).await?;
+
+// What shares the database, and what would refuse this design there.
+let shared = design.shared_database(&*adapter).await?;
+for project in &shared.projects {
+    println!("{} owns {}", project.name, project.owns.len());
+}
+for conflict in &shared.conflicts {
+    eprintln!("{conflict}");
+}
+
+// The CLI says these before the run; the library adopts without a word.
+for held in design.adoptions(&*adapter).await? {
+    println!("adopting {}.{} from {}", held.object.schema, held.object.name, held.owner);
+}
+design.apply(&*adapter, None, false, None, Progress::none()).await?;
+```
+
+- `adopting_from(owner)` takes over, as the run claims, what the design declares
+  that `owner` holds — `--adopt-from`; `adoptions(adapter)` lists what it would.
+- `allowing_ownership_change()` lets the design run under an owner name that
+  holds entities it declares none of — `--allow-ownership-change`.
+- `shared_database(adapter)` is `dbd inspect --shared`: a `SharedDatabase` of
+  `SharedProject`s (`name`, `env`, `version`, `recording`, `owns`, `schemas`,
+  `uses` as `SharedUse`s) and this design's `conflicts`.
+- `design::leave_out_other_owners(adapter, owner, entities)` is what `init
+  --from-db` and `merge` do with introspected entities: it returns what to keep
+  — with an `External` for each left-out entity a kept one depends on — and
+  what it left out.
+- `check_reset_run_guards(adapter, &marks, force)` is every guard `reset`
+  checks before it claims, a reused name first.
+
+An adapter keeps the registry through `DatabaseAdapter` methods that default to
+none — `claim_objects`, `owned_objects`, `record_uses`, `release_objects`,
+`ownership`, `registry`, `dependents`, `users_of`, `not_owned_in_schema`,
+`lock_writes`/`unlock_writes`/`abandon_writes` — with `keeps_registry()` saying
+whether it does, and `same_object` how it compares two keys. The PostgreSQL and
+SQLite adapters keep one.
+
 ## What the CLI adds
 
 These checks are made by the `dbd` command, not by the `Design` methods. An
@@ -690,7 +752,7 @@ embedder that wants them makes them itself:
 - **The dry runs' questions.** Given a database — opened with
   `connect_existing`, so a missing SQLite file is not created —
   `dbd apply --dry-run` and `deploy --dry-run` check the scope pin and
-  `check_apply_guards`, and list `pending_migration_preview`;
+  `check_run_guards`, and list `pending_migration_preview`;
   `import --dry-run` checks the pin and `guard_env`; `policies --dry-run`
   checks the pin. The ad-hoc `dbd import -n -f`, which loads through the adapter
   rather than `import_data`, calls `guard_env` itself.
@@ -699,16 +761,20 @@ embedder that wants them makes them itself:
   scope)`) instead of refusing.
 - **The reset target.** `dbd reset` refuses a `--target` that is not the kind
   of database the connection reaches, before connecting.
-- **Reset's preview.** `Design::reset` checks its own guard (a database marked
-  prod, or versioned) unless forced; `dbd reset --dry-run` checks it too, given
-  a database, through the public method
-  `design.check_reset_guard(&marks)` (`marks` from `Design::database_marks`),
-  so a preview refuses where the reset would. A method because its refusal
+- **Reset's preview.** `Design::reset` checks its own guards (a reused owner
+  name; then, unless forced, a database marked prod — by any project — or
+  versioned); `dbd reset --dry-run` checks them too, given a database, through
+  the public method `design.check_reset_run_guards(adapter, &marks, force)`
+  (`marks` from `Design::database_marks`), and asks `reset_preview` what the run
+  would keep, so a preview refuses — and keeps — where the reset would. A method because its refusal
   calls the database a released project's only when `project.released` is
   set.
   `reset_script` alone checks nothing.
 - **The release check.** `dbd reconcile` refuses on a released project;
   `Design::reconcile` does not.
+- **Adoptions, said.** `dbd apply`, `deploy` and `reconcile` with
+  `--adopt-from` print each adoption (`Design::adoptions`) before the run, once
+  its ownership check passes; `Design::apply` adopts without a word.
 - **Grants on apply and reconcile.** `dbd apply` and `dbd reconcile` call
   `Design::apply_grants` after `Design::apply` and `Design::reconcile`;
   `Design::deploy` includes them.

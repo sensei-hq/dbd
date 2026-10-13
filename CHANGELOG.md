@@ -119,7 +119,7 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   migration's `DROP TABLE … CASCADE`, took a view committed over the table
   the same way. Every writing `apply`, `reconcile`, `reset`, `import`,
   `policies` and grant — a `deploy`'s phases each — now holds the database's
-  dbd write lock (an advisory lock on `dbd:write`, in a session of its own):
+  dbd write lock (an advisory lock on `hashtext('dbd:write')`, in a session of its own):
   shared to build, so those of different projects still run side by side;
   exclusive for a reset, a reconcile and an apply running migrations. A run
   waits for the lock at most 5 minutes, asking again every 100ms, its session
@@ -171,6 +171,12 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   A SQLite reset is guarded by the uses owners record and the foreign keys
   that reference a table: a table another project's view reads is not
   dropped.
+- **A guide to sharing a database** —
+  [docs/guide/14-sharing-a-database.md](docs/guide/14-sharing-a-database.md),
+  on the site at `/guide/sharing-a-database`: owners and the registry, what each
+  command does beside other projects, moving entities and names, `inspect
+  --shared`, onboarding and SQLite. The commands reference, `llms.txt`,
+  `llms-full.txt` and the skill cover the new flags and rules.
 - **The uses guard sees further** (#7, phase 2). A dependent nobody owns —
   a project's not yet recording its uses — is guarded where a project might
   own it, by `--prune`'s rule: in a schema another project uses, or anywhere
@@ -214,7 +220,8 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   `Dependence::owner` is an `Option` — `None` for a dependent nobody owns —
   and `Dependence::schema` names the dependent's schema.
 - `Design::adopting_from`, `allowing_ownership_change`, `adoptions` and
-  `check_run_guards` — the guards `apply` checks, name reuse first;
+  `check_run_guards` — the guards `apply` checks, name reuse first — and
+  `check_reset_run_guards`, a reset's;
   `Design::shared_database` (`SharedDatabase`, `SharedProject`, `SharedUse`)
   and `design::leave_out_other_owners`; `DatabaseAdapter::registry`
   (`adapter::Registry`, `RecordedUse`; default empty), `keeps_registry`

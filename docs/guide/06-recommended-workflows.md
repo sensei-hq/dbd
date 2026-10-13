@@ -80,8 +80,9 @@ dbd format         # normalize to your conventions (introspected column order is
 ```
 
 `init --from-db` writes a baseline snapshot, so the project is version-tracked from day one. It
-**refuses** if the database is already dbd-managed (it finds `dbd.meta`, or a legacy `_dbd_meta`) —
-use `dbd merge` for that. From here it's an ordinary project: edit DDL → snapshot → apply.
+**refuses** if the database already records this project (in `dbd.meta`, or a legacy `_dbd_meta`) —
+use `dbd merge` for that. Another project's record is no bar: a second project onboards beside the
+first, leaving out what that one owns (see [sharing a database](14-sharing-a-database.md)). From here it's an ordinary project: edit DDL → snapshot → apply.
 
 The reversed project applies cleanly back to the database it came from — the DDL is re-runnable
 (`IF NOT EXISTS`, `OR REPLACE`), so the first `dbd apply` records the version and changes nothing,

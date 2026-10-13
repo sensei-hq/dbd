@@ -265,8 +265,8 @@ entities before it drops any (see Claim). On top of that:
   whole, as its `DROP` names it — not the rest of what its file creates, which
   the reset leaves. Postgres's cascade cannot reach another owner's entity,
   because the guard refused first — `--force` or not.
-- The reset holds the database's dbd write lock — `pg_advisory_lock` on
-  `dbd:write`, exclusive — from its first read to its last drop. So does a
+- The reset holds the database's dbd write lock — an advisory lock on
+  `hashtext('dbd:write')`, exclusive — from its first read to its last drop. So does a
   reconcile, and an apply running migrations, whose drops are guarded the
   same way; an apply that only builds holds it shared, as do imports,
   policies and grants. So no other project's run writes between what a

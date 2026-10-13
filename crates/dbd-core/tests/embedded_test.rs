@@ -15830,3 +15830,135 @@ async fn the_shared_database_names_this_designs_conflicts() {
         shared.conflicts
     );
 }
+
+// ── #7 Phase 2, docs-slice audit: what the guides promised and the code missed ─
+
+/// Another project's materialized view is neither drift nor an orphan to
+/// this one: `diff` reported it "only in database", and `diff --exit-code`
+/// failed on every run over a view the project can never change (#7).
+#[tokio::test]
+async fn diff_does_not_report_another_projects_materialized_view() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    named_project(
+        sd.path(),
+        "shop",
+        "",
+        &[
+            ORDERS_OWNER_FILES[0],
+            (
+                "ddl/materialized_view/app/mv_orders.ddl",
+                "create materialized view if not exists app.mv_orders as select id from app.orders;\n",
+            ),
+        ],
+    )
+    .apply(&*shop, None, false, None, Progress::none())
+    .await
+    .expect("shop's apply");
+    let theirs = named_project(bd.path(), "billing", "", &ORDERS_OWNER_FILES[1..]);
+    theirs
+        .apply(&*billing, None, false, None, Progress::none())
+        .await
+        .expect("billing's apply");
+
+    let diff = theirs.diff_live(&*billing, None).await.expect("billing's diff");
+    assert!(diff.matview_drift.is_empty(), "{:?}", diff.matview_drift);
+}
+
+/// A reset by a design reusing an owner's name met the reset guard first —
+/// "versioned at v1", the previous design's history — and the override the
+/// guide names could not pass it. The reuse is named first, and an allowed
+/// reuse passes the version block, not the prod one (#7).
+#[tokio::test]
+async fn a_reset_reusing_a_name_is_named_before_its_guard_and_the_override_passes_the_version() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let (sd, nd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    write_project(
+        sd.path(),
+        "project:\n  name: shop\n  version: 1\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+        &ORDERS_OWNER_FILES[..1],
+    )
+    .apply(&*shop, None, false, None, Progress::none())
+    .await
+    .expect("shop's dev apply at v1");
+    let newcomer = named_project(nd.path(), "shop", "", &ORDERS_OWNER_FILES[1..]);
+
+    let err = newcomer
+        .reset(&*shop, "postgres", false, false, false, None)
+        .await
+        .expect_err("another project under the name shop")
+        .to_string();
+    assert!(err.contains("this design declares none of them"), "{err}");
+    newcomer
+        .allowing_ownership_change()
+        .reset(&*shop, "postgres", false, false, false, None)
+        .await
+        .expect("an allowed reuse passes the version block");
+    assert_table_exists(&*shop, "app", "orders").await;
+}
+
+/// A renamed `project.name` meets its own entities under the old name: the
+/// refusal says what the guards' does — set the name back — not only that
+/// another project owns them (#7).
+#[tokio::test]
+async fn a_renamed_projects_refusal_says_to_set_the_name_back() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let (sd, rd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1])
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+
+    let renamed = connect(&url, "shop2").await.unwrap();
+    let err = named_project(rd.path(), "shop2", "", &ORDERS_OWNER_FILES[..1])
+        .apply(&*renamed, None, false, None, Progress::none())
+        .await
+        .expect_err("app.orders is shop's")
+        .to_string();
+    assert!(err.contains("owned by \"shop\""), "{err}");
+    assert!(err.contains("set project.name back to 'shop'"), "{err}");
+}
+
+/// A full reset leaves nothing of the project, so it forgets its record — and
+/// now the uses it recorded too: a reset project's dropped view went on
+/// refusing another project's drop of what it read. Nothing it dropped is
+/// listed as held (#7).
+#[tokio::test]
+async fn a_full_reset_forgets_the_projects_uses() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let design = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1]);
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    let theirs = billing_reading(
+        bd.path(),
+        &[(
+            "ddl/view/billing/v_orders.ddl",
+            "create or replace view billing.v_orders as select id from app.orders;\n",
+        )],
+    );
+    theirs
+        .apply(&*billing, None, false, None, Progress::none())
+        .await
+        .expect("billing's apply");
+
+    theirs
+        .reset(&*billing, "postgres", true, false, false, None)
+        .await
+        .expect("billing's full reset");
+    let registry = shop.registry().await.unwrap();
+    assert!(!registry.claims.iter().any(|h| h.owner == "billing"), "{registry:?}");
+    assert!(!registry.uses.iter().any(|u| u.owner == "billing"), "{registry:?}");
+    design
+        .reset(&*shop, "postgres", true, false, false, None)
+        .await
+        .expect("nothing of billing's uses app.orders any more");
+}

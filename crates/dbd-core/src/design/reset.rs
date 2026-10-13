@@ -70,10 +70,7 @@ impl Design {
         // another owner's, before anything is dropped: a reset's drops commit,
         // so it claims first — see `Design::claim_first` (#7).
         let marks = self.database_marks(adapter).await?;
-        if !force {
-            self.check_reset_guard(&marks)?;
-            self.check_reset_prod_elsewhere(adapter).await?;
-        }
+        self.check_reset_run_guards(adapter, &marks, force).await?;
         self.claim_first(adapter).await?;
 
         let (keep, roles_kept) = self
@@ -114,9 +111,16 @@ impl Design {
         // with a `default:` scope builds and resets under it, and a bare
         // `reset --force` there kept the mark. A narrower scope leaves the rest
         // of the project — and its version and pin — in place.
+        // So do the uses it recorded (#7): kept, a dropped view of the
+        // project's went on refusing another project's drop of what it read.
+        // What the design declares stays claimed — the project is reset, not
+        // retired, and another project is not handed what it dropped — and a
+        // claim of anything else that is gone is released.
         let pinned = marks.own.as_ref().and_then(|m| m.scope.as_deref());
         if scope.is_none_or(|s| s.is_all || pinned == Some(s.name.as_str())) {
             adapter.forget_project_meta().await?;
+            adapter.record_uses(self.owner(), &[]).await?;
+            adapter.release_objects(self.owner(), &self.declared_objects()).await?;
         }
 
         Ok(summary)
@@ -137,6 +141,32 @@ impl Design {
     /// `init --from-db` captured is versioned with `released` never set, and
     /// was refused as "a released project's database".
     pub fn check_reset_guard(&self, marks: &DatabaseMarks) -> Result<()> {
+        self.reset_guard(marks, true)
+    }
+
+    /// Every guard a reset checks before it claims (#7), as [`Design::reset`]
+    /// checks them: first a design reusing an owner's name — refused unless
+    /// allowed, and named before the guards, which read the previous design's
+    /// record; then, unless `force`, [`Self::check_reset_guard`] — less its
+    /// versioned-database block for an allowed reuse, the version being the
+    /// previous design's history — and another project's prod record.
+    pub async fn check_reset_run_guards(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        marks: &DatabaseMarks,
+        force: bool,
+    ) -> Result<()> {
+        let reused = self.reuses_owner_name(adapter).await?;
+        if force {
+            return Ok(());
+        }
+        self.reset_guard(marks, !reused)?;
+        self.check_reset_prod_elsewhere(adapter).await
+    }
+
+    /// [`Self::check_reset_guard`], its versioned-database block only when
+    /// `versioned`.
+    fn reset_guard(&self, marks: &DatabaseMarks, versioned: bool) -> Result<()> {
         // Compared through the alias table: rows written before the CLI
         // normalised `-e` can say `production`.
         let is_prod = |m: &&crate::adapter::ProjectMeta| {
@@ -146,7 +176,10 @@ impl Design {
         // recorded version is what is known: a fresh install of a released
         // project records its version with no migration ever run, and this
         // said "has applied migrations" of it.
-        let (row, own, other) = match (marks.rows().find(is_prod), marks.rows().find(|m| m.version >= 1)) {
+        let (row, own, other) = match (
+            marks.rows().find(is_prod),
+            marks.rows().find(|m| versioned && m.version >= 1),
+        ) {
             (Some(row), _) => (
                 row,
                 "database is marked as prod".to_string(),
