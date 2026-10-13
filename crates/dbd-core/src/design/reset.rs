@@ -47,6 +47,23 @@ impl Design {
         drop_extensions: bool,
         scope: Option<&ResolvedScope>,
     ) -> Result<ResetComplete> {
+        // The database's dbd write lock, exclusive, from its first read to its
+        // last drop: what it reads of other projects stays true until it has
+        // dropped — no other project's run writes between (#7).
+        let run = self.reset_run(adapter, target, force, drop_schemas, drop_extensions, scope);
+        super::ownership::with_write_lock(adapter, true, run).await
+    }
+
+    /// [`Design::reset`]'s run, under the write lock.
+    async fn reset_run(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        target: &str,
+        force: bool,
+        drop_schemas: bool,
+        drop_extensions: bool,
+        scope: Option<&ResolvedScope>,
+    ) -> Result<ResetComplete> {
         // The guards first, as `apply` runs them — they read the marks without
         // healing, and a renamed project is best told it was renamed. Then
         // heal and claim the design's entities, refusing a design declaring
@@ -55,14 +72,17 @@ impl Design {
         let marks = self.database_marks(adapter).await?;
         if !force {
             self.check_reset_guard(&marks)?;
+            self.check_reset_prod_elsewhere(adapter).await?;
         }
         self.claim_first(adapter).await?;
 
-        let roles_kept = self.roles_kept_by_reset(adapter, target, scope).await?;
-        let keep: Vec<String> = roles_kept.iter().map(|k| k.role.clone()).collect();
+        let (keep, roles_kept) = self
+            .reset_keeps(adapter, target, drop_schemas, drop_extensions, scope)
+            .await?;
         let plan = self.reset_plan(target, drop_schemas, drop_extensions, scope, &keep)?;
         let mut summary = ResetComplete {
             roles_kept,
+            kept: keep.notes,
             ..Default::default()
         };
         if let Some(sql) = &plan.sql {
@@ -183,7 +203,163 @@ impl Design {
         scope: Option<&ResolvedScope>,
         keep: &[String],
     ) -> Result<Option<String>> {
-        Ok(self.reset_plan(target, drop_schemas, drop_extensions, scope, keep)?.sql)
+        let keep = super::ownership::ResetKeep {
+            held_elsewhere: keep.to_vec(),
+            ..Default::default()
+        };
+        Ok(self
+            .reset_plan(target, drop_schemas, drop_extensions, scope, &keep)?
+            .sql)
+    }
+
+    /// What a reset of the database `adapter` reaches would run, and leave —
+    /// asked of that database as the real run asks it, refusing where it
+    /// refuses: the script, keeping the roles another database holds and what
+    /// other projects have or use there (#7), and a summary with nothing
+    /// dropped and those kept. For `reset --dry-run` with a database to ask.
+    pub async fn reset_preview(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        target: &str,
+        force: bool,
+        drop_schemas: bool,
+        drop_extensions: bool,
+        scope: Option<&ResolvedScope>,
+    ) -> Result<(Option<String>, ResetComplete)> {
+        if !force {
+            self.check_reset_prod_elsewhere(adapter).await?;
+        }
+        let (keep, roles_kept) = self
+            .reset_keeps(adapter, target, drop_schemas, drop_extensions, scope)
+            .await?;
+        let sql = self
+            .reset_plan(target, drop_schemas, drop_extensions, scope, &keep)?
+            .sql;
+        Ok((
+            sql,
+            ResetComplete {
+                roles_kept,
+                kept: keep.notes,
+                ..Default::default()
+            },
+        ))
+    }
+
+    /// Everything a reset keeps: the roles another database on the server
+    /// holds, and what other projects in this one have or use — refusing when
+    /// another project depends on what it drops.
+    async fn reset_keeps(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        target: &str,
+        drop_schemas: bool,
+        drop_extensions: bool,
+        scope: Option<&ResolvedScope>,
+    ) -> Result<(super::ownership::ResetKeep, Vec<KeptRole>)> {
+        let roles_kept = self.roles_kept_by_reset(adapter, target, scope).await?;
+        // SQLite's reset drops its own tables and views, without `CASCADE`;
+        // `postgres` and `supabase` are both Postgres.
+        let mut keep = if target == "sqlite" {
+            super::ownership::ResetKeep::default()
+        } else {
+            let drops = self.reset_drops(target, drop_schemas, drop_extensions, scope)?;
+            self.reset_ownership(adapter, &drops).await?
+        };
+        keep.held_elsewhere = roles_kept.iter().map(|k| k.role.clone()).collect();
+        Ok((keep, roles_kept))
+    }
+
+    /// What a Postgres reset would drop by name, before anything is kept.
+    fn reset_drops(
+        &self,
+        target: &str,
+        drop_schemas: bool,
+        drop_extensions: bool,
+        scope: Option<&ResolvedScope>,
+    ) -> Result<ResetDrops> {
+        let entities = self.reset_entities(scope)?.iter().map(|e| e.name.clone()).collect();
+        let schemas = if drop_schemas {
+            self.reset_target_schemas(scope)?
+                .into_iter()
+                .filter(|s| !script::schema_is_protected(s, target))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let extensions = if drop_extensions {
+            self.reset_extensions(scope)
+        } else {
+            Vec::new()
+        };
+        // Roles are dropped on a `postgres` target only (see `reset_plan`).
+        let roles = if target == "postgres" {
+            self.reset_roles(scope).into_iter().map(|r| r.name).collect()
+        } else {
+            Vec::new()
+        };
+        Ok(ResetDrops {
+            entities,
+            schemas,
+            extensions,
+            roles,
+        })
+    }
+
+    /// The data-model entities a reset drops one by one — the scope's, or all
+    /// of them — in apply order.
+    fn reset_entities(&self, scope: Option<&ResolvedScope>) -> Result<Vec<&Entity>> {
+        let is_data_model = |e: &Entity| crate::entity::TYPES_WITH_SCHEMA.contains(&e.entity_type);
+        Ok(match scope {
+            Some(s) if !s.is_all => {
+                let ws = self.working_set(s)?;
+                self.entities
+                    .iter()
+                    .filter(|e| is_data_model(e) && Self::entity_in_scope(e, s, &ws))
+                    .collect()
+            }
+            _ => self.entities.iter().filter(|e| is_data_model(e)).collect(),
+        })
+    }
+
+    /// The roles a reset drops. Roles aren't scope-selectable, so only a full
+    /// reset drops them; a subset scope leaves shared roles intact. Every role
+    /// the design declares counts — `ddl/role/` files as well as
+    /// `target.roles`, which used to be the only ones dropped.
+    fn reset_roles(&self, scope: Option<&ResolvedScope>) -> Vec<crate::config::RoleEntry> {
+        if matches!(scope, Some(s) if !s.is_all) {
+            return Vec::new();
+        }
+        self.entities
+            .iter()
+            .filter(|e| e.entity_type == EntityType::Role)
+            .map(|e| crate::config::RoleEntry {
+                name: e.name.clone(),
+                refers: Vec::new(),
+            })
+            .collect()
+    }
+
+    /// The active target's extensions (by bare name) a reset with
+    /// `--extensions` drops — only those the scope installs: a scope's
+    /// `extensions:` allowlist bounds what reset drops as it bounds what apply
+    /// creates.
+    pub(crate) fn reset_extensions(&self, scope: Option<&ResolvedScope>) -> Vec<String> {
+        let admitted = |name: &str| match scope {
+            Some(s) if !s.is_all => s.extensions.as_ref().is_none_or(|allow| allow.contains(name)),
+            _ => true,
+        };
+        self.config
+            .target
+            .values()
+            .next()
+            .map(|t| {
+                t.extensions
+                    .iter()
+                    .map(|e| e.name().to_string())
+                    .filter(|n| admitted(n))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// The design's roles a reset of the database `adapter` reaches must keep,
@@ -227,39 +403,22 @@ impl Design {
         drop_schemas: bool,
         drop_extensions: bool,
         scope: Option<&ResolvedScope>,
-        keep: &[String],
+        keep: &super::ownership::ResetKeep,
     ) -> Result<ResetPlan> {
-        // Roles aren't scope-selectable, so only a full reset drops them; a
-        // subset scope leaves shared roles intact. Every role the design
-        // declares counts — `ddl/role/` files as well as `target.roles`, which
-        // used to be the only ones dropped.
         let is_subset = matches!(scope, Some(s) if !s.is_all);
-        let roles: Vec<crate::config::RoleEntry> = if is_subset {
-            Vec::new()
-        } else {
-            self.entities
-                .iter()
-                .filter(|e| e.entity_type == EntityType::Role)
-                .map(|e| crate::config::RoleEntry {
-                    name: e.name.clone(),
-                    refers: Vec::new(),
-                })
-                .collect()
-        };
+        // A role kept for another project here keeps its grants too — that
+        // project relies on them — so the script leaves it alone. One kept for
+        // another database has this database's grants revoked (see
+        // `script::build_reset_script_keeping`).
+        let roles: Vec<crate::config::RoleEntry> = self
+            .reset_roles(scope)
+            .into_iter()
+            .filter(|r| !keep.roles.contains(&r.name))
+            .collect();
 
         // Data-model entities to drop individually (scope-filtered), in the
         // builder's reverse dependency order.
-        let is_data_model = |e: &Entity| crate::entity::TYPES_WITH_SCHEMA.contains(&e.entity_type);
-        let entities: Vec<&Entity> = match scope {
-            Some(s) if !s.is_all => {
-                let ws = self.working_set(s)?;
-                self.entities
-                    .iter()
-                    .filter(|e| is_data_model(e) && Self::entity_in_scope(e, s, &ws))
-                    .collect()
-            }
-            _ => self.entities.iter().filter(|e| is_data_model(e)).collect(),
-        };
+        let entities = self.reset_entities(scope)?;
 
         let mut objects: Vec<(EntityType, String)> =
             entities.iter().rev().map(|e| (e.entity_type, e.name.clone())).collect();
@@ -274,29 +433,19 @@ impl Design {
         }
 
         // Schemas the `--schemas` path may drop — all managed schemas, or just
-        // those the scope occupies.
-        let schemas = self.reset_target_schemas(scope)?;
-
-        // The active target's extensions (by bare name) for the `--extensions`
-        // path — only those the scope installs: a scope's `extensions:`
-        // allowlist bounds what reset drops as it bounds what apply creates.
-        let admitted = |name: &str| match scope {
-            Some(s) if !s.is_all => s.extensions.as_ref().is_none_or(|allow| allow.contains(name)),
-            _ => true,
-        };
+        // those the scope occupies — and the extensions `--extensions` may,
+        // less what other projects have or use (#7).
+        let schemas: Vec<String> = self
+            .reset_target_schemas(scope)?
+            .into_iter()
+            .filter(|s| !keep.schemas.contains(s))
+            .collect();
         let extensions: Vec<String> = self
-            .config
-            .target
-            .values()
-            .next()
-            .map(|t| {
-                t.extensions
-                    .iter()
-                    .map(|e| e.name().to_string())
-                    .filter(|n| admitted(n))
-                    .collect()
-            })
-            .unwrap_or_default();
+            .reset_extensions(scope)
+            .into_iter()
+            .filter(|e| !keep.extensions.contains(e))
+            .collect();
+        let keep = &keep.held_elsewhere;
 
         if drop_extensions {
             objects.extend(extensions.iter().map(|e| (EntityType::Extension, e.clone())));
@@ -355,6 +504,15 @@ impl Design {
     }
 }
 
+/// What a reset would drop by name before anything is kept — the data-model
+/// entities, and on request the schemas, extensions and roles.
+pub(crate) struct ResetDrops {
+    pub(crate) entities: Vec<String>,
+    pub(crate) schemas: Vec<String>,
+    pub(crate) extensions: Vec<String>,
+    pub(crate) roles: Vec<String>,
+}
+
 /// What [`Design::reset_plan`] would run, and what it would drop.
 struct ResetPlan {
     sql: Option<String>,
@@ -371,6 +529,9 @@ pub struct ResetComplete {
     /// The design's roles the reset left in place because another database on
     /// the server holds something of theirs.
     pub roles_kept: Vec<KeptRole>,
+    /// What the reset left for other projects in this database, one line each
+    /// — `schema app kept: it holds table app.invoices ("billing")` (#7).
+    pub kept: Vec<String>,
 }
 
 /// A role [`Design::reset`] kept, and why.

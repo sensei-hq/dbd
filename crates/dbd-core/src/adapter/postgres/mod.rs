@@ -2581,12 +2581,42 @@ ORDER BY 1, 2, 4, 5"#;
         self.bookkeeping.release_objects(guard.as_mut(), owner, declared).await
     }
 
-    async fn dependents(&self, owner: &str, guarded: &[super::Guarded]) -> Result<Vec<super::Dependence>> {
-        self.bookkeeping.dependents(owner, guarded).await
+    async fn dependents(
+        &self,
+        owner: &str,
+        guarded: &[super::Guarded],
+        mine: &[super::OwnedObject],
+    ) -> Result<Vec<super::Dependence>> {
+        self.bookkeeping.dependents(owner, guarded, mine).await
+    }
+
+    async fn users_of(&self, owner: &str, kind: &str, target: &str) -> Result<Vec<String>> {
+        self.bookkeeping.users_of(owner, kind, target).await
+    }
+
+    async fn not_owned_in_schema(
+        &self,
+        owner: &str,
+        schema: &str,
+        mine: &[super::OwnedObject],
+    ) -> Result<Vec<super::SchemaMember>> {
+        self.bookkeeping.not_owned_in_schema(owner, schema, mine).await
     }
 
     async fn get_db_version(&self) -> Result<u32> {
         self.bookkeeping.version().await
+    }
+
+    async fn lock_writes(&self, exclusive: bool) -> Result<()> {
+        self.bookkeeping.lock_writes(exclusive).await
+    }
+
+    async fn unlock_writes(&self) -> Result<()> {
+        self.bookkeeping.unlock_writes().await
+    }
+
+    fn abandon_writes(&self) {
+        self.bookkeeping.abandon_writes()
     }
 
     async fn apply_migration(&self, version: u32, sql: &str, description: &str, checksum: &str) -> Result<()> {

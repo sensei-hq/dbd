@@ -501,6 +501,14 @@ pub async fn apply_policies(
     if dry_run {
         return Ok(plan);
     }
+    // A policy depends on the tables it names: written under the database's
+    // dbd write lock, shared, so another project's reset or prune reads it
+    // before it drops `CASCADE` (#7).
+    ownership::with_write_lock(adapter, false, run_policies(adapter, project_dir, plan)).await
+}
+
+/// [`apply_policies`]'s run of `plan`, under the write lock.
+async fn run_policies(adapter: &dyn DatabaseAdapter, project_dir: &Path, plan: PolicyReport) -> Result<PolicyReport> {
     let mut report = PolicyReport {
         applied: Vec::new(),
         failed: Vec::new(),

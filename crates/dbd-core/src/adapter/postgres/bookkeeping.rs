@@ -24,6 +24,17 @@ use crate::error::{DbdError, Result};
 pub(super) struct Bookkeeping {
     pool: PgPool,
     project: String,
+    /// The database's dbd write lock while this adapter holds it.
+    write_lock: tokio::sync::Mutex<WriteLock>,
+}
+
+/// The database's dbd write lock as an adapter holds it: how many runs nested
+/// in it, the session holding it, and whether exclusive.
+#[derive(Default)]
+struct WriteLock {
+    depth: usize,
+    session: Option<sqlx::PgConnection>,
+    exclusive: bool,
 }
 
 impl Bookkeeping {
@@ -53,7 +64,133 @@ impl Bookkeeping {
             PRIMARY KEY (owner, kind, target, via) );";
 
     pub(super) fn new(pool: PgPool, project: String) -> Self {
-        Self { pool, project }
+        Self {
+            pool,
+            project,
+            write_lock: tokio::sync::Mutex::new(WriteLock::default()),
+        }
+    }
+
+    /// Take the database's dbd write lock (#7) — the advisory lock on
+    /// `dbd:write`, shared or exclusive — in a session of its own, held until
+    /// [`Self::unlock_writes`]. A session lock, not a transaction's: a run
+    /// commits as it goes, and holds it across. The session is out of the
+    /// pool, so dropping it — [`Self::abandon_writes`] — releases the lock;
+    /// and it sits idle through the run, so no `idle_session_timeout` may end
+    /// it. A nested call shares the lock already held, and is refused one
+    /// exclusive inside a shared one. It waits by asking again, not in one
+    /// long statement — a statement holds a snapshot, which the run holding
+    /// the lock waits out to `CREATE INDEX CONCURRENTLY` — saying so in its
+    /// `application_name`, for at most [`WRITE_LOCK_TIMEOUT`].
+    pub(super) async fn lock_writes(&self, exclusive: bool) -> Result<()> {
+        use sqlx::Connection;
+        let mut held = self.write_lock.lock().await;
+        if held.depth > 0 {
+            if exclusive && !held.exclusive {
+                return Err(DbdError::Config(
+                    "a run holding the dbd write lock shared cannot take it exclusive".to_string(),
+                ));
+            }
+            held.depth += 1;
+            return Ok(());
+        }
+        let failed = |e: sqlx::Error| DbdError::Config(format!("taking the dbd write lock failed: {e}"));
+        let mut session = self.pool.acquire().await.map_err(failed)?.detach();
+        for prepare in [
+            "SELECT set_config('idle_session_timeout', '0', false) \
+               WHERE current_setting('idle_session_timeout', true) IS NOT NULL",
+            "SET application_name = 'dbd: waiting for the write lock'",
+        ] {
+            if let Err(e) = sqlx::query(prepare).execute(&mut session).await {
+                let _ = session.close().await;
+                return Err(failed(e));
+            }
+        }
+        let try_lock = if exclusive {
+            "SELECT pg_try_advisory_lock(hashtext('dbd:write'))"
+        } else {
+            "SELECT pg_try_advisory_lock_shared(hashtext('dbd:write'))"
+        };
+        let deadline = std::time::Instant::now() + WRITE_LOCK_TIMEOUT;
+        loop {
+            match sqlx::query_scalar::<_, bool>(try_lock).fetch_one(&mut session).await {
+                Ok(true) => break,
+                Ok(false) if std::time::Instant::now() < deadline => tokio::time::sleep(WRITE_LOCK_POLL).await,
+                Ok(false) => {
+                    let _ = session.close().await;
+                    return Err(DbdError::Config(format!(
+                        "waited {} minutes for another dbd run writing to this database to finish; try again \
+                         once it has",
+                        WRITE_LOCK_TIMEOUT.as_secs() / 60
+                    )));
+                }
+                Err(e) => {
+                    let _ = session.close().await;
+                    return Err(failed(e));
+                }
+            }
+        }
+        if let Err(e) = sqlx::query("SET application_name = 'dbd: holding the write lock'")
+            .execute(&mut session)
+            .await
+        {
+            let _ = session.close().await;
+            return Err(failed(e));
+        }
+        *held = WriteLock {
+            depth: 1,
+            session: Some(session),
+            exclusive,
+        };
+        Ok(())
+    }
+
+    /// Release the lock [`Self::lock_writes`] took, once the outermost run
+    /// that took it is done. A lock its session no longer holds — the session
+    /// ended mid-run — fails the run: another project's may have written
+    /// beside it.
+    pub(super) async fn unlock_writes(&self) -> Result<()> {
+        use sqlx::Connection;
+        let mut held = self.write_lock.lock().await;
+        match held.depth {
+            0 => return Ok(()),
+            1 => held.depth = 0,
+            _ => {
+                held.depth -= 1;
+                return Ok(());
+            }
+        }
+        let Some(mut session) = held.session.take() else {
+            return Ok(());
+        };
+        let unlock = if held.exclusive {
+            "SELECT pg_advisory_unlock(hashtext('dbd:write'))"
+        } else {
+            "SELECT pg_advisory_unlock_shared(hashtext('dbd:write'))"
+        };
+        let released = sqlx::query_scalar::<_, bool>(unlock).fetch_one(&mut session).await;
+        let _ = session.close().await;
+        match released {
+            Ok(true) => Ok(()),
+            Ok(false) | Err(_) => Err(DbdError::Config(
+                "the dbd write lock was lost during the run — its session ended — so another project's run \
+                 may have written beside it; check the database before running again"
+                    .to_string(),
+            )),
+        }
+    }
+
+    /// Give up the lock without a word to the server, for a run dropped
+    /// part-way: one level of nesting, and at the outermost the session —
+    /// dropped, it closes, and the server releases the lock.
+    pub(super) fn abandon_writes(&self) {
+        if let Ok(mut held) = self.write_lock.try_lock() {
+            match held.depth {
+                0 => {}
+                1 => *held = WriteLock::default(),
+                _ => held.depth -= 1,
+            }
+        }
     }
 
     /// The project this bookkeeping is kept for.
@@ -718,6 +855,7 @@ impl Bookkeeping {
         &self,
         owner: &str,
         guarded: &[crate::adapter::Guarded],
+        mine: &[crate::adapter::OwnedObject],
     ) -> Result<Vec<crate::adapter::Dependence>> {
         use crate::adapter::GuardedPart;
         let read = |e: sqlx::Error| DbdError::Config(format!("uses guard read failed: {e}"));
@@ -737,20 +875,26 @@ impl Bookkeeping {
                 GuardedPart::Index(n) => ("index", n.as_str()),
                 GuardedPart::Truncate => ("truncate", ""),
             };
-            let mut seen: std::collections::BTreeSet<(String, String)> = sqlx::query_as(DEPENDENTS_SQL)
+            // Each dependent once, by owner and name, with its schema.
+            let rows: Vec<(Option<String>, String, String)> = sqlx::query_as(DEPENDENTS_SQL)
                 .bind(&g.object.namespace)
                 .bind(&g.object.schema)
                 .bind(&g.object.name)
                 .bind(part)
                 .bind(part_name)
                 .bind(owner)
+                .bind(mine.iter().map(|o| o.namespace.clone()).collect::<Vec<_>>())
+                .bind(mine.iter().map(|o| o.schema.clone()).collect::<Vec<_>>())
+                .bind(mine.iter().map(|o| o.name.clone()).collect::<Vec<_>>())
                 .fetch_all(&self.pool)
                 .await
-                .map_err(read)?
+                .map_err(read)?;
+            let mut seen: std::collections::BTreeMap<(Option<String>, String), String> = rows
                 .into_iter()
+                .map(|(owner, via, schema)| ((owner, via), schema))
                 .collect();
             // A schema's uses are its entities' uses.
-            let uses: Vec<(String, String)> = sqlx::query_as(
+            let uses: Vec<(Option<String>, String)> = sqlx::query_as(
                 "SELECT owner, via FROM dbd.uses WHERE kind = 'entity' AND owner <> $2 \
                    AND (target = $1 OR ($4 AND (starts_with(target, 'relation:' || $5 || '.') \
                                                 OR starts_with(target, 'routine:' || $5 || '.')))) \
@@ -766,14 +910,136 @@ impl Bookkeeping {
             .map_err(read)?;
             // A truncate drops nothing a use could name.
             if part != "truncate" {
-                seen.extend(uses);
+                for key in uses {
+                    seen.entry(key).or_default();
+                }
             }
             found.extend(
                 seen.into_iter()
-                    .map(|(owner, via)| crate::adapter::Dependence { guarded: i, owner, via }),
+                    .map(|((owner, via), schema)| crate::adapter::Dependence {
+                        guarded: i,
+                        owner,
+                        via,
+                        schema,
+                    }),
             );
         }
         Ok(found)
+    }
+
+    /// The other owners that record a shared use of `target` of `kind`.
+    pub(super) async fn users_of(&self, owner: &str, kind: &str, target: &str) -> Result<Vec<String>> {
+        let registry: Option<String> = sqlx::query_scalar("SELECT to_regclass('dbd.uses')::text")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("uses read failed: {e}")))?;
+        if registry.is_none() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_scalar(
+            "SELECT DISTINCT owner FROM dbd.uses WHERE kind = $1 AND target = $2 AND owner <> $3 ORDER BY 1",
+        )
+        .bind(kind)
+        .bind(target)
+        .bind(owner)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbdError::Config(format!("uses read failed: {e}")))
+    }
+
+    /// What `schema` holds that is not `owner`'s, `mine` counted as its own.
+    pub(super) async fn not_owned_in_schema(
+        &self,
+        owner: &str,
+        schema: &str,
+        mine: &[crate::adapter::OwnedObject],
+    ) -> Result<Vec<crate::adapter::SchemaMember>> {
+        let read = |e: sqlx::Error| DbdError::Config(format!("schema contents read failed: {e}"));
+        let registry: Option<String> = sqlx::query_scalar("SELECT to_regclass('dbd.objects')::text")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(read)?;
+        let column = |f: fn(&crate::adapter::OwnedObject) -> &str| -> Vec<String> {
+            mine.iter().map(|o| f(o).to_string()).collect()
+        };
+        // Without a registry nothing is anyone's: every object not declared is
+        // the schema's to keep.
+        let owners = if registry.is_some() {
+            "(SELECT o.owner FROM dbd.objects o WHERE o.namespace = x.namespace AND o.schema = $2 AND o.name = x.name)"
+        } else {
+            "NULL::varchar"
+        };
+        // An extension's members — `deptype = 'e'` — are listed as the
+        // extension, once, whatever it is called; and what is part of another
+        // object — `deptype = 'i'`, a range type's constructors — as that
+        // object. Not a composite type: its relation is part of its type, and
+        // the two are one entity.
+        let member = |class: &str, oid: &str| {
+            format!(
+                "NOT EXISTS (SELECT 1 FROM pg_depend e WHERE e.classid = '{class}'::regclass \
+                 AND e.objid = {oid} AND e.objsubid = 0 AND (e.deptype = 'e' OR (e.deptype = 'i' \
+                 AND NOT (e.classid = 'pg_class'::regclass AND e.refclassid = 'pg_type'::regclass))))"
+            )
+        };
+        // A partition of a table that is `owner`'s — declared or claimed —
+        // goes with its parent's drop.
+        let own_parent = format!(
+            "EXISTS (SELECT 1 FROM pg_inherits i JOIN pg_class p ON p.oid = i.inhparent \
+               JOIN pg_namespace pn ON pn.oid = p.relnamespace WHERE i.inhrelid = c.oid AND ( \
+               EXISTS (SELECT 1 FROM unnest($3::text[], $4::text[], $5::text[]) AS m(namespace, schema, name) \
+                       WHERE m.namespace = 'relation' AND m.schema = pn.nspname AND m.name = p.relname) {claimed}))",
+            claimed = if registry.is_some() {
+                "OR EXISTS (SELECT 1 FROM dbd.objects o WHERE o.namespace = 'relation' AND o.schema = pn.nspname \
+                 AND o.name = p.relname AND o.owner = $1)"
+            } else {
+                ""
+            }
+        );
+        let sql = format!(
+            "SELECT DISTINCT x.kind, x.name, {owners} AS owner \
+             FROM ( \
+               SELECT 'relation' AS namespace, c.relname AS name, \
+                      CASE c.relkind WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' \
+                                     WHEN 'S' THEN 'sequence' WHEN 'f' THEN 'foreign table' \
+                                     WHEN 'c' THEN 'type' ELSE 'table' END AS kind \
+               FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+               WHERE n.nspname = $2 AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S', 'c') AND {class_member} \
+                 AND NOT (c.relispartition AND {own_parent}) \
+                 AND NOT (c.relkind = 'S' AND EXISTS (SELECT 1 FROM pg_depend d \
+                          WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid \
+                            AND d.refclassid = 'pg_class'::regclass AND d.deptype IN ('a', 'i'))) \
+               UNION ALL \
+               SELECT 'relation', t.typname, 'type' FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
+               WHERE n.nspname = $2 AND t.typrelid = 0 AND t.typelem = 0 AND t.typtype IN ('e', 'd', 'r', 'm', 'b') \
+                 AND {type_member} \
+               UNION ALL \
+               SELECT 'routine', p.proname, CASE p.prokind WHEN 'p' THEN 'procedure' ELSE 'function' END \
+               FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = $2 AND {proc_member} \
+               UNION ALL \
+               SELECT 'extension', x.extname, 'extension' \
+               FROM pg_extension x JOIN pg_namespace n ON n.oid = x.extnamespace WHERE n.nspname = $2 \
+             ) x \
+             WHERE NOT EXISTS (SELECT 1 FROM unnest($3::text[], $4::text[], $5::text[]) AS m(namespace, schema, name) \
+                               WHERE m.namespace = x.namespace AND m.schema = $2 AND m.name = x.name) \
+               AND {owners} IS DISTINCT FROM $1 \
+             ORDER BY 1, 2",
+            class_member = member("pg_class", "c.oid"),
+            type_member = member("pg_type", "t.oid"),
+            proc_member = member("pg_proc", "p.oid"),
+        );
+        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(&sql)
+            .bind(owner)
+            .bind(schema)
+            .bind(column(|o| &o.namespace))
+            .bind(column(|o| &o.schema))
+            .bind(column(|o| &o.name))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(read)?;
+        Ok(rows
+            .into_iter()
+            .map(|(kind, name, owner)| crate::adapter::SchemaMember { kind, name, owner })
+            .collect())
     }
 
     /// Read the recorded version for this project (authoritative version source).
@@ -1067,6 +1333,14 @@ impl Bookkeeping {
 /// table — before it gives up and says which.
 const HEAL_LOCK_TIMEOUT: &str = "5s";
 
+/// How long a run waits for the database's dbd write lock — for another
+/// project's run to finish — before it gives up. A run holds it from its
+/// first write to its last, an apply's data load included.
+const WRITE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How often a run waiting for the write lock asks for it again.
+const WRITE_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// `"schema"."relname"`, each part quoted.
 fn quoted_table(schema: &str, relname: &str) -> String {
     format!(
@@ -1215,8 +1489,15 @@ async fn release_in(
 /// further, dropping nothing: the table, every table inheriting from or a
 /// partition of one it empties, and every table whose foreign key points at
 /// one it empties. Each dependent is named by its owning
-/// relation, type or routine. Rows: the other owner, and the dependent as
-/// `kind schema.name`.
+/// relation, type or routine. A schema starts from all it holds: its
+/// relations, its types — row and array types included, so a column of one
+/// is reached — its routines, and its collations, text search objects,
+/// operators, operator classes and families, and conversions — a column
+/// collated by one goes with it. `$7`–`$9`: the asking owner's declared
+/// entities, its own claimed or not. Rows: the other owner — none for an
+/// entity nobody owns that stands on its own (a composite type does) and is
+/// neither the one dropped nor declared by the owner asking — the dependent as
+/// `kind schema.name`, and its schema.
 const DEPENDENTS_SQL: &str = "\
 WITH RECURSIVE \
 rel AS (SELECT c.oid, c.reltype FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -1261,9 +1542,20 @@ start(classid, objid, objsubid) AS ( \
   UNION ALL SELECT 'pg_class'::regclass::oid, c.oid, 0 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
             WHERE $1 = 'schema' AND n.nspname = $2 AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S', 'c') \
   UNION ALL SELECT 'pg_type'::regclass::oid, t.oid, 0 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
-            WHERE $1 = 'schema' AND n.nspname = $2 AND t.typrelid = 0 AND t.typelem = 0 \
+            WHERE $1 = 'schema' AND n.nspname = $2 \
   UNION ALL SELECT 'pg_proc'::regclass::oid, p.oid, 0 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
             WHERE $1 = 'schema' AND n.nspname = $2 \
+  UNION ALL SELECT x.classid, x.objid, 0 FROM pg_namespace n CROSS JOIN LATERAL ( \
+              SELECT 'pg_collation'::regclass::oid, oid FROM pg_collation WHERE collnamespace = n.oid \
+              UNION ALL SELECT 'pg_ts_config'::regclass::oid, oid FROM pg_ts_config WHERE cfgnamespace = n.oid \
+              UNION ALL SELECT 'pg_ts_dict'::regclass::oid, oid FROM pg_ts_dict WHERE dictnamespace = n.oid \
+              UNION ALL SELECT 'pg_ts_parser'::regclass::oid, oid FROM pg_ts_parser WHERE prsnamespace = n.oid \
+              UNION ALL SELECT 'pg_ts_template'::regclass::oid, oid FROM pg_ts_template WHERE tmplnamespace = n.oid \
+              UNION ALL SELECT 'pg_operator'::regclass::oid, oid FROM pg_operator WHERE oprnamespace = n.oid \
+              UNION ALL SELECT 'pg_opclass'::regclass::oid, oid FROM pg_opclass WHERE opcnamespace = n.oid \
+              UNION ALL SELECT 'pg_opfamily'::regclass::oid, oid FROM pg_opfamily WHERE opfnamespace = n.oid \
+              UNION ALL SELECT 'pg_conversion'::regclass::oid, oid FROM pg_conversion WHERE connamespace = n.oid \
+            ) x(classid, objid) WHERE $1 = 'schema' AND n.nspname = $2 \
   UNION ALL SELECT d.classid, d.objid, d.objsubid FROM pg_extension e \
             JOIN pg_depend d ON d.refclassid = 'pg_extension'::regclass AND d.refobjid = e.oid AND d.deptype = 'e' \
             WHERE $1 = 'extension' AND e.extname = $3 \
@@ -1301,10 +1593,11 @@ owning(classid, objid) AS ( \
   SELECT 'pg_type'::regclass::oid, k.contypid FROM walk w JOIN pg_constraint k \
          ON w.classid = 'pg_constraint'::regclass AND k.oid = w.objid AND k.conrelid = 0 AND k.contypid <> 0 \
 ), \
-found(namespace, schema, name, kind) AS ( \
+found(namespace, schema, name, kind, classid, objid) AS ( \
   SELECT 'relation', n.nspname, c.relname, \
          CASE c.relkind WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' WHEN 'S' THEN 'sequence' \
-                        WHEN 'f' THEN 'foreign table' WHEN 'c' THEN 'type' ELSE 'table' END \
+                        WHEN 'f' THEN 'foreign table' WHEN 'c' THEN 'type' ELSE 'table' END, \
+         'pg_class'::regclass::oid, c.oid \
   FROM owning w JOIN pg_class c0 ON w.classid = 'pg_class'::regclass AND c0.oid = w.objid \
   JOIN pg_class c ON c.oid = CASE WHEN c0.relkind IN ('i', 'I') \
                                   THEN (SELECT x.indrelid FROM pg_index x WHERE x.indexrelid = c0.oid) \
@@ -1313,15 +1606,26 @@ found(namespace, schema, name, kind) AS ( \
   UNION \
   SELECT 'relation', n.nspname, COALESCE(c.relname, t.typname), \
          CASE WHEN c.oid IS NULL THEN 'type' WHEN c.relkind = 'v' THEN 'view' \
-              WHEN c.relkind = 'm' THEN 'materialized view' ELSE 'table' END \
+              WHEN c.relkind = 'm' THEN 'materialized view' ELSE 'table' END, \
+         CASE WHEN c.oid IS NULL THEN 'pg_type'::regclass::oid ELSE 'pg_class'::regclass::oid END, \
+         COALESCE(c.oid, t.oid) \
   FROM owning w JOIN pg_type t ON w.classid = 'pg_type'::regclass AND t.oid = w.objid \
   LEFT JOIN pg_class c ON c.oid = t.typrelid \
   JOIN pg_namespace n ON n.oid = COALESCE(c.relnamespace, t.typnamespace) \
   UNION \
-  SELECT 'routine', n.nspname, p.proname, CASE p.prokind WHEN 'p' THEN 'procedure' ELSE 'function' END \
+  SELECT 'routine', n.nspname, p.proname, CASE p.prokind WHEN 'p' THEN 'procedure' ELSE 'function' END, \
+         'pg_proc'::regclass::oid, p.oid \
   FROM owning w JOIN pg_proc p ON w.classid = 'pg_proc'::regclass AND p.oid = w.objid \
   JOIN pg_namespace n ON n.oid = p.pronamespace \
 ) \
-SELECT DISTINCT o.owner, f.kind || ' ' || f.schema || '.' || f.name \
-FROM found f JOIN dbd.objects o ON o.namespace = f.namespace AND o.schema = f.schema AND o.name = f.name \
-WHERE o.owner <> $6";
+SELECT DISTINCT o.owner, f.kind || ' ' || f.schema || '.' || f.name, f.schema \
+FROM found f LEFT JOIN dbd.objects o ON o.namespace = f.namespace AND o.schema = f.schema AND o.name = f.name \
+WHERE o.owner IS DISTINCT FROM $6 \
+  AND (o.owner IS NOT NULL OR ( \
+    NOT (f.namespace = $1 AND f.schema = $2 AND f.name = $3) AND NOT ($1 = 'schema' AND f.schema = $2) \
+    AND NOT EXISTS (SELECT 1 FROM unnest($7::text[], $8::text[], $9::text[]) AS m(namespace, schema, name) \
+                    WHERE m.namespace = f.namespace AND m.schema = f.schema AND m.name = f.name) \
+    AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = f.classid AND d.objid = f.objid \
+                    AND d.objsubid = 0 AND d.deptype IN ('i', 'a', 'e') \
+                    AND NOT (d.deptype = 'i' AND d.classid = 'pg_class'::regclass \
+                             AND d.refclassid = 'pg_type'::regclass))))";

@@ -261,6 +261,34 @@ impl Design {
         name: Option<&str>,
         dry_run: bool,
         scope: Option<&ResolvedScope>,
+        progress: Progress<S, D, C>,
+    ) -> Result<()>
+    where
+        S: FnMut(&str),
+        D: FnMut(&str, Option<&str>),
+        C: FnMut(ApplyComplete),
+    {
+        // A real run holds the database's dbd write lock from its first read
+        // to its last write (#7): shared to build, so another project's reset
+        // waits for it and reads what it built; exclusive to run migrations,
+        // whose drops `CASCADE` by what the guard read of other projects, so
+        // no other project's run writes between the two.
+        let run = self.apply_run(adapter, name, dry_run, scope, progress);
+        if dry_run {
+            return run.await;
+        }
+        let migrates = !adapter.prefers_batch_apply()
+            && !snapshot::pending_migrations(adapter.get_db_version().await?, &self.project_dir).is_empty();
+        ownership::with_write_lock(adapter, migrates, run).await
+    }
+
+    /// [`Design::apply`]'s run, under the write lock when it writes.
+    async fn apply_run<S, D, C>(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        name: Option<&str>,
+        dry_run: bool,
+        scope: Option<&ResolvedScope>,
         mut progress: Progress<S, D, C>,
     ) -> Result<()>
     where
@@ -951,7 +979,8 @@ impl Design {
         }
         match crate::script::build_grants_script(&schema_grants, &supabase_schemas) {
             Some(sql) => {
-                adapter.execute_script(&sql).await?;
+                // Under the database's dbd write lock, shared, as an apply (#7).
+                ownership::with_write_lock(adapter, false, adapter.execute_script(&sql)).await?;
                 Ok(GrantsOutcome::Applied)
             }
             None => Ok(GrantsOutcome::None),

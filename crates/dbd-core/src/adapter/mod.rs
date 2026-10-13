@@ -106,14 +106,18 @@ pub enum GuardedPart {
     Truncate,
 }
 
-/// Another owner's dependence on a [`Guarded`] entity (#7).
+/// Another owner's dependence on a [`Guarded`] entity (#7) — or one nobody
+/// owns, which may be a project's that does not record its uses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dependence {
     /// Which of the guarded entities, by its place in the list asked about.
     pub guarded: usize,
-    pub owner: String,
-    /// The owner's entity that depends on it — `view billing.v_orders`.
+    /// `None` for an entity nobody owns.
+    pub owner: Option<String>,
+    /// The entity that depends on it — `view billing.v_orders`.
     pub via: String,
+    /// That entity's schema.
+    pub schema: String,
 }
 
 /// What the ownership registry says of a run's live entities (#7), for a
@@ -160,6 +164,35 @@ pub struct Use {
 pub struct HeldObject {
     pub object: OwnedObject,
     pub owner: String,
+}
+
+/// Something a schema holds that one owner's design does not declare (#7): an
+/// entity — another owner's, or one nobody owns — or an extension installed
+/// in the schema, which stands for all its members.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaMember {
+    /// `table`, `view`, `materialized view`, `sequence`, `foreign table`,
+    /// `type`, `function`, `procedure` or `extension`.
+    pub kind: String,
+    /// The bare name; a routine's once for all its overloads.
+    pub name: String,
+    /// Its owner in the registry, if it has one.
+    pub owner: Option<String>,
+}
+
+impl SchemaMember {
+    /// `table app.invoices ("billing")`, `extension citext`.
+    pub fn label(&self, schema: &str) -> String {
+        let named = if self.kind == "extension" {
+            format!("extension {}", self.name)
+        } else {
+            format!("{} {schema}.{}", self.kind, self.name)
+        };
+        match &self.owner {
+            Some(owner) => format!("{named} (\"{owner}\")"),
+            None => named,
+        }
+    }
 }
 
 /// The database adapter trait — each target implements this.
@@ -545,12 +578,57 @@ pub trait DatabaseAdapter: Send + Sync {
     /// Other owners' dependences on `guarded` — what a drop's `CASCADE`, or a
     /// part's removal, would reach that another owner holds, and the uses
     /// other owners recorded of them; for a part, only uses whose body the
-    /// database cannot track (a routine's). Reads only. Adapters without a
-    /// registry find none.
-    async fn dependents(&self, owner: &str, guarded: &[Guarded]) -> Result<Vec<Dependence>> {
-        let _ = (owner, guarded);
+    /// database cannot track (a routine's). What it would reach that nobody
+    /// owns comes too, owner `None`: an entity standing on its own, not part
+    /// of another — not an owned sequence, a partition, an array type or an
+    /// extension's member — and not one the drop names nor one of `mine`, the
+    /// entities `owner`'s design declares, which are its own claimed or not.
+    /// Reads only. Adapters without a registry find none.
+    async fn dependents(&self, owner: &str, guarded: &[Guarded], mine: &[OwnedObject]) -> Result<Vec<Dependence>> {
+        let _ = (owner, guarded, mine);
         Ok(Vec::new())
     }
+
+    /// The other owners that record a shared use — `kind` `schema`,
+    /// `extension` or `role` — of `target` (#7). Reads only. Adapters without
+    /// a registry find none.
+    async fn users_of(&self, owner: &str, kind: &str, target: &str) -> Result<Vec<String>> {
+        let _ = (owner, kind, target);
+        Ok(Vec::new())
+    }
+
+    /// What `schema` holds that is not `owner`'s — another owner's entity, one
+    /// nobody owns, and every extension installed there — sorted (#7). `mine`
+    /// — the entities the owner's design declares — count as its own, claimed
+    /// yet or not. A sequence a column owns, a row type, an array type and a
+    /// range type's constructors are their owner's, and an extension's
+    /// members the extension's, not the schema's. Reads only. Adapters
+    /// without a registry find none.
+    async fn not_owned_in_schema(&self, owner: &str, schema: &str, mine: &[OwnedObject]) -> Result<Vec<SchemaMember>> {
+        let _ = (owner, schema, mine);
+        Ok(Vec::new())
+    }
+    /// Hold the database's dbd write lock until [`Self::unlock_writes`] (#7):
+    /// shared by a run that builds, exclusive for one that drops `CASCADE` by
+    /// what it read of other projects — a reset, a reconcile, an apply running
+    /// migrations — so no other project's run writes between its reads and its
+    /// drops. A nested call shares the lock already held, and is refused one
+    /// exclusive inside a shared one. Waits a bounded time, then fails.
+    /// Adapters without other projects to wait for need none.
+    async fn lock_writes(&self, exclusive: bool) -> Result<()> {
+        let _ = exclusive;
+        Ok(())
+    }
+
+    /// Release what [`Self::lock_writes`] took — failing if the lock was
+    /// lost on the way.
+    async fn unlock_writes(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Give up what [`Self::lock_writes`] took, at once and without asking
+    /// the database: for a run dropped part-way.
+    fn abandon_writes(&self) {}
     async fn get_db_version(&self) -> Result<u32>;
     async fn apply_migration(&self, version: u32, sql: &str, description: &str, checksum: &str) -> Result<()>;
     async fn clear_project_migrations(&self) -> Result<()>;

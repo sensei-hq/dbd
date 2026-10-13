@@ -354,16 +354,26 @@ impl Design {
                 None => {}
             }
         }
-        owned.not_recording = adapter
+        owned.not_recording = self.not_recording(adapter, &found.recording).await?;
+        Ok(owned)
+    }
+
+    /// The other projects the database records that do not record their uses
+    /// — not in `recording` — sorted.
+    async fn not_recording(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        recording: &std::collections::BTreeSet<String>,
+    ) -> Result<Vec<String>> {
+        Ok(adapter
             .other_projects_meta()
             .await?
             .into_iter()
             .map(|m| m.project)
-            .filter(|p| p != self.owner() && !found.recording.contains(p))
+            .filter(|p| p != self.owner() && !recording.contains(p))
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
-            .collect();
-        Ok(owned)
+            .collect())
     }
 
     /// Claim what a prune is about to drop, in the transaction that drops it:
@@ -472,7 +482,17 @@ impl Design {
                 guarded.push((g, label));
             }
         }
-        let uses = self.uses_of(adapter, &guarded).await?;
+        // A table nobody owns that the prune drops too is no use of another it
+        // drops: what depends on it goes in the same run.
+        let going: std::collections::HashSet<String> = plan
+            .dropped
+            .iter()
+            .map(|stmt| {
+                let k = key(&stmt.entity_name);
+                format!("table {}.{}", k.schema, k.name)
+            })
+            .collect();
+        let uses = self.uses_besides(adapter, &guarded, &going).await?;
         // A prune candidate depended on: kept, named.
         let mut kept = Vec::new();
         for ((_, label), uses) in guarded.iter().zip(&uses).take(prunes) {
@@ -597,6 +617,166 @@ impl Design {
         refuse_uses(guarded.iter().zip(&uses))
     }
 
+    /// Refuse a reset, unless forced, while another project's record marks the
+    /// database prod (#7): it is prod for every project in it. An env dbd does
+    /// not know is no proof it is not, and refuses too.
+    pub(crate) async fn check_reset_prod_elsewhere(&self, adapter: &dyn DatabaseAdapter) -> Result<()> {
+        let prod = adapter.other_projects_meta().await?.into_iter().find(|m| {
+            m.project != self.owner() && !matches!(crate::config::normalize_env(Some(&m.env)).as_deref(), Ok("dev"))
+        });
+        let Some(row) = prod else {
+            return Ok(());
+        };
+        let marked = match crate::config::normalize_env(Some(&row.env)) {
+            Ok(_) => "marked this database prod".to_string(),
+            Err(_) => format!("recorded env '{}', which dbd does not know and reads as prod", row.env),
+        };
+        Err(DbdError::SafetyGuard(format!(
+            "reset is blocked — project '{}' {marked}, and a database is prod for every project in it. \
+             Use --force to override.",
+            row.project
+        )))
+    }
+
+    /// What a reset of this owner's must leave, or refuse, for other owners
+    /// (#7). Refuses, forced or not, when another owner depends on what the
+    /// reset drops — an entity, or a schema `--schemas` drops — since dropped
+    /// `CASCADE` it takes theirs with it. Keeps, naming why: a schema
+    /// `--schemas` would drop that holds anything not this owner's — another
+    /// owner's entity, or one nobody owns — or that another owner uses; an
+    /// extension `--extensions` would drop that another owner uses or depends
+    /// on; a role another owner uses. Reads only.
+    pub(crate) async fn reset_ownership(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        drop: &super::reset::ResetDrops,
+    ) -> Result<ResetKeep> {
+        use crate::adapter::{Guarded, GuardedPart};
+        let mut keep = ResetKeep::default();
+
+        // What the reset drops by name: each entity as its `DROP` names it —
+        // `DROP TABLE "app"."orders"` — and not the rest of what its file
+        // creates, which the reset leaves: an enum beside the table stays.
+        let guarded: Vec<(Guarded, String)> = self
+            .entities
+            .iter()
+            .filter(|e| drop.entities.contains(&e.name))
+            .filter_map(|e| {
+                let (namespace, kind) = owned_kind(e.entity_type)?;
+                let schema = e.schema.clone().unwrap_or_else(|| "public".to_string());
+                let (_, name) = crate::entity::split_qualified_name(&e.name);
+                let label = format!("{schema}.{name}");
+                let object = OwnedObject {
+                    namespace: namespace.to_string(),
+                    schema,
+                    name,
+                    kind: kind.to_string(),
+                };
+                Some((
+                    Guarded {
+                        object,
+                        part: GuardedPart::Whole,
+                    },
+                    label,
+                ))
+            })
+            .collect();
+        let uses = self.uses_of(adapter, &guarded).await?;
+        refuse_uses(guarded.iter().zip(&uses))?;
+
+        // A schema dropped `CASCADE` takes what is in it — kept when that is
+        // not all this owner's, and guarded when it is: another owner may
+        // depend on an entity of this owner's the design no longer declares.
+        // An extension the design installs in a schema of its own is its
+        // own — unless another owner uses or depends on it.
+        let mine = self.declared_objects();
+        let declared_extensions = self.reset_extensions(None);
+        let mut dropped_schemas = Vec::new();
+        for schema in &drop.schemas {
+            let mut others = Vec::new();
+            for member in adapter.not_owned_in_schema(self.owner(), schema, &mine).await? {
+                let own_extension = member.kind == "extension"
+                    && declared_extensions.contains(&member.name)
+                    && self.extension_users(adapter, &member.name).await?.is_none();
+                if !own_extension {
+                    others.push(member.label(schema));
+                }
+            }
+            let users = adapter.users_of(self.owner(), "schema", schema).await?;
+            let why = if !others.is_empty() {
+                const SHOWN: usize = 5;
+                let mut named: Vec<String> = others.iter().take(SHOWN).cloned().collect();
+                if others.len() > SHOWN {
+                    named.push(format!("and {} more", others.len() - SHOWN));
+                }
+                format!("it holds {}", named.join(", "))
+            } else if !users.is_empty() {
+                format!("{} uses it", quoted(&users))
+            } else {
+                dropped_schemas.push((
+                    Guarded {
+                        object: OwnedObject {
+                            namespace: "schema".to_string(),
+                            schema: schema.clone(),
+                            name: schema.clone(),
+                            kind: String::new(),
+                        },
+                        part: GuardedPart::Whole,
+                    },
+                    format!("schema {schema}"),
+                ));
+                continue;
+            };
+            keep.schemas.push(schema.clone());
+            keep.notes.push(format!("schema {schema} kept: {why}"));
+        }
+        let uses = self.uses_of(adapter, &dropped_schemas).await?;
+        refuse_uses(dropped_schemas.iter().zip(&uses))?;
+        for extension in &drop.extensions {
+            if let Some(why) = self.extension_users(adapter, extension).await? {
+                keep.extensions.push(extension.clone());
+                keep.notes.push(format!("extension {extension} kept: {why}"));
+            }
+        }
+        for role in &drop.roles {
+            let users = adapter.users_of(self.owner(), "role", role).await?;
+            if !users.is_empty() {
+                keep.roles.push(role.clone());
+                keep.notes.push(format!("role {role} kept: {} uses it", quoted(&users)));
+            }
+        }
+        Ok(keep)
+    }
+
+    /// Why another owner needs `extension`, if one does: it records a use of
+    /// it, or something of its depends on it — a column of its type, say.
+    async fn extension_users(&self, adapter: &dyn DatabaseAdapter, extension: &str) -> Result<Option<String>> {
+        use crate::adapter::{Guarded, GuardedPart};
+        let users = adapter.users_of(self.owner(), "extension", extension).await?;
+        if !users.is_empty() {
+            return Ok(Some(format!("{} uses it", quoted(&users))));
+        }
+        let g = (
+            Guarded {
+                object: OwnedObject {
+                    namespace: "extension".to_string(),
+                    schema: String::new(),
+                    name: extension.to_string(),
+                    kind: String::new(),
+                },
+                part: GuardedPart::Whole,
+            },
+            extension.to_string(),
+        );
+        Ok(self
+            .uses_of(adapter, std::slice::from_ref(&g))
+            .await?
+            .into_iter()
+            .next()
+            .flatten()
+            .map(|uses| format!("{uses} depends on it")))
+    }
+
     /// The other owners' uses of each of `guarded`, as one phrase each —
     /// `"billing" (view billing.v_orders)` — or `None` where there are none.
     async fn uses_of(
@@ -604,18 +784,50 @@ impl Design {
         adapter: &dyn DatabaseAdapter,
         guarded: &[(crate::adapter::Guarded, String)],
     ) -> Result<Vec<Option<String>>> {
+        self.uses_besides(adapter, guarded, &std::collections::HashSet::new())
+            .await
+    }
+
+    /// [`Self::uses_of`], passing over a dependent nobody owns that the run
+    /// drops too — `going`, each as `table app.legacy_orders`.
+    async fn uses_besides(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        guarded: &[(crate::adapter::Guarded, String)],
+        going: &std::collections::HashSet<String>,
+    ) -> Result<Vec<Option<String>>> {
         if guarded.is_empty() {
             return Ok(Vec::new());
         }
         let objects: Vec<crate::adapter::Guarded> = guarded.iter().map(|(g, _)| g.clone()).collect();
-        let found = adapter.dependents(self.owner(), &objects).await?;
+        let found: Vec<crate::adapter::Dependence> = adapter
+            .dependents(self.owner(), &objects, &self.declared_objects())
+            .await?
+            .into_iter()
+            .filter(|d| d.owner.is_some() || !going.contains(&d.via))
+            .collect();
+        // What nobody owns is guarded where a project might own it, by the
+        // rule `--prune` keeps such a table by: in a schema another owner
+        // uses, or anywhere while a project the database records does not
+        // record its uses.
+        let mut could_own = None;
+        if found.iter().any(|d| d.owner.is_none()) {
+            let known = adapter.ownership(self.owner(), &[]).await?;
+            could_own = Some((known.schema_users, self.not_recording(adapter, &known.recording).await?));
+        }
+        let phrase = |d: &crate::adapter::Dependence| match &d.owner {
+            Some(owner) => Some(format!("\"{owner}\" ({})", d.via)),
+            None => {
+                let (schema_users, not_recording) = could_own.as_ref()?;
+                let mut could: std::collections::BTreeSet<String> = not_recording.iter().cloned().collect();
+                could.extend(schema_users.get(&d.schema).into_iter().flatten().cloned());
+                let could: Vec<String> = could.into_iter().collect();
+                (!could.is_empty()).then(|| format!("{} (owned by nobody; maybe by {})", d.via, quoted(&could)))
+            }
+        };
         Ok((0..guarded.len())
             .map(|i| {
-                let uses: Vec<String> = found
-                    .iter()
-                    .filter(|d| d.guarded == i)
-                    .map(|d| format!("\"{}\" ({})", d.owner, d.via))
-                    .collect();
+                let uses: Vec<String> = found.iter().filter(|d| d.guarded == i).filter_map(phrase).collect();
                 (!uses.is_empty()).then(|| uses.join(", "))
             })
             .collect())
@@ -702,6 +914,53 @@ impl Design {
         }
         plan.warnings.extend(kept);
     }
+}
+
+/// Run `work` holding the database's dbd write lock (#7), released however
+/// `work` ends, a run dropped part-way included — see
+/// [`DatabaseAdapter::lock_writes`].
+pub(crate) async fn with_write_lock<T>(
+    adapter: &dyn DatabaseAdapter,
+    exclusive: bool,
+    work: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    /// Gives the lock up if the run is dropped before it ends.
+    struct Abandon<'a>(Option<&'a dyn DatabaseAdapter>);
+    impl Drop for Abandon<'_> {
+        fn drop(&mut self) {
+            if let Some(adapter) = self.0 {
+                adapter.abandon_writes();
+            }
+        }
+    }
+    adapter.lock_writes(exclusive).await?;
+    let mut abandon = Abandon(Some(adapter));
+    let done = work.await;
+    abandon.0 = None;
+    let released = adapter.unlock_writes().await;
+    let value = done?;
+    released?;
+    Ok(value)
+}
+
+/// `"a", "b"`.
+fn quoted(names: &[String]) -> String {
+    names.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", ")
+}
+
+/// What a reset leaves for other owners, and why — see
+/// [`Design::reset_ownership`].
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ResetKeep {
+    pub(crate) schemas: Vec<String>,
+    pub(crate) extensions: Vec<String>,
+    /// Roles kept for another project here: neither dropped nor revoked.
+    pub(crate) roles: Vec<String>,
+    /// Roles kept because another database holds them: their grants here are
+    /// revoked, and they are not dropped.
+    pub(crate) held_elsewhere: Vec<String>,
+    /// One line each: `schema app kept: it holds table app.invoices ("billing")`.
+    pub(crate) notes: Vec<String>,
 }
 
 /// Refuse, naming each, the guarded entities another owner uses —

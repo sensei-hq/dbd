@@ -1,26 +1,23 @@
 # Checkpoint
 
-**Slice:** #7 Phase 2, slice 4 (the uses guard) on `feat/ownership-guard`, from
-`feat/ownership` — where slices 1–3 landed as PR #50 (`5e6ad4dc`) and PR #51
-(`6196810c`). Phase 1 is on `develop`, unreleased.
+**Slice:** #7 Phase 2, slice 5 (reset rules) on `feat/ownership-reset`, from
+`feat/ownership` (slices 1–4: PRs #50–#52). Phase 1 is on `develop`, unreleased.
 
 ## Done
 
-- Slices 1–3 merged into `feat/ownership` (PRs #50, #51): registry, claim,
-  uses, prune by ownership.
-- Slice 4 = PR #52 (impl `9c91df5b`, `968c1293`; fixes `3612a8cf`, `6ebdf47d`,
-  `8092df1a`, `a17e3e56`, `c08bf8d9`):
-  the guard walks pg_depend as a CASCADE reaches, part by part (inherited
-  columns, arrays, domain checks) + dbd.uses (recorded whoever owns the
-  target; routine bodies in any file); reconcile refuses dropped parts, a prune
-  keeps used tables; apply refuses a migration's drops, or an unreadable one.
-- Embedded 238/238, `cli_live` 48/48, workspace 2005/0, clippy, fmt, doc clean.
+- Slice 5 (PR #53): reset keeps/refuses for other projects, `ResetComplete.kept`,
+  `reset_preview`. Two review rounds fixed test-first: the dbd write lock
+  (`dbd:write`; exclusive for reset/reconcile/migrating apply, shared for
+  apply/import/policies/grants; polls, survives idle timeouts, gives way on
+  cancel); the guard sees what nobody owns (prune's rule), composites, a
+  schema's collations, arrays and row types; supabase; kept roles' grants.
+- Embedded 278/278, `cli_live` 49/49, workspace 2006/0, clippy, fmt, doc clean.
 
 ## Next
 
-    # PR #52: regression check + CI green → merge locally into feat/ownership;
-    # then slice 5: reset rules (drops only own; --schemas/--extensions/roles
-    # skip what others use; reset's CASCADE behind the same guard).
+    gh pr checks 53 --watch
+    # CI green → local --no-ff merge into feat/ownership; then slice 6:
+    # name reuse (--allow-ownership-change) + transfer (--adopt-from)
 
 ## Open
 
@@ -32,7 +29,10 @@
 - A bare type of another project's is no use (dropped as a built-in).
 - An apply in one transaction runs `apply.before` hooks before its claim
   (documented in the spec). `dbd.objects` still allows namespace `type`, unused.
-- Docs slice (end of Phase 2) must cover `--prune-unowned` in the guides.
+- Docs slice (end of Phase 2) must cover `--prune-unowned`, reset's kept
+  lines and the write lock's waits in the guides.
+- Delete by hand: `/tmp/dbd-mut` (+ `git worktree prune`), `/tmp/dbd-mut-target`,
+  `/tmp/dbd-idx.*`, `/tmp/dbd-review2*`, `/tmp/dbd-lockreview*`.
 - Phase 1 is releasable as 0.25.2 when asked.
 
 ## Known limits
