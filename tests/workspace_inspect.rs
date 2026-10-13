@@ -164,23 +164,43 @@ fn inspect_of_a_named_entity_inspects_it_in_its_module() {
     assert!(!out.status.success(), "{}", self::text(&out));
 }
 
-/// Scopes select modules in a workspace — not yet: a scope must not quietly
-/// select within each module as if it were the whole design.
+/// `shop`, with a scope selecting `shared` alone.
+fn shop_with_scopes(dir: &Path) {
+    shop(dir);
+    let manifest = fs::read_to_string(dir.join("design.yaml")).unwrap();
+    fs::write(
+        dir.join("design.yaml"),
+        format!("{manifest}\nscopes:\n  solo:\n    modules: [shared]\n"),
+    )
+    .unwrap();
+}
+
+/// In a workspace a scope selects modules: `inspect --scope` inspects those it
+/// selects — `all`, every one — and `--deps` reaches each module's scope.
 #[test]
-fn inspect_refuses_a_scope_on_a_workspace() {
+fn inspect_inspects_the_modules_a_scope_selects() {
     let tmp = tempfile::tempdir().unwrap();
-    shop(tmp.path());
+    shop_with_scopes(tmp.path());
 
-    // `all` is a scope every design has, so only the refusal fails the run.
-    let out = dbd(tmp.path(), &["inspect", "--scope", "all"]);
+    let out = dbd(tmp.path(), &["inspect", "--scope", "solo"]);
     let text = text(&out);
-    assert!(!out.status.success(), "{text}");
-    assert!(text.contains("--scope") && text.contains("modules:"), "{text}");
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains("module shared (shop/shared)") && !text.contains("module core"),
+        "{text}"
+    );
 
-    let out = dbd(tmp.path(), &["inspect", "--deps", "include"]);
+    for args in [&["inspect", "--scope", "all"][..], &["inspect", "--deps", "include"]] {
+        let out = dbd(tmp.path(), args);
+        let text = self::text(&out);
+        assert!(out.status.success(), "{args:?}: {text}");
+        assert!(text.contains("module core (shop/core)"), "{args:?}: {text}");
+    }
+
+    let out = dbd(tmp.path(), &["inspect", "--scope", "nope"]);
     let text = self::text(&out);
     assert!(!out.status.success(), "{text}");
-    assert!(text.contains("--deps") && text.contains("modules:"), "{text}");
+    assert!(text.contains("nope") && text.contains("solo"), "{text}");
 }
 
 /// The commands that do not run a workspace yet refuse it rather than run
@@ -240,17 +260,63 @@ fn module_on_a_design_without_modules_is_refused() {
     assert!(text.contains("--module") && text.contains("modules:"), "{text}");
 }
 
-/// Scopes select modules in a workspace — not yet: a run refuses one rather
-/// than select within each module as if it were the whole design.
+/// A run under a scope previews the modules the scope selects.
 #[test]
-fn a_scope_on_a_workspace_run_is_refused() {
+fn a_scope_selects_the_modules_a_run_goes_over() {
+    let tmp = tempfile::tempdir().unwrap();
+    shop_with_scopes(tmp.path());
+
+    let out = dbd(tmp.path(), &["apply", "--dry-run", "--scope", "solo"]);
+    let text = text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains("module shared (shop/shared)") && !text.contains("module core"),
+        "{text}"
+    );
+
+    // `--module` within a scope: one of the modules it selects.
+    let out = dbd(
+        tmp.path(),
+        &["apply", "--dry-run", "--scope", "solo", "--module", "core"],
+    );
+    let text = self::text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("\"core\"") && text.contains("solo"), "{text}");
+}
+
+/// Run inside a module's folder, dbd finds the workspace by walking up, as
+/// Cargo does, and runs that module — with the modules it depends on.
+#[test]
+fn a_run_inside_a_module_folder_runs_that_module() {
     let tmp = tempfile::tempdir().unwrap();
     shop(tmp.path());
+    let run_in = |dir: &Path| {
+        Command::cargo_bin("dbd")
+            .unwrap()
+            .env_remove("DATABASE_URL")
+            .current_dir(dir)
+            .args(["inspect"])
+            .output()
+            .unwrap()
+    };
 
-    let out = dbd(tmp.path(), &["apply", "--dry-run", "--scope", "all"]);
+    for dir in [tmp.path().join("core"), tmp.path().join("core/ddl/table/app")] {
+        let out = run_in(&dir);
+        let text = text(&out);
+        assert!(out.status.success(), "{}: {text}", dir.display());
+        assert!(
+            text.contains("module shared (shop/shared)") && text.contains("module core (shop/core)"),
+            "{}: {text}",
+            dir.display()
+        );
+    }
+    let out = run_in(&tmp.path().join("shared"));
     let text = text(&out);
-    assert!(!out.status.success(), "{text}");
-    assert!(text.contains("--scope") && text.contains("modules:"), "{text}");
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains("module shared (shop/shared)") && !text.contains("module core"),
+        "{text}"
+    );
 }
 
 /// A module's folder is relative to the project directory (`--source`), as
