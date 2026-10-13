@@ -69,6 +69,30 @@ pub struct ReconcilePlan {
     /// the columns each moves — what the caller checks against the live
     /// database for a materialized view that would block one.
     pub enum_swaps: Vec<EnumSwap>,
+    /// What the plan drops from an existing table or enum, part by part —
+    /// [`Self::destructive_changes`] as data, for the uses guard to check
+    /// against what other owners depend on (#7).
+    pub dropped_parts: Vec<DroppedPart>,
+}
+
+/// One part of an existing table or enum a plan drops.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DroppedPart {
+    /// The table or enum, `schema.name`.
+    pub entity: String,
+    pub kind: DroppedKind,
+    /// The column, constraint, index or enum value; a foreign key's columns.
+    pub name: String,
+}
+
+/// What kind of part a [`DroppedPart`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DroppedKind {
+    Column,
+    Constraint,
+    Index,
+    EnumValue,
+    ForeignKey,
 }
 
 /// One enum's type swap: the values it loses and the `(table, column)` pairs
@@ -86,6 +110,19 @@ impl ReconcilePlan {
         self.destructive = true;
         if !self.destructive_changes.contains(&change) {
             self.destructive_changes.push(change);
+        }
+    }
+
+    /// Record a part the plan drops — as a destructive change, and as data.
+    fn mark_dropped(&mut self, change: String, entity: &str, kind: DroppedKind, name: &str) {
+        self.mark_destructive(change);
+        let part = DroppedPart {
+            entity: entity.to_string(),
+            kind,
+            name: name.to_string(),
+        };
+        if !self.dropped_parts.contains(&part) {
+            self.dropped_parts.push(part);
         }
     }
 
@@ -833,8 +870,10 @@ pub fn plan_reconcile(live: &Snapshot, desired: &Snapshot) -> ReconcilePlan {
         warnings,
         ..Default::default()
     };
-    for change in diffs.iter().flat_map(dropped_fields) {
-        plan.mark_destructive(change);
+    for d in &diffs {
+        for (change, kind, name) in dropped_fields(d) {
+            plan.mark_dropped(change, &d.entity_name, kind, &name);
+        }
     }
 
     for d in &diffs {
@@ -879,8 +918,8 @@ pub fn plan_reconcile(live: &Snapshot, desired: &Snapshot) -> ReconcilePlan {
 /// an enum value: the data-loss cases gated by `allow_destructive` — one line
 /// each, for [`ReconcilePlan::destructive_changes`]. Whole-object drops are
 /// handled separately via pruning.
-fn dropped_fields(d: &MigrationDiff) -> Vec<String> {
-    use crate::diff::FieldType;
+fn dropped_fields(d: &MigrationDiff) -> Vec<(String, DroppedKind, String)> {
+    use crate::diff::{FieldDetail, FieldType};
     let DiffAction::Change(changes) = &d.action else {
         return Vec::new();
     };
@@ -888,13 +927,33 @@ fn dropped_fields(d: &MigrationDiff) -> Vec<String> {
         .iter()
         .filter(|c| matches!(c.action, ChangeAction::Drop(_)))
         .map(|c| {
-            let kind = match c.field_type {
-                FieldType::Column => "column",
-                FieldType::Constraint => "constraint",
-                FieldType::Index => "index",
-                FieldType::EnumValue => "enum value",
+            let (label, kind) = match c.field_type {
+                FieldType::Column => ("column", DroppedKind::Column),
+                FieldType::Constraint => ("constraint", DroppedKind::Constraint),
+                FieldType::Index => ("index", DroppedKind::Index),
+                FieldType::EnumValue => ("enum value", DroppedKind::EnumValue),
             };
-            format!("{}: drops {kind} {}", d.entity_name, c.field_name)
+            // The part's own name, as the database knows it — a constraint's
+            // diff key is its shape (`uq:code`), not its name.
+            let name = match &c.action {
+                ChangeAction::Drop(detail) => match detail.as_ref() {
+                    FieldDetail::Constraint(
+                        TableConstraint::PrimaryKey { name, .. }
+                        | TableConstraint::Unique { name, .. }
+                        | TableConstraint::Check { name, .. }
+                        | TableConstraint::Exclude { name, .. },
+                    ) => name.clone(),
+                    FieldDetail::Constraint(TableConstraint::ForeignKey(fk)) => fk.name.clone(),
+                    FieldDetail::Index(ix) => ix.name.clone(),
+                    _ => None,
+                },
+                _ => None,
+            };
+            (
+                format!("{}: drops {label} {}", d.entity_name, c.field_name),
+                kind,
+                name.unwrap_or_else(|| c.field_name.clone()),
+            )
         })
         .collect()
 }
@@ -1009,7 +1068,12 @@ pub fn plan_fk_convergence(plan: &mut ReconcilePlan, live: &Snapshot, desired: &
                     fk.clone(),
                 )))),
             });
-            plan.mark_destructive(format!("{qname}: drops foreign key ({})", fk.columns.join(", ")));
+            plan.mark_dropped(
+                format!("{qname}: drops foreign key ({})", fk.columns.join(", ")),
+                &qname,
+                DroppedKind::ForeignKey,
+                &fk.columns.join(", "),
+            );
         }
 
         // Adds: a design FK missing from the live DB (unnamed → Postgres auto-names).
@@ -1162,10 +1226,15 @@ pub fn plan_check_convergence(plan: &mut ReconcilePlan, live: &Snapshot, desired
                 field_type: FieldType::Constraint,
                 action: ChangeAction::Drop(Box::new(FieldDetail::Constraint((*con).clone()))),
             });
-            plan.mark_destructive(format!(
-                "{qname}: drops CHECK constraint {}",
-                name.as_deref().unwrap_or_default()
-            ));
+            plan.mark_dropped(
+                format!(
+                    "{qname}: drops CHECK constraint {}",
+                    name.as_deref().unwrap_or_default()
+                ),
+                &qname,
+                DroppedKind::Constraint,
+                name.as_deref().unwrap_or_default(),
+            );
         }
 
         // Adds: a design CHECK the live DB lacks. An unnamed one is emitted
@@ -1570,7 +1639,7 @@ pub fn plan_enum_recreation(
         // `plan_reconcile` named the dropped values already, from the diff.
         for value in &removed {
             let change = format!("{qname}: drops enum value {value}");
-            plan.mark_destructive(change);
+            plan.mark_dropped(change, &qname, DroppedKind::EnumValue, value);
         }
     }
 }
@@ -1675,10 +1744,10 @@ pub(crate) fn with_indexes_of(canonical: &Snapshot, raw: &Snapshot) -> Snapshot 
 }
 
 /// A live column whose type is the enum being recreated.
-pub(crate) struct EnumColumn {
+struct EnumColumn {
     /// Qualified table name (`schema.table`).
-    pub(crate) table: String,
-    pub(crate) column: String,
+    table: String,
+    column: String,
     default_value: Option<String>,
     /// Whether the column is `enum[]` rather than plain `enum`.
     is_array: bool,
@@ -1689,7 +1758,7 @@ pub(crate) struct EnumColumn {
 /// Reads the canonicalized snapshot, where an enum column's type is already
 /// schema-qualified and lowercased and an array collapsed to a single `[]` — so
 /// an exact match is enough and there is no spelling to re-derive here.
-pub(crate) fn enum_columns(live: &Snapshot, qname: &str) -> Vec<EnumColumn> {
+fn enum_columns(live: &Snapshot, qname: &str) -> Vec<EnumColumn> {
     let array = format!("{qname}[]");
     let mut out = Vec::new();
     for t in &live.tables {
@@ -1834,7 +1903,8 @@ pub fn plan_index_convergence(plan: &mut ReconcilePlan, live: &Snapshot, desired
         {
             if let Some(name) = &ix.name {
                 lines.push(format!("DROP INDEX IF EXISTS \"{}\".\"{}\";", dt.schema, name));
-                plan.mark_destructive(format!("{}.{}: drops index {name}", dt.schema, dt.name));
+                let table = format!("{}.{}", dt.schema, dt.name);
+                plan.mark_dropped(format!("{table}: drops index {name}"), &table, DroppedKind::Index, name);
             }
         }
 

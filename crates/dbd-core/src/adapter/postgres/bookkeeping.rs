@@ -521,11 +521,12 @@ impl Bookkeeping {
     /// waits at most [`HEAL_LOCK_TIMEOUT`] for the registry. A shared use —
     /// schema, extension, role — is recorded as given. An entity use names its
     /// target `namespace:schema.name`, the name split at its first dot as dbd
-    /// splits one, and is recorded where another owner holds it — and not at
-    /// all when nobody else does. One named bare is looked up along its search
-    /// path as Postgres looks it up: a read is of the first relation on the
-    /// path, owned or not; a call, of any routine on it that could be the one
-    /// its arguments reach.
+    /// splits one, and is recorded whoever owns it — or nobody yet: the uses
+    /// guard asks the registry who owns a target when it runs, so a use of
+    /// an entity its owner claims later still guards it. One named bare is
+    /// looked up along its search path as Postgres looks it up: a read is of
+    /// the first relation on the path that exists; a call, of any routine on
+    /// it that could be the one its arguments reach.
     pub(super) async fn record_uses(
         &self,
         tx: Option<&mut Transaction<'static, Postgres>>,
@@ -599,8 +600,7 @@ impl Bookkeeping {
         // A bare name's candidates are those that exist, as Postgres finds
         // them. A read is of the first relation on the path; a call is
         // resolved by its arguments too, which dbd does not weigh, so it is a
-        // use of every routine on the path it could reach. Recorded where
-        // another owner holds it.
+        // use of every routine on the path it could reach.
         sqlx::query(
             "WITH d AS ( \
                SELECT * FROM unnest($2::int4[], $3::int4[], $4::text[], $5::text[], $6::text[], $7::text[], $8::bool[]) \
@@ -618,10 +618,8 @@ impl Bookkeeping {
                  WHERE n.nspname = d.schema AND p.proname = d.name)) \
              ) \
              INSERT INTO dbd.uses (owner, kind, target, via) \
-               SELECT $1, 'entity', o.namespace || ':' || o.schema || '.' || o.name, f.via \
+               SELECT $1, 'entity', f.namespace || ':' || f.schema || '.' || f.name, f.via \
                FROM (SELECT * FROM relations UNION ALL SELECT * FROM routines) f \
-               JOIN dbd.objects o ON o.namespace = f.namespace AND o.schema = f.schema AND o.name = f.name \
-                 AND o.owner <> $1 \
              ON CONFLICT DO NOTHING",
         )
         .bind(owner)
@@ -710,6 +708,72 @@ impl Bookkeeping {
                     .map_err(|e| DbdError::Config(format!("release: commit failed: {e}")))
             }
         }
+    }
+
+    /// Other owners' dependences on `guarded`, from the catalog's dependency
+    /// graph — whatever a `CASCADE` would reach, a dependent's own dependents
+    /// included — and from `dbd.uses`, which sees into routine bodies the
+    /// catalog does not. Reads only; a database with no registry has none.
+    pub(super) async fn dependents(
+        &self,
+        owner: &str,
+        guarded: &[crate::adapter::Guarded],
+    ) -> Result<Vec<crate::adapter::Dependence>> {
+        use crate::adapter::GuardedPart;
+        let read = |e: sqlx::Error| DbdError::Config(format!("uses guard read failed: {e}"));
+        let registry: Option<String> = sqlx::query_scalar("SELECT to_regclass('dbd.objects')::text")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(read)?;
+        if registry.is_none() {
+            return Ok(Vec::new());
+        }
+        let mut found = Vec::new();
+        for (i, g) in guarded.iter().enumerate() {
+            let (part, part_name) = match &g.part {
+                GuardedPart::Whole => ("whole", ""),
+                GuardedPart::Column(c) => ("column", c.as_str()),
+                GuardedPart::Constraint(c) => ("constraint", c.as_str()),
+                GuardedPart::Index(n) => ("index", n.as_str()),
+                GuardedPart::Truncate => ("truncate", ""),
+            };
+            let mut seen: std::collections::BTreeSet<(String, String)> = sqlx::query_as(DEPENDENTS_SQL)
+                .bind(&g.object.namespace)
+                .bind(&g.object.schema)
+                .bind(&g.object.name)
+                .bind(part)
+                .bind(part_name)
+                .bind(owner)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(read)?
+                .into_iter()
+                .collect();
+            // A schema's uses are its entities' uses.
+            let uses: Vec<(String, String)> = sqlx::query_as(
+                "SELECT owner, via FROM dbd.uses WHERE kind = 'entity' AND owner <> $2 \
+                   AND (target = $1 OR ($4 AND (starts_with(target, 'relation:' || $5 || '.') \
+                                                OR starts_with(target, 'routine:' || $5 || '.')))) \
+                   AND ($3 OR via LIKE 'function %' OR via LIKE 'procedure %')",
+            )
+            .bind(format!("{}:{}.{}", g.object.namespace, g.object.schema, g.object.name))
+            .bind(owner)
+            .bind(part == "whole")
+            .bind(g.object.namespace == "schema")
+            .bind(&g.object.schema)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(read)?;
+            // A truncate drops nothing a use could name.
+            if part != "truncate" {
+                seen.extend(uses);
+            }
+            found.extend(
+                seen.into_iter()
+                    .map(|(owner, via)| crate::adapter::Dependence { guarded: i, owner, via }),
+            );
+        }
+        Ok(found)
     }
 
     /// Read the recorded version for this project (authoritative version source).
@@ -1129,3 +1193,135 @@ async fn release_in(
     .map_err(|e| registry_error(&e, "dbd.objects", "release"))?;
     bounded_wait(tx, "dbd.objects", false).await
 }
+
+/// What depends on one guarded entity, owned by another owner: `$1..$3` the
+/// entity's namespace — `relation`, `routine`, or `schema` or `extension` for
+/// the whole of one — schema and name; `$4` what of it goes — `whole`,
+/// `column`, `constraint` or `index` — and `$5` that part's name; `$6` the
+/// owner asking.
+///
+/// Starts where a drop starts: a table with its row type and that type's
+/// array; a type and its array; a column, with the same column of every table
+/// inheriting it — dropped with it, through inheritance rather than the
+/// dependency graph; a constraint, with the index behind a primary key, unique
+/// or exclusion constraint (a foreign key's is the referenced table's, which
+/// dropping it leaves alone); an index; every overload of a routine; all of a
+/// schema; an extension's members. Walks `pg_depend` dependent by dependent,
+/// each as itself — a column as its column, a constraint, default, trigger or
+/// policy as itself — so a part reaches what depends on the part and not on
+/// its table; a view's rewrite rule stands for the whole view, which is what
+/// depends on the view, and a generated column's expression leads to the
+/// column it is part of. A `truncate` reaches what it empties and walks no
+/// further, dropping nothing: the table, every table inheriting from or a
+/// partition of one it empties, and every table whose foreign key points at
+/// one it empties. Each dependent is named by its owning
+/// relation, type or routine. Rows: the other owner, and the dependent as
+/// `kind schema.name`.
+const DEPENDENTS_SQL: &str = "\
+WITH RECURSIVE \
+rel AS (SELECT c.oid, c.reltype FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+        WHERE $1 = 'relation' AND n.nspname = $2 AND c.relname = $3), \
+typ AS (SELECT t.oid, t.typarray FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
+        WHERE $1 = 'relation' AND n.nspname = $2 AND t.typname = $3 AND t.typrelid = 0), \
+inh(child) AS ( \
+  SELECT i.inhrelid FROM pg_inherits i JOIN rel ON i.inhparent = rel.oid WHERE $4 = 'column' \
+  UNION SELECT i.inhrelid FROM pg_inherits i JOIN inh ON i.inhparent = inh.child \
+), \
+emptied(member) AS ( \
+  SELECT rel.oid FROM rel WHERE $4 = 'truncate' \
+  UNION \
+  SELECT x.member FROM emptied e CROSS JOIN LATERAL ( \
+    SELECT i.inhrelid FROM pg_inherits i WHERE i.inhparent = e.member \
+    UNION ALL \
+    SELECT k.conrelid FROM pg_constraint k WHERE k.confrelid = e.member AND k.contype = 'f' \
+  ) x(member) \
+), \
+start(classid, objid, objsubid) AS ( \
+  SELECT 'pg_class'::regclass::oid, rel.oid, 0 FROM rel WHERE $4 = 'whole' \
+  UNION ALL SELECT 'pg_type'::regclass::oid, rel.reltype, 0 FROM rel WHERE $4 = 'whole' AND rel.reltype <> 0 \
+  UNION ALL SELECT 'pg_type'::regclass::oid, t.typarray, 0 FROM rel JOIN pg_type t ON t.oid = rel.reltype \
+            WHERE $4 = 'whole' AND t.typarray <> 0 \
+  UNION ALL SELECT 'pg_type'::regclass::oid, typ.oid, 0 FROM typ WHERE $4 = 'whole' \
+  UNION ALL SELECT 'pg_type'::regclass::oid, typ.typarray, 0 FROM typ WHERE $4 = 'whole' AND typ.typarray <> 0 \
+  UNION ALL SELECT 'pg_class'::regclass::oid, rel.oid, a.attnum FROM rel \
+            JOIN pg_attribute a ON a.attrelid = rel.oid \
+            WHERE $4 = 'column' AND a.attname = $5 AND NOT a.attisdropped \
+  UNION ALL SELECT 'pg_class'::regclass::oid, inh.child, a.attnum FROM inh \
+            JOIN pg_attribute a ON a.attrelid = inh.child \
+            WHERE a.attname = $5 AND NOT a.attisdropped AND NOT a.attislocal \
+  UNION ALL SELECT 'pg_constraint'::regclass::oid, k.oid, 0 FROM rel \
+            JOIN pg_constraint k ON k.conrelid = rel.oid WHERE $4 = 'constraint' AND k.conname = $5 \
+  UNION ALL SELECT 'pg_class'::regclass::oid, k.conindid, 0 FROM rel \
+            JOIN pg_constraint k ON k.conrelid = rel.oid \
+            WHERE $4 = 'constraint' AND k.conname = $5 AND k.contype IN ('p', 'u', 'x') AND k.conindid <> 0 \
+  UNION ALL SELECT 'pg_class'::regclass::oid, i.oid, 0 FROM pg_class i JOIN pg_namespace n ON n.oid = i.relnamespace \
+            WHERE $4 = 'index' AND $1 = 'relation' AND n.nspname = $2 AND i.relname = $5 AND i.relkind IN ('i', 'I') \
+  UNION ALL SELECT 'pg_proc'::regclass::oid, p.oid, 0 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+            WHERE $1 = 'routine' AND n.nspname = $2 AND p.proname = $3 \
+  UNION ALL SELECT 'pg_class'::regclass::oid, c.oid, 0 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+            WHERE $1 = 'schema' AND n.nspname = $2 AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S', 'c') \
+  UNION ALL SELECT 'pg_type'::regclass::oid, t.oid, 0 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
+            WHERE $1 = 'schema' AND n.nspname = $2 AND t.typrelid = 0 AND t.typelem = 0 \
+  UNION ALL SELECT 'pg_proc'::regclass::oid, p.oid, 0 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+            WHERE $1 = 'schema' AND n.nspname = $2 \
+  UNION ALL SELECT d.classid, d.objid, d.objsubid FROM pg_extension e \
+            JOIN pg_depend d ON d.refclassid = 'pg_extension'::regclass AND d.refobjid = e.oid AND d.deptype = 'e' \
+            WHERE $1 = 'extension' AND e.extname = $3 \
+  UNION ALL SELECT 'pg_class'::regclass::oid, emptied.member, 0 FROM emptied \
+), \
+walk(classid, objid, objsubid) AS ( \
+  SELECT classid, objid, objsubid FROM start \
+  UNION \
+  SELECT x.classid, x.objid, x.objsubid FROM walk w \
+  CROSS JOIN LATERAL ( \
+    SELECT CASE WHEN d.classid = 'pg_rewrite'::regclass THEN 'pg_class'::regclass::oid ELSE d.classid END, \
+           CASE WHEN d.classid = 'pg_rewrite'::regclass \
+                THEN (SELECT r.ev_class FROM pg_rewrite r WHERE r.oid = d.objid) ELSE d.objid END, \
+           CASE WHEN d.classid = 'pg_rewrite'::regclass THEN 0 ELSE d.objsubid END \
+    FROM pg_depend d \
+    WHERE d.refclassid = w.classid AND d.refobjid = w.objid \
+      AND (w.objsubid = 0 OR d.refobjsubid = w.objsubid) AND d.deptype IN ('n', 'a') \
+    UNION ALL \
+    SELECT d.refclassid, d.refobjid, d.refobjsubid FROM pg_depend d \
+    WHERE w.classid = 'pg_attrdef'::regclass AND d.classid = w.classid AND d.objid = w.objid AND d.deptype = 'i' \
+  ) x(classid, objid, objsubid) \
+  WHERE $4 <> 'truncate' \
+), \
+owning(classid, objid) AS ( \
+  SELECT CASE WHEN w.classid IN ('pg_constraint'::regclass, 'pg_trigger'::regclass, 'pg_attrdef'::regclass, \
+                                 'pg_policy'::regclass) THEN 'pg_class'::regclass::oid ELSE w.classid END, \
+         CASE w.classid \
+           WHEN 'pg_constraint'::regclass THEN (SELECT k.conrelid FROM pg_constraint k WHERE k.oid = w.objid) \
+           WHEN 'pg_trigger'::regclass THEN (SELECT t.tgrelid FROM pg_trigger t WHERE t.oid = w.objid) \
+           WHEN 'pg_attrdef'::regclass THEN (SELECT a.adrelid FROM pg_attrdef a WHERE a.oid = w.objid) \
+           WHEN 'pg_policy'::regclass THEN (SELECT p.polrelid FROM pg_policy p WHERE p.oid = w.objid) \
+           ELSE w.objid END \
+  FROM walk w \
+  UNION \
+  SELECT 'pg_type'::regclass::oid, k.contypid FROM walk w JOIN pg_constraint k \
+         ON w.classid = 'pg_constraint'::regclass AND k.oid = w.objid AND k.conrelid = 0 AND k.contypid <> 0 \
+), \
+found(namespace, schema, name, kind) AS ( \
+  SELECT 'relation', n.nspname, c.relname, \
+         CASE c.relkind WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' WHEN 'S' THEN 'sequence' \
+                        WHEN 'f' THEN 'foreign table' WHEN 'c' THEN 'type' ELSE 'table' END \
+  FROM owning w JOIN pg_class c0 ON w.classid = 'pg_class'::regclass AND c0.oid = w.objid \
+  JOIN pg_class c ON c.oid = CASE WHEN c0.relkind IN ('i', 'I') \
+                                  THEN (SELECT x.indrelid FROM pg_index x WHERE x.indexrelid = c0.oid) \
+                                  ELSE c0.oid END \
+  JOIN pg_namespace n ON n.oid = c.relnamespace \
+  UNION \
+  SELECT 'relation', n.nspname, COALESCE(c.relname, t.typname), \
+         CASE WHEN c.oid IS NULL THEN 'type' WHEN c.relkind = 'v' THEN 'view' \
+              WHEN c.relkind = 'm' THEN 'materialized view' ELSE 'table' END \
+  FROM owning w JOIN pg_type t ON w.classid = 'pg_type'::regclass AND t.oid = w.objid \
+  LEFT JOIN pg_class c ON c.oid = t.typrelid \
+  JOIN pg_namespace n ON n.oid = COALESCE(c.relnamespace, t.typnamespace) \
+  UNION \
+  SELECT 'routine', n.nspname, p.proname, CASE p.prokind WHEN 'p' THEN 'procedure' ELSE 'function' END \
+  FROM owning w JOIN pg_proc p ON w.classid = 'pg_proc'::regclass AND p.oid = w.objid \
+  JOIN pg_namespace n ON n.oid = p.pronamespace \
+) \
+SELECT DISTINCT o.owner, f.kind || ' ' || f.schema || '.' || f.name \
+FROM found f JOIN dbd.objects o ON o.namespace = f.namespace AND o.schema = f.schema AND o.name = f.name \
+WHERE o.owner <> $6";

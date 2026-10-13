@@ -197,6 +197,42 @@ is of the first relation on the path that exists, owned or not. A call is
 resolved by its arguments as well, which dbd does not weigh, so it is a use of
 every routine on the path it could reach.
 
+A use is recorded whoever owns its target, or nobody yet: the guard asks the
+registry who owns a target when it runs, so a use made before the target's
+owner claimed it still guards it. A routine another entity's file creates — a
+table's trigger function — records its body's uses as its own.
+
+The guard walks `pg_depend` from what goes, as a `CASCADE` reaches it: a table
+with its row type and that type's array; a type and its array; a column, with
+the same column of every table inheriting it (dropped through inheritance,
+which `pg_depend` does not record); a constraint, with the index behind a
+primary key, unique or exclusion constraint; an index; a routine's overloads;
+a whole schema; an extension's members. Each dependent is walked as itself — a
+column as its column, a constraint, default, trigger or policy as itself — so a
+part reaches only what depends on the part; a view's rewrite rule stands for
+the whole view, and a generated column's expression leads to its column. A
+`TRUNCATE … CASCADE` reaches what it empties and drops nothing: the table, the
+partitions and inheriting tables of what it empties, and every table whose
+foreign key points at what it empties. Each is named by its owning
+relation, type or routine. For a part
+of a table, `dbd.uses` adds only the uses recorded through routine bodies,
+which the catalog does not track. It runs before any write, dry runs
+included:
+
+- `reconcile` refuses a dropped column, constraint, index or enum value another
+  owner depends on; a prune keeps a table another owner depends on, named:
+  `app.old is used by "billing" (view billing.v_old) — not pruned; remove that
+  use first`.
+- `apply` reads what each pending migration it runs drops — in its `.sql`,
+  `.drop.sql` and `.data.sql`, inside `DO` blocks too: a `DROP` of a relation,
+  type, routine, index, schema or extension, an `ALTER TABLE … DROP COLUMN` or
+  `DROP CONSTRAINT`, a `TRUNCATE … CASCADE` — with a bare name on the path the
+  migration runs on, and refuses the run when another owner depends on any of
+  it. A script dbd cannot parse is refused where another project is recorded:
+  what it drops is unknown. A design not read as Postgres — SQLite's — may keep
+  migrations in its own dialect: a script libpg_query cannot read is passed
+  over there, and what it can read is guarded as any other's.
+
 This is the contract between owners. It plays the role an API plays between
 services.
 

@@ -10040,8 +10040,10 @@ const BILLING_USES_YAML: &str = "project:\n  name: billing\nsource:\n  dialect: 
 /// A reference from one project's entity to another project's is recorded as
 /// a use — the target in the registry's own namespace, and the entity that
 /// makes it — so the owner cannot drop what another project depends on (#7).
-/// A reference to something nobody owns is no use of anyone's. A run records
-/// its design's uses afresh: one its design no longer makes is gone.
+/// A reference to something nobody owns yet is recorded too: its owner may
+/// claim it later, and the uses guard asks who owns a target when it runs. A
+/// run records its design's uses afresh: one its design no longer makes is
+/// gone.
 #[tokio::test]
 async fn a_reference_to_another_projects_entity_is_recorded_as_a_use() {
     let (_pg, url) = start_pg().await;
@@ -10083,9 +10085,9 @@ async fn a_reference_to_another_projects_entity_is_recorded_as_a_use() {
     .await;
     assert_catalog(
         &*billing_adapter,
-        false,
-        "SELECT 1 FROM dbd.uses WHERE target LIKE '%loose%'",
-        "a use of the unowned public.loose",
+        true,
+        &used_by("billing", "entity", "relation:public.loose", "view billing.v_orders"),
+        "billing's use of the unowned public.loose",
     )
     .await;
 
@@ -10601,43 +10603,26 @@ async fn every_overload_records_its_references() {
     }
 }
 
-/// A reference to `a.b.c` names, as dbd splits a name at its first dot,
-/// `"a"."b.c"` — not a `"a.b"."c"` another project holds (#7).
+/// A use is recorded as written, whoever owns its target when it is — the
+/// guard asks the registry who owns it when it runs — so a dotted reference
+/// is kept as its text: `relation:a.b.c` (#7).
 #[tokio::test]
-async fn a_dotted_reference_is_matched_as_dbd_splits_it() {
+async fn a_dotted_reference_is_recorded_as_written() {
     let (_pg, url) = start_pg().await;
     let shop = connect(&url, "shop").await.unwrap();
     shop.heal_bookkeeping().await.unwrap();
-    let record = |schema: &'static str, name: &'static str| {
-        format!(
-            "DELETE FROM dbd.objects; INSERT INTO dbd.objects (namespace, schema, name, kind, owner) \
-             VALUES ('relation', '{schema}', '{name}', 'table', 'crm');"
-        )
-    };
     let dotted = dbd_core::adapter::Use {
         kind: "entity".to_string(),
         target: "relation:a.b.c".to_string(),
         via: "view app.v".to_string(),
         search_path: Vec::new(),
     };
-
-    shop.execute_script(&record("a.b", "c")).await.unwrap();
-    shop.record_uses("shop", std::slice::from_ref(&dotted)).await.unwrap();
-    assert_catalog(
-        &*shop,
-        false,
-        "SELECT 1 FROM dbd.uses WHERE owner = 'shop' AND kind = 'entity'",
-        "a use of crm's \"a.b\".\"c\"",
-    )
-    .await;
-
-    shop.execute_script(&record("a", "b.c")).await.unwrap();
     shop.record_uses("shop", std::slice::from_ref(&dotted)).await.unwrap();
     assert_catalog(
         &*shop,
         true,
         &used_by("shop", "entity", "relation:a.b.c", "view app.v"),
-        "a use of crm's \"a\".\"b.c\"",
+        "shop's dotted use",
     )
     .await;
 }
@@ -11480,8 +11465,8 @@ async fn a_bare_name_is_a_use_of_the_first_table_on_the_path() {
 
 /// A bare name means the first table on the path that exists, owned or not:
 /// with an unowned `billing.orders` ahead of `app.orders`, a view reading
-/// `orders` reads billing's and uses no one's. Looked up in the registry, it
-/// was recorded as a use of `app.orders` (#7).
+/// `orders` reads billing's — that is its use, not `app.orders`. Looked up in
+/// the registry, it was recorded as a use of `app.orders` (#7).
 #[tokio::test]
 async fn a_bare_name_reads_an_unowned_table_first_on_the_path() {
     let (_pg, url) = start_pg().await;
@@ -11510,8 +11495,15 @@ async fn a_bare_name_reads_an_unowned_table_first_on_the_path() {
     assert_catalog(
         &*billing,
         false,
-        "SELECT 1 FROM dbd.uses WHERE owner = 'billing' AND kind = 'entity'",
-        "a use, of a table billing's view does not read",
+        "SELECT 1 FROM dbd.uses WHERE owner = 'billing' AND target = 'relation:app.orders'",
+        "a use of app.orders, which billing's view does not read",
+    )
+    .await;
+    assert_catalog(
+        &*billing,
+        true,
+        &used_by("billing", "entity", "relation:billing.orders", "view billing.v"),
+        "billing's use of the billing.orders its view reads",
     )
     .await;
 }
@@ -12496,4 +12488,1212 @@ async fn a_prune_that_fails_part_way_says_nothing_was_pruned() {
         .to_string();
     assert!(err.contains("nothing was pruned"), "{err}");
     assert_table_exists(&*shop, "app", "aa_legacy").await;
+}
+
+// ── #7 Phase 2, slice 4: the uses guard ──────────────────────────────────────
+
+/// `shop`'s `app.orders` with a `total` column; `billing`, in its own schema,
+/// declares it external.
+fn orders_with_total(dir: &std::path::Path, columns: &str) -> Design {
+    named_project(
+        dir,
+        "shop",
+        "",
+        &[(
+            "ddl/table/app/orders.ddl",
+            &format!("set search_path to app;\ncreate table if not exists orders (id int primary key{columns});\n"),
+        )],
+    )
+}
+
+fn billing_reading(dir: &std::path::Path, files: &[(&str, &str)]) -> Design {
+    write_project(
+        dir,
+        "project:\n  name: billing\nsource:\n  dialect: postgresql\nschemas:\n  - billing\n\
+         external:\n  - name: app.orders\n  - name: app.old\n  - name: app.colour\n",
+        files,
+    )
+}
+
+/// A column another project's view reads is part of the contract between
+/// them: dropping it is refused before any write, dry run included, naming
+/// the view and its owner (#7).
+#[tokio::test]
+async fn a_column_another_projects_view_reads_is_not_dropped() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    orders_with_total(sd.path(), ", total int")
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    billing_reading(
+        bd.path(),
+        &[(
+            "ddl/view/billing/v_totals.ddl",
+            "create or replace view billing.v_totals as select total from app.orders;\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    let design = orders_with_total(sd.path(), "");
+    for dry_run in [true, false] {
+        let err = design
+            .reconcile(&*shop, dry_run, true, false, None, Progress::none())
+            .await
+            .expect_err("billing's view reads app.orders.total")
+            .to_string();
+        assert!(
+            err.contains("app.orders.total is used by \"billing\" (view billing.v_totals); remove that use first"),
+            "{err}"
+        );
+    }
+    assert_catalog(
+        &*shop,
+        true,
+        "SELECT 1 FROM information_schema.columns WHERE table_schema = 'app' AND table_name = 'orders' AND column_name = 'total'",
+        "app.orders.total",
+    )
+    .await;
+}
+
+/// A function body is invisible to Postgres's dependency tracking: dropping a
+/// column another project's function reads succeeded, and broke the function
+/// silently. The project's recorded use refuses it (#7).
+#[tokio::test]
+async fn a_column_another_projects_function_reads_is_not_dropped() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    orders_with_total(sd.path(), ", total int")
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    billing_reading(
+        bd.path(),
+        &[(
+            "ddl/function/billing/sum_totals.ddl",
+            "create or replace function billing.sum_totals() returns bigint language sql \
+             as $$ select sum(total) from app.orders $$;\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    let err = orders_with_total(sd.path(), "")
+        .reconcile(&*shop, false, true, false, None, Progress::none())
+        .await
+        .expect_err("billing's function reads app.orders")
+        .to_string();
+    assert!(
+        err.contains("\"billing\"") && err.contains("function billing.sum_totals"),
+        "{err}"
+    );
+    assert_catalog(
+        &*shop,
+        true,
+        "SELECT 1 FROM information_schema.columns WHERE table_schema = 'app' AND table_name = 'orders' AND column_name = 'total'",
+        "app.orders.total",
+    )
+    .await;
+}
+
+/// A prune drops `CASCADE`, which took another project's view over the
+/// pruned table with it. A table another project depends on is kept, named
+/// (#7).
+#[tokio::test]
+async fn a_table_another_projects_view_reads_is_not_pruned() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let old = (
+        "ddl/table/app/old.ddl",
+        "create table if not exists app.old (id int);\n",
+    );
+    named_project(sd.path(), "shop", "", &[ORDERS_OWNER_FILES[0], old])
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    billing_reading(
+        bd.path(),
+        &[(
+            "ddl/view/billing/v_old.ddl",
+            "create or replace view billing.v_old as select id from app.old;\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    std::fs::remove_file(sd.path().join(old.0)).unwrap();
+    let plan = Design::from_config_with_dir(&sd.path().join("design.yaml"), "dev", Some(sd.path()))
+        .unwrap()
+        .reconcile(&*shop, false, false, true, None, Progress::none())
+        .await
+        .expect("shop's prune");
+    assert_table_exists(&*shop, "app", "old").await;
+    assert_catalog(
+        &*shop,
+        true,
+        "SELECT 1 FROM pg_views WHERE schemaname = 'billing' AND viewname = 'v_old'",
+        "billing's view",
+    )
+    .await;
+    assert!(
+        plan.warnings
+            .iter()
+            .any(|w| w == "app.old is used by \"billing\" (view billing.v_old) — not pruned; remove that use first"),
+        "{:?}",
+        plan.warnings
+    );
+}
+
+/// A table another project inherits from is depended on too (#7).
+#[tokio::test]
+async fn a_table_another_project_inherits_from_is_not_pruned() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let old = (
+        "ddl/table/app/old.ddl",
+        "create table if not exists app.old (id int);\n",
+    );
+    named_project(sd.path(), "shop", "", &[ORDERS_OWNER_FILES[0], old])
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    // dbd declares no inheriting table, so billing's is made by hand — and is
+    // billing's in the registry.
+    billing_reading(
+        bd.path(),
+        &[(
+            "ddl/table/billing/ledger.ddl",
+            "create table if not exists billing.ledger (id int);\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+    billing
+        .execute_script(
+            "CREATE TABLE billing.child () INHERITS (app.old); \
+             INSERT INTO dbd.objects (namespace, schema, name, kind, owner) \
+             VALUES ('relation', 'billing', 'child', 'table', 'billing');",
+        )
+        .await
+        .unwrap();
+
+    std::fs::remove_file(sd.path().join(old.0)).unwrap();
+    Design::from_config_with_dir(&sd.path().join("design.yaml"), "dev", Some(sd.path()))
+        .unwrap()
+        .reconcile(&*shop, false, false, true, None, Progress::none())
+        .await
+        .expect("shop's prune");
+    assert_table_exists(&*shop, "app", "old").await;
+    assert_table_exists(&*shop, "billing", "child").await;
+}
+
+/// Removing an enum value rewrites every column of that type, wherever it is:
+/// a column of another project's table in a schema of its own failed the
+/// swap with Postgres's word for it. Refused, naming it (#7).
+#[tokio::test]
+async fn an_enum_value_a_column_in_another_schema_holds_is_refused() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let colour = |values: &str| {
+        (
+            "ddl/enum/app/colour.ddl",
+            format!("create type app.colour as enum ({values});\n"),
+        )
+    };
+    let (path, sql) = colour("'red', 'blue'");
+    named_project(sd.path(), "shop", "", &[(path, &sql)])
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    billing_reading(
+        bd.path(),
+        &[(
+            "ddl/table/billing/inv.ddl",
+            "create table if not exists billing.inv (id int primary key, c app.colour);\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    let (path, sql) = colour("'red'");
+    let err = named_project(sd.path(), "shop", "", &[(path, &sql)])
+        .reconcile(&*shop, true, true, false, None, Progress::none())
+        .await
+        .expect_err("billing's billing.inv.c holds app.colour")
+        .to_string();
+    assert!(
+        err.contains("app.colour is used by \"billing\"") && err.contains("billing.inv"),
+        "{err}"
+    );
+}
+
+/// A unique constraint another project's foreign key relies on is part of the
+/// contract too (#7).
+#[tokio::test]
+async fn a_constraint_another_projects_foreign_key_relies_on_is_not_dropped() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    orders_with_total(sd.path(), ", code text, constraint orders_code_key unique (code)")
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    billing_reading(
+        bd.path(),
+        &[(
+            "ddl/table/billing/refs.ddl",
+            "create table if not exists billing.refs (code text references app.orders (code));\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    let err = orders_with_total(sd.path(), ", code text")
+        .reconcile(&*shop, true, true, false, None, Progress::none())
+        .await
+        .expect_err("billing's foreign key relies on orders_code_key")
+        .to_string();
+    assert!(
+        err.contains("orders_code_key") && err.contains("\"billing\"") && err.contains("billing.refs"),
+        "{err}"
+    );
+}
+
+/// A released project's migration drops what its design dropped — `DROP TABLE
+/// … CASCADE`, which took another project's view over it. The run is refused
+/// before anything runs, dry run included, naming the use (#7).
+#[tokio::test]
+async fn a_migration_dropping_a_table_another_project_reads_is_refused() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let dir = sd.path();
+    let yaml = "project:\n  name: shop\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+    let old = "ddl/table/app/old.ddl";
+    cut_version(
+        dir,
+        yaml,
+        &[
+            ORDERS_OWNER_FILES[0],
+            (
+                old,
+                "set search_path to app;\ncreate table if not exists old (id integer primary key);\n",
+            ),
+        ],
+        &[],
+        "v1",
+    );
+    released(dir)
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    billing_reading(
+        bd.path(),
+        &[(
+            "ddl/view/billing/v_old.ddl",
+            "create or replace view billing.v_old as select id from app.old;\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    cut_version(dir, yaml, &[], &[old], "v2 drops old");
+    for dry_run in [true, false] {
+        let err = released(dir)
+            .apply(&*shop, None, dry_run, None, Progress::none())
+            .await
+            .expect_err("billing's view reads app.old")
+            .to_string();
+        assert!(
+            err.contains("app.old is used by \"billing\" (view billing.v_old); remove that use first"),
+            "{err}"
+        );
+    }
+    assert_table_exists(&*shop, "app", "old").await;
+    assert_eq!(shop.get_db_version().await.unwrap(), 1, "v2 did not run");
+}
+
+/// A migration dropping a column another project's function body reads
+/// broke that function silently: the catalog does not see into it. The
+/// project's recorded use refuses the run (#7).
+#[tokio::test]
+async fn a_migration_dropping_a_column_another_projects_function_reads_is_refused() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let dir = sd.path();
+    let yaml = "project:\n  name: shop\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+    let orders = |columns: &str| {
+        format!("set search_path to app;\ncreate table if not exists orders (id integer primary key{columns});\n")
+    };
+    let v1 = orders(", total integer");
+    cut_version(dir, yaml, &[("ddl/table/app/orders.ddl", &v1)], &[], "v1");
+    released(dir)
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    billing_reading(
+        bd.path(),
+        &[(
+            "ddl/function/billing/sum_totals.ddl",
+            "create or replace function billing.sum_totals() returns bigint language sql \
+             as $$ select sum(total) from app.orders $$;\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    let v2 = orders("");
+    cut_version(dir, yaml, &[("ddl/table/app/orders.ddl", &v2)], &[], "v2 drops total");
+    let err = released(dir)
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect_err("billing's function reads app.orders")
+        .to_string();
+    assert!(
+        err.contains("\"billing\"") && err.contains("function billing.sum_totals"),
+        "{err}"
+    );
+    assert_catalog(
+        &*shop,
+        true,
+        "SELECT 1 FROM information_schema.columns WHERE table_schema = 'app' AND table_name = 'orders' AND column_name = 'total'",
+        "app.orders.total",
+    )
+    .await;
+}
+
+/// `shop`'s released project at v1 with `app.orders` and, for the other
+/// fixtures, whatever `extra` adds.
+fn released_shop(dir: &std::path::Path, orders: &str, extra: &[(&str, &str)]) {
+    let yaml = "project:\n  name: shop\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+    let mut files: Vec<(&str, &str)> = vec![("ddl/table/app/orders.ddl", orders)];
+    files.extend_from_slice(extra);
+    cut_version(dir, yaml, &files, &[], "v1");
+}
+
+/// A migration's `DROP` inside a `DO` block is a drop all the same: it took
+/// another project's view and the run reported success (#7).
+#[tokio::test]
+async fn a_migration_dropping_inside_a_do_block_is_refused() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let dir = sd.path();
+    released_shop(
+        dir,
+        "set search_path to app;\ncreate table if not exists orders (id integer primary key, total integer);\n",
+        &[],
+    );
+    released(dir)
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    billing_reading(
+        bd.path(),
+        &[(
+            "ddl/view/billing/v_totals.ddl",
+            "create or replace view billing.v_totals as select total from app.orders;\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    // v2 adds a column, and its migration also drops `total`, by hand, in a DO block.
+    let yaml = "project:\n  name: shop\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+    cut_version(
+        dir,
+        yaml,
+        &[(
+            "ddl/table/app/orders.ddl",
+            "set search_path to app;\ncreate table if not exists orders (id integer primary key, total integer, note text);\n",
+        )],
+        &[],
+        "v2",
+    );
+    let sql_path = dir.join("migrations/002/app/orders.sql");
+    let generated = std::fs::read_to_string(&sql_path).unwrap();
+    std::fs::write(
+        &sql_path,
+        format!("{generated}\nDO $$ BEGIN ALTER TABLE app.orders DROP COLUMN total CASCADE; END $$;\n"),
+    )
+    .unwrap();
+    let err = released(dir)
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect_err("billing's view reads app.orders.total")
+        .to_string();
+    assert!(
+        err.contains("app.orders.total is used by \"billing\" (view billing.v_totals)"),
+        "{err}"
+    );
+    assert_catalog(
+        &*shop,
+        true,
+        "SELECT 1 FROM pg_views WHERE schemaname = 'billing' AND viewname = 'v_totals'",
+        "billing's view",
+    )
+    .await;
+}
+
+/// `DROP SCHEMA … CASCADE` drops everything in it — another project's table
+/// in that schema too (#7).
+#[tokio::test]
+async fn a_migration_dropping_a_schema_another_project_has_tables_in_is_refused() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let dir = sd.path();
+    let orders = "set search_path to app;\ncreate table if not exists orders (id integer primary key);\n";
+    released_shop(dir, orders, &[]);
+    released(dir)
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    named_project(bd.path(), "billing", "", &ORDERS_OWNER_FILES[1..])
+        .apply(&*billing, None, false, None, Progress::none())
+        .await
+        .expect("billing's apply");
+
+    let yaml = "project:\n  name: shop\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+    cut_version(
+        dir,
+        yaml,
+        &[(
+            "ddl/table/app/orders.ddl",
+            "set search_path to app;\ncreate table if not exists orders (id integer primary key, note text);\n",
+        )],
+        &[],
+        "v2",
+    );
+    let sql_path = dir.join("migrations/002/app/orders.sql");
+    let generated = std::fs::read_to_string(&sql_path).unwrap();
+    std::fs::write(&sql_path, format!("{generated}\nDROP SCHEMA app CASCADE;\n")).unwrap();
+    let err = released(dir)
+        .apply(&*shop, None, true, None, Progress::none())
+        .await
+        .expect_err("billing's app.invoices is in app")
+        .to_string();
+    assert!(err.contains("\"billing\"") && err.contains("app.invoices"), "{err}");
+}
+
+/// A part's dependents are its own: dropping a `NOT NULL` column another
+/// project's view does not read was refused, as if the view read it (#7).
+#[tokio::test]
+async fn a_column_no_other_project_reads_is_dropped() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    orders_with_total(sd.path(), ", total int, note text not null default 'x'")
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    billing_reading(
+        bd.path(),
+        &[(
+            "ddl/view/billing/v_totals.ddl",
+            "create or replace view billing.v_totals as select id, total from app.orders;\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    let plan = orders_with_total(sd.path(), ", total int")
+        .reconcile(&*shop, false, true, false, None, Progress::none())
+        .await
+        .expect("billing's view does not read app.orders.note");
+    assert_eq!(
+        plan.destructive_changes,
+        vec!["app.orders: drops column note".to_string()]
+    );
+}
+
+/// Removing an enum value rewrites the columns of that type, not the tables
+/// they are in: another project's view over this project's table, reading no
+/// such column, does not depend on the swap (#7).
+#[tokio::test]
+async fn an_enum_value_no_other_projects_column_holds_is_removed() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let files = |values: &str| -> Vec<(String, String)> {
+        vec![
+            (
+                "ddl/enum/app/colour.ddl".to_string(),
+                format!("create type app.colour as enum ({values});\n"),
+            ),
+            (
+                "ddl/table/app/cars.ddl".to_string(),
+                "create table if not exists app.cars (id int primary key, c app.colour);\n".to_string(),
+            ),
+        ]
+    };
+    let v1 = files("'red', 'blue'");
+    let v1: Vec<(&str, &str)> = v1.iter().map(|(p, s)| (p.as_str(), s.as_str())).collect();
+    named_project(sd.path(), "shop", "", &v1)
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    write_project(
+        bd.path(),
+        "project:\n  name: billing\nsource:\n  dialect: postgresql\nschemas:\n  - billing\n\
+         external:\n  - name: app.cars\n",
+        &[(
+            "ddl/view/billing/v_cars.ddl",
+            "create or replace view billing.v_cars as select id from app.cars;\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    let v2 = files("'red'");
+    let v2: Vec<(&str, &str)> = v2.iter().map(|(p, s)| (p.as_str(), s.as_str())).collect();
+    named_project(sd.path(), "shop", "", &v2)
+        .reconcile(&*shop, false, true, false, None, Progress::none())
+        .await
+        .expect("billing's view reads no column of app.colour");
+}
+
+/// Dropping a foreign key touches nothing of the table it references: a
+/// migration dropping one that points at another project's table was refused
+/// (#7).
+#[tokio::test]
+async fn a_migration_dropping_a_foreign_key_to_another_projects_table_runs() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    write_project(
+        bd.path(),
+        "project:\n  name: billing\nsource:\n  dialect: postgresql\nschemas:\n  - billing\n",
+        &[
+            (
+                "ddl/table/billing/users.ddl",
+                "create table if not exists billing.users (id int primary key);\n",
+            ),
+            (
+                "ddl/view/billing/v_ids.ddl",
+                "create or replace view billing.v_ids as select id from billing.users;\n",
+            ),
+        ],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+    let dir = sd.path();
+    let yaml = "project:\n  name: shop\nsource:\n  dialect: postgresql\nschemas:\n  - app\n\
+                external:\n  - name: billing.users\n";
+    cut_version(
+        dir,
+        yaml,
+        &[(
+            "ddl/table/app/orders.ddl",
+            "create table if not exists app.orders (id integer primary key, \
+             user_id int constraint orders_user_fk references billing.users (id));\n",
+        )],
+        &[],
+        "v1",
+    );
+    released(dir)
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    cut_version(
+        dir,
+        yaml,
+        &[(
+            "ddl/table/app/orders.ddl",
+            "create table if not exists app.orders (id integer primary key, user_id int);\n",
+        )],
+        &[],
+        "v2 drops the foreign key",
+    );
+    // As dbd writes a foreign key's drop.
+    let sql_path = dir.join("migrations/002/app/orders.sql");
+    let generated = std::fs::read_to_string(&sql_path).unwrap_or_default();
+    std::fs::write(
+        &sql_path,
+        format!("{generated}\nALTER TABLE app.orders DROP CONSTRAINT IF EXISTS orders_user_fk;\n"),
+    )
+    .unwrap();
+    released(dir)
+        .apply(&*shop, None, true, None, Progress::none())
+        .await
+        .expect("dropping shop's own foreign key holds nobody up");
+}
+
+/// Dropping a parent's column drops it from every table inheriting from it —
+/// through inheritance, not the dependency graph: another project's child
+/// lost its column and its data silently (#7).
+#[tokio::test]
+async fn a_column_another_projects_child_inherits_is_not_dropped() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    orders_with_total(sd.path(), ", total int")
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    billing_reading(
+        bd.path(),
+        &[(
+            "ddl/table/billing/ledger.ddl",
+            "create table if not exists billing.ledger (id int);\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+    billing
+        .execute_script(
+            "CREATE TABLE billing.child (own int) INHERITS (app.orders); \
+             INSERT INTO dbd.objects (namespace, schema, name, kind, owner) \
+             VALUES ('relation', 'billing', 'child', 'table', 'billing');",
+        )
+        .await
+        .unwrap();
+
+    let err = orders_with_total(sd.path(), "")
+        .reconcile(&*shop, true, true, false, None, Progress::none())
+        .await
+        .expect_err("billing.child inherits app.orders.total")
+        .to_string();
+    assert!(
+        err.contains("app.orders.total is used by \"billing\" (table billing.child)"),
+        "{err}"
+    );
+}
+
+/// A use is recorded whatever owns its target when it is recorded: `billing`'s
+/// function read `app.orders` before `shop` had claimed it, recorded no use,
+/// and `shop` then dropped the column it reads (#7).
+#[tokio::test]
+async fn a_use_recorded_before_its_target_was_claimed_still_guards_it() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    shop.execute_script("CREATE SCHEMA app; CREATE TABLE app.orders (id int primary key, total int);")
+        .await
+        .unwrap();
+    billing_reading(
+        bd.path(),
+        &[(
+            "ddl/function/billing/sum_totals.ddl",
+            "create or replace function billing.sum_totals() returns bigint language sql \
+             as $$ select sum(total) from app.orders $$;\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+    orders_with_total(sd.path(), ", total int")
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's first apply claims app.orders");
+
+    let err = orders_with_total(sd.path(), "")
+        .reconcile(&*shop, true, true, false, None, Progress::none())
+        .await
+        .expect_err("billing's function reads app.orders")
+        .to_string();
+    assert!(err.contains("function billing.sum_totals"), "{err}");
+}
+
+/// A routine a table's file creates — its trigger function — is a routine
+/// all the same: what its body reads is its use (#7).
+#[tokio::test]
+async fn a_routine_in_a_table_file_records_its_uses() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    orders_with_total(sd.path(), ", total int")
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    billing_reading(
+        bd.path(),
+        &[(
+            "ddl/table/billing/ledger.ddl",
+            "create table if not exists billing.ledger (id int);\n\
+             create or replace function billing.ledger_total() returns bigint language sql \
+             as $$ select sum(total) from app.orders $$;\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    let err = orders_with_total(sd.path(), "")
+        .reconcile(&*shop, true, true, false, None, Progress::none())
+        .await
+        .expect_err("billing's function reads app.orders")
+        .to_string();
+    assert!(err.contains("function billing.ledger_total"), "{err}");
+}
+
+/// An array of a type depends on it too: removing an enum value rewrites an
+/// `app.colour[]` column of another project's table (#7).
+#[tokio::test]
+async fn an_enum_value_another_projects_array_column_holds_is_refused() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let colour = |values: &str| {
+        (
+            "ddl/enum/app/colour.ddl",
+            format!("create type app.colour as enum ({values});\n"),
+        )
+    };
+    let (path, sql) = colour("'red', 'blue'");
+    named_project(sd.path(), "shop", "", &[(path, &sql)])
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    billing_reading(
+        bd.path(),
+        &[(
+            "ddl/table/billing/ledger.ddl",
+            "create table if not exists billing.ledger (id int);\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+    // Made by hand, so the catalog alone knows of it.
+    billing
+        .execute_script(
+            "CREATE TABLE billing.paint (id int, cs app.colour[]); \
+             INSERT INTO dbd.objects (namespace, schema, name, kind, owner) \
+             VALUES ('relation', 'billing', 'paint', 'table', 'billing');",
+        )
+        .await
+        .unwrap();
+
+    let (path, sql) = colour("'red'");
+    let err = named_project(sd.path(), "shop", "", &[(path, &sql)])
+        .reconcile(&*shop, true, true, false, None, Progress::none())
+        .await
+        .expect_err("billing.paint.cs holds app.colour[]")
+        .to_string();
+    assert!(
+        err.contains("app.colour is used by \"billing\" (table billing.paint)"),
+        "{err}"
+    );
+}
+
+/// A migration dbd cannot read is one it cannot clear where another project
+/// shares the database: the guard read nothing in it and let it through, dry
+/// run included (#7).
+#[tokio::test]
+async fn a_migration_dbd_cannot_read_is_refused() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    named_project(bd.path(), "billing", "", &ORDERS_OWNER_FILES[1..])
+        .apply(&*billing, None, false, None, Progress::none())
+        .await
+        .expect("billing's apply");
+    let dir = sd.path();
+    released_shop(
+        dir,
+        "set search_path to app;\ncreate table if not exists orders (id integer primary key);\n",
+        &[],
+    );
+    released(dir)
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    let yaml = "project:\n  name: shop\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+    cut_version(
+        dir,
+        yaml,
+        &[(
+            "ddl/table/app/orders.ddl",
+            "set search_path to app;\ncreate table if not exists orders (id integer primary key, note text);\n",
+        )],
+        &[],
+        "v2",
+    );
+    let sql_path = dir.join("migrations/002/app/orders.sql");
+    let generated = std::fs::read_to_string(&sql_path).unwrap();
+    std::fs::write(&sql_path, format!("{generated}\nDROP TABLE app.orders ((((;\n")).unwrap();
+    let err = released(dir)
+        .apply(&*shop, None, true, None, Progress::none())
+        .await
+        .expect_err("dbd cannot read what the migration drops")
+        .to_string();
+    assert!(err.contains("orders.sql"), "{err}");
+}
+
+/// A generated column is computed from another: dropping that one `CASCADE`
+/// drops the generated column and what reads it — another project's view
+/// over it went, unguarded (#7).
+#[tokio::test]
+async fn a_migration_cascading_through_a_generated_column_is_refused() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let dir = sd.path();
+    let g = |extra: &str| {
+        format!(
+            "set search_path to app;\ncreate table if not exists orders (id integer primary key, \
+             x integer, doubled integer generated always as (x * 2) stored{extra});\n"
+        )
+    };
+    released_shop(dir, &g(""), &[]);
+    released(dir)
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    billing_reading(
+        bd.path(),
+        &[(
+            "ddl/view/billing/v_doubled.ddl",
+            "create or replace view billing.v_doubled as select doubled from app.orders;\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    let yaml = "project:\n  name: shop\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+    let v2 = g(", note text");
+    cut_version(dir, yaml, &[("ddl/table/app/orders.ddl", &v2)], &[], "v2");
+    let sql_path = dir.join("migrations/002/app/orders.sql");
+    let generated = std::fs::read_to_string(&sql_path).unwrap();
+    std::fs::write(
+        &sql_path,
+        format!("{generated}\nALTER TABLE app.orders DROP COLUMN x CASCADE;\n"),
+    )
+    .unwrap();
+    let err = released(dir)
+        .apply(&*shop, None, true, None, Progress::none())
+        .await
+        .expect_err("billing's view reads the column x generates")
+        .to_string();
+    assert!(err.contains("\"billing\" (view billing.v_doubled)"), "{err}");
+}
+
+/// An extension's members — its types, its functions — are what another
+/// project's columns and views use: `DROP EXTENSION … CASCADE` dropped them,
+/// unguarded (#7).
+#[tokio::test]
+async fn a_migration_dropping_an_extension_another_project_uses_is_refused() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let dir = sd.path();
+    shop.execute_script("CREATE EXTENSION IF NOT EXISTS citext;")
+        .await
+        .unwrap();
+    let orders = "set search_path to app;\ncreate table if not exists orders (id integer primary key);\n";
+    released_shop(dir, orders, &[]);
+    released(dir)
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    billing_reading(
+        bd.path(),
+        &[(
+            "ddl/table/billing/contacts.ddl",
+            "create table if not exists billing.contacts (id int primary key, email citext);\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    let yaml = "project:\n  name: shop\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+    cut_version(
+        dir,
+        yaml,
+        &[(
+            "ddl/table/app/orders.ddl",
+            "set search_path to app;\ncreate table if not exists orders (id integer primary key, note text);\n",
+        )],
+        &[],
+        "v2",
+    );
+    let sql_path = dir.join("migrations/002/app/orders.sql");
+    let generated = std::fs::read_to_string(&sql_path).unwrap();
+    std::fs::write(&sql_path, format!("{generated}\nDROP EXTENSION citext CASCADE;\n")).unwrap();
+    let err = released(dir)
+        .apply(&*shop, None, true, None, Progress::none())
+        .await
+        .expect_err("billing's table uses citext")
+        .to_string();
+    assert!(err.contains("\"billing\" (table billing.contacts)"), "{err}");
+}
+
+/// `TRUNCATE … CASCADE` empties the tables whose foreign keys point at the
+/// truncated one — and nothing else: another project's view reading it is no
+/// reason to refuse a data script's reload, its table referencing it is (#7).
+#[tokio::test]
+async fn a_truncate_cascade_is_refused_only_for_another_projects_referencing_table() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let dir = sd.path();
+    let orders = "set search_path to app;\ncreate table if not exists orders (id integer primary key);\n";
+    released_shop(dir, orders, &[]);
+    released(dir)
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    billing_reading(
+        bd.path(),
+        &[(
+            "ddl/view/billing/v_orders.ddl",
+            "create or replace view billing.v_orders as select id from app.orders;\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    let yaml = "project:\n  name: shop\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+    cut_version(
+        dir,
+        yaml,
+        &[(
+            "ddl/table/app/orders.ddl",
+            "set search_path to app;\ncreate table if not exists orders (id integer primary key, note text);\n",
+        )],
+        &[],
+        "v2",
+    );
+    let sql_path = dir.join("migrations/002/app/orders.sql");
+    let generated = std::fs::read_to_string(&sql_path).unwrap();
+    std::fs::write(&sql_path, format!("{generated}\nTRUNCATE app.orders CASCADE;\n")).unwrap();
+    released(dir)
+        .apply(&*shop, None, true, None, Progress::none())
+        .await
+        .expect("a view reading app.orders is not emptied by its TRUNCATE");
+
+    billing
+        .execute_script(
+            "CREATE TABLE billing.refs (order_id int REFERENCES app.orders (id)); \
+             INSERT INTO dbd.objects (namespace, schema, name, kind, owner) \
+             VALUES ('relation', 'billing', 'refs', 'table', 'billing');",
+        )
+        .await
+        .unwrap();
+    let err = released(dir)
+        .apply(&*shop, None, true, None, Progress::none())
+        .await
+        .expect_err("billing.refs references app.orders")
+        .to_string();
+    assert!(err.contains("\"billing\" (table billing.refs)"), "{err}");
+}
+
+/// A `TRUNCATE … CASCADE` of another project's table empties that table
+/// first of all (#7).
+#[tokio::test]
+async fn a_migration_truncating_another_projects_table_is_refused() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let dir = sd.path();
+    let orders = "set search_path to app;\ncreate table if not exists orders (id integer primary key);\n";
+    released_shop(dir, orders, &[]);
+    released(dir)
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    billing_reading(
+        bd.path(),
+        &[(
+            "ddl/table/billing/ledger.ddl",
+            "create table if not exists billing.ledger (id int);\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    let yaml = "project:\n  name: shop\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+    cut_version(
+        dir,
+        yaml,
+        &[(
+            "ddl/table/app/orders.ddl",
+            "set search_path to app;\ncreate table if not exists orders (id integer primary key, note text);\n",
+        )],
+        &[],
+        "v2",
+    );
+    let sql_path = dir.join("migrations/002/app/orders.sql");
+    let generated = std::fs::read_to_string(&sql_path).unwrap();
+    std::fs::write(&sql_path, format!("{generated}\nTRUNCATE billing.ledger CASCADE;\n")).unwrap();
+    let err = released(dir)
+        .apply(&*shop, None, true, None, Progress::none())
+        .await
+        .expect_err("billing.ledger is billing's")
+        .to_string();
+    assert!(err.contains("billing.ledger"), "{err}");
+}
+
+/// A `TRUNCATE` without `ONLY` empties every partition and inheriting table
+/// too, and cascades to the tables referencing those (#7).
+#[tokio::test]
+async fn a_truncate_cascade_reaches_what_references_a_partition_or_a_child() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let dir = sd.path();
+    let orders = "set search_path to app;\ncreate table if not exists orders (id integer primary key);\n";
+    released_shop(dir, orders, &[]);
+    released(dir)
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    billing_reading(
+        bd.path(),
+        &[(
+            "ddl/table/billing/ledger.ddl",
+            "create table if not exists billing.ledger (id int);\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+    shop.execute_script(
+        "CREATE TABLE app.events (id int, at date, PRIMARY KEY (id, at)) PARTITION BY RANGE (at); \
+         CREATE TABLE app.events_2024 PARTITION OF app.events FOR VALUES FROM ('2024-01-01') TO ('2025-01-01'); \
+         CREATE TABLE app.base (id int PRIMARY KEY); \
+         CREATE TABLE app.kid (PRIMARY KEY (id)) INHERITS (app.base);",
+    )
+    .await
+    .unwrap();
+    billing
+        .execute_script(
+            "CREATE TABLE billing.event_refs (id int, at date, FOREIGN KEY (id, at) REFERENCES app.events_2024 (id, at)); \
+             CREATE TABLE billing.kid_refs (id int REFERENCES app.kid (id)); \
+             INSERT INTO dbd.objects (namespace, schema, name, kind, owner) VALUES \
+             ('relation', 'billing', 'event_refs', 'table', 'billing'), \
+             ('relation', 'billing', 'kid_refs', 'table', 'billing');",
+        )
+        .await
+        .unwrap();
+
+    let yaml = "project:\n  name: shop\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+    cut_version(
+        dir,
+        yaml,
+        &[(
+            "ddl/table/app/orders.ddl",
+            "set search_path to app;\ncreate table if not exists orders (id integer primary key, note text);\n",
+        )],
+        &[],
+        "v2",
+    );
+    let sql_path = dir.join("migrations/002/app/orders.sql");
+    let generated = std::fs::read_to_string(&sql_path).unwrap();
+    std::fs::write(
+        &sql_path,
+        format!("{generated}\nTRUNCATE app.events CASCADE;\nTRUNCATE app.base CASCADE;\n"),
+    )
+    .unwrap();
+    let err = released(dir)
+        .apply(&*shop, None, true, None, Progress::none())
+        .await
+        .expect_err("billing's tables reference app.events_2024 and app.kid")
+        .to_string();
+    assert!(
+        err.contains("billing.event_refs") && err.contains("billing.kid_refs"),
+        "{err}"
+    );
+}
+
+/// A Postgres project read verbatim still runs Postgres migrations: their
+/// drops are guarded as any Postgres project's are (#7).
+#[tokio::test]
+async fn a_verbatim_postgres_projects_migration_drops_are_guarded() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let dir = sd.path();
+    let yaml = |version: u32| {
+        format!(
+            "project:\n  name: shop\n  version: {version}\nsource:\n  dialect: postgresql\n  parser: verbatim\n\
+             schemas:\n  - app\n"
+        )
+    };
+    let write = |rel: &str, body: &str| {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    };
+    write(
+        "ddl/table/app/orders.ddl",
+        "create table if not exists app.orders (id integer primary key);\n",
+    );
+    write("design.yaml", &yaml(1));
+    released(dir)
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    billing_reading(
+        bd.path(),
+        &[(
+            "ddl/view/billing/v_orders.ddl",
+            "create or replace view billing.v_orders as select id from app.orders;\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    write(
+        "migrations/002/graph.json",
+        r#"{"fromVersion":1,"toVersion":2,"added":[],"altered":["app.orders"],"dropped":[]}"#,
+    );
+    write("migrations/002/app/orders.sql", "DROP TABLE app.orders CASCADE;\n");
+    write("design.yaml", &yaml(2));
+    let err = released(dir)
+        .apply(&*shop, None, true, None, Progress::none())
+        .await
+        .expect_err("billing's view reads app.orders")
+        .to_string();
+    assert!(err.contains("billing.v_orders"), "{err}");
 }

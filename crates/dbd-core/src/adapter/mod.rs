@@ -84,6 +84,38 @@ pub struct OwnedObject {
     pub kind: String,
 }
 
+/// Something a run is about to drop or rewrite, for the uses guard (#7): an
+/// entity, whole or one part of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Guarded {
+    /// The entity, keyed as the registry keys it.
+    pub object: OwnedObject,
+    pub part: GuardedPart,
+}
+
+/// What of a [`Guarded`] entity goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuardedPart {
+    /// The whole entity: a drop, or an enum's type swap.
+    Whole,
+    Column(String),
+    Constraint(String),
+    Index(String),
+    /// A `TRUNCATE … CASCADE`: it empties the tables whose foreign keys point
+    /// at the entity, and drops nothing.
+    Truncate,
+}
+
+/// Another owner's dependence on a [`Guarded`] entity (#7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dependence {
+    /// Which of the guarded entities, by its place in the list asked about.
+    pub guarded: usize,
+    pub owner: String,
+    /// The owner's entity that depends on it — `view billing.v_orders`.
+    pub via: String,
+}
+
 /// What the ownership registry says of a run's live entities (#7), for a
 /// prune to decide by.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -109,9 +141,9 @@ pub struct Use {
     pub kind: String,
     /// The schema, extension or role's name; for an `entity`,
     /// `namespace:schema.name` — `relation:app.orders` — with the name split
-    /// at its first dot as dbd splits one. An entity use is recorded only
-    /// where another owner holds the target, and not at all when nobody else
-    /// does.
+    /// at its first dot as dbd splits one. An entity use is recorded whoever
+    /// owns its target, or nobody yet: the uses guard asks the registry when
+    /// it runs.
     pub target: String,
     /// For an `entity`, the owner's own entity that makes the reference —
     /// `view billing.v_invoices`; empty otherwise.
@@ -481,11 +513,10 @@ pub trait DatabaseAdapter: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Record `uses` as everything `owner` uses, replacing what it used before.
-    /// An `entity` use is recorded only where another owner holds the target,
-    /// in that owner's namespace (#7). Like a claim, in the open batch
-    /// transaction when there is one. Adapters without a registry record
-    /// nothing.
+    /// Record `uses` as everything `owner` uses, replacing what it used before
+    /// (#7) — an `entity` use whoever owns its target, or nobody yet. Like a
+    /// claim, in the open batch transaction when there is one. Adapters
+    /// without a registry record nothing.
     async fn record_uses(&self, owner: &str, uses: &[Use]) -> Result<()> {
         let _ = (owner, uses);
         Ok(())
@@ -509,6 +540,16 @@ pub trait DatabaseAdapter: Send + Sync {
     async fn release_objects(&self, owner: &str, declared: &[OwnedObject]) -> Result<()> {
         let _ = (owner, declared);
         Ok(())
+    }
+
+    /// Other owners' dependences on `guarded` — what a drop's `CASCADE`, or a
+    /// part's removal, would reach that another owner holds, and the uses
+    /// other owners recorded of them; for a part, only uses whose body the
+    /// database cannot track (a routine's). Reads only. Adapters without a
+    /// registry find none.
+    async fn dependents(&self, owner: &str, guarded: &[Guarded]) -> Result<Vec<Dependence>> {
+        let _ = (owner, guarded);
+        Ok(Vec::new())
     }
     async fn get_db_version(&self) -> Result<u32>;
     async fn apply_migration(&self, version: u32, sql: &str, description: &str, checksum: &str) -> Result<()>;

@@ -82,6 +82,19 @@ pub(crate) fn created_identities(sql: &str) -> Vec<(Created, Option<String>, Str
         return Vec::new();
     };
     let mut created = created_by(&parsed, sql);
+    for query in do_block_statements(&parsed, sql) {
+        if let Ok(inner) = pg_query::parse(&query) {
+            created.extend(created_by(&inner, &query));
+        }
+    }
+    created
+}
+
+/// The statements the top-level `DO` blocks of `parsed` — `sql`'s parse —
+/// run, as SQL text, in order: what they create, drop or alter is the
+/// script's as much as what it says outright.
+pub(crate) fn do_block_statements(parsed: &pg_query::ParseResult, sql: &str) -> Vec<String> {
+    let mut queries = Vec::new();
     for raw in &parsed.protobuf.stmts {
         if !matches!(
             raw.stmt.as_ref().and_then(|s| s.node.as_ref()),
@@ -95,18 +108,11 @@ pub(crate) fn created_identities(sql: &str) -> Vec<(Created, Option<String>, Str
         } else {
             (start + raw.stmt_len as usize).min(sql.len())
         };
-        let Some(Ok(tree)) = sql.get(start..end).map(pg_query::parse_plpgsql) else {
-            continue;
-        };
-        let mut queries = Vec::new();
-        common::collect_plpgsql_queries(&tree, &mut queries);
-        for query in queries {
-            if let Ok(inner) = pg_query::parse(&query) {
-                created.extend(created_by(&inner, &query));
-            }
+        if let Some(Ok(tree)) = sql.get(start..end).map(pg_query::parse_plpgsql) {
+            common::collect_plpgsql_queries(&tree, &mut queries);
         }
     }
-    created
+    queries
 }
 
 /// [`created_identities`] for one parsed script, its `DO` blocks unread.

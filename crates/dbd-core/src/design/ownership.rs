@@ -146,12 +146,13 @@ impl Design {
     /// Everything the design uses without owning it (#7): the schemas its
     /// entities live in and the ones it declares, its extensions and roles —
     /// shared with any other owner — and each reference any of its entities
-    /// makes to an entity it does not declare, which the registry records only
-    /// where another owner holds the target. A call is of a routine, anything
-    /// else of a relation. `via` names the referring entity; overloads in
-    /// several files each record their own references. A name written bare
-    /// that dbd could not find carries the search path Postgres looks it up
-    /// along.
+    /// makes to an entity it does not declare — recorded whoever owns the
+    /// target, the uses guard asking the registry when it runs. A call is of a
+    /// routine, anything else of a relation. `via` names the referring entity;
+    /// overloads in several files each record their own references, and a
+    /// routine another entity's file creates records its body's. A name
+    /// written bare that dbd could not find carries the search path Postgres
+    /// looks it up along.
     pub(crate) fn declared_uses(&self) -> Vec<Use> {
         let keyed = self.entity_keys();
         let owned: std::collections::HashSet<String> = keyed
@@ -184,17 +185,10 @@ impl Design {
                 _ => {}
             }
         }
-        for (e, keys) in &keyed {
-            let Some(via) = keys.first() else {
-                continue;
-            };
-            // As the resolver walks it: the named schemas, then `public`, which
-            // dbd keeps on every path it applies.
-            let mut search_path: Vec<String> = e.schema_path.schemas().map(str::to_string).collect();
-            if !search_path.iter().any(|s| s == crate::reconcile::DEFAULT_SCHEMA) {
-                search_path.push(crate::reconcile::DEFAULT_SCHEMA.to_string());
-            }
-            for r in e.refs.iter().filter(|r| {
+        // Each reference `refs` makes, through `via`: a guessed schema that
+        // resolved to nothing carries the path it is looked up along.
+        let mut add = |via: &OwnedObject, refs: &[crate::entity::Ref], search_path: &[String]| {
+            for r in refs.iter().filter(|r| {
                 matches!(
                     r.kind,
                     RefKind::Reads | RefKind::Writes | RefKind::Calls | RefKind::Uses
@@ -214,12 +208,45 @@ impl Design {
                         kind: "entity".to_string(),
                         target,
                         via: format!("{} {}.{}", via.kind, via.schema, via.name),
-                        search_path: if r.unresolved && r.schema_source.is_guess() {
-                            search_path.clone()
+                        search_path: if r.schema_source.is_guess() {
+                            search_path.to_vec()
                         } else {
                             Vec::new()
                         },
                     });
+                }
+            }
+        };
+        for (e, keys) in &keyed {
+            let Some(via) = keys.first() else {
+                continue;
+            };
+            // As the resolver walks it: the named schemas, then `public`, which
+            // dbd keeps on every path it applies.
+            let mut search_path: Vec<String> = e.schema_path.schemas().map(str::to_string).collect();
+            if !search_path.iter().any(|s| s == crate::reconcile::DEFAULT_SCHEMA) {
+                search_path.push(crate::reconcile::DEFAULT_SCHEMA.to_string());
+            }
+            // A reference dbd resolved is `Resolved`, no guess; one it could
+            // not still carries the path.
+            add(via, &e.refs, &search_path);
+            // A routine its file creates beside the entity it is for — a
+            // table's trigger function — uses what its own body refers to.
+            if matches!(e.entity_type, EntityType::Function | EntityType::Procedure)
+                || !keys.iter().any(|k| k.namespace == "routine")
+            {
+                continue;
+            }
+            let Some(sql) = e
+                .file
+                .as_ref()
+                .and_then(|file| crate::source_text::read_to_string(&self.project_dir.join(file)).ok())
+            else {
+                continue;
+            };
+            for (_, name, refs) in crate::parser::pg::procs::routine_body_refs(&sql, &e.schema_path) {
+                if let Some(routine) = keys.iter().find(|k| k.namespace == "routine" && k.name == name) {
+                    add(routine, &refs, &search_path);
                 }
             }
         }
@@ -381,46 +408,217 @@ impl Design {
         }
     }
 
-    /// Refuse, before any write and under a dry run, removing an enum value
-    /// when a column of that type is in another owner's table: the swap
-    /// rewrites every such column, and this run has no say over that table —
-    /// left to it, the swap failed on every run with Postgres's word for it
-    /// (#7). `others` is the live snapshot of those tables.
-    pub(crate) fn refuse_enum_swaps_another_owner_holds(
+    /// The uses guard (#7): what another owner depends on is part of the
+    /// contract between them. A prune candidate another owner depends on is
+    /// kept, named — dropped `CASCADE`, it took that owner's dependents with
+    /// it. A part the plan drops — a column, a constraint, an index, an enum's
+    /// value (its whole type is swapped) — that another owner depends on is
+    /// refused, before any write and under a dry run, naming each use. A
+    /// part's dependents are the catalog's, column by column, and the uses
+    /// recorded through routine bodies, which the catalog does not track.
+    pub(crate) async fn guard_uses(
         &self,
-        plan: &crate::reconcile::ReconcilePlan,
-        others: &crate::snapshot::Snapshot,
-        owned: &LiveOwnership,
+        adapter: &dyn DatabaseAdapter,
+        plan: &mut crate::reconcile::ReconcilePlan,
     ) -> Result<()> {
-        let mut held = Vec::new();
-        for swap in &plan.enum_swaps {
-            let columns: Vec<String> = crate::reconcile::enum_columns(others, &swap.enum_name)
-                .into_iter()
-                .map(|c| {
-                    let key = match crate::entity::split_qualified_name(&c.table) {
-                        (Some(schema), name) => (schema, name),
-                        (None, name) => (crate::reconcile::DEFAULT_SCHEMA.to_string(), name),
-                    };
-                    let owner = owned.others.get(&key).map(String::as_str).unwrap_or("another owner");
-                    format!("{}.{} (\"{owner}\")", c.table, c.column)
-                })
-                .collect();
-            if columns.is_empty() {
-                continue;
+        use crate::adapter::{Guarded, GuardedPart};
+        use crate::reconcile::DroppedKind;
+        let key = |entity: &str| {
+            let (schema, name) = crate::entity::split_qualified_name(entity);
+            OwnedObject {
+                namespace: "relation".to_string(),
+                schema: schema.unwrap_or_else(|| crate::reconcile::DEFAULT_SCHEMA.to_string()),
+                name,
+                kind: String::new(),
             }
-            let values: Vec<String> = swap.removed.iter().map(|v| crate::sql_quote::literal(v)).collect();
-            held.push(format!(
-                "removing {} from {} rewrites every column of that type, and {} {} in another owner's table",
-                values.join(", "),
-                swap.enum_name,
-                columns.join(", "),
-                if columns.len() == 1 { "is" } else { "are" },
-            ));
+        };
+        let prunes = plan.dropped.len();
+        let mut guarded: Vec<(Guarded, String)> = plan
+            .dropped
+            .iter()
+            .map(|stmt| {
+                (
+                    Guarded {
+                        object: key(&stmt.entity_name),
+                        part: GuardedPart::Whole,
+                    },
+                    stmt.entity_name.clone(),
+                )
+            })
+            .collect();
+        for part in &plan.dropped_parts {
+            let (part_kind, label) = match part.kind {
+                DroppedKind::Column => (
+                    GuardedPart::Column(part.name.clone()),
+                    format!("{}.{}", part.entity, part.name),
+                ),
+                DroppedKind::Constraint if !part.name.is_empty() => (
+                    GuardedPart::Constraint(part.name.clone()),
+                    format!("{} constraint {}", part.entity, part.name),
+                ),
+                DroppedKind::Index => (
+                    GuardedPart::Index(part.name.clone()),
+                    format!("{} index {}", part.entity, part.name),
+                ),
+                DroppedKind::EnumValue => (GuardedPart::Whole, part.entity.clone()),
+                // A foreign key of this project's own table holds nobody up.
+                DroppedKind::Constraint | DroppedKind::ForeignKey => continue,
+            };
+            let g = Guarded {
+                object: key(&part.entity),
+                part: part_kind,
+            };
+            if !guarded.iter().any(|(seen, _)| *seen == g) {
+                guarded.push((g, label));
+            }
         }
-        if held.is_empty() {
-            return Ok(());
+        let uses = self.uses_of(adapter, &guarded).await?;
+        // A prune candidate depended on: kept, named.
+        let mut kept = Vec::new();
+        for ((_, label), uses) in guarded.iter().zip(&uses).take(prunes) {
+            if let Some(uses) = uses {
+                kept.push(label.clone());
+                plan.warnings
+                    .push(format!("{label} is used by {uses} — not pruned; remove that use first"));
+            }
         }
-        Err(DbdError::Config(format!("{}; remove that use first", held.join("; "))))
+        plan.dropped.retain(|stmt| !kept.contains(&stmt.entity_name));
+        // A part depended on: refused.
+        refuse_uses(guarded.iter().zip(&uses).skip(prunes))
+    }
+
+    /// The uses guard for `apply` (#7): what a pending migration the run
+    /// executes drops — read from each script it runs, a `.drop.sql`, `.sql`
+    /// or `.data.sql` — that another owner depends on refuses the run, before
+    /// anything runs and under a dry run, naming each use. A script dbd cannot
+    /// read is refused too: what it drops is unknown. A name the script leaves
+    /// to the search path is read in its own `SET search_path`, else the path
+    /// the migration runs on — its entity's. `plan` is the run's own, built
+    /// without writing.
+    pub(crate) async fn guard_migration_drops(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        plan: &super::ExecutionPlan,
+    ) -> Result<()> {
+        use crate::adapter::{Guarded, GuardedPart};
+        // A design not read as Postgres may keep migrations in its own dialect
+        // — SQLite's — which libpg_query cannot read: such a script is passed
+        // over, not refused. What it can read is guarded as any other's. An
+        // unreadable script is refused only where there is someone else to
+        // protect: another project recorded in the database.
+        let postgres =
+            crate::parser::ParserChoice::resolve(&self.config.source.dialect, self.config.source.parser.as_deref())
+                .is_ok_and(|parser| parser == crate::parser::ParserChoice::PgQuery);
+        let mut others: Option<bool> = None;
+        let mut guarded: Vec<(Guarded, String)> = Vec::new();
+        for step in &plan.steps {
+            let (entity, path) = match step {
+                super::ExecutionStep::DropEntity {
+                    entity_name,
+                    drop_sql_path,
+                    ..
+                } => (entity_name, drop_sql_path),
+                super::ExecutionStep::MigrateEntity {
+                    entity_name,
+                    migration_sql_path,
+                    ..
+                } => (entity_name, migration_sql_path),
+                super::ExecutionStep::MigrateData {
+                    entity_name,
+                    data_sql_path,
+                    ..
+                } => (entity_name, data_sql_path),
+                _ => continue,
+            };
+            let Ok(sql) = crate::source_text::read_to_string(path) else {
+                continue;
+            };
+            if let Err(e) = pg_query::parse(&sql) {
+                if !postgres {
+                    continue;
+                }
+                let others = match others {
+                    Some(others) => others,
+                    None => *others.insert(!adapter.other_projects_meta().await?.is_empty()),
+                };
+                if !others {
+                    continue;
+                }
+                return Err(DbdError::Config(format!(
+                    "{}: dbd cannot read this migration ({e}), so cannot tell what it drops that \
+                     another project depends on — fix the script",
+                    path.display()
+                )));
+            }
+            // The path the migration runs on: its entity's — the one its file
+            // states, else the project's — and for an entity the design no
+            // longer has, the project's.
+            let entity_schema = self
+                .entities
+                .iter()
+                .find(|e| &e.name == entity)
+                .and_then(|e| e.schema_path.default_schema().map(str::to_string))
+                .or_else(|| {
+                    self.config
+                        .source
+                        .search_path
+                        .as_ref()
+                        .and_then(|path| path.first().cloned())
+                })
+                .or_else(|| crate::entity::split_qualified_name(entity).0)
+                .unwrap_or_else(|| crate::reconcile::DEFAULT_SCHEMA.to_string());
+            for (namespace, schema, name, part) in crate::script::drops_in(&sql) {
+                let schema = schema.unwrap_or_else(|| entity_schema.clone());
+                let label = match &part {
+                    GuardedPart::Whole if namespace == "schema" => format!("schema {name}"),
+                    GuardedPart::Whole if namespace == "extension" => format!("extension {name}"),
+                    GuardedPart::Index(i) if *i == name => format!("index {schema}.{i}"),
+                    GuardedPart::Whole => format!("{schema}.{name}"),
+                    GuardedPart::Column(column) => format!("{schema}.{name}.{column}"),
+                    GuardedPart::Constraint(c) => format!("{schema}.{name} constraint {c}"),
+                    GuardedPart::Index(i) => format!("{schema}.{name} index {i}"),
+                    GuardedPart::Truncate => format!("{schema}.{name}, truncated with CASCADE,"),
+                };
+                let g = Guarded {
+                    object: OwnedObject {
+                        namespace: namespace.to_string(),
+                        schema,
+                        name,
+                        kind: String::new(),
+                    },
+                    part,
+                };
+                if !guarded.iter().any(|(seen, _)| *seen == g) {
+                    guarded.push((g, label));
+                }
+            }
+        }
+        let uses = self.uses_of(adapter, &guarded).await?;
+        refuse_uses(guarded.iter().zip(&uses))
+    }
+
+    /// The other owners' uses of each of `guarded`, as one phrase each —
+    /// `"billing" (view billing.v_orders)` — or `None` where there are none.
+    async fn uses_of(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        guarded: &[(crate::adapter::Guarded, String)],
+    ) -> Result<Vec<Option<String>>> {
+        if guarded.is_empty() {
+            return Ok(Vec::new());
+        }
+        let objects: Vec<crate::adapter::Guarded> = guarded.iter().map(|(g, _)| g.clone()).collect();
+        let found = adapter.dependents(self.owner(), &objects).await?;
+        Ok((0..guarded.len())
+            .map(|i| {
+                let uses: Vec<String> = found
+                    .iter()
+                    .filter(|d| d.guarded == i)
+                    .map(|d| format!("\"{}\" ({})", d.owner, d.via))
+                    .collect();
+                (!uses.is_empty()).then(|| uses.join(", "))
+            })
+            .collect())
     }
 
     /// Settle what a prune drops by ownership (#7). Another owner's entities
@@ -504,6 +702,24 @@ impl Design {
         }
         plan.warnings.extend(kept);
     }
+}
+
+/// Refuse, naming each, the guarded entities another owner uses —
+/// `app.orders.total is used by "billing" (view billing.v_totals); remove that
+/// use first`.
+fn refuse_uses<'a>(
+    guarded: impl Iterator<Item = (&'a (crate::adapter::Guarded, String), &'a Option<String>)>,
+) -> Result<()> {
+    let refused: Vec<String> = guarded
+        .filter_map(|((_, label), uses)| uses.as_ref().map(|uses| format!("{label} is used by {uses}")))
+        .collect();
+    if refused.is_empty() {
+        return Ok(());
+    }
+    Err(DbdError::Config(format!(
+        "{}; remove that use first",
+        refused.join("; ")
+    )))
 }
 
 /// What the registry says of a run's live tables and enums (#7).

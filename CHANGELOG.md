@@ -76,6 +76,23 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   migration or by hand; until then it stays the project's. A prune's `DROP`
   now quotes the table it names: `app."Report"` written unquoted dropped the
   `app.report` beside it.
+- **What another project depends on is guarded** (#7, phase 2). Before
+  `reconcile` drops a column, constraint, index or enum value, or `apply` runs
+  a migration that drops a table, column, constraint, index, schema or
+  extension — inside a `DO` block too — dbd asks Postgres's dependency graph
+  what a `CASCADE` would reach, part by part: a view, an inheriting table or
+  partition, a foreign key, a column of the type or an array of it. It also
+  asks the uses other projects recorded, which see into function bodies —
+  recorded whoever owned the target then, a table file's trigger function's
+  included. A migration dbd cannot parse is refused where another project
+  shares the database; a `TRUNCATE … CASCADE` is refused when it would
+  empty another project's table — the one truncated, a partition or child of
+  it, or one whose foreign key points at any of those. Anything another project
+  depends on refuses
+  the run, before any write and dry run included: `app.orders.total is used by
+  "billing" (view billing.v_totals); remove that use first`. A `--prune`
+  keeps such a table, naming the use, where its `CASCADE` took the other
+  project's view with it.
 
 ### Library API
 
@@ -88,6 +105,11 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   or `Unowned`; a `bool` still reads as `Off` or `On`. `DatabaseAdapter` gains
   `ownership` and `release_objects` (defaults: nothing owned, nothing
   released), with the `adapter::Ownership` the first returns.
+- `DatabaseAdapter::dependents` (default: none) reports other owners'
+  dependences on what a run drops, with `adapter::Guarded`, `GuardedPart`
+  and `Dependence`. `ReconcilePlan::dropped_parts` lists what a plan drops
+  from an existing table or enum, part by part (`DroppedPart`,
+  `DroppedKind`).
 - `Entity::refs` keeps a schema-qualified type or sequence reference that
   resolves to nothing — another project's, an extension's — marked
   `unresolved` and unwarned, where it was dropped. A bare one is still dropped
