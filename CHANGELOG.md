@@ -93,6 +93,23 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   "billing" (view billing.v_totals); remove that use first`. A `--prune`
   keeps such a table, naming the use, where its `CASCADE` took the other
   project's view with it.
+- **`reset` drops only what is its own to drop** (#7, phase 2). It drops the
+  entities its design declares, `CASCADE`, behind the same guard: one another
+  project depends on refuses the reset before it drops anything, `--force`
+  or not — `app.orders is used by "billing" (view billing.v_orders); remove
+  that use first`. `--schemas` keeps a schema holding anything not the
+  project's — another project's entity, one nobody owns, an extension
+  another project needs — or that another project uses, and refuses to drop
+  one holding something of the project's another project depends on, an
+  entity its design no longer declares included; an extension the design
+  installs in a schema of its own is its own. `--extensions` keeps an
+  extension another project uses or depends on — a column of its type — and
+  a full reset keeps a role another project uses. Each is named after what
+  the reset dropped: `schema app kept: it holds table app.invoices
+  ("billing").` `reset --dry-run` asks the same database, and shows the same
+  script and the same lines. A database any project marked prod is prod for
+  every project in it: another project's unforced reset is refused, where
+  only its own mark refused it.
 
 ### Library API
 
@@ -117,6 +134,11 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   reads the string — `nextval('App.Seq')` refers to `app.seq` — and a type or
   sequence reference reaches the sequence or enum whose mixed-case path names
   it, folded (`Order_No.ddl`).
+- `ResetComplete::kept` names what a reset left for other projects, one line
+  each, and `Design::reset_preview` returns the script a reset would run and
+  that summary, asked of the database. `DatabaseAdapter` gains `users_of` and
+  `not_owned_in_schema` (defaults: none), with the `adapter::SchemaMember`
+  the second returns.
 
 ### Fixed
 

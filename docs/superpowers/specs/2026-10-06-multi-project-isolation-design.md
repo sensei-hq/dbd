@@ -239,13 +239,24 @@ services.
 **Reset.** Reset drops only entities this owner owns; it claims its design's
 entities before it drops any (see Claim). On top of that:
 
-- `--schemas` drops a schema only when it holds no entity owned by anyone else
-  and no unowned entity.
-- `--extensions` and `DROP ROLE` skip anything another owner uses.
-- `CASCADE` stays, after the same uses guard: Postgres's cascade cannot reach
-  another owner's entity, because the guard refused first.
 - The prod guard refuses while any owner's row is `env = 'prod'`, unless
-  `--force` is given.
+  `--force` is given. It reads before the claim, so a refused reset writes
+  nothing.
+- `CASCADE` stays, after the same uses guard: every entity the reset drops,
+  whole. Postgres's cascade cannot reach another owner's entity, because the
+  guard refused first — `--force` or not.
+- `--schemas` keeps a schema that holds an entity owned by anyone else, an
+  unowned entity, or an extension another owner uses or depends on, and one
+  another owner records a use of. An extension the design installs there and
+  no other owner needs is the design's: it goes with the schema. A schema it
+  drops is guarded whole, since its `CASCADE` takes this owner's entities the
+  design no longer declares too.
+- `--extensions` keeps an extension another owner uses or depends on, and a
+  full reset keeps a role another owner uses.
+- What it keeps is left out of the script and named, one line each, on
+  `ResetComplete::kept`: `schema app kept: it holds table app.invoices
+  ("billing")`. `Design::reset_preview` answers the same for `reset --dry-run`,
+  from the same database.
 
 **Name reuse** (H3) is detected at claim time. Suppose a design arrives under an
 owner name that already owns entities in this database, and it declares none of
