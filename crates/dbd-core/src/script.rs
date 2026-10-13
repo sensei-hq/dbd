@@ -1751,4 +1751,20 @@ mod tests {
         assert!(script.contains("GRANT SELECT ON ALL TABLES IN SCHEMA \"config\" TO \"app_user\""));
         assert!(script.contains("GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA \"config\" TO \"app_admin\""));
     }
+
+    /// What a migration drops is read from every statement it runs — a `DO`
+    /// block's included (#7).
+    #[test]
+    fn a_scripts_drops_are_read_inside_do_blocks() {
+        use crate::adapter::GuardedPart;
+        assert_eq!(
+            drops_in("DO $$ BEGIN ALTER TABLE app.orders DROP COLUMN total CASCADE; END $$;"),
+            vec![(
+                "relation",
+                Some("app".to_string()),
+                "orders".to_string(),
+                GuardedPart::Column("total".to_string())
+            )]
+        );
+    }
 }
