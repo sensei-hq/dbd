@@ -9,12 +9,12 @@
 - Slices 1–3 merged into `feat/ownership` (PRs #50, #51): registry, claim,
   uses, prune by ownership.
 - Slice 4 = PR #52 (impl `9c91df5b`, `968c1293`; fixes `3612a8cf`, `6ebdf47d`,
-  `8092df1a`, `a17e3e56`):
+  `8092df1a`, `a17e3e56`, `c08bf8d9`):
   the guard walks pg_depend as a CASCADE reaches, part by part (inherited
   columns, arrays, domain checks) + dbd.uses (recorded whoever owns the
   target; routine bodies in any file); reconcile refuses dropped parts, a prune
   keeps used tables; apply refuses a migration's drops, or an unreadable one.
-- Embedded 235/235, `cli_live` 48/48, workspace 2005/0, clippy, fmt, doc clean.
+- Embedded 238/238, `cli_live` 48/48, workspace 2005/0, clippy, fmt, doc clean.
 
 ## Next
 
