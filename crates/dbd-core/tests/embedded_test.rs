@@ -13979,6 +13979,84 @@ async fn a_reset_with_schemas_is_refused_when_another_project_depends_on_what_th
     .await;
 }
 
+/// A design may install an extension into a schema of its own. The
+/// extension's members are the extension's, and the extension the design's:
+/// `--schemas` drops the schema, and the extension with it, as it did (#7).
+#[tokio::test]
+async fn a_reset_drops_a_schema_holding_only_its_own_extension() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    let design = write_project(
+        sd.path(),
+        &format!("project:\n  name: shop\nsource:\n  dialect: postgresql\n{CITEXT_IN_EXT}schemas:\n  - ext\n  - app\n"),
+        &ORDERS_OWNER_FILES[..1],
+    );
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+
+    let summary = design
+        .reset(&*shop, "postgres", true, true, false, None)
+        .await
+        .expect("shop's reset");
+    assert!(summary.kept.is_empty(), "{:?}", summary.kept);
+    assert_catalog(
+        &*shop,
+        false,
+        "SELECT 1 FROM pg_namespace WHERE nspname = 'ext'",
+        "schema ext",
+    )
+    .await;
+}
+
+/// But a schema holding an extension another project depends on is kept:
+/// dropped `CASCADE`, it took the extension and their column of its type (#7).
+#[tokio::test]
+async fn a_reset_keeps_a_schema_holding_an_extension_another_project_depends_on() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let design = write_project(
+        sd.path(),
+        &format!("project:\n  name: shop\nsource:\n  dialect: postgresql\n{CITEXT_IN_EXT}schemas:\n  - ext\n  - app\n"),
+        &ORDERS_OWNER_FILES[..1],
+    );
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    billing_reading(
+        bd.path(),
+        &[(
+            "ddl/table/billing/contacts.ddl",
+            "create table if not exists billing.contacts (id int primary key, email ext.citext);\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    let summary = design
+        .reset(&*shop, "postgres", true, true, false, None)
+        .await
+        .expect("shop's reset");
+    assert_schema_exists(&*shop, "ext").await;
+    assert!(
+        summary
+            .kept
+            .iter()
+            .any(|k| k.starts_with("schema ext kept") && k.contains("extension citext")),
+        "{:?}",
+        summary.kept
+    );
+}
+
+const CITEXT_IN_EXT: &str =
+    "target:\n  postgres:\n    url: $DATABASE_URL\n    extensions:\n      - name: citext\n        schema: ext\n";
+
 /// An extension another project depends on without declaring it — a column of
 /// its type — is kept by `--extensions` as one it declares is (#7).
 #[tokio::test]
