@@ -93,7 +93,7 @@ fn a_modules_snapshot_is_in_its_folder_and_versions_its_block() {
     let workspace = Workspace::load(&root.join("design.yaml"), "dev", Some(root)).expect("load");
     let core = workspace.modules().iter().find(|m| m.name() == Some("core")).unwrap();
     assert_eq!(core.design().module(), Some("core"));
-    dbd_core::snapshot::create_snapshot(
+    dbd_core::snapshot::create_snapshot_of(
         core.design().entities(),
         core.design().project_dir(),
         &root.join("design.yaml"),

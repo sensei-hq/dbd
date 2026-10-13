@@ -127,7 +127,9 @@ impl Workspace {
         let mut scanned: Vec<(String, Design)> = Vec::new();
         for name in &order {
             let config = module_config(&text, &manifest.project.name, name)?;
-            scanned.push((name.clone(), Design::scan(config, env, folders[name].clone())?));
+            let mut design = Design::scan(config, env, folders[name].clone())?;
+            design.module = Some(name.clone());
+            scanned.push((name.clone(), design));
         }
         let objects: Vec<Vec<OwnedObject>> = scanned.iter().map(|(_, d)| d.declared_objects()).collect();
         check_overlaps(&scanned, &objects)?;
@@ -273,6 +275,20 @@ impl Workspace {
             Some(found) => found,
             None => real.as_deref().and_then(walk).flatten(),
         }
+    }
+
+    /// The modules `config_path` declares, by name, each with its folder under
+    /// `project_dir` — read without loading any module's design, for the
+    /// commands that go over the files of a workspace (`format`, `doctor`,
+    /// `snapshot --list`). Empty for a design without `modules:`. Refuses a
+    /// folder outside the project.
+    pub fn folders(config_path: &Path, project_dir: &Path) -> Result<Vec<(String, PathBuf)>> {
+        let manifest = crate::config::read(config_path)?;
+        manifest
+            .modules
+            .iter()
+            .map(|(name, module)| Ok((name.clone(), project_dir.join(module_folder(name, module)?))))
+            .collect()
     }
 
     /// Whether the manifest declares `modules:` — `false` for a project that

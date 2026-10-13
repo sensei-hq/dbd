@@ -1481,14 +1481,15 @@ pub fn cmd_format(config: &Path, project_dir: &Path, check: bool, verbosity: Ver
         dbd_core::config::FormatConfig::default()
     };
 
-    let files = dbd_core::scanner::scan_ddl(project_dir)?;
+    // A workspace's DDL is each module's, in its folder (#7).
     let mut changed = 0;
-
-    for file in &files {
-        if format_in_place(project_dir, file, &format_config, !check)? {
-            changed += 1;
-            let verb = if check { "would reformat" } else { "formatted" };
-            output::info(verbosity, &format!("  {verb}: {}", file.display()));
+    for (_, dir) in super::file_folders(config, project_dir)? {
+        for file in &dbd_core::scanner::scan_ddl(&dir)? {
+            if format_in_place(&dir, file, &format_config, !check)? {
+                changed += 1;
+                let verb = if check { "would reformat" } else { "formatted" };
+                output::info(verbosity, &format!("  {verb}: {}", file.display()));
+            }
         }
     }
 

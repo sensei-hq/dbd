@@ -619,6 +619,9 @@ pub struct Design {
     import_emptied: std::sync::atomic::AtomicBool,
     /// The owners a reset runs beside — see [`Design::resetting_beside`].
     reset_beside: std::collections::HashSet<String>,
+    /// The module this design is in its workspace's manifest — see
+    /// [`Design::module`].
+    module: Option<String>,
 }
 
 /// A workspace manifest's hooks, and the folder their paths are relative to —
@@ -1029,6 +1032,7 @@ impl Design {
             import_truncates: None,
             import_emptied: std::sync::atomic::AtomicBool::new(false),
             reset_beside: std::collections::HashSet::new(),
+            module: None,
         })
     }
 
@@ -1204,6 +1208,13 @@ impl Design {
     pub fn emptying_for_import(mut self, tables: Vec<String>) -> Self {
         self.import_truncates = Some(tables);
         self
+    }
+
+    /// The module this design is in its workspace's manifest (#7) — what its
+    /// version and release state are written under, `modules.<module>` —
+    /// or `None` for a project's own design.
+    pub fn module(&self) -> Option<&str> {
+        self.module.as_deref()
     }
 
     /// Whether this design's import emptied tables before it loaded — false

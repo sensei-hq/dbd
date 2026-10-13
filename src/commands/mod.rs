@@ -101,6 +101,10 @@ fn runs_a_workspace(command: &Commands) -> bool {
             | Commands::Refresh { .. }
             | Commands::Migrate { .. }
             | Commands::Reset { .. }
+            | Commands::Snapshot { .. }
+            | Commands::Release { .. }
+            | Commands::Format { .. }
+            | Commands::Doctor { .. }
             | Commands::Install { .. }
     )
 }
@@ -282,6 +286,20 @@ pub(super) fn format_policy_line(policies: &dbd_core::design::PolicyReport) -> S
             n => format!(", {n} skipped (out of scope)"),
         }
     )
+}
+
+/// The folders a command going over a project's files reads (#7): each
+/// module's of a workspace, labelled for the module, or the project's own.
+pub(super) fn file_folders(config: &Path, project_dir: &Path) -> Result<Vec<(Option<String>, PathBuf)>> {
+    let folders = if config.exists() {
+        Workspace::folders(config, project_dir)?
+    } else {
+        Vec::new()
+    };
+    if folders.is_empty() {
+        return Ok(vec![(None, project_dir.to_path_buf())]);
+    }
+    Ok(folders.into_iter().map(|(name, dir)| (Some(name), dir)).collect())
 }
 
 /// Warn when a run's design has no DDL of its own. For a project it is the
@@ -529,10 +547,9 @@ pub async fn run(
 
         Commands::Snapshot { list, name } => {
             if *list {
-                migration::cmd_snapshot_list(project_dir, verbosity);
-                return Ok(());
+                return migration::cmd_snapshot_list(config, project_dir, module, verbosity);
             }
-            migration::cmd_snapshot_create(config, env, project_dir, name.as_deref(), verbosity)
+            migration::cmd_snapshot_create(config, env, project_dir, module, name.as_deref(), verbosity)
         }
 
         Commands::Migrate { status } => {
@@ -792,7 +809,9 @@ pub async fn run(
             .await
         }
 
-        Commands::Release { name } => project::cmd_release(config, env, project_dir, name.as_deref(), verbosity),
+        Commands::Release { name } => {
+            project::cmd_release(config, env, project_dir, module, name.as_deref(), verbosity)
+        }
 
         Commands::Install { project, dry_run } => install::cmd_install(*project, *dry_run, project_dir, verbosity),
     }

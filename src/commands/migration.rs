@@ -458,7 +458,34 @@ pub(crate) async fn migrate_status_with_adapter(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn cmd_snapshot_list(project_dir: &Path, verbosity: Verbosity) {
+pub fn cmd_snapshot_list(config: &Path, project_dir: &Path, module: Option<&str>, verbosity: Verbosity) -> Result<()> {
+    let folders = super::file_folders(config, project_dir)?;
+    let in_workspace = folders.iter().any(|(m, _)| m.is_some());
+    let project = in_workspace
+        .then(|| dbd_core::config::read(config).map(|c| c.project.name))
+        .transpose()?;
+    if let Some(wanted) = module
+        && !folders.iter().any(|(m, _)| m.as_deref() == Some(wanted))
+    {
+        anyhow::bail!("no module \"{wanted}\" in {}", config.display());
+    }
+    let mut first = true;
+    for (name, dir) in folders {
+        if module.is_some() && name.as_deref() != module {
+            continue;
+        }
+        if let (Some(name), Some(project)) = (&name, &project) {
+            let label = format!("module {name} ({project}/{name})");
+            output::always(&if first { label } else { format!("\n{label}") });
+        }
+        first = false;
+        list_snapshots_in(&dir, verbosity);
+    }
+    Ok(())
+}
+
+/// The snapshots in `dir`'s `snapshots/`, a line each.
+fn list_snapshots_in(project_dir: &Path, verbosity: Verbosity) {
     let dir = project_dir;
     let snapshots = dbd_core::snapshot::list_snapshots(dir);
 
@@ -489,12 +516,39 @@ pub fn cmd_snapshot_create(
     config: &Path,
     env: &str,
     project_dir: &Path,
+    module: Option<&str>,
     description: Option<&str>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
+    // A snapshot records the design, whatever scope a database runs: every
+    // module's, or the one named — each in its folder, at its own version.
+    let targets = super::targets(
+        config,
+        env,
+        project_dir,
+        Some("all"),
+        None,
+        module,
+        None,
+        super::Order::Alone,
+    )?;
+    for (i, target) in targets.into_iter().enumerate() {
+        let (design, dir) = target.enter(i == 0);
+        snapshot_design(&design, config, &dir, description, verbosity)?;
+    }
+    Ok(())
+}
+
+/// [`cmd_snapshot_create`] for one design: the project's, or one module's.
+fn snapshot_design(
+    design: &Design,
+    config: &Path,
+    project_dir: &Path,
+    description: Option<&str>,
+    verbosity: Verbosity,
+) -> Result<()> {
     let desc = description.unwrap_or("snapshot");
-    let result = dbd_core::snapshot::create_snapshot(design.entities(), project_dir, config, desc)
+    let result = dbd_core::snapshot::create_snapshot_of(design.entities(), project_dir, config, design.module(), desc)
         .context("Failed to create snapshot")?;
 
     // Single snapshot, no changes
@@ -545,7 +599,11 @@ pub fn cmd_snapshot_create(
     }
 
     let final_version = result.snapshots.last().map(|s| s.snapshot.version).unwrap_or(0);
-    output::info(verbosity, &format!("\ndesign.yaml version updated to {final_version}"));
+    let field = match design.module() {
+        Some(module) => format!("modules.{module}.version"),
+        None => "version".to_string(),
+    };
+    output::info(verbosity, &format!("\ndesign.yaml {field} updated to {final_version}"));
 
     Ok(())
 }
@@ -573,13 +631,19 @@ mod tests {
     #[test]
     fn snapshot_list_empty_dir_is_noop() {
         let tmp = tempfile::tempdir().unwrap();
-        cmd_snapshot_list(tmp.path(), Verbosity::Normal);
+        cmd_snapshot_list(&tmp.path().join("design.yaml"), tmp.path(), None, Verbosity::Normal).unwrap();
     }
 
     /// Listing against the real fixture exercises the print-each-snapshot path.
     #[test]
     fn snapshot_list_on_fixture_project() {
-        cmd_snapshot_list(&testutil::fixtures(), Verbosity::Verbose);
+        cmd_snapshot_list(
+            &testutil::fixture_config(),
+            &testutil::fixtures(),
+            None,
+            Verbosity::Verbose,
+        )
+        .unwrap();
     }
 
     /// A Supabase project resets as a Supabase project without being told so:
@@ -713,7 +777,7 @@ mod tests {
     fn snapshot_create_writes_into_temp_project() {
         let proj = testutil::copy_fixture_project();
         let cfg = proj.path().join("design.yaml");
-        cmd_snapshot_create(&cfg, "dev", proj.path(), Some("test snapshot"), Verbosity::Normal).unwrap();
+        cmd_snapshot_create(&cfg, "dev", proj.path(), None, Some("test snapshot"), Verbosity::Normal).unwrap();
     }
 
     /// A second snapshot with nothing changed takes the no-changes branch and
@@ -722,10 +786,10 @@ mod tests {
     fn snapshot_create_twice_reports_no_changes() {
         let proj = testutil::copy_fixture_project();
         let cfg = proj.path().join("design.yaml");
-        cmd_snapshot_create(&cfg, "dev", proj.path(), Some("first"), Verbosity::Normal).unwrap();
+        cmd_snapshot_create(&cfg, "dev", proj.path(), None, Some("first"), Verbosity::Normal).unwrap();
         let after_first = dbd_core::snapshot::list_snapshots(proj.path()).len();
 
-        cmd_snapshot_create(&cfg, "dev", proj.path(), Some("second"), Verbosity::Normal).unwrap();
+        cmd_snapshot_create(&cfg, "dev", proj.path(), None, Some("second"), Verbosity::Normal).unwrap();
         let after_second = dbd_core::snapshot::list_snapshots(proj.path()).len();
 
         assert_eq!(
@@ -740,7 +804,7 @@ mod tests {
     fn snapshot_create_after_a_change_adds_a_snapshot() {
         let proj = testutil::copy_fixture_project();
         let cfg = proj.path().join("design.yaml");
-        cmd_snapshot_create(&cfg, "dev", proj.path(), Some("baseline"), Verbosity::Normal).unwrap();
+        cmd_snapshot_create(&cfg, "dev", proj.path(), None, Some("baseline"), Verbosity::Normal).unwrap();
         let before = dbd_core::snapshot::list_snapshots(proj.path()).len();
 
         std::fs::write(
@@ -750,7 +814,7 @@ mod tests {
         )
         .unwrap();
 
-        cmd_snapshot_create(&cfg, "dev", proj.path(), Some("after change"), Verbosity::Verbose).unwrap();
+        cmd_snapshot_create(&cfg, "dev", proj.path(), None, Some("after change"), Verbosity::Verbose).unwrap();
         let after = dbd_core::snapshot::list_snapshots(proj.path()).len();
 
         assert!(
@@ -765,12 +829,12 @@ mod tests {
     fn snapshot_list_prints_existing_snapshots() {
         let proj = testutil::copy_fixture_project();
         let cfg = proj.path().join("design.yaml");
-        cmd_snapshot_create(&cfg, "dev", proj.path(), Some("listed"), Verbosity::Normal).unwrap();
+        cmd_snapshot_create(&cfg, "dev", proj.path(), None, Some("listed"), Verbosity::Normal).unwrap();
         assert!(
             !dbd_core::snapshot::list_snapshots(proj.path()).is_empty(),
             "precondition: the project must have a snapshot to list"
         );
-        cmd_snapshot_list(proj.path(), Verbosity::Verbose);
+        cmd_snapshot_list(&proj.path().join("design.yaml"), proj.path(), None, Verbosity::Verbose).unwrap();
     }
 
     // ── Adapter-backed paths, via the mock ────────────────────────────────────
@@ -787,14 +851,14 @@ mod tests {
     async fn migrate_status_reports_pending_when_db_behind() {
         let proj = testutil::copy_fixture_project();
         let cfg = proj.path().join("design.yaml");
-        cmd_snapshot_create(&cfg, "dev", proj.path(), Some("baseline"), Verbosity::Normal).unwrap();
+        cmd_snapshot_create(&cfg, "dev", proj.path(), None, Some("baseline"), Verbosity::Normal).unwrap();
         std::fs::write(
             proj.path().join("ddl/table/config/pending_probe.ddl"),
             "set search_path to config;\n\
              create table if not exists pending_probe (id int primary key);\n",
         )
         .unwrap();
-        cmd_snapshot_create(&cfg, "dev", proj.path(), Some("change"), Verbosity::Normal).unwrap();
+        cmd_snapshot_create(&cfg, "dev", proj.path(), None, Some("change"), Verbosity::Normal).unwrap();
 
         // Precondition: a database at v1 has the v1→v2 migration outstanding.
         let pending = dbd_core::snapshot::pending_migrations(1, proj.path());
