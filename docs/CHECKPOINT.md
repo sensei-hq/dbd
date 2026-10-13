@@ -8,18 +8,17 @@
 - Slice 1 merged (PR #61): `Workspace::load` — a module is a `Design` owned by
   `<project>/<module>`; the `modules:` block validated; T19/T20 refuse the load.
 - Slice 2 merged (PR #62): a workspace runs module by module as each module's
-  owner (T21); `--module`; the manifest's hooks around the run; every module
-  checked before any writes; reset whole-or-nothing in reverse; deploy schema
-  then data; import empties together; `export` per module.
+  owner (T21); `--module`; manifest hooks around the run; every module checked
+  before any writes; whole-or-nothing reset; deploy schema then data.
+- Slice 3 merged (PR #63): `scopes.<name>.modules`, each scope projected per
+  module (`Workspace::under_scope`/`under_scope_of`, `check_scope_gaps`);
+  walking up from a module folder (`Workspace::locate`).
 
 ## Next
 
-Slice 3 PR #63 (`feat/workspaces-scopes` → `feat/workspaces`): both review
-rounds fixed (f930d147, 08d366d8) and the plan updated. Next: full suites, CI,
-merge; then slice 4 (per-module history: snapshot, release, migrations; format
-and doctor over modules).
-
-    gh pr checks 63
+Slice 4 (per-module history): `snapshot`, `release` and `apply`'s migrations
+per module (writing `modules.<name>.version`/`released`), and `format` and
+`doctor` over the modules. Branch `feat/workspaces-history`, red tests first.
 
 ## Open
 
