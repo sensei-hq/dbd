@@ -112,15 +112,17 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   project marked prod — or recorded with an env dbd does not know — is prod
   for every project in it: another project's unforced reset is refused,
   where only its own mark refused it.
-- **Runs of different projects no longer interleave with a reset** (#7,
+- **Runs of different projects no longer interleave with a drop** (#7,
   phase 2). A reset read what other projects had, then dropped `CASCADE`:
   another project's apply committing in between had its table taken by
-  `DROP SCHEMA … CASCADE`, and both runs reported success. Every writing
-  `apply` (a `deploy`'s included), `reconcile` and `reset` now holds the
-  database's dbd write lock (`pg_advisory_lock` on `dbd:write`, in a session of its own) —
-  shared, so applies and reconciles of different projects still run side by
-  side; exclusive for a reset, which waits for the runs before it, at most 5
-  minutes, while the runs after it wait for it.
+  `DROP SCHEMA … CASCADE`, and both runs reported success; a prune, or a
+  migration's `DROP TABLE … CASCADE`, took a view committed over the table
+  the same way. Every writing `apply` (a `deploy`'s included), `reconcile`
+  and `reset` now holds the database's dbd write lock (`pg_advisory_lock` on
+  `dbd:write`, in a session of its own) — shared by an apply that only
+  builds, so those of different projects still run side by side; exclusive
+  for a reset, a reconcile and an apply running migrations, which wait for
+  the runs before them, at most 5 minutes, while the runs after them wait.
 - **The uses guard sees further** (#7, phase 2). A dependent nobody owns —
   a project's not yet recording its uses — is guarded where a project might
   own it, by `--prune`'s rule: in a schema another project uses, or anywhere

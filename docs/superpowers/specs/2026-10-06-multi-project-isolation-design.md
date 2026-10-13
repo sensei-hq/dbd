@@ -255,9 +255,10 @@ entities before it drops any (see Claim). On top of that:
   the reset leaves. Postgres's cascade cannot reach another owner's entity,
   because the guard refused first — `--force` or not.
 - The reset holds the database's dbd write lock — `pg_advisory_lock` on
-  `dbd:write`, exclusive — from its first read to its last drop, and every
-  writing `apply` and `reconcile` holds it shared. So no other project's run
-  writes between what the reset reads and what it drops: the reset waits for
+  `dbd:write`, exclusive — from its first read to its last drop. So does a
+  reconcile, and an apply running migrations, whose drops are guarded the
+  same way; an apply that only builds holds it shared. So no other project's
+  run writes between what a guarded run reads and what it drops: it waits for
   the runs before it, at most 5 minutes, and the runs after it wait for it.
 - `--schemas` keeps a schema that holds an entity owned by anyone else, an
   unowned entity, or an extension another owner uses or depends on, and one
