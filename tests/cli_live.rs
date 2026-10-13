@@ -3698,4 +3698,37 @@ async fn a_module_migrates_on_its_own_version() {
         owners.iter().any(|o| o.starts_with("shop/shared (prod, v1)")),
         "{owners:?}"
     );
+    let out = dir.join("out");
+    let o = dbd(dir, &url, &["export", "--module", "core", "-o", out.to_str().unwrap()]);
+    assert!(o.status.success(), "export: {}", combined(&o));
+    let orders = std::fs::read_to_string(out.join("app/orders.csv")).unwrap();
+    assert!(
+        orders.lines().next().unwrap_or_default().contains("note"),
+        "the migration ran: {orders}"
+    );
+}
+
+/// A released module changes by snapshot and apply; reconcile leaves it out,
+/// and reconciles the modules depending on it.
+#[tokio::test]
+async fn reconcile_leaves_a_released_dependency_out() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    shop_workspace(dir);
+    let o = dbd(dir, &url, &["release", "--module", "shared"]);
+    assert!(o.status.success(), "release shared: {}", combined(&o));
+    let o = dbd(dir, &url, &["deploy"]);
+    assert!(o.status.success(), "deploy: {}", combined(&o));
+
+    let o = dbd(dir, &url, &["reconcile", "--module", "core"]);
+    let said = combined(&o);
+    assert!(o.status.success(), "{said}");
+    assert!(
+        said.contains("module core (shop/core)") && said.contains("shared"),
+        "{said}"
+    );
+
+    let o = dbd(dir, &url, &["reconcile", "--module", "shared"]);
+    assert!(!o.status.success(), "shared is released: {}", combined(&o));
 }

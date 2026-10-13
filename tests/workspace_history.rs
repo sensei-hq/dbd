@@ -155,3 +155,123 @@ fn doctor_goes_over_every_module() {
     assert!(out.status.success(), "{}", self::text(&out));
     assert!(tmp.path().join("core/ddl/table/app/notes.ddl").exists());
 }
+
+fn read(dir: &Path) -> dbd_core::config::DesignConfig {
+    dbd_core::config::read(&dir.join("design.yaml")).unwrap()
+}
+
+#[test]
+fn release_of_a_module_leaves_its_dependencies_unreleased() {
+    let tmp = tempfile::tempdir().unwrap();
+    shop(tmp.path());
+    let out = dbd(tmp.path(), &["release", "--module", "core"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let config = read(tmp.path());
+    assert!(config.modules["core"].released);
+    assert!(!config.modules["shared"].released);
+}
+
+/// A whole-workspace release is checked for every module before any is
+/// released: one refused leaves design.yaml as it was.
+#[test]
+fn a_whole_workspace_release_is_refused_whole() {
+    let tmp = tempfile::tempdir().unwrap();
+    shop(tmp.path());
+    let out = dbd(tmp.path(), &["snapshot", "-n", "first"]);
+    assert!(out.status.success(), "{}", text(&out));
+    write(
+        tmp.path(),
+        "core/ddl/table/app/orders.ddl",
+        "set search_path to app;\n\ncreate table if not exists orders (\n  id integer primary key\n, note text\n);\n",
+    );
+    let before = manifest(tmp.path());
+    let out = dbd(tmp.path(), &["release"]);
+    assert!(
+        !out.status.success(),
+        "core has changes no snapshot records: {}",
+        text(&out)
+    );
+    assert_eq!(manifest(tmp.path()), before);
+}
+
+/// A whole-workspace release releases what is not released yet, and refuses
+/// when nothing is left.
+#[test]
+fn a_whole_workspace_release_skips_what_is_released() {
+    let tmp = tempfile::tempdir().unwrap();
+    shop(tmp.path());
+    assert!(dbd(tmp.path(), &["release", "--module", "core"]).status.success());
+    let out = dbd(tmp.path(), &["release"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(read(tmp.path()).modules["shared"].released);
+    let out = dbd(tmp.path(), &["release"]);
+    assert!(!out.status.success(), "{}", text(&out));
+}
+
+/// `format` and `doctor` go over the module asked for — `--module`, or the
+/// folder they are run in — and refuse a module there is none of.
+#[test]
+fn format_and_doctor_take_a_module() {
+    let tmp = tempfile::tempdir().unwrap();
+    shop(tmp.path());
+    write(
+        tmp.path(),
+        "shared/ddl/table/app/rates.ddl",
+        "set search_path to app;\nCREATE TABLE IF NOT EXISTS rates (id INTEGER PRIMARY KEY);\n",
+    );
+    write(
+        tmp.path(),
+        "shared/ddl/views/app/v.ddl",
+        "set search_path to app;\ncreate or replace view v as select 1 as one;\n",
+    );
+    let out = dbd(tmp.path(), &["--module", "core", "format", "--check"]);
+    assert!(out.status.success(), "core's files are formatted: {}", text(&out));
+    let out = dbd(tmp.path(), &["--module", "nosuch", "format", "--check"]);
+    assert!(!out.status.success(), "{}", text(&out));
+    let out = dbd(tmp.path(), &["--module", "core", "doctor"]);
+    assert!(
+        !text(&out).contains("views"),
+        "shared's folder is not core's: {}",
+        text(&out)
+    );
+}
+
+/// A module folder that is not there is refused, not audited clean.
+#[test]
+fn doctor_refuses_a_missing_module_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    shop(tmp.path());
+    let manifest = manifest(tmp.path());
+    fs::write(
+        tmp.path().join("design.yaml"),
+        manifest.replace(
+            "    depends_on: [shared]\n",
+            "    depends_on: [shared]\n    path: src/core\n",
+        ),
+    )
+    .unwrap();
+    let out = dbd(tmp.path(), &["doctor"]);
+    let text = text(&out);
+    assert!(!text.contains("No issues found") && text.contains("src/core"), "{text}");
+}
+
+/// `doctor` audits — and migrates — a design.yaml written for an older dbd,
+/// which does not parse as today's: it is the command for one.
+#[test]
+fn doctor_audits_a_config_it_cannot_parse() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "design.yaml",
+        "project:\n  name: legacy\n  version: v2\n  database: postgresql\n",
+    );
+    write(
+        tmp.path(),
+        "ddl/tables/app/t.ddl",
+        "set search_path to app;\ncreate table if not exists t (id integer primary key);\n",
+    );
+    let out = dbd(tmp.path(), &["doctor"]);
+    let text = text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("project.database"), "{text}");
+}

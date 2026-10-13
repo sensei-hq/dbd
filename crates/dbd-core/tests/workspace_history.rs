@@ -107,3 +107,40 @@ fn a_modules_snapshot_is_in_its_folder_and_versions_its_block() {
     assert_eq!(manifest(root).modules["core"].version, Some(1));
     Workspace::load(&root.join("design.yaml"), "dev", Some(root)).expect("the workspace still loads");
 }
+
+/// An edit in place changes the one key: a keep-chomped note keeps its
+/// trailing lines.
+#[test]
+fn an_edit_in_place_changes_the_one_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "design.yaml",
+        "project:\n  name: shop\n\nmodules:\n  core:\n    note: |+\n      text\n\n\n  shared: {}\n",
+    );
+    config::update_version_of(&root.join("design.yaml"), Some("core"), 2).expect("core");
+    let read = manifest(root);
+    assert_eq!(read.modules["core"].version, Some(2));
+    assert_eq!(read.modules["core"].note.as_deref(), Some("text\n\n\n"));
+}
+
+/// A module's block before another's is edited in place, the other's keys
+/// and comments as they were.
+#[test]
+fn editing_a_module_before_another_keeps_the_others() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "design.yaml",
+        "project:\n  name: shop\n\nmodules:\n  core:\n    note: the app  # core's\n  dojo:\n    \
+         depends_on: [core]  # dojo's\n    version: 5\n",
+    );
+    config::update_version_of(&root.join("design.yaml"), Some("core"), 2).expect("core");
+    let read = manifest(root);
+    assert_eq!(read.modules["core"].version, Some(2));
+    assert_eq!(read.modules["dojo"].version, Some(5));
+    let text = std::fs::read_to_string(root.join("design.yaml")).unwrap();
+    assert!(text.contains("# core's") && text.contains("# dojo's"), "{text}");
+}
