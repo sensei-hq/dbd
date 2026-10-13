@@ -344,7 +344,7 @@ fn a_scope_a_command_ignores_is_not_refused_on_a_workspace() {
     let out = dbd(tmp.path(), &["migrate", "--scope", "all"]);
     let text = text(&out);
     assert!(out.status.success(), "{text}");
-    assert!(!text.contains("do not select over"), "{text}");
+    assert!(text.contains("--scope all ignored"), "{text}");
 }
 
 /// A workspace is converted from a project with `dbd split`; `init` and
@@ -425,4 +425,137 @@ fn a_sqlite_workspace_reloads_its_modules_data() {
             "{run}"
         );
     }
+}
+
+/// Run `dbd <args>` in `dir`, as a shell started there would.
+fn dbd_in(dir: &Path, args: &[&str]) -> Output {
+    Command::cargo_bin("dbd")
+        .unwrap()
+        .env_remove("DATABASE_URL")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+/// `shop`, its manifest's scopes `scopes` added.
+fn shop_scoped(dir: &Path, scopes: &str) {
+    shop(dir);
+    let manifest = fs::read_to_string(dir.join("design.yaml")).unwrap();
+    fs::write(dir.join("design.yaml"), format!("{manifest}\nscopes:\n{scopes}")).unwrap();
+}
+
+/// Run in a module's folder that the `default` scope leaves out, the module
+/// runs on its own — it is what was asked for.
+#[test]
+fn a_run_in_a_module_folder_the_default_scope_leaves_out_runs_that_module() {
+    let tmp = tempfile::tempdir().unwrap();
+    shop_scoped(tmp.path(), "  default:\n    modules: [shared]\n");
+    let out = dbd_in(&tmp.path().join("core"), &["inspect"]);
+    let text = text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("module core (shop/core)"), "{text}");
+}
+
+/// `-n` on an entity of a module the scope leaves out names the module.
+#[test]
+fn a_named_entity_outside_the_scope_is_refused_naming_its_module() {
+    let tmp = tempfile::tempdir().unwrap();
+    shop_with_scopes(tmp.path());
+    let out = dbd(
+        tmp.path(),
+        &["apply", "--dry-run", "--scope", "solo", "-n", "app.orders"],
+    );
+    let text = text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("\"core\"") && text.contains("solo"), "{text}");
+}
+
+/// A design without modules is not looked for above where dbd runs.
+#[test]
+fn a_design_without_modules_is_not_looked_for_above() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "design.yaml",
+        "project:\n  name: plain\n\nschemas:\n  - app\n",
+    );
+    write(tmp.path(), "ddl/table/app/t.ddl", &table("t", "id integer primary key"));
+    fs::create_dir_all(tmp.path().join("reports")).unwrap();
+    let out = dbd_in(&tmp.path().join("reports"), &["inspect"]);
+    assert!(!out.status.success(), "{}", text(&out));
+}
+
+/// Walking up re-points the run at the workspace — a deploy's source too.
+#[test]
+fn a_deploy_inside_a_module_folder_runs_that_module() {
+    let tmp = tempfile::tempdir().unwrap();
+    shop(tmp.path());
+    let out = dbd_in(&tmp.path().join("core"), &["deploy", "--dry-run"]);
+    let text = text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("module core (shop/core)"), "{text}");
+}
+
+/// `init` starts a project where it is run, and `--module` says which module
+/// to run wherever dbd is run from.
+#[test]
+fn init_does_not_walk_up_and_module_overrides_the_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    shop(tmp.path());
+    let out = dbd_in(&tmp.path().join("core"), &["inspect", "--module", "shared"]);
+    let text = text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains("module shared (shop/shared)") && !text.contains("module core"),
+        "{text}"
+    );
+
+    let out = dbd_in(&tmp.path().join("core"), &["init", "--name", "fresh"]);
+    let text = self::text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(tmp.path().join("core/design.yaml").exists(), "{text}");
+}
+
+/// Run in a folder of the workspace no module holds, the whole workspace runs;
+/// `-s` naming a module folder runs that module.
+#[test]
+fn a_run_in_a_folder_no_module_holds_runs_the_workspace() {
+    let tmp = tempfile::tempdir().unwrap();
+    shop(tmp.path());
+    fs::create_dir_all(tmp.path().join("docs")).unwrap();
+    let out = dbd_in(&tmp.path().join("docs"), &["inspect"]);
+    let text = text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains("module shared (shop/shared)") && text.contains("module core (shop/core)"),
+        "{text}"
+    );
+
+    let out = dbd_in(tmp.path(), &["-s", "core", "inspect"]);
+    let text = self::text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("module core (shop/core)"), "{text}");
+}
+
+/// `--deps` reaches each module's scope: a gap the scope reports is refused,
+/// and taken in under `--deps include`.
+#[test]
+fn deps_reaches_each_modules_scope() {
+    let tmp = tempfile::tempdir().unwrap();
+    shop_scoped(tmp.path(), "  notes_only:\n    includes: [app.notes]\n");
+    write(
+        tmp.path(),
+        "core/ddl/table/app/notes.ddl",
+        &table(
+            "notes",
+            "id integer primary key\n, order_id integer references orders (id)",
+        ),
+    );
+    let out = dbd(tmp.path(), &["inspect", "--scope", "notes_only"]);
+    let text = text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("dependency gap") && text.contains("app.orders"), "{text}");
+    let out = dbd(tmp.path(), &["inspect", "--scope", "notes_only", "--deps", "include"]);
+    assert!(out.status.success(), "{}", self::text(&out));
 }
