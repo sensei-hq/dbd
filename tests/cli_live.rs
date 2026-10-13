@@ -3078,3 +3078,77 @@ async fn module_runs_one_module_and_its_dependencies() {
     assert!(!o.status.success(), "{}", combined(&o));
     assert!(combined(&o).contains("\"nope\""), "{}", combined(&o));
 }
+
+/// A workspace's diff is one answer: `--exit-code` says whether any module
+/// drifts — not only the first — and `--json` is one document, each module's
+/// diff under its name.
+#[tokio::test]
+async fn a_workspace_diff_answers_for_every_module() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    shop_workspace(dir);
+    let o = dbd(dir, &url, &["deploy"]);
+    assert!(o.status.success(), "deploy: {}", combined(&o));
+
+    // Only the last module drifts: a table its design has and the database
+    // does not.
+    std::fs::write(
+        dir.join("dojo/ddl/table/dojo/belts.ddl"),
+        "set search_path to dojo;\ncreate table if not exists belts (id integer primary key);\n",
+    )
+    .unwrap();
+
+    let o = dbd(dir, &url, &["diff", "--exit-code"]);
+    assert_eq!(o.status.code(), Some(2), "a module drifts: {}", combined(&o));
+
+    let o = dbd(dir, &url, &["diff", "--json"]);
+    assert!(o.status.success(), "{}", combined(&o));
+    let doc: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap_or_else(|e| panic!("{e}: {}", stdout(&o)));
+    let modules: Vec<&str> = doc["modules"]
+        .as_array()
+        .expect("a modules array")
+        .iter()
+        .map(|m| m["module"].as_str().expect("a module name"))
+        .collect();
+    assert_eq!(modules, ["shared", "core", "dojo"], "{doc}");
+    assert_eq!(doc["modules"][2]["owner"], "shop/dojo", "{doc}");
+}
+
+/// A policy failing in one module is reported, and the modules after it still
+/// get theirs; the run then fails — `policies` and `apply --with-policies` alike.
+#[tokio::test]
+async fn a_workspace_policy_failure_does_not_skip_the_modules_after_it() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    shop_workspace(dir);
+    let o = dbd(dir, &url, &["deploy"]);
+    assert!(o.status.success(), "deploy: {}", combined(&o));
+
+    for (rel, sql) in [
+        (
+            "shared/policies/app/currencies.sql",
+            "alter table app.no_such_table enable row level security;\n",
+        ),
+        (
+            "core/policies/app/orders.sql",
+            "alter table app.orders enable row level security;\n",
+        ),
+    ] {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, sql).unwrap();
+    }
+
+    for args in [&["policies"][..], &["apply", "--with-policies"]] {
+        let o = dbd(dir, &url, args);
+        let text = combined(&o);
+        assert!(!o.status.success(), "{args:?}: shared's policy fails: {text}");
+        assert_eq!(
+            module_headers(&stdout(&o)),
+            ["shared", "core", "dojo"],
+            "{args:?}: every module still runs: {text}"
+        );
+    }
+}
