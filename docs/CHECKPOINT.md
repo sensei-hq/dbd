@@ -8,17 +8,19 @@ Phase 1 is on `develop`, unreleased.
 
 - Slices 1–4 in `feat/ownership`: registry, claim, uses; prune by ownership;
   the uses guard on reconcile's drops and apply's migrations.
-- Slice 5 implemented (`97d866e7`, docs `732ff4d1`): any project's prod mark
-  refuses an unforced reset; entity and dropped-schema uses guard; `--schemas`,
-  `--extensions` and roles keep what other projects have, use or depend on,
-  named on `ResetComplete.kept`; `reset_preview` for `--dry-run`.
-- Embedded 249/249, `cli_live` 49/49, workspace 2006/0, clippy, fmt, doc clean.
+- Slice 5 (PR #53): reset keeps/refuses for other projects, `ResetComplete.kept`,
+  `reset_preview`. Review round 1 fixed test-first: the dbd write lock
+  (`dbd:write` advisory; exclusive for reset, reconcile, migrating apply);
+  the guard sees what nobody owns (prune's rule) and a schema's collations;
+  supabase resets; kept roles keep grants; path-key guard; unknown env = prod.
+- Embedded 266/266, `cli_live` 49/49, workspace 2006/0, clippy, fmt, doc clean.
 
 ## Next
 
-    gh pr create --base feat/ownership --head feat/ownership-reset
-    # then focused review, fixes test-first, CI green, local --no-ff merge;
-    # slice 6: name reuse (--allow-ownership-change) + transfer (--adopt-from)
+    git push; gh pr checks 53 --watch
+    # focused re-review of the write lock + guard reach, fixes test-first,
+    # CI green, local --no-ff merge into feat/ownership; then slice 6:
+    # name reuse (--allow-ownership-change) + transfer (--adopt-from)
 
 ## Open
 
@@ -30,8 +32,10 @@ Phase 1 is on `develop`, unreleased.
 - A bare type of another project's is no use (dropped as a built-in).
 - An apply in one transaction runs `apply.before` hooks before its claim
   (documented in the spec). `dbd.objects` still allows namespace `type`, unused.
-- Docs slice (end of Phase 2) must cover `--prune-unowned` and reset's kept
-  lines in the guides.
+- Docs slice (end of Phase 2) must cover `--prune-unowned`, reset's kept
+  lines and the write lock's waits in the guides.
+- Scratch dirs to delete by hand: `/tmp/dbd-mut` (a reviewer's worktree;
+  then `git worktree prune`), `/tmp/dbd-mut-target`, `/tmp/dbd-idx.*`.
 - Phase 1 is releasable as 0.25.2 when asked.
 
 ## Known limits
