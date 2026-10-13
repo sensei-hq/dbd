@@ -12,13 +12,12 @@
 
 ## Next
 
-Slice 1 PR #61 (`feat/workspaces-load` → `feat/workspaces`): CI green; review
-findings' red tests committed (19fd2aa8). Implement: roles/created types/folded
-enums across modules, Kahn order in `modules:` order, dotfiles, sqlite label,
-own-folder rule (no `.`, no nesting), `Workspace::config`, a dispatcher guard
-for commands that do not run a workspace; then plan/spec wording.
+Slice 1 PR #61 (`feat/workspaces-load` → `feat/workspaces`): review findings
+fixed (2534f002) and plan/spec updated (9ceacd0f). Full suites and a focused
+re-review running; then CI green and merge into `feat/workspaces`, then slice 2
+(running a workspace: per-module runs, `--module`, T21).
 
-    cargo test -p dbd-core --test workspace_load && cargo test --test workspace_inspect
+    gh pr checks 61
 
 ## Open
 
