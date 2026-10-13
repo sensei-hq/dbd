@@ -12,12 +12,13 @@
 
 ## Next
 
-Slice 1 on `feat/workspaces-load`: implemented (`design/workspace.rs`,
-`Workspace::load`, `Design::scan`/`resolved`, inspect per module); workspace,
-clippy, fmt, doc green. Embedded, cli_live and SQLite suites running; then PR
-into `feat/workspaces`, adversarial review, CI, merge.
+Slice 1 PR #61 (`feat/workspaces-load` → `feat/workspaces`): CI green; review
+findings' red tests committed (19fd2aa8). Implement: roles/created types/folded
+enums across modules, Kahn order in `modules:` order, dotfiles, sqlite label,
+own-folder rule (no `.`, no nesting), `Workspace::config`, a dispatcher guard
+for commands that do not run a workspace; then plan/spec wording.
 
-    cargo test -p dbd-core --features embedded-tests --test embedded_test -- --test-threads=2
+    cargo test -p dbd-core --test workspace_load && cargo test --test workspace_inspect
 
 ## Open
 
