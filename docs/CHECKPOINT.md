@@ -12,9 +12,8 @@
   `3612a8cf` walk, `6ebdf47d` migration reader, `8092df1a` uses recording):
   the guard walks pg_depend as a CASCADE reaches, part by part (inherited
   columns, arrays, domain checks) + dbd.uses (recorded whoever owns the
-  target; routine bodies in any file); reconcile refuses dropped parts, a
-  prune keeps used tables; apply refuses a migration's drops (DO blocks,
-  schemas, indexes, data scripts) and an unreadable one.
+  target; routine bodies in any file); reconcile refuses dropped parts, a prune
+  keeps used tables; apply refuses a migration's drops, or an unreadable one.
 - Embedded 232/232, `cli_live` 48/48, workspace 2003/0, clippy, fmt, doc clean.
 
 ## Next
