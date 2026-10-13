@@ -70,25 +70,57 @@ pub async fn cmd_diff(
     verbosity: Verbosity,
 ) -> Result<()> {
     let targets = super::targets(config, env, project_dir, module, None, super::Order::Build)?;
+    let mut diffs: Vec<(Option<String>, String, SchemaDiff)> = Vec::new();
     for (i, target) in targets.into_iter().enumerate() {
-        let (design, _) = target.enter(i == 0);
-        diff_design(design, config, database_url, json, exit_code, scope, deps, verbosity).await?;
+        let module = target.module.clone();
+        // Under --json stdout is the document: which module is next goes to
+        // stderr, as the scope line does.
+        let design = match (json, target.label()) {
+            (true, Some(label)) => {
+                eprintln!("{label}");
+                target.design
+            }
+            _ => target.enter(i == 0).0,
+        };
+        let owner = design.owner().to_string();
+        let diff = diff_design(design, config, database_url, json, scope, deps).await?;
+        diffs.push((module, owner, diff));
     }
+
+    if json {
+        // A project's diff is its document; a workspace's, each module's under
+        // its name — one document either way, for a pipeline to parse.
+        let doc = match &diffs[..] {
+            [(None, _, diff)] => serde_json::to_value(diff).context("Failed to serialize diff")?,
+            _ => {
+                let mut modules = Vec::new();
+                for (module, owner, diff) in &diffs {
+                    let diff = serde_json::to_value(diff).context("Failed to serialize diff")?;
+                    modules.push(serde_json::json!({ "module": module, "owner": owner, "diff": diff }));
+                }
+                serde_json::json!({ "modules": modules })
+            }
+        };
+        output::always(&serde_json::to_string_pretty(&doc).context("Failed to serialize diff")?);
+    }
+    // Every module answers: the run drifts if any module does.
+    if let Some(code) = diff_exit_code(diffs.iter().all(|(_, _, d)| d.is_empty()), exit_code) {
+        std::process::exit(code);
+    }
+    let _ = verbosity;
     Ok(())
 }
 
-/// [`cmd_diff`] for one design: the project's, or one module's.
-#[allow(clippy::too_many_arguments)]
+/// [`cmd_diff`] for one design: the project's, or one module's — its report
+/// said, unless the run's is one JSON document.
 async fn diff_design(
     design: Design,
     config: &Path,
     database_url: Option<&str>,
     json: bool,
-    exit_code: bool,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
-    verbosity: Verbosity,
-) -> Result<()> {
+) -> Result<SchemaDiff> {
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
     // On stderr under --json: stdout is the document, and a pipeline parses it.
     let (kept, total) = design.scope_counts(&resolved)?;
@@ -116,20 +148,12 @@ async fn diff_design(
         .await
         .context("Diff failed")?;
 
-    if json {
-        let doc = serde_json::to_string_pretty(&diff).context("Failed to serialize diff")?;
-        output::always(&doc);
-    } else {
+    if !json {
         for line in diff_report_lines(&diff) {
             output::always(&line);
         }
     }
-
-    if let Some(code) = diff_exit_code(diff.is_empty(), exit_code) {
-        std::process::exit(code);
-    }
-    let _ = verbosity;
-    Ok(())
+    Ok(diff)
 }
 
 /// terraform-`plan` style exit codes for `--exit-code`: `Some(0)` in sync,

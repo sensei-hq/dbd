@@ -151,7 +151,7 @@ pub async fn cmd_inspect(
     let targets = super::targets(config, env, project_dir, module, name, super::Order::Build)?;
     let mut blocking = 0;
     for (i, target) in targets.into_iter().enumerate() {
-        let in_module = target.label().is_some();
+        let in_module = target.module.is_some();
         let (mut design, dir) = target.enter(i == 0);
         super::warn_if_no_authored_ddl(&design, &dir, in_module);
         blocking += inspect_design(&mut design, &dir, &inspect).await?;
@@ -979,8 +979,9 @@ pub async fn cmd_apply(
     verbosity: Verbosity,
 ) -> Result<()> {
     let targets = super::targets(config, env, project_dir, module, name, super::Order::Build)?;
+    let mut code = 0;
     for (i, target) in targets.into_iter().enumerate() {
-        let in_module = target.label().is_some();
+        let in_module = target.module.is_some();
         let (design, dir) = target.enter(i == 0);
         super::warn_if_no_authored_ddl(&design, &dir, in_module);
         let run = ApplyRun {
@@ -994,7 +995,11 @@ pub async fn cmd_apply(
             deps,
             verbosity,
         };
-        apply_design(ownership.applied_to(design), &dir, &run).await?;
+        code = code.max(apply_design(ownership.applied_to(design), &dir, &run).await?);
+    }
+    // A module's failed policy fails the run, once every module has run.
+    if code != 0 {
+        std::process::exit(code);
     }
     Ok(())
 }
@@ -1013,7 +1018,7 @@ struct ApplyRun<'a> {
 }
 
 /// [`cmd_apply`] for one design: the project's, or one module's.
-async fn apply_design(design: Design, project_dir: &Path, run: &ApplyRun<'_>) -> Result<()> {
+async fn apply_design(design: Design, project_dir: &Path, run: &ApplyRun<'_>) -> Result<i32> {
     let &ApplyRun {
         config,
         database_url,
@@ -1086,7 +1091,7 @@ async fn apply_design(design: Design, project_dir: &Path, run: &ApplyRun<'_>) ->
             None => super::note_unlisted_migrations(verbosity, project_dir),
         }
         output::summary(0, 0, entities.len());
-        return Ok(());
+        return Ok(0);
     }
 
     let adapter = get_adapter(config, database_url, design.owner()).await?;
@@ -1156,14 +1161,12 @@ async fn apply_design(design: Design, project_dir: &Path, run: &ApplyRun<'_>) ->
             output::always(&format!("  Policy FAILED: {} — {}", file.display(), err));
         }
         // Report first, then fail — same order as inspect, so the reason is on
-        // screen before the non-zero exit.
-        let code = policy_phase_exit_code(&report);
-        if code != 0 {
-            std::process::exit(code);
-        }
+        // screen before the non-zero exit, which the caller makes once every
+        // module has run.
+        return Ok(policy_phase_exit_code(&report));
     }
 
-    Ok(())
+    Ok(0)
 }
 
 /// Select the materialized views a `refresh` invocation should target, in
@@ -1307,14 +1310,20 @@ pub async fn cmd_policies(
     verbosity: Verbosity,
 ) -> Result<()> {
     let targets = super::targets(config, env, project_dir, module, None, super::Order::Build)?;
+    let mut code = 0;
     for (i, target) in targets.into_iter().enumerate() {
         let (design, dir) = target.enter(i == 0);
-        policies_design(design, &dir, config, database_url, dry_run, scope, deps, verbosity).await?;
+        code = code.max(policies_design(design, &dir, config, database_url, dry_run, scope, deps, verbosity).await?);
+    }
+    // A module's failed policy fails the run, once every module has run.
+    if code != 0 {
+        std::process::exit(code);
     }
     Ok(())
 }
 
-/// [`cmd_policies`] for one design: the project's, or one module's.
+/// [`cmd_policies`] for one design: the project's, or one module's. Returns
+/// the exit code its failed policies ask for.
 #[allow(clippy::too_many_arguments)]
 async fn policies_design(
     design: Design,
@@ -1325,7 +1334,7 @@ async fn policies_design(
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
-) -> Result<()> {
+) -> Result<i32> {
     // `dbd policies` takes the global --scope like every other command; before
     // this it silently applied every file, so a policy for a schema this plane
     // does not have reported `schema "…" does not exist` on every run.
@@ -1350,7 +1359,7 @@ async fn policies_design(
         let plan = dbd_core::design::plan_policies(project_dir, policy_ws.as_ref().map(|(n, ws)| (n.as_str(), ws)))?;
         if plan.applied.is_empty() && plan.skipped.is_empty() {
             output::info(verbosity, "No policy files found in policies/");
-            return Ok(());
+            return Ok(0);
         }
         // Each list under its own heading: "Would apply" over a list of skips
         // announced work the run will not do.
@@ -1368,7 +1377,7 @@ async fn policies_design(
                 output::info(verbosity, &format!("  skipped {} — {why}", file.display()));
             }
         }
-        return Ok(());
+        return Ok(0);
     }
 
     let adapter = get_adapter(config, database_url, design.owner()).await?;
@@ -1390,7 +1399,7 @@ async fn policies_design(
 
     if report.applied.is_empty() && report.failed.is_empty() && report.skipped.is_empty() {
         output::info(verbosity, "No policy files found in policies/");
-        return Ok(());
+        return Ok(0);
     }
 
     for file in &report.applied {
@@ -1409,12 +1418,7 @@ async fn policies_design(
         ),
     );
 
-    let code = policy_phase_exit_code(&report);
-    if code != 0 {
-        std::process::exit(code);
-    }
-
-    Ok(())
+    Ok(policy_phase_exit_code(&report))
 }
 
 pub fn cmd_format(config: &Path, project_dir: &Path, check: bool, verbosity: Verbosity) -> Result<()> {

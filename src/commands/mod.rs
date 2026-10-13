@@ -158,21 +158,23 @@ pub(super) struct Target {
     pub design: Design,
     /// Where its files are: the project directory, or the module's folder.
     pub dir: std::path::PathBuf,
-    /// `module core (shop/core)`, said before a module's run.
-    label: Option<String>,
+    /// The module's name — `None` for a project's own design.
+    pub module: Option<String>,
 }
 
 impl Target {
-    /// `module core (shop/core)` for a module of a workspace.
-    pub fn label(&self) -> Option<&str> {
-        self.label.as_deref()
+    /// `module core (shop/core)`, said before a module's run.
+    pub fn label(&self) -> Option<String> {
+        self.module
+            .as_ref()
+            .map(|m| format!("module {m} ({})", self.design.owner()))
     }
 
     /// Say which module the run is in — the first without a blank line before
     /// it — and hand over its design and folder.
     pub fn enter(self, first: bool) -> (Design, std::path::PathBuf) {
-        if let Some(label) = &self.label {
-            output::always(&if first { label.clone() } else { format!("\n{label}") });
+        if let Some(label) = self.label() {
+            output::always(&if first { label } else { format!("\n{label}") });
         }
         (self.design, self.dir)
     }
@@ -228,7 +230,7 @@ pub(super) fn targets(
     Ok(modules
         .into_iter()
         .map(|m| Target {
-            label: m.name().map(|n| format!("module {n} ({})", m.owner())),
+            module: m.name().map(str::to_string),
             dir: m.design().project_dir().to_path_buf(),
             design: m.into_design(),
         })
