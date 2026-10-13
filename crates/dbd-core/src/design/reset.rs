@@ -291,7 +291,12 @@ impl Design {
         } else {
             Vec::new()
         };
-        let roles = self.reset_roles(scope).into_iter().map(|r| r.name).collect();
+        // Roles are dropped on a `postgres` target only (see `reset_plan`).
+        let roles = if target == "postgres" {
+            self.reset_roles(scope).into_iter().map(|r| r.name).collect()
+        } else {
+            Vec::new()
+        };
         Ok(ResetDrops {
             entities,
             schemas,

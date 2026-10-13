@@ -788,6 +788,7 @@ impl Bookkeeping {
         &self,
         owner: &str,
         guarded: &[crate::adapter::Guarded],
+        mine: &[crate::adapter::OwnedObject],
     ) -> Result<Vec<crate::adapter::Dependence>> {
         use crate::adapter::GuardedPart;
         let read = |e: sqlx::Error| DbdError::Config(format!("uses guard read failed: {e}"));
@@ -815,6 +816,9 @@ impl Bookkeeping {
                 .bind(part)
                 .bind(part_name)
                 .bind(owner)
+                .bind(mine.iter().map(|o| o.namespace.clone()).collect::<Vec<_>>())
+                .bind(mine.iter().map(|o| o.schema.clone()).collect::<Vec<_>>())
+                .bind(mine.iter().map(|o| o.name.clone()).collect::<Vec<_>>())
                 .fetch_all(&self.pool)
                 .await
                 .map_err(read)?;
@@ -901,13 +905,29 @@ impl Bookkeeping {
         // An extension's members — `deptype = 'e'` — are listed as the
         // extension, once, whatever it is called; and what is part of another
         // object — `deptype = 'i'`, a range type's constructors — as that
-        // object.
+        // object. Not a composite type: its relation is part of its type, and
+        // the two are one entity.
         let member = |class: &str, oid: &str| {
             format!(
                 "NOT EXISTS (SELECT 1 FROM pg_depend e WHERE e.classid = '{class}'::regclass \
-                 AND e.objid = {oid} AND e.objsubid = 0 AND e.deptype IN ('e', 'i'))"
+                 AND e.objid = {oid} AND e.objsubid = 0 AND (e.deptype = 'e' OR (e.deptype = 'i' \
+                 AND NOT (e.classid = 'pg_class'::regclass AND e.refclassid = 'pg_type'::regclass))))"
             )
         };
+        // A partition of a table that is `owner`'s — declared or claimed —
+        // goes with its parent's drop.
+        let own_parent = format!(
+            "EXISTS (SELECT 1 FROM pg_inherits i JOIN pg_class p ON p.oid = i.inhparent \
+               JOIN pg_namespace pn ON pn.oid = p.relnamespace WHERE i.inhrelid = c.oid AND ( \
+               EXISTS (SELECT 1 FROM unnest($3::text[], $4::text[], $5::text[]) AS m(namespace, schema, name) \
+                       WHERE m.namespace = 'relation' AND m.schema = pn.nspname AND m.name = p.relname) {claimed}))",
+            claimed = if registry.is_some() {
+                "OR EXISTS (SELECT 1 FROM dbd.objects o WHERE o.namespace = 'relation' AND o.schema = pn.nspname \
+                 AND o.name = p.relname AND o.owner = $1)"
+            } else {
+                ""
+            }
+        );
         let sql = format!(
             "SELECT DISTINCT x.kind, x.name, {owners} AS owner \
              FROM ( \
@@ -917,6 +937,7 @@ impl Bookkeeping {
                                      WHEN 'c' THEN 'type' ELSE 'table' END AS kind \
                FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
                WHERE n.nspname = $2 AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S', 'c') AND {class_member} \
+                 AND NOT (c.relispartition AND {own_parent}) \
                  AND NOT (c.relkind = 'S' AND EXISTS (SELECT 1 FROM pg_depend d \
                           WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid \
                             AND d.refclassid = 'pg_class'::regclass AND d.deptype IN ('a', 'i'))) \
@@ -1399,11 +1420,14 @@ async fn release_in(
 /// partition of one it empties, and every table whose foreign key points at
 /// one it empties. Each dependent is named by its owning
 /// relation, type or routine. A schema starts from all it holds: its
-/// relations, types and routines, and its collations, text search objects,
+/// relations, its types — row and array types included, so a column of one
+/// is reached — its routines, and its collations, text search objects,
 /// operators, operator classes and families, and conversions — a column
-/// collated by one goes with it. Rows: the other owner — none for an entity
-/// nobody owns that stands on its own and is not the one dropped — the
-/// dependent as `kind schema.name`, and its schema.
+/// collated by one goes with it. `$7`–`$9`: the asking owner's declared
+/// entities, its own claimed or not. Rows: the other owner — none for an
+/// entity nobody owns that stands on its own (a composite type does) and is
+/// neither the one dropped nor declared by the owner asking — the dependent as
+/// `kind schema.name`, and its schema.
 const DEPENDENTS_SQL: &str = "\
 WITH RECURSIVE \
 rel AS (SELECT c.oid, c.reltype FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -1448,7 +1472,7 @@ start(classid, objid, objsubid) AS ( \
   UNION ALL SELECT 'pg_class'::regclass::oid, c.oid, 0 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
             WHERE $1 = 'schema' AND n.nspname = $2 AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S', 'c') \
   UNION ALL SELECT 'pg_type'::regclass::oid, t.oid, 0 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
-            WHERE $1 = 'schema' AND n.nspname = $2 AND t.typrelid = 0 AND t.typelem = 0 \
+            WHERE $1 = 'schema' AND n.nspname = $2 \
   UNION ALL SELECT 'pg_proc'::regclass::oid, p.oid, 0 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
             WHERE $1 = 'schema' AND n.nspname = $2 \
   UNION ALL SELECT x.classid, x.objid, 0 FROM pg_namespace n CROSS JOIN LATERAL ( \
@@ -1529,5 +1553,9 @@ FROM found f LEFT JOIN dbd.objects o ON o.namespace = f.namespace AND o.schema =
 WHERE o.owner IS DISTINCT FROM $6 \
   AND (o.owner IS NOT NULL OR ( \
     NOT (f.namespace = $1 AND f.schema = $2 AND f.name = $3) AND NOT ($1 = 'schema' AND f.schema = $2) \
+    AND NOT EXISTS (SELECT 1 FROM unnest($7::text[], $8::text[], $9::text[]) AS m(namespace, schema, name) \
+                    WHERE m.namespace = f.namespace AND m.schema = f.schema AND m.name = f.name) \
     AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = f.classid AND d.objid = f.objid \
-                    AND d.objsubid = 0 AND d.deptype IN ('i', 'a', 'e'))))";
+                    AND d.objsubid = 0 AND d.deptype IN ('i', 'a', 'e') \
+                    AND NOT (d.deptype = 'i' AND d.classid = 'pg_class'::regclass \
+                             AND d.refclassid = 'pg_type'::regclass))))";

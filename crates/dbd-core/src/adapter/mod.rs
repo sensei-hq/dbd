@@ -581,10 +581,11 @@ pub trait DatabaseAdapter: Send + Sync {
     /// database cannot track (a routine's). What it would reach that nobody
     /// owns comes too, owner `None`: an entity standing on its own, not part
     /// of another — not an owned sequence, a partition, an array type or an
-    /// extension's member — and not one the drop names. Reads only. Adapters
-    /// without a registry find none.
-    async fn dependents(&self, owner: &str, guarded: &[Guarded]) -> Result<Vec<Dependence>> {
-        let _ = (owner, guarded);
+    /// extension's member — and not one the drop names nor one of `mine`, the
+    /// entities `owner`'s design declares, which are its own claimed or not.
+    /// Reads only. Adapters without a registry find none.
+    async fn dependents(&self, owner: &str, guarded: &[Guarded], mine: &[OwnedObject]) -> Result<Vec<Dependence>> {
+        let _ = (owner, guarded, mine);
         Ok(Vec::new())
     }
 

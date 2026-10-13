@@ -482,7 +482,17 @@ impl Design {
                 guarded.push((g, label));
             }
         }
-        let uses = self.uses_of(adapter, &guarded).await?;
+        // A table nobody owns that the prune drops too is no use of another it
+        // drops: what depends on it goes in the same run.
+        let going: std::collections::HashSet<String> = plan
+            .dropped
+            .iter()
+            .map(|stmt| {
+                let k = key(&stmt.entity_name);
+                format!("table {}.{}", k.schema, k.name)
+            })
+            .collect();
+        let uses = self.uses_besides(adapter, &guarded, &going).await?;
         // A prune candidate depended on: kept, named.
         let mut kept = Vec::new();
         for ((_, label), uses) in guarded.iter().zip(&uses).take(prunes) {
@@ -774,11 +784,28 @@ impl Design {
         adapter: &dyn DatabaseAdapter,
         guarded: &[(crate::adapter::Guarded, String)],
     ) -> Result<Vec<Option<String>>> {
+        self.uses_besides(adapter, guarded, &std::collections::HashSet::new())
+            .await
+    }
+
+    /// [`Self::uses_of`], passing over a dependent nobody owns that the run
+    /// drops too — `going`, each as `table app.legacy_orders`.
+    async fn uses_besides(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        guarded: &[(crate::adapter::Guarded, String)],
+        going: &std::collections::HashSet<String>,
+    ) -> Result<Vec<Option<String>>> {
         if guarded.is_empty() {
             return Ok(Vec::new());
         }
         let objects: Vec<crate::adapter::Guarded> = guarded.iter().map(|(g, _)| g.clone()).collect();
-        let found = adapter.dependents(self.owner(), &objects).await?;
+        let found: Vec<crate::adapter::Dependence> = adapter
+            .dependents(self.owner(), &objects, &self.declared_objects())
+            .await?
+            .into_iter()
+            .filter(|d| d.owner.is_some() || !going.contains(&d.via))
+            .collect();
         // What nobody owns is guarded where a project might own it, by the
         // rule `--prune` keeps such a table by: in a schema another owner
         // uses, or anywhere while a project the database records does not

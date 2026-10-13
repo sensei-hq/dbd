@@ -2581,8 +2581,13 @@ ORDER BY 1, 2, 4, 5"#;
         self.bookkeeping.release_objects(guard.as_mut(), owner, declared).await
     }
 
-    async fn dependents(&self, owner: &str, guarded: &[super::Guarded]) -> Result<Vec<super::Dependence>> {
-        self.bookkeeping.dependents(owner, guarded).await
+    async fn dependents(
+        &self,
+        owner: &str,
+        guarded: &[super::Guarded],
+        mine: &[super::OwnedObject],
+    ) -> Result<Vec<super::Dependence>> {
+        self.bookkeeping.dependents(owner, guarded, mine).await
     }
 
     async fn users_of(&self, owner: &str, kind: &str, target: &str) -> Result<Vec<String>> {
