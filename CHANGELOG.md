@@ -117,12 +117,15 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   another project's apply committing in between had its table taken by
   `DROP SCHEMA … CASCADE`, and both runs reported success; a prune, or a
   migration's `DROP TABLE … CASCADE`, took a view committed over the table
-  the same way. Every writing `apply` (a `deploy`'s included), `reconcile`
-  and `reset` now holds the database's dbd write lock (`pg_advisory_lock` on
-  `dbd:write`, in a session of its own) — shared by an apply that only
-  builds, so those of different projects still run side by side; exclusive
-  for a reset, a reconcile and an apply running migrations, which wait for
-  the runs before them, at most 5 minutes, while the runs after them wait.
+  the same way. Every writing `apply`, `reconcile`, `reset`, `import`,
+  `policies` and grant — a `deploy`'s phases each — now holds the database's
+  dbd write lock (an advisory lock on `dbd:write`, in a session of its own):
+  shared to build, so those of different projects still run side by side;
+  exclusive for a reset, a reconcile and an apply running migrations. A run
+  waits for the lock at most 5 minutes, asking again every 100ms, its session
+  named `dbd: waiting for the write lock` meanwhile. The session turns off
+  `idle_session_timeout`, a run that finds its lock lost when it releases it
+  fails, and a run dropped part-way gives the lock up.
 - **The uses guard sees further** (#7, phase 2). A dependent nobody owns —
   a project's not yet recording its uses — is guarded where a project might
   own it, by `--prune`'s rule: in a schema another project uses, or anywhere
@@ -159,8 +162,10 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   each, and `Design::reset_preview` returns the script a reset would run and
   that summary, asked of the database. `DatabaseAdapter` gains `users_of` and
   `not_owned_in_schema` (defaults: none), with the `adapter::SchemaMember`
-  the second returns; and `lock_writes` and `unlock_writes` (defaults: no
-  lock), which `Design::apply`, `reconcile` and `reset` hold around a run.
+  the second returns; and `lock_writes`, `unlock_writes` and
+  `abandon_writes` (defaults: no lock), which `Design::apply`, `reconcile`,
+  `reset`, `import_data`, `apply_grants` and `design::apply_policies` hold
+  around a run.
   `Dependence::owner` is an `Option` — `None` for a dependent nobody owns —
   and `Dependence::schema` names the dependent's schema.
 

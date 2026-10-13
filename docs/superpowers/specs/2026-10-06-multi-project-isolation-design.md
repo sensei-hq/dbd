@@ -257,9 +257,15 @@ entities before it drops any (see Claim). On top of that:
 - The reset holds the database's dbd write lock — `pg_advisory_lock` on
   `dbd:write`, exclusive — from its first read to its last drop. So does a
   reconcile, and an apply running migrations, whose drops are guarded the
-  same way; an apply that only builds holds it shared. So no other project's
-  run writes between what a guarded run reads and what it drops: it waits for
-  the runs before it, at most 5 minutes, and the runs after it wait for it.
+  same way; an apply that only builds holds it shared, as do imports,
+  policies and grants. So no other project's run writes between what a
+  guarded run reads and what it drops: it waits for the runs before it, at
+  most 5 minutes, and the runs after it wait for it. A run waits by asking
+  again, not in one long statement — whose snapshot the holder's `CREATE
+  INDEX CONCURRENTLY` would wait out — and its session says so in its
+  `application_name`. The session holding the lock sits idle through the run,
+  so it turns `idle_session_timeout` off; a lock found lost at release fails
+  the run; a run dropped part-way drops the session, and the lock with it.
 - `--schemas` keeps a schema that holds an entity owned by anyone else, an
   unowned entity, or an extension another owner uses or depends on, and one
   another owner records a use of. An extension the design installs there and
