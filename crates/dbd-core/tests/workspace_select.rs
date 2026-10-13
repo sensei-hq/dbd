@@ -34,8 +34,12 @@ fn shop(root: &Path) {
     ] {
         write(root, hook, "select 1;\n");
     }
-    for module in ["shared", "core", "dojo"] {
-        std::fs::create_dir_all(root.join(module)).unwrap();
+    for (module, table) in [("shared", "currencies"), ("core", "orders"), ("dojo", "belts")] {
+        write(
+            root,
+            &format!("{module}/ddl/table/app/{table}.ddl"),
+            &format!("set search_path to app;\ncreate table if not exists {table} (id integer primary key);\n"),
+        );
     }
 }
 
@@ -170,4 +174,119 @@ fn a_design_without_modules_runs_its_hooks_once() {
     write(root, "hooks/b.sql", "select 1;\n");
     let selected = load(root).select(None).expect("select");
     assert_eq!(hooks(&selected[0]), ["apply.before hooks/b.sql"]);
+}
+
+/// `-n`: the module declaring the entity, alone — with the manifest's hooks
+/// around it, as around any run.
+#[test]
+fn a_named_entity_selects_its_module_with_the_manifests_hooks_around_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    shop(tmp.path());
+    let selected = load(tmp.path()).select_declaring(None, "app.orders").expect("select");
+    let [core] = &selected[..] else { panic!("one module") };
+    assert_eq!(core.owner(), "shop/core");
+    assert_eq!(
+        hooks(core),
+        [
+            "apply.before hooks/ws-before.sql",
+            "apply.after hooks/core-after.sql",
+            "apply.after hooks/ws-after.sql"
+        ]
+    );
+
+    let err = match load(tmp.path()).select_declaring(None, "app.nothing") {
+        Ok(_) => panic!("no module declares it"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("app.nothing"), "{err}");
+}
+
+/// A module `--module` leaves out is named, not taken for missing.
+#[test]
+fn a_named_entity_outside_the_selected_module_names_its_module() {
+    let tmp = tempfile::tempdir().unwrap();
+    shop(tmp.path());
+    let err = match load(tmp.path()).select_declaring(Some("shared"), "app.orders") {
+        Ok(_) => panic!("app.orders is core's"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.contains("app.orders") && err.contains("\"core\"") && err.contains("shared"),
+        "{err}"
+    );
+}
+
+/// A module's dependencies are selected through their own: `top` takes `mid`,
+/// and `mid` takes `base`.
+#[test]
+fn a_dependency_of_a_dependency_is_selected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "design.yaml",
+        "project:\n  name: p\n\nmodules:\n  top:\n    depends_on: [mid]\n  mid:\n    depends_on: [base]\n  base: {}\n",
+    );
+    for m in ["top", "mid", "base"] {
+        std::fs::create_dir_all(root.join(m)).unwrap();
+    }
+    let selected = load(root).select(Some("top")).expect("select");
+    assert_eq!(owners(&selected), ["p/base", "p/mid", "p/top"]);
+}
+
+/// The manifest's `import.after` is the workspace's, as its `apply:` is: it
+/// runs once, after the last module's import, read from the project folder —
+/// not once per module, from each module's.
+#[test]
+fn the_manifests_import_after_runs_once_after_the_last_module() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    shop(root);
+    let manifest = std::fs::read_to_string(root.join("design.yaml")).unwrap();
+    write(
+        root,
+        "design.yaml",
+        &format!("{manifest}\nimport:\n  after: [sql/loader.sql]\n"),
+    );
+    write(root, "sql/loader.sql", "select 1;\n");
+
+    let selected = load(root).select(None).expect("select");
+    let after: Vec<Vec<String>> = selected
+        .iter()
+        .map(|m| m.design().import_after_preview(None).expect("preview").0)
+        .collect();
+    assert_eq!(after, [vec![], vec![], vec!["sql/loader.sql".to_string()]]);
+    for module in &selected {
+        assert!(module.design().config().import.after.is_empty(), "{}", module.owner());
+    }
+}
+
+/// Each `export:` entry is the module's that declares its entity; one no
+/// module declares stays with the first, which warns about it once.
+#[test]
+fn each_export_entry_is_the_modules_that_declares_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    shop(root);
+    let manifest = std::fs::read_to_string(root.join("design.yaml")).unwrap();
+    write(
+        root,
+        "design.yaml",
+        &format!("{manifest}\nexport:\n  - app.orders\n  - app.currencies\n  - app.ghost\n"),
+    );
+
+    let workspace = load(root);
+    let exports: Vec<Vec<String>> = workspace
+        .modules()
+        .iter()
+        .map(|m| m.design().config().export.iter().map(|e| e.name()).collect())
+        .collect();
+    assert_eq!(
+        exports,
+        [
+            vec!["app.currencies".to_string(), "app.ghost".to_string()],
+            vec!["app.orders".to_string()],
+            vec![],
+        ]
+    );
 }

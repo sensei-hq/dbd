@@ -3004,6 +3004,18 @@ fn module_headers(text: &str) -> Vec<&str> {
         .collect()
 }
 
+/// The projects `inspect --shared` lists, a line each: `shop/core (prod, v0) —
+/// owns 1: relation app.orders`.
+fn owners_listed(dir: &Path, url: &str) -> Vec<String> {
+    let o = dbd(dir, url, &["inspect", "--shared"]);
+    stdout(&o)
+        .lines()
+        .take_while(|l| !l.starts_with("No conflicts") && !l.starts_with("Conflicts") && !l.is_empty())
+        .filter(|l| l.starts_with("  ") && !l.starts_with("    "))
+        .map(|l| l.trim().to_string())
+        .collect()
+}
+
 /// Every command that runs a design runs a workspace module by module, in
 /// `depends_on` order, each as its own owner — and `reset` in reverse.
 #[tokio::test]
@@ -3021,6 +3033,16 @@ async fn a_workspace_runs_module_by_module() {
         "{}",
         combined(&o)
     );
+    // Each module ran, as its own owner: its record, and what it owns.
+    let owners = owners_listed(dir, &url);
+    for line in [
+        "shop/shared (prod, v0) — owns 1: relation app.currencies",
+        "shop/core (prod, v0) — owns 1: relation app.orders",
+        "shop/dojo (prod, v0) — owns 1: relation dojo.sessions",
+    ] {
+        assert!(owners.iter().any(|o| o == line), "{line}: {owners:?}");
+    }
+    assert!(!owners.iter().any(|o| o.starts_with("shop (")), "{owners:?}");
 
     for args in [
         &["apply"][..],
@@ -3066,9 +3088,31 @@ async fn module_runs_one_module_and_its_dependencies() {
     assert!(o.status.success(), "apply --module core: {}", combined(&o));
     assert_eq!(module_headers(&stdout(&o)), ["shared", "core"], "{}", combined(&o));
 
-    let o = dbd(dir, &url, &["inspect", "--shared"]);
-    let text = combined(&o);
-    assert!(text.contains("shop/core") && !text.contains("shop/dojo ("), "{text}");
+    let owners = owners_listed(dir, &url);
+    assert!(
+        owners
+            .iter()
+            .any(|o| o == "shop/shared (prod, v0) — owns 1: relation app.currencies")
+            && owners
+                .iter()
+                .any(|o| o == "shop/core (prod, v0) — owns 1: relation app.orders")
+            && !owners.iter().any(|o| o.starts_with("shop/dojo")),
+        "{owners:?}"
+    );
+
+    // `-n`: the module declaring the entity.
+    let o = dbd(dir, &url, &["apply", "-n", "app.orders"]);
+    assert!(o.status.success(), "apply -n app.orders: {}", combined(&o));
+    assert_eq!(module_headers(&stdout(&o)), ["core"], "{}", combined(&o));
+
+    // A dry run asks the database as the module's owner: core's record says
+    // prod, so an unforced reset of it is refused, preview and all.
+    let o = dbd(dir, &url, &["reset", "--dry-run", "--module", "core"]);
+    assert!(!o.status.success(), "{}", combined(&o));
+    assert!(combined(&o).contains("marked as prod"), "{}", combined(&o));
+    let o = dbd(dir, &url, &["reset", "--dry-run", "--force", "--module", "core"]);
+    assert!(o.status.success(), "{}", combined(&o));
+    assert_eq!(module_headers(&stdout(&o)), ["core"], "{}", combined(&o));
 
     let o = dbd(dir, &url, &["reset", "--force", "--module", "core"]);
     assert!(o.status.success(), "reset --module core: {}", combined(&o));
@@ -3113,6 +3157,27 @@ async fn a_workspace_diff_answers_for_every_module() {
         .collect();
     assert_eq!(modules, ["shared", "core", "dojo"], "{doc}");
     assert_eq!(doc["modules"][2]["owner"], "shop/dojo", "{doc}");
+    let changed = |i: usize| -> Vec<String> {
+        doc["modules"][i]["diff"]["changes"]
+            .as_array()
+            .expect("changes")
+            .iter()
+            .map(|c| c["entity_name"].as_str().expect("entity_name").to_string())
+            .collect()
+    };
+    assert_eq!(changed(0), Vec::<String>::new(), "{doc}");
+    assert_eq!(changed(1), Vec::<String>::new(), "{doc}");
+    assert_eq!(changed(2), ["dojo.belts"], "{doc}");
+
+    // The first module drifting, and the last not, drifts the run all the same.
+    std::fs::remove_file(dir.join("dojo/ddl/table/dojo/belts.ddl")).unwrap();
+    std::fs::write(
+        dir.join("shared/ddl/table/app/rates.ddl"),
+        "set search_path to app;\ncreate table if not exists rates (id integer primary key);\n",
+    )
+    .unwrap();
+    let o = dbd(dir, &url, &["diff", "--exit-code"]);
+    assert_eq!(o.status.code(), Some(2), "the first module drifts: {}", combined(&o));
 }
 
 /// A policy failing in one module is reported, and the modules after it still
@@ -3141,7 +3206,10 @@ async fn a_workspace_policy_failure_does_not_skip_the_modules_after_it() {
         std::fs::write(path, sql).unwrap();
     }
 
-    for args in [&["policies"][..], &["apply", "--with-policies"]] {
+    for (args, applied) in [
+        (&["policies"][..], "Policies: 1 applied, 0 failed."),
+        (&["apply", "--with-policies"], "Applied 1 policy file(s)."),
+    ] {
         let o = dbd(dir, &url, args);
         let text = combined(&o);
         assert!(!o.status.success(), "{args:?}: shared's policy fails: {text}");
@@ -3149,6 +3217,153 @@ async fn a_workspace_policy_failure_does_not_skip_the_modules_after_it() {
             module_headers(&stdout(&o)),
             ["shared", "core", "dojo"],
             "{args:?}: every module still runs: {text}"
+        );
+        let out = stdout(&o);
+        let core = out.find("module core (shop/core)").expect("core's header");
+        let dojo = out.find("module dojo (shop/dojo)").expect("dojo's header");
+        assert!(
+            out[core..dojo].contains(applied),
+            "{args:?}: core's policy applied: {out}"
+        );
+    }
+}
+
+/// A project without modules prints no module header, whatever it runs.
+#[tokio::test]
+async fn a_project_without_modules_prints_no_module_header() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir);
+    for args in [
+        &["apply"][..],
+        &["apply", "--dry-run"],
+        &["diff"],
+        &["reconcile", "--dry-run"],
+        &["migrate", "--status"],
+        &["policies"],
+        &["inspect", "--shared"],
+        &["reset", "--force"],
+    ] {
+        let o = dbd(dir, &url, args);
+        assert!(o.status.success(), "{args:?}: {}", combined(&o));
+        assert_eq!(
+            module_headers(&stdout(&o)),
+            Vec::<&str>::new(),
+            "{args:?}: {}",
+            combined(&o)
+        );
+    }
+}
+
+/// A reset that one module's guard refuses is refused before any module
+/// drops anything — and its preview, which reads what the run would, passes
+/// where the run passes.
+#[tokio::test]
+async fn a_workspace_reset_is_refused_whole_or_runs_whole() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    shop_workspace(dir);
+    let o = dbd(dir, &url, &["deploy", "-e", "dev"]);
+    assert!(o.status.success(), "deploy: {}", combined(&o));
+
+    // The preview of a reset the run performs: dojo and core go before shared,
+    // so their uses of shared's currencies do not hold it back.
+    let o = dbd(dir, &url, &["reset", "-e", "dev", "--dry-run"]);
+    assert!(o.status.success(), "{}", combined(&o));
+    assert!(stdout(&o).contains("\"app\".\"currencies\""), "{}", combined(&o));
+
+    // shared is versioned: an unforced reset is refused — before dojo and
+    // core drop anything.
+    let manifest = std::fs::read_to_string(dir.join("design.yaml")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        manifest.replace("  shared: {}\n", "  shared:\n    version: 1\n"),
+    )
+    .unwrap();
+    let o = dbd(dir, &url, &["deploy", "-e", "dev", "--module", "shared"]);
+    assert!(o.status.success(), "deploy shared at v1: {}", combined(&o));
+    let o = dbd(dir, &url, &["reset", "-e", "dev"]);
+    assert!(!o.status.success(), "shared's guard refuses: {}", combined(&o));
+    let owners = owners_listed(dir, &url);
+    for owned in [
+        "relation app.orders",
+        "relation dojo.sessions",
+        "relation app.currencies",
+    ] {
+        assert!(owners.iter().any(|o| o.ends_with(owned)), "{owned} kept: {owners:?}");
+    }
+}
+
+/// A workspace's import reloads a module's reference data the modules after
+/// it reference — emptied together, as one project's tables are — and does so
+/// again; its export writes each module's tables.
+#[tokio::test]
+async fn a_workspace_imports_across_its_modules_and_exports_each() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    shop_workspace(dir);
+    for (rel, csv) in [
+        ("shared/import/app/currencies.csv", "code\nUSD\n"),
+        ("core/import/app/orders.csv", "id,currency\n1,USD\n"),
+        ("dojo/import/dojo/sessions.csv", "id,currency\n7,USD\n"),
+    ] {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, csv).unwrap();
+    }
+    let o = dbd(dir, &url, &["deploy", "-e", "dev"]);
+    assert!(o.status.success(), "deploy: {}", combined(&o));
+    let o = dbd(dir, &url, &["import", "-e", "dev"]);
+    assert!(o.status.success(), "a second load: {}", combined(&o));
+
+    let out = dir.join("out");
+    let o = dbd(dir, &url, &["export", "-o", out.to_str().unwrap()]);
+    assert!(o.status.success(), "export: {}", combined(&o));
+    for (rel, row) in [
+        ("app/currencies.csv", "USD"),
+        ("app/orders.csv", "1,USD"),
+        ("dojo/sessions.csv", "7,USD"),
+    ] {
+        let text = std::fs::read_to_string(out.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"));
+        assert!(text.contains(row), "{rel}: {text}");
+    }
+
+    // `--module` exports the module alone: an export reads, and needs nothing
+    // of its dependencies.
+    let only = dir.join("only");
+    let o = dbd(dir, &url, &["export", "--module", "core", "-o", only.to_str().unwrap()]);
+    assert!(o.status.success(), "export --module core: {}", combined(&o));
+    assert_eq!(module_headers(&stdout(&o)), ["core"], "{}", combined(&o));
+    assert!(!only.join("app/currencies.csv").exists());
+}
+
+/// A refusal any module's run would meet before its first write — a hook file
+/// that is missing — refuses the workspace's run before the first module
+/// writes.
+#[tokio::test]
+async fn a_refusal_in_a_later_module_refuses_the_run_before_any_module_writes() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    shop_workspace(dir);
+    let manifest = std::fs::read_to_string(dir.join("design.yaml")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        format!("{manifest}\napply:\n  after: [hooks/missing.sql]\n"),
+    )
+    .unwrap();
+
+    for args in [&["apply"][..], &["deploy"], &["reconcile"]] {
+        let o = dbd(dir, &url, args);
+        assert!(!o.status.success(), "{args:?}: {}", combined(&o));
+        assert!(combined(&o).contains("hooks/missing.sql"), "{args:?}: {}", combined(&o));
+        let owners = owners_listed(dir, &url);
+        assert!(
+            !owners.iter().any(|o| o.contains("owns")),
+            "{args:?}: nothing built: {owners:?}"
         );
     }
 }

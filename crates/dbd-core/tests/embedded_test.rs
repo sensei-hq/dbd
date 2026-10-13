@@ -16132,3 +16132,29 @@ async fn a_workspace_resets_its_modules_in_reverse() {
     )
     .await;
 }
+
+/// A workspace's reconcile runs the manifest's hooks once around its modules,
+/// as its deploy does.
+#[tokio::test]
+async fn a_workspace_reconcile_runs_its_manifests_hooks_once_around_its_modules() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    for module in shop_workspace(tmp.path()).select(None).expect("select") {
+        let adapter = connect(&url, module.owner()).await.unwrap();
+        module
+            .design()
+            .reconcile(&*adapter, false, false, false, None, Progress::none())
+            .await
+            .unwrap_or_else(|e| panic!("{}'s reconcile: {e}", module.owner()));
+    }
+
+    let adapter = connect(&url, "shop/shared").await.unwrap();
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 WHERE (SELECT array_agg(said ORDER BY n) FROM public.hook_log) \
+         = ARRAY['workspace before', 'core after', 'workspace after']",
+        "the hooks, once each, in order",
+    )
+    .await;
+}

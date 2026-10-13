@@ -267,3 +267,31 @@ fn module_folders_are_found_under_the_source_directory() {
     assert!(out.status.success(), "{text}");
     assert!(text.contains("module core (shop/core)"), "{text}");
 }
+
+/// `migrate` reads no scope, and says so; a workspace does not then refuse the
+/// scope it ignores.
+#[test]
+fn a_scope_a_command_ignores_is_not_refused_on_a_workspace() {
+    let tmp = tempfile::tempdir().unwrap();
+    shop(tmp.path());
+
+    let out = dbd(tmp.path(), &["migrate", "--scope", "all"]);
+    let text = text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(!text.contains("do not select over"), "{text}");
+}
+
+/// A workspace is converted from a project with `dbd split`; `init` and
+/// `merge` onboard a project and say where a workspace comes from.
+#[test]
+fn init_and_merge_point_a_workspace_at_split() {
+    let tmp = tempfile::tempdir().unwrap();
+    shop(tmp.path());
+
+    for args in [&["merge", "--dry-run"][..], &["init", "--dry-run"]] {
+        let out = dbd(tmp.path(), args);
+        let text = text(&out);
+        assert!(!out.status.success(), "{args:?}: {text}");
+        assert!(text.contains("dbd split"), "{args:?}: {text}");
+    }
+}
