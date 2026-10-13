@@ -12,13 +12,12 @@
 
 ## Next
 
-Slice 2 on `feat/workspaces-run`: implemented (eb024a24, 0daf688a) — modules
-run in order as their owners, `--module`, the manifest's hooks around the run,
-T21 green; plan records the decisions. Next: full suites, PR into
-`feat/workspaces`, adversarial review, CI, merge; then slice 3 (scopes over
-modules, walking up from a module folder).
+Slice 2 PR #62 (`feat/workspaces-run` → `feat/workspaces`): three reviews'
+findings fixed (fc497ff4) — preflight before any module writes, whole-or-nothing
+reset, -n/hooks, import together, export per module; plan/spec updated
+(3299354b). Full suites + focused re-review running; then CI, merge, slice 3.
 
-    cargo test --features embedded-tests --test cli_live
+    gh pr checks 62
 
 ## Open
 
