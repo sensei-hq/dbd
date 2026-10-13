@@ -1,22 +1,20 @@
 # Checkpoint
 
-**Slice:** #7 Phase 2, slice 8 (SQLite parity) on `feat/ownership-sqlite`, from
-`feat/ownership` (slices 1–7: PRs #50–#55).
+**Slice:** #7 Phase 2, docs slice on `feat/ownership-docs`, from `feat/ownership`
+(slices 1–8: PRs #50–#56, `42b4c09d`). Phase 1 is on `develop`, unreleased.
 
 ## Done
 
-- Slices 1–7 in `feat/ownership` (`01631bb3`): registry, claim, uses; prune;
-  uses guard; reset rules and write lock; name reuse, `--adopt-from`;
-  `inspect --shared`, onboarding beside other projects.
-- Slice 8 implemented (`94e59e45`): SQLite `_dbd_objects`/`_dbd_uses`, T18.
-- Embedded 295/295, `cli_live` 61/61, workspace 2013/0, clippy, fmt, doc clean.
+- Phase 2 code complete in `feat/ownership`: registry, claim, uses; prune by
+  ownership; uses guard; reset rules and the write lock; name reuse and
+  `--adopt-from`; `inspect --shared`, onboarding; SQLite parity.
+- Embedded 295/295, `cli_live` 61/61, workspace 2017/0, clippy, fmt, doc clean.
 
 ## Next
 
-    gh pr create --base feat/ownership --head feat/ownership-sqlite
-    # review, CI, local merge; then the docs slice (guides 03/04, a sharing
-    # guide, llms.txt/llms-full.txt, both SKILL.md, site mirrors,
-    # dbd-pattern-verifier); then feat/ownership → develop
+    # docs slice: guide 14 (sharing a database), guide 04 flags and
+    # inspect --shared, guide 08 SQLite, llms.txt, llms-full.txt, both
+    # SKILL.md, README, dbd-pattern-verifier; then feat/ownership → develop
 
 ## Open
 
