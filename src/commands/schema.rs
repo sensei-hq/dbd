@@ -64,12 +64,18 @@ fn format_shared_database(shared: &dbd_core::design::SharedDatabase, project: &s
             (Some(env), Some(version)) => format!(" ({env}, v{version})"),
             _ => " (no record)".to_string(),
         };
-        if !p.recording && p.owns.is_empty() {
+        // A project the database records that records no uses has not run a
+        // dbd keeping the registry — what `init --from-db` and `merge` refuse
+        // over — whatever it holds.
+        if p.env.is_some() && !p.recording {
             lines.push(format!(
-                "  {}{record} — records nothing of what it owns: it has not run a dbd that keeps the registry",
+                "  {}{record} — records nothing of what it owns and uses: it has not run a dbd that keeps \
+                 the registry",
                 p.name
             ));
-            continue;
+            if p.owns.is_empty() {
+                continue;
+            }
         }
         let mut owned: Vec<String> = p
             .owns

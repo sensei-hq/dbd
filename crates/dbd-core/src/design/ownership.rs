@@ -1116,13 +1116,21 @@ pub struct SharedUse {
 /// `entities` less what another owner than `owner` holds in the database
 /// `adapter` reaches, and what was left out, with its owner — for reverse
 /// engineering beside other projects (#7): `init --from-db` and `merge` took
-/// them as this project's. Refused while a project the database records does
-/// not record what it owns: its entities cannot be told from nobody's.
+/// them as this project's. What is kept and references something left out —
+/// a foreign key's table, a view's — gains an `External` entity for it,
+/// commented with its owner, so the design declares it `external:` and the
+/// reference resolves. Refused while a
+/// project the database records does not record what it owns and uses: its
+/// entities cannot be told from nobody's. A database keeping no registry
+/// leaves nothing out.
 pub async fn leave_out_other_owners(
     adapter: &dyn DatabaseAdapter,
     owner: &str,
     entities: Vec<Entity>,
 ) -> Result<(Vec<Entity>, Vec<HeldObject>)> {
+    if !adapter.keeps_registry() {
+        return Ok((entities, Vec::new()));
+    }
     let registry = adapter.registry().await?;
     let recording: std::collections::BTreeSet<&str> = registry
         .uses
@@ -1140,14 +1148,15 @@ pub async fn leave_out_other_owners(
         .into_iter()
         .collect();
     if !silent.is_empty() {
+        let one = silent.len() == 1;
         return Err(DbdError::Config(format!(
-            "{} here {} no record of what {} — {} entities cannot be told from nobody's. Run {} apply or \
-             reconcile with this dbd first",
+            "{} here {} not run a dbd that records what {} owns and uses — {} entities cannot be told from \
+             nobody's. Run {} apply or reconcile with this dbd first",
             quoted(&silent),
-            if silent.len() == 1 { "keeps" } else { "keep" },
-            if silent.len() == 1 { "it owns" } else { "they own" },
-            if silent.len() == 1 { "its" } else { "their" },
-            if silent.len() == 1 { "its" } else { "their" },
+            if one { "has" } else { "have" },
+            if one { "it" } else { "they" },
+            if one { "its" } else { "their" },
+            if one { "its" } else { "their" },
         )));
     }
     let held: std::collections::HashMap<(&str, &str, &str), &HeldObject> = registry
@@ -1185,6 +1194,50 @@ pub async fn leave_out_other_owners(
             None => kept.push(e),
         }
     }
+    if left.is_empty() {
+        return Ok((kept, left));
+    }
+    // What is kept and depends on something left out — a foreign key's
+    // table, what a view reads — as a drop's `CASCADE` would reach it.
+    let qualified = |e: &Entity| {
+        let (schema, name) = crate::entity::split_qualified_name(&e.name);
+        let schema = schema
+            .or_else(|| e.schema.clone())
+            .unwrap_or_else(|| crate::reconcile::DEFAULT_SCHEMA.to_string());
+        format!("{schema}.{name}")
+    };
+    let kept_names: std::collections::HashSet<String> = kept.iter().map(qualified).collect();
+    let relations: Vec<&HeldObject> = left.iter().filter(|h| h.object.namespace == "relation").collect();
+    let guarded: Vec<crate::adapter::Guarded> = relations
+        .iter()
+        .map(|h| crate::adapter::Guarded {
+            object: h.object.clone(),
+            part: crate::adapter::GuardedPart::Whole,
+        })
+        .collect();
+    let referenced: std::collections::BTreeSet<String> = adapter
+        .dependents(owner, &guarded, &[])
+        .await?
+        .into_iter()
+        .filter(|d| {
+            d.via
+                .rsplit_once(' ')
+                .is_some_and(|(_, dependent)| kept_names.contains(dependent))
+        })
+        .map(|d| {
+            let h = relations[d.guarded];
+            format!("{}.{}", h.object.schema, h.object.name)
+        })
+        .collect();
+    let owners: std::collections::HashMap<String, &str> = left
+        .iter()
+        .map(|h| (format!("{}.{}", h.object.schema, h.object.name), h.owner.as_str()))
+        .collect();
+    kept.extend(referenced.iter().map(|name| {
+        let mut external = Entity::new(EntityType::External, name);
+        external.comment = owners.get(name).map(|owner| format!("another project's (\"{owner}\")"));
+        external
+    }));
     Ok((kept, left))
 }
 

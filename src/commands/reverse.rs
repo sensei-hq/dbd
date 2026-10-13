@@ -115,13 +115,42 @@ pub(crate) fn merge_decision(managed: Option<u32>, project_version: u32) -> Merg
     }
 }
 
+/// Whose `name` is, when it is an `External` another project owns — see
+/// [`dbd_core::design::leave_out_other_owners`].
+fn external_owner<'a>(entities: &'a [dbd_core::Entity], name: &str) -> Option<&'a str> {
+    entities
+        .iter()
+        .find(|e| e.entity_type == dbd_core::EntityType::External && e.name == name)
+        .and_then(|e| e.comment.as_deref())
+}
+
+/// A line per file of the project's with no entity in the database — or one
+/// another project owns there, left out, which is no orphan (#7).
+fn orphan_lines(orphans: &[std::path::PathBuf], left: &[dbd_core::adapter::HeldObject]) -> Vec<String> {
+    orphans
+        .iter()
+        .map(|o| {
+            let schema = o.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str());
+            let name = o.file_stem().and_then(|s| s.to_str());
+            let owner = left
+                .iter()
+                .find(|h| Some(h.object.schema.as_str()) == schema && Some(h.object.name.as_str()) == name);
+            match owner {
+                Some(h) => format!("  left out: {} — owned by \"{}\"", o.display(), h.owner),
+                None => format!("  orphan (no DB entity): {}", o.display()),
+            }
+        })
+        .collect()
+}
+
 /// What the database holds for this project to reverse-engineer: `entities`
-/// less what other projects own there, each named as it is left out (#7).
+/// less what other projects own there, each named as it is left out, with
+/// what was left out (#7).
 async fn leave_out_other_owners(
     adapter: &dyn dbd_core::DatabaseAdapter,
     project: &str,
     entities: Vec<dbd_core::Entity>,
-) -> Result<Vec<dbd_core::Entity>> {
+) -> Result<(Vec<dbd_core::Entity>, Vec<dbd_core::adapter::HeldObject>)> {
     let (kept, left) = dbd_core::design::leave_out_other_owners(adapter, project, entities).await?;
     if !left.is_empty() {
         let named: Vec<String> = left
@@ -140,7 +169,7 @@ async fn leave_out_other_owners(
             named.join(", ")
         ));
     }
-    Ok(kept)
+    Ok((kept, left))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -192,11 +221,22 @@ pub async fn cmd_init_from_db(
             meta.version
         );
     }
+    // A database keeping no ownership registry cannot say what another
+    // project owns, so it cannot be onboarded beside one.
+    if !adapter.keeps_registry()
+        && let Some(d) = adapter.reverse_managed_version().await?
+    {
+        bail!(
+            "database is managed by dbd (version {d}), and keeps no record of what each project owns; \
+             `dbd init --from-db` is only for databases not managed by dbd — use `dbd merge` from the \
+             project's repository instead"
+        );
+    }
 
     // A fresh project has no design.yaml yet, so use the default format settings —
     // matching what `dbd format` would later apply with a freshly-scaffolded config.
     let entities = adapter.introspect().await.context("introspection failed")?;
-    let mut entities = leave_out_other_owners(&*adapter, &project_name, entities).await?;
+    let (mut entities, _) = leave_out_other_owners(&*adapter, &project_name, entities).await?;
     // Roles are cluster-global and gated behind the `--roles` opt-in: append them
     // only when asked (introspect_roles is NOT part of introspect()).
     if roles {
@@ -456,7 +496,7 @@ pub async fn cmd_merge(
         }
         MergeDecision::Snapshot => {
             let entities = adapter.introspect().await.context("introspection failed")?;
-            let mut entities = leave_out_other_owners(&*adapter, &project_name, entities).await?;
+            let (mut entities, left) = leave_out_other_owners(&*adapter, &project_name, entities).await?;
             // Roles are cluster-global and gated behind the `--roles` opt-in: append
             // them only when asked (introspect_roles is NOT part of introspect()).
             if roles {
@@ -468,7 +508,7 @@ pub async fn cmd_merge(
                 supabase: reverse::looks_like_supabase(&entities) || config.default_target() == Some("supabase"),
                 ..sel
             };
-            merge_snapshot(project_dir, config_path, env, &entities, sel, dry_run, &config)
+            merge_snapshot(project_dir, config_path, env, &entities, &left, sel, dry_run, &config)
         }
     }
 }
@@ -506,7 +546,7 @@ pub fn cmd_merge_from_dbml(
         supabase: config.default_target() == Some("supabase"),
         ..sel
     };
-    merge_snapshot(project_dir, config_path, env, &entities, sel, dry_run, &config)
+    merge_snapshot(project_dir, config_path, env, &entities, &[], sel, dry_run, &config)
 }
 
 /// The unified `merge` apply path (foreign DB, or managed DB at/ahead of the project):
@@ -524,11 +564,14 @@ pub fn cmd_merge_from_dbml(
 /// already overwritten with no `.bak` and no snapshot exists. Recover via version
 /// control (`git checkout -- .` or equivalent). This mirrors the non-transactionality
 /// note on `apply_overwrite`.
+#[allow(clippy::too_many_arguments)]
 fn merge_snapshot(
     project_dir: &Path,
     config_path: &Path,
     env: &str,
     entities: &[dbd_core::Entity],
+    // What another project owns, left out of `entities` (#7).
+    left: &[dbd_core::adapter::HeldObject],
     sel: SchemaSelect,
     dry_run: bool,
     config: &dbd_core::config::DesignConfig,
@@ -577,9 +620,14 @@ fn merge_snapshot(
     let managed = managed_tables(project_dir, config)?;
     for name in reverse::Declared::from_entities(&kept, &selected).externals {
         if !declared_externals.contains(&name.as_str()) && !managed.contains(&name) {
-            eprintln!(
-                "  warning: a foreign key references `{name}`, outside the captured schemas; declare it under external: in design.yaml"
-            );
+            match external_owner(&kept, &name) {
+                Some(owner) => eprintln!(
+                    "  warning: `{name}` is {owner}, and referenced here; declare it under external: in design.yaml"
+                ),
+                None => eprintln!(
+                    "  warning: a foreign key references `{name}`, outside the captured schemas; declare it under external: in design.yaml"
+                ),
+            }
         }
     }
     // An extension is declared in design.yaml, never written as a file, and
@@ -619,8 +667,8 @@ fn merge_snapshot(
         for it in plan.items.iter().filter(|i| i.action == reverse::FileAction::Conflict) {
             println!("  conflict (differs from DB): {}", it.path.display());
         }
-        for o in &plan.orphans {
-            println!("  orphan (no DB entity): {}", o.display());
+        for line in orphan_lines(&plan.orphans, left) {
+            println!("{line}");
         }
         for label in &plan.skipped_unsafe {
             eprintln!("  warning: skipped unsafe path segment: {label}");
@@ -648,8 +696,8 @@ fn merge_snapshot(
 
     // Apply: overwrite Create + Conflict in place (no `.bak`), skip Skip.
     let report = reverse::apply_overwrite(project_dir, &plan)?;
-    for o in &plan.orphans {
-        println!("  orphan (no DB entity): {}", o.display());
+    for line in orphan_lines(&plan.orphans, left) {
+        println!("{line}");
     }
     for label in &plan.skipped_unsafe {
         eprintln!("  warning: skipped unsafe path segment: {label}");
@@ -833,7 +881,10 @@ fn run_plan(
 
     // 3. write design.yaml (init only; only if absent; skip on dry-run)
     for name in declared.iter().flat_map(|d| &d.externals) {
-        println!("  external: {name} — a foreign key references it, outside the captured schemas");
+        match external_owner(&kept, name) {
+            Some(owner) => println!("  external: {name} — {owner}, referenced here"),
+            None => println!("  external: {name} — a foreign key references it, outside the captured schemas"),
+        }
     }
     // A schema is the project's when something was captured in it — a file
     // written, or an extension declared with it as its `schema:` — or when
@@ -894,8 +945,8 @@ fn run_plan(
             report.unchanged, report.orphans
         );
     }
-    for o in &plan.orphans {
-        println!("  orphan (no DB entity): {}", o.display());
+    for line in orphan_lines(&plan.orphans, &[]) {
+        println!("{line}");
     }
     for label in &plan.skipped_unsafe {
         eprintln!("  warning: skipped unsafe path segment: {label}");

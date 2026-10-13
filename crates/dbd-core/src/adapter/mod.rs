@@ -587,6 +587,13 @@ pub trait DatabaseAdapter: Send + Sync {
         Ok(Registry::default())
     }
 
+    /// Whether this database keeps an ownership registry (#7) — whether an
+    /// empty [`Self::registry`] means nobody owns anything, or that nothing
+    /// is known. Default: none kept.
+    fn keeps_registry(&self) -> bool {
+        false
+    }
+
     /// Record `uses` as everything `owner` uses, replacing what it used before
     /// (#7) — an `entity` use whoever owns its target, or nobody yet. Like a
     /// claim, in the open batch transaction when there is one. Adapters

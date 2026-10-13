@@ -2576,6 +2576,10 @@ ORDER BY 1, 2, 4, 5"#;
         self.bookkeeping.registry().await
     }
 
+    fn keeps_registry(&self) -> bool {
+        true
+    }
+
     async fn record_uses(&self, owner: &str, uses: &[super::Use]) -> Result<()> {
         let mut guard = self.batch.lock().await;
         self.bookkeeping.record_uses(guard.as_mut(), owner, uses).await
