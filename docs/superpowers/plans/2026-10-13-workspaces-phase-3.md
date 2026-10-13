@@ -172,6 +172,33 @@ Taken in slice 4:
   migration would rebuild it without them; its old entries are fixed by hand.
   A design.yaml it cannot read is named as an issue, with the error.
 
+Taken in slice 5:
+
+- `dbml`, `diagram`, `graph`, `combine` and `emit` go over the modules a run
+  selects (`--module`, `--scope`, the folder dbd runs in), in `depends_on`
+  order, each through its own scope, as one design: what each module keeps
+  in view, together — so a key, a type or a read into a dependency lands on
+  its entity, drawn and written once, in its module, from its module's
+  definition. Without the gap check: a table a scope leaves out of a
+  dependency is a stub (`out_of_scope`), as in one design.
+- The schema model (still v3, additive) carries `modules` — each module's
+  `name`, `owner`, `depends_on` and `note`, in load order — and `module` on
+  each table, entity, enum and stub a module declares; each history entry
+  carries its module, the modules' histories one after another in load
+  order. A project's model is as it was: no `modules`, no `module`. Its
+  `project` is the manifest's.
+- `graph`'s nodes carry `module` in a workspace; `-n` is the entity's
+  subgraph across the modules in view, refused for one none declares.
+- `dbml` documents the workspace in one document (or one per `dbml:` doc); a
+  document with no groups of its own (no `groups`, no
+  `auto_group_by_schema`) gets one `TableGroup` per module — DBML puts a
+  table in one group.
+- `combine` and `emit` write one script; a comment heads each module's
+  statements, `module <name> (<owner>)`.
+- The viewer groups the sidebar by module, then schema; the diagram is tinted
+  by module or by schema — a switch, module first for a workspace's model;
+  an entity's page and each changelog entry name their module.
+
 ## Slices
 
 Each is red tests first, then the implementation, a focused review, CI, and a

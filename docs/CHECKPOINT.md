@@ -13,15 +13,15 @@
 - Slice 3 merged (PR #63): `scopes.<name>.modules`, each scope projected per
   module (`Workspace::under_scope`/`under_scope_of`, `check_scope_gaps`);
   walking up from a module folder (`Workspace::locate`).
+- Slice 4 merged (PR #64): per-module history — `snapshot`, `release`,
+  `format`, `doctor`; reconcile leaves released modules out.
 
 ## Next
 
-Slice 4 PR #64 (`feat/workspaces-history` → `feat/workspaces`): review and
-re-review findings fixed (ef53788e), the plan updated. Next: full suites, CI,
-merge; then slice 5 (viewer grouping and outputs: dbml, diagram, graph,
-combine, emit).
-
-    gh pr checks 64
+Slice 5 on `feat/workspaces-viewer`: decisions in the plan ("Taken in slice
+5"). Next: red tests (core model over modules, CLI artifacts, site viewer),
+then the implementation.
+    cargo test -p dbd-core --test workspace_view; cargo test --test workspace_artifacts
 
 ## Open
 
