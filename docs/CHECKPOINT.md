@@ -18,15 +18,15 @@
 
 ## Next
 
-Slice 5 on `feat/workspaces-viewer`: decisions in the plan ("Taken in slice
-5"). Next: red tests (core model over modules, CLI artifacts, site viewer),
-then the implementation.
-    cargo test -p dbd-core --test workspace_view; cargo test --test workspace_artifacts
+Slice 5 on `feat/workspaces-viewer`: decisions in the plan; red tests in
+ede5e71d (core `Reading`, CLI artifacts, site `modules.test.ts`). Next: the
+implementation — core, then CLI, then the viewer.
+    cargo test -p dbd-core --test workspace_reading; cargo test --test workspace_artifacts
+    (cd site && bun run test -- src/lib/design/modules.test.ts)
 
 ## Open
 
-- `dbd init --dry-run` writes design.yaml and the scaffold (pre-existing, not
-  #7) — reported, not filed.
+- `dbd init --dry-run` writes design.yaml and the scaffold (not #7; unfiled).
 - Issue #60: reconcile re-emits a mixed-case or quoted `nextval('App.Seq')`
   default every run — probe pg_get_expr before fixing.
 - Declined: best-effort batch rollback error; dropping the old `dbd.import_tmp`;
