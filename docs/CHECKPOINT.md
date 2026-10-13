@@ -12,9 +12,10 @@
 
 ## Next
 
-    # docs slice: guide 14 (sharing a database), guide 04 flags and
-    # inspect --shared, guide 08 SQLite, llms.txt, llms-full.txt, both
-    # SKILL.md, README, dbd-pattern-verifier; then feat/ownership → develop
+    gh pr create --base feat/ownership --head feat/ownership-docs
+    # docs written (978b2d7c): guide 14, guide 04/08, llms, both SKILL.md,
+    # README. Spec-conformance audit, fixes, CI, merge; then feat/ownership →
+    # develop (PR, CI, local merge)
 
 ## Open
 
@@ -26,8 +27,6 @@
 - A bare type of another project's is no use (dropped as a built-in).
 - An apply in one transaction runs `apply.before` hooks before its claim
   (documented in the spec). `dbd.objects` still allows namespace `type`, unused.
-- Docs slice (end of Phase 2) must cover `--prune-unowned`, reset's kept
-  lines and the write lock's waits in the guides.
 - Delete by hand: `/tmp/dbd-mut` (+ `git worktree prune`), `/tmp/dbd-mut-target`,
   `/tmp/dbd-idx.*`, `/tmp/dbd-review2*`, `/tmp/dbd-lockreview*`.
 - Phase 1 is releasable as 0.25.2 when asked.
