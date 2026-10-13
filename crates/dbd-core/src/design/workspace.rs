@@ -39,6 +39,8 @@ pub struct Workspace {
     scope_modules: IndexMap<String, HashSet<String>>,
     /// The scope [`Workspace::under_scope`] narrowed the workspace to.
     scope: Option<String>,
+    /// The modules it left out, for saying which an entity is in.
+    left_out: Vec<Module>,
 }
 
 /// One module of a [`Workspace`]: a design of its own.
@@ -115,6 +117,7 @@ impl Workspace {
                 root: project_dir,
                 scope_modules: IndexMap::new(),
                 scope: None,
+                left_out: Vec::new(),
             });
         }
 
@@ -218,6 +221,7 @@ impl Workspace {
             root: project_dir,
             scope_modules,
             scope: None,
+            left_out: Vec::new(),
         })
     }
 
@@ -227,8 +231,11 @@ impl Workspace {
     /// `None` when the nearest such file above declares no modules, or there is
     /// none: a design without modules is not looked for above where it is run.
     pub fn locate(dir: &Path, config_name: &Path) -> Option<(PathBuf, Option<String>)> {
-        let dir = dir.canonicalize().ok()?;
-        for root in dir.ancestors().skip(1) {
+        // Along the path the run was started in — a module folder may be a
+        // link to its files elsewhere — and, failing that, the real one.
+        let logical = logical_path(dir)?;
+        let real = logical.canonicalize().ok();
+        for root in logical.ancestors().skip(1) {
             let config_path = root.join(config_name);
             if !config_path.is_file() {
                 continue;
@@ -241,8 +248,11 @@ impl Workspace {
                 return None;
             }
             let module = manifest.modules.iter().find_map(|(name, module)| {
-                let folder = root.join(module_folder(name, module).ok()?).canonicalize().ok()?;
-                dir.starts_with(&folder).then(|| name.clone())
+                let folder = root.join(module_folder(name, module).ok()?);
+                let real_folder = folder.canonicalize().ok();
+                let holds = logical.starts_with(&folder)
+                    || matches!((&real, &real_folder), (Some(d), Some(f)) if d.starts_with(f));
+                holds.then(|| name.clone())
             });
             return Some((root.to_path_buf(), module));
         }
@@ -304,10 +314,95 @@ impl Workspace {
             )));
         };
         let selected = selected.clone();
-        self.modules
-            .retain(|m| m.name.as_ref().is_some_and(|n| selected.contains(n)));
+        let (kept, left_out): (Vec<Module>, Vec<Module>) = std::mem::take(&mut self.modules)
+            .into_iter()
+            .partition(|m| m.name.as_ref().is_some_and(|n| selected.contains(n)));
+        self.modules = kept;
+        self.left_out = left_out;
         self.scope = Some(name.to_string());
+        self.check_scope_gaps(name)?;
         Ok(self)
+    }
+
+    /// [`Self::under_scope`] for a run of `module` — named, or the folder it
+    /// is run in: with no `scope`, the `default` scope when it selects the
+    /// module; a module the default leaves out runs on its own, as asked for,
+    /// each module resolving its own `default`, else `all`.
+    pub fn under_scope_of(self, scope: Option<&str>, module: Option<&str>) -> Result<Self> {
+        let default_leaves_out = |m: &str| {
+            self.scope_modules
+                .get("default")
+                .is_some_and(|selected| !selected.contains(m))
+        };
+        match (scope, module) {
+            (None, Some(m)) if default_leaves_out(m) => self.under_scope(Some("all")),
+            _ => self.under_scope(scope),
+        }
+    }
+
+    /// Refuse a scope leaving out of one module what another it selects
+    /// requires — a gap, as in one design: the module requiring it holds it
+    /// as an external, which no scope's gap analysis follows.
+    fn check_scope_gaps(&self, scope: &str) -> Result<()> {
+        let mut in_scope: HashMap<&str, HashSet<String>> = HashMap::new();
+        for module in &self.modules {
+            let resolved = module.design.resolve_scope(Some(scope), None)?;
+            let name = module.name.as_deref().unwrap_or_default();
+            in_scope.insert(name, module.design.working_set(&resolved)?);
+        }
+        let declared_by = |entity: &str| {
+            self.modules.iter().find_map(|m| {
+                m.design
+                    .entities
+                    .iter()
+                    .any(|e| e.name == entity && e.entity_type != EntityType::External)
+                    .then(|| m.name.as_deref().unwrap_or_default())
+            })
+        };
+        let mut gaps: Vec<String> = Vec::new();
+        for module in &self.modules {
+            let name = module.name.as_deref().unwrap_or_default();
+            let externals: HashSet<&str> = module
+                .design
+                .entities
+                .iter()
+                .filter(|e| e.entity_type == EntityType::External)
+                .map(|e| e.name.as_str())
+                .collect();
+            for entity in module
+                .design
+                .entities
+                .iter()
+                .filter(|e| in_scope[name].contains(&e.name))
+            {
+                for r in entity
+                    .refs
+                    .iter()
+                    .filter(|r| !r.unresolved && externals.contains(r.name.as_str()))
+                {
+                    if let Some(owner) = declared_by(&r.name)
+                        && !in_scope[owner].contains(&r.name)
+                    {
+                        let gap = format!(
+                            "{} (module \"{name}\") requires {}, which scope '{scope}' leaves out of module \"{owner}\"",
+                            entity.name, r.name
+                        );
+                        if !gaps.contains(&gap) {
+                            gaps.push(gap);
+                        }
+                    }
+                }
+            }
+        }
+        if gaps.is_empty() {
+            return Ok(());
+        }
+        Err(DbdError::Config(format!(
+            "{} dependency gap(s) in scope '{scope}' — stop excluding what is required, or exclude what requires \
+             it too:\n  {}",
+            gaps.len(),
+            gaps.join("\n  ")
+        )))
     }
 
     /// Refuse a module `name` the scope this workspace runs under leaves out.
@@ -371,7 +466,18 @@ impl Workspace {
             .filter_map(|m| m.name.as_deref())
             .collect();
         if declaring.is_empty() {
-            return Err(DbdError::Config(format!("no module declares {name}")));
+            let outside = self.left_out.iter().find(|m| {
+                m.design
+                    .resolve_name(name, None)
+                    .is_ok_and(|e| e.entity_type != EntityType::External)
+            });
+            return Err(DbdError::Config(match (outside, &self.scope) {
+                (Some(m), Some(scope)) => format!(
+                    "{name} is module \"{}\"'s, which scope {scope} does not select",
+                    m.name.as_deref().unwrap_or_default()
+                ),
+                _ => format!("no module declares {name}"),
+            }));
         }
         if !declaring.iter().any(|d| wanted.contains(*d)) {
             return Err(DbdError::Config(format!(
@@ -483,8 +589,11 @@ fn project_scopes(manifest: &DesignConfig, modules: &mut [Module]) -> Result<Ind
             }
             ScopeEntry::Spec(spec) => spec,
         };
-        // What of each module an item names, by module.
-        let matched = |item: &str| -> Result<IndexMap<String, ()>> {
+        // The modules an item names something of: for an include, an entity
+        // of the module's own — every module has the manifest's schemas, so
+        // a schema alone selects none; for an exclude, anything, its schema
+        // included.
+        let matched = |item: &str, entities_only: bool| -> Result<IndexMap<String, ()>> {
             let mut hits = IndexMap::new();
             for module in modules.iter() {
                 let own: Vec<crate::entity::Entity> = module
@@ -494,9 +603,12 @@ fn project_scopes(manifest: &DesignConfig, modules: &mut [Module]) -> Result<Ind
                     .filter(|e| e.entity_type != EntityType::External)
                     .cloned()
                     .collect();
-                if crate::scope::match_item(item, &own).is_ok_and(|m| !m.is_empty())
-                    && let Some(name) = &module.name
-                {
+                let hit = crate::scope::match_item(item, &own).is_ok_and(|names| {
+                    names
+                        .iter()
+                        .any(|n| !entities_only || own.iter().any(|e| &e.name == n && crate::scope::is_scopable(e)))
+                });
+                if hit && let Some(name) = &module.name {
                     hits.insert(name.clone(), ());
                 }
             }
@@ -520,13 +632,13 @@ fn project_scopes(manifest: &DesignConfig, modules: &mut [Module]) -> Result<Ind
         }
         let mut includes: IndexMap<String, Vec<String>> = IndexMap::new();
         for item in &spec.includes {
-            for module in matched(item)?.into_keys() {
+            for module in matched(item, true)?.into_keys() {
                 includes.entry(module).or_default().push(item.clone());
             }
         }
         let mut excludes: IndexMap<String, Vec<String>> = IndexMap::new();
         for item in &spec.excludes {
-            for module in matched(item)?.into_keys() {
+            for module in matched(item, false)?.into_keys() {
                 excludes.entry(module).or_default().push(item.clone());
             }
         }
@@ -961,4 +1073,26 @@ fn check_overlaps(scanned: &[(String, Design)], objects: &[Vec<OwnedObject>]) ->
         },
         overlaps.join("\n  ")
     )))
+}
+
+/// `dir` made absolute along the path a shell started there names it —
+/// `$PWD`, when it is the folder dbd runs in — with `.` and `..` resolved by
+/// name. `None` when there is no such folder.
+fn logical_path(dir: &Path) -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    let base = std::env::var_os("PWD")
+        .map(PathBuf::from)
+        .filter(|pwd| pwd.canonicalize().ok() == cwd.canonicalize().ok())
+        .unwrap_or(cwd);
+    let mut path = PathBuf::new();
+    for component in base.join(dir).components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                path.pop();
+            }
+            other => path.push(other),
+        }
+    }
+    path.is_dir().then_some(path)
 }

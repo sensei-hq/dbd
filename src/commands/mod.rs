@@ -318,7 +318,7 @@ pub(super) fn targets(
 ) -> Result<Vec<Target>> {
     let workspace = Workspace::load(config, env, Some(project_dir))
         .context("Failed to load design")?
-        .under_scope(scope)?;
+        .under_scope_of(scope, module)?;
     let has_modules = workspace.has_modules();
     let modules = match (order, name) {
         (Order::Build, Some(n)) if has_modules => workspace.select_declaring(module, n)?,
