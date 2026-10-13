@@ -19,7 +19,7 @@ leaves it alone, a drop another project depends on is refused naming the use,
 and a reset keeps what other projects have or use. Entities move between
 projects with `--adopt-from`, `dbd inspect --shared` shows what shares a
 database, and a second project onboards beside the first with `init
---from-db`. The new guide, [sharing a database](docs/guide/14-sharing-a-database.md),
+--from-db`. The new guide, [sharing a database](https://dbd.sensei-hq.com/guide/sharing-a-database),
 covers it all. The first phase of [#7] — fixes to the bookkeeping, refresh jobs
 and imports that projects sharing a database undid for each other — ships with
 it.
@@ -205,8 +205,8 @@ parameters.
   that reference a table: a table another project's view reads is not
   dropped.
 - **A guide to sharing a database** —
-  [docs/guide/14-sharing-a-database.md](docs/guide/14-sharing-a-database.md),
-  on the site at `/guide/sharing-a-database`: owners and the registry, what each
+  [sharing a database](https://dbd.sensei-hq.com/guide/sharing-a-database)
+  (`docs/guide/14-sharing-a-database.md`): owners and the registry, what each
   command does beside other projects, moving entities and names, `inspect
   --shared`, onboarding and SQLite. The commands reference, `llms.txt`,
   `llms-full.txt` and the skill cover the new flags and rules.
