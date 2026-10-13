@@ -12,13 +12,12 @@
 
 ## Next
 
-Slice 1 on `feat/workspaces-load`: red tests committed
-(`crates/dbd-core/tests/workspace_load.rs`, `tests/workspace_inspect.rs`, the
-config `modules:` parse tests). Implement: `ModuleConfig`, `design/workspace.rs`
-(`Workspace::load`, validation, T19 overlap, T20 gaps), `Design::from_config`
-refusing `modules:`, `dbd inspect` per module.
+Slice 1 on `feat/workspaces-load`: implemented (`design/workspace.rs`,
+`Workspace::load`, `Design::scan`/`resolved`, inspect per module); workspace,
+clippy, fmt, doc green. Embedded, cli_live and SQLite suites running; then PR
+into `feat/workspaces`, adversarial review, CI, merge.
 
-    cargo test -p dbd-core --test workspace_load && cargo test --test workspace_inspect
+    cargo test -p dbd-core --features embedded-tests --test embedded_test -- --test-threads=2
 
 ## Open
 
