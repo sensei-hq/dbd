@@ -2555,10 +2555,11 @@ async fn apply_adopting_from_an_owner_says_what_it_takes() {
     let applied = dbd(giver.path(), &url, &["apply"]);
     assert!(applied.status.success(), "{}", combined(&applied));
 
+    // Versioned as the giver is, so what refuses it is ownership alone.
     let taker = tempfile::tempdir().unwrap();
     std::fs::write(
         taker.path().join("design.yaml"),
-        "project:\n  name: taker\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+        "project:\n  name: taker\n  version: 1\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
     )
     .unwrap();
     std::fs::create_dir_all(taker.path().join("ddl/table/app")).unwrap();
@@ -2568,7 +2569,9 @@ async fn apply_adopting_from_an_owner_says_what_it_takes() {
     )
     .unwrap();
     let refused = dbd(taker.path(), &url, &["apply"]);
-    assert!(!refused.status.success(), "{}", combined(&refused));
+    let out = combined(&refused);
+    assert!(!refused.status.success(), "{out}");
+    assert!(out.contains("owned by \"clilive\""), "{out}");
 
     let adopted = dbd(taker.path(), &url, &["apply", "--adopt-from", "clilive"]);
     let out = combined(&adopted);
@@ -2675,4 +2678,68 @@ fn taker_of_widgets(giver: &Path) -> tempfile::TempDir {
     )
     .unwrap();
     taker
+}
+
+/// A preview adopting says what the run would adopt — apply, deploy and
+/// reconcile alike — and a reconcile adopting what it takes (#7).
+#[tokio::test]
+async fn previews_say_what_they_would_adopt_and_a_reconcile_what_it_takes() {
+    let (_pg, url) = start_pg().await;
+    let giver = tempfile::tempdir().unwrap();
+    project(giver.path());
+    let applied = dbd(giver.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+    let taker = taker_of_widgets(giver.path());
+
+    for command in ["apply", "deploy", "reconcile"] {
+        let previewed = dbd(taker.path(), &url, &[command, "--dry-run", "--adopt-from", "clilive"]);
+        let out = combined(&previewed);
+        assert!(previewed.status.success(), "{command}: {out}");
+        assert!(
+            out.contains("[dry-run] would adopt relation app.widgets from \"clilive\""),
+            "{command}: {out}"
+        );
+    }
+    let reconciled = dbd(taker.path(), &url, &["reconcile", "--adopt-from", "clilive"]);
+    let out = combined(&reconciled);
+    assert!(reconciled.status.success(), "{out}");
+    assert!(out.contains("adopting relation app.widgets from \"clilive\""), "{out}");
+}
+
+/// Under a reused owner name, `deploy`, `reconcile` and `reset` are refused,
+/// and run with `--allow-ownership-change` (#7).
+#[tokio::test]
+async fn deploy_reconcile_and_reset_take_allow_ownership_change() {
+    let (_pg, url) = start_pg().await;
+    let first = tempfile::tempdir().unwrap();
+    project(first.path());
+    let applied = dbd(first.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+
+    for (table, args) in [
+        ("gadgets", &["deploy"][..]),
+        ("sprockets", &["reconcile"]),
+        ("cogs", &["reset", "--force"]),
+    ] {
+        let reuser = tempfile::tempdir().unwrap();
+        std::fs::write(
+            reuser.path().join("design.yaml"),
+            "project:\n  name: clilive\n  version: 1\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(reuser.path().join("ddl/table/app")).unwrap();
+        std::fs::write(
+            reuser.path().join(format!("ddl/table/app/{table}.ddl")),
+            format!("create table if not exists app.{table} (id integer primary key);\n"),
+        )
+        .unwrap();
+        let refused = dbd(reuser.path(), &url, args);
+        let out = combined(&refused);
+        assert!(
+            !refused.status.success() && out.contains("this design declares none of them"),
+            "{args:?}: {out}"
+        );
+        let allowed = dbd(reuser.path(), &url, &[args, &["--allow-ownership-change"]].concat());
+        assert!(allowed.status.success(), "{args:?}: {}", combined(&allowed));
+    }
 }

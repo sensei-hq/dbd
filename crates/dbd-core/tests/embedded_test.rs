@@ -15552,3 +15552,168 @@ async fn a_reused_name_is_named_before_the_version_guard_and_its_override_passes
         .expect("the override");
     assert_table_exists(&*shop, "app", "invoices").await;
 }
+
+/// Billing owns `app.orders`, another project `app.invoices`.
+async fn billing_and_other_own_one_each(url: &str) -> (tempfile::TempDir, tempfile::TempDir) {
+    let billing = connect(url, "billing").await.unwrap();
+    let other = connect(url, "other").await.unwrap();
+    let (bd, od) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    named_project(bd.path(), "billing", "", &ORDERS_OWNER_FILES[..1])
+        .apply(&*billing, None, false, None, Progress::none())
+        .await
+        .expect("billing's apply");
+    named_project(od.path(), "other", "", &ORDERS_OWNER_FILES[1..])
+        .apply(&*other, None, false, None, Progress::none())
+        .await
+        .expect("other's apply");
+    (bd, od)
+}
+
+/// The claim refuses on its own, adopting nothing: a reset claims first,
+/// with no read before it to refuse for it (#7).
+#[tokio::test]
+async fn a_claim_refused_for_a_third_owner_adopts_nothing() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let _dirs = billing_and_other_own_one_each(&url).await;
+    let sd = tempfile::tempdir().unwrap();
+    let err = named_project(sd.path(), "shop", "", ORDERS_OWNER_FILES)
+        .adopting_from("billing")
+        .reset(&*shop, "postgres", true, false, false, None)
+        .await
+        .expect_err("app.invoices is other's")
+        .to_string();
+    assert!(err.contains("owned by \"other\""), "{err}");
+    assert_catalog(
+        &*shop,
+        true,
+        &owned_by("relation", "app", "orders", "table", "billing"),
+        "billing's app.orders",
+    )
+    .await;
+    assert_table_exists(&*shop, "app", "orders").await;
+}
+
+/// In a run's batch, an adoption rolls back with the claim that made it (#7).
+#[tokio::test]
+async fn an_adoption_in_a_batch_rolls_back_with_it() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let _dirs = billing_and_other_own_one_each(&url).await;
+    let object = |name: &str| dbd_core::adapter::OwnedObject {
+        namespace: "relation".into(),
+        schema: "app".into(),
+        name: name.into(),
+        kind: "table".into(),
+    };
+    shop.begin_batch().await.unwrap();
+    let held = shop
+        .claim_objects("shop", &[object("invoices"), object("orders")], true, Some("billing"))
+        .await
+        .unwrap();
+    assert_eq!(
+        held.iter().map(|h| h.object.name.as_str()).collect::<Vec<_>>(),
+        ["invoices"]
+    );
+    shop.rollback_batch().await.unwrap();
+    assert_catalog(
+        &*shop,
+        true,
+        &owned_by("relation", "app", "orders", "table", "billing"),
+        "billing's app.orders",
+    )
+    .await;
+}
+
+/// A dry run adopting refuses where the run would: for what a third owner
+/// holds (#7).
+#[tokio::test]
+async fn a_dry_run_adopting_is_refused_for_a_third_owner() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let _dirs = billing_and_other_own_one_each(&url).await;
+    let sd = tempfile::tempdir().unwrap();
+    let err = named_project(sd.path(), "shop", "", ORDERS_OWNER_FILES)
+        .adopting_from("billing")
+        .apply(&*shop, None, true, None, Progress::none())
+        .await
+        .expect_err("app.invoices is other's")
+        .to_string();
+    assert!(err.contains("app.invoices is owned by \"other\""), "{err}");
+}
+
+/// An enum is an entity an owner holds: a design under its name declaring
+/// none of it reuses the name (#7).
+#[tokio::test]
+async fn a_name_reuse_counts_an_owners_enum() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let (sd, nd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    named_project(
+        sd.path(),
+        "shop",
+        "",
+        &[(
+            "ddl/enum/app/status.ddl",
+            "create type app.status as enum ('a', 'b');\n",
+        )],
+    )
+    .apply(&*shop, None, false, None, Progress::none())
+    .await
+    .expect("shop's apply");
+    let err = named_project(nd.path(), "shop", "", &ORDERS_OWNER_FILES[1..])
+        .apply(&*shop, None, true, None, Progress::none())
+        .await
+        .expect_err("shop holds app.status")
+        .to_string();
+    assert!(err.contains("owns 1 entity"), "{err}");
+}
+
+/// A routine its owner dropped is gone: no sign of another project (#7).
+#[tokio::test]
+async fn a_name_reuse_skips_a_dropped_routine() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let (sd, nd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    named_project(
+        sd.path(),
+        "shop",
+        "",
+        &[(
+            "ddl/function/app/f.ddl",
+            "create or replace function app.f() returns int language sql as $$ select 1 $$;\n",
+        )],
+    )
+    .apply(&*shop, None, false, None, Progress::none())
+    .await
+    .expect("shop's apply");
+    shop.execute_script("DROP FUNCTION app.f();").await.unwrap();
+    named_project(nd.path(), "shop", "", &ORDERS_OWNER_FILES[1..])
+        .apply(&*shop, None, true, None, Progress::none())
+        .await
+        .expect("shop holds nothing that exists");
+}
+
+/// A project adopting from a versioned one is not that one renamed: the
+/// giver's record is not read as the receiver's (#7).
+#[tokio::test]
+async fn adopting_from_a_versioned_project_reads_none_of_its_record() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    write_project(
+        bd.path(),
+        "project:\n  name: billing\n  version: 1\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+        &ORDERS_OWNER_FILES[..1],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1])
+        .adopting_from("billing")
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop adopts, unversioned, from billing at v1");
+}
