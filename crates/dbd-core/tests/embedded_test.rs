@@ -13522,3 +13522,178 @@ async fn a_truncate_cascade_is_refused_only_for_another_projects_referencing_tab
         .to_string();
     assert!(err.contains("\"billing\" (table billing.refs)"), "{err}");
 }
+
+/// A `TRUNCATE … CASCADE` of another project's table empties that table
+/// first of all (#7).
+#[tokio::test]
+async fn a_migration_truncating_another_projects_table_is_refused() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let dir = sd.path();
+    let orders = "set search_path to app;\ncreate table if not exists orders (id integer primary key);\n";
+    released_shop(dir, orders, &[]);
+    released(dir)
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    billing_reading(
+        bd.path(),
+        &[(
+            "ddl/table/billing/ledger.ddl",
+            "create table if not exists billing.ledger (id int);\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    let yaml = "project:\n  name: shop\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+    cut_version(
+        dir,
+        yaml,
+        &[(
+            "ddl/table/app/orders.ddl",
+            "set search_path to app;\ncreate table if not exists orders (id integer primary key, note text);\n",
+        )],
+        &[],
+        "v2",
+    );
+    let sql_path = dir.join("migrations/002/app/orders.sql");
+    let generated = std::fs::read_to_string(&sql_path).unwrap();
+    std::fs::write(&sql_path, format!("{generated}\nTRUNCATE billing.ledger CASCADE;\n")).unwrap();
+    let err = released(dir)
+        .apply(&*shop, None, true, None, Progress::none())
+        .await
+        .expect_err("billing.ledger is billing's")
+        .to_string();
+    assert!(err.contains("billing.ledger"), "{err}");
+}
+
+/// A `TRUNCATE` without `ONLY` empties every partition and inheriting table
+/// too, and cascades to the tables referencing those (#7).
+#[tokio::test]
+async fn a_truncate_cascade_reaches_what_references_a_partition_or_a_child() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let dir = sd.path();
+    let orders = "set search_path to app;\ncreate table if not exists orders (id integer primary key);\n";
+    released_shop(dir, orders, &[]);
+    released(dir)
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    billing_reading(
+        bd.path(),
+        &[(
+            "ddl/table/billing/ledger.ddl",
+            "create table if not exists billing.ledger (id int);\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+    shop.execute_script(
+        "CREATE TABLE app.events (id int, at date, PRIMARY KEY (id, at)) PARTITION BY RANGE (at); \
+         CREATE TABLE app.events_2024 PARTITION OF app.events FOR VALUES FROM ('2024-01-01') TO ('2025-01-01'); \
+         CREATE TABLE app.base (id int PRIMARY KEY); \
+         CREATE TABLE app.kid (PRIMARY KEY (id)) INHERITS (app.base);",
+    )
+    .await
+    .unwrap();
+    billing
+        .execute_script(
+            "CREATE TABLE billing.event_refs (id int, at date, FOREIGN KEY (id, at) REFERENCES app.events_2024 (id, at)); \
+             CREATE TABLE billing.kid_refs (id int REFERENCES app.kid (id)); \
+             INSERT INTO dbd.objects (namespace, schema, name, kind, owner) VALUES \
+             ('relation', 'billing', 'event_refs', 'table', 'billing'), \
+             ('relation', 'billing', 'kid_refs', 'table', 'billing');",
+        )
+        .await
+        .unwrap();
+
+    let yaml = "project:\n  name: shop\nsource:\n  dialect: postgresql\nschemas:\n  - app\n";
+    cut_version(
+        dir,
+        yaml,
+        &[(
+            "ddl/table/app/orders.ddl",
+            "set search_path to app;\ncreate table if not exists orders (id integer primary key, note text);\n",
+        )],
+        &[],
+        "v2",
+    );
+    let sql_path = dir.join("migrations/002/app/orders.sql");
+    let generated = std::fs::read_to_string(&sql_path).unwrap();
+    std::fs::write(
+        &sql_path,
+        format!("{generated}\nTRUNCATE app.events CASCADE;\nTRUNCATE app.base CASCADE;\n"),
+    )
+    .unwrap();
+    let err = released(dir)
+        .apply(&*shop, None, true, None, Progress::none())
+        .await
+        .expect_err("billing's tables reference app.events_2024 and app.kid")
+        .to_string();
+    assert!(
+        err.contains("billing.event_refs") && err.contains("billing.kid_refs"),
+        "{err}"
+    );
+}
+
+/// A Postgres project read verbatim still runs Postgres migrations: their
+/// drops are guarded as any Postgres project's are (#7).
+#[tokio::test]
+async fn a_verbatim_postgres_projects_migration_drops_are_guarded() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let dir = sd.path();
+    let yaml = |version: u32| {
+        format!(
+            "project:\n  name: shop\n  version: {version}\nsource:\n  dialect: postgresql\n  parser: verbatim\n\
+             schemas:\n  - app\n"
+        )
+    };
+    let write = |rel: &str, body: &str| {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    };
+    write(
+        "ddl/table/app/orders.ddl",
+        "create table if not exists app.orders (id integer primary key);\n",
+    );
+    write("design.yaml", &yaml(1));
+    released(dir)
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    billing_reading(
+        bd.path(),
+        &[(
+            "ddl/view/billing/v_orders.ddl",
+            "create or replace view billing.v_orders as select id from app.orders;\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+
+    write(
+        "migrations/002/graph.json",
+        r#"{"fromVersion":1,"toVersion":2,"added":[],"altered":["app.orders"],"dropped":[]}"#,
+    );
+    write("migrations/002/app/orders.sql", "DROP TABLE app.orders CASCADE;\n");
+    write("design.yaml", &yaml(2));
+    let err = released(dir)
+        .apply(&*shop, None, true, None, Progress::none())
+        .await
+        .expect_err("billing's view reads app.orders")
+        .to_string();
+    assert!(err.contains("billing.v_orders"), "{err}");
+}
