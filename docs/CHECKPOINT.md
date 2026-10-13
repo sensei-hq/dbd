@@ -12,9 +12,12 @@
 
 ## Next
 
-    git checkout -b feat/workspaces-load
-    # slice 1: modules: block, Workspace::load, per-module Designs, inspect's
-    # overlap check (T19) and depends_on gaps (T20); red tests first
+Slice 1 PR #61 (`feat/workspaces-load` → `feat/workspaces`): two review rounds
+fixed (2534f002, a34dc1b3), plan/spec updated (9ceacd0f). Waiting on CI, then
+merge into `feat/workspaces` locally; then slice 2 (running a workspace:
+per-module runs and adapters, `--module`, manifest hooks around the run, T21).
+
+    gh pr checks 61
 
 ## Open
 

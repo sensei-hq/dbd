@@ -35,6 +35,11 @@ pub struct DesignConfig {
     pub ignore: Vec<String>,
     #[serde(default)]
     pub format: FormatConfig,
+    /// The modules of a workspace (#7), in the order written. Empty for a
+    /// project without them: a workspace of one, the project itself. See
+    /// [`crate::design::Workspace`].
+    #[serde(default)]
+    pub modules: IndexMap<String, ModuleConfig>,
 }
 
 impl DesignConfig {
@@ -176,6 +181,35 @@ impl ProjectConfig {
     pub fn version(&self) -> u32 {
         self.version.unwrap_or(DEFAULT_PROJECT_VERSION)
     }
+}
+
+// ── Modules ─────────────────────────────────────────────
+
+/// One module of a workspace: `modules.<name>` (#7).
+///
+/// A module is a design of its own, owned by `<project>/<module>` and rooted at
+/// its folder. What it shares with the other modules — targets, schemas,
+/// `source`, `import` options, format — is the manifest's; what is its own is
+/// here. Unknown keys are refused: a misspelt `depends_on` would quietly leave
+/// a module without its dependencies.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleConfig {
+    pub note: Option<String>,
+    /// The modules this one references, deployed before it.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    /// Its folder, relative to the project directory; `<name>` when absent.
+    pub path: Option<String>,
+    /// As [`ProjectConfig::version`], for this module.
+    pub version: Option<u32>,
+    /// As [`ProjectConfig::released`], for this module.
+    #[serde(default)]
+    pub released: bool,
+    /// This module's hooks; the manifest's own `apply:` runs once around the
+    /// whole workspace.
+    #[serde(default)]
+    pub apply: ApplyConfig,
 }
 
 // ── Source ───────────────────────────────────────────────
@@ -1216,6 +1250,33 @@ scopes:
         let yaml = "project:\n  name: t\n";
         let config: DesignConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(config.scopes.is_empty());
+    }
+
+    // ── Modules ───────────────────────────────────────────
+
+    #[test]
+    fn parses_a_modules_block_in_declared_order() {
+        let yaml = "project:\n  name: t\nmodules:\n  core:\n    note: The app\n    depends_on: [shared]\n    \
+                    path: db/core\n    version: 2\n    released: true\n    apply:\n      after: [x.sql]\n  shared: {}\n";
+        let config: DesignConfig = serde_yaml::from_str(yaml).unwrap();
+        let names: Vec<&str> = config.modules.keys().map(String::as_str).collect();
+        assert_eq!(names, ["core", "shared"]);
+        let core = &config.modules["core"];
+        assert_eq!(core.note.as_deref(), Some("The app"));
+        assert_eq!(core.depends_on, ["shared"]);
+        assert_eq!(core.path.as_deref(), Some("db/core"));
+        assert_eq!(core.version, Some(2));
+        assert!(core.released);
+        assert_eq!(core.apply.after.len(), 1);
+        let shared = &config.modules["shared"];
+        assert!(shared.depends_on.is_empty() && shared.path.is_none() && shared.version.is_none());
+        assert!(!shared.released);
+    }
+
+    #[test]
+    fn modules_default_empty_when_absent() {
+        let config: DesignConfig = serde_yaml::from_str("project:\n  name: t\n").unwrap();
+        assert!(config.modules.is_empty());
     }
 
     // ── Materialized views ────────────────────────────────

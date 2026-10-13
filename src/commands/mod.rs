@@ -84,6 +84,28 @@ fn warn_if_scope_ignored(command: &Commands, scope: Option<&str>, deps: Option<d
     }
 }
 
+/// Refuse a `design.yaml` with `modules:` — a workspace, a design per module
+/// (#7) — in a command that does not run one yet. Loading it as one design
+/// is refused by `Design::from_config`, but `format`, `doctor` and `snapshot
+/// --list` read the project without loading one, and reported a workspace's
+/// empty root clean. `install` reads no project; a config dbd cannot read is
+/// left to the command to report.
+fn refuse_a_workspace_until_it_runs_one(command: &Commands, config: &Path) -> Result<()> {
+    if matches!(
+        command,
+        Commands::Inspect { shared: false, .. } | Commands::Install { .. }
+    ) {
+        return Ok(());
+    }
+    match dbd_core::config::read(config) {
+        Ok(read) if !read.modules.is_empty() => anyhow::bail!(
+            "{} declares modules: — this command does not run a design with modules: yet (dbd inspect does)",
+            config.display()
+        ),
+        _ => Ok(()),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     command: &Commands,
@@ -106,6 +128,7 @@ pub async fn run(
              For other commands, clone the repository and pass its local path to --source."
         );
     }
+    refuse_a_workspace_until_it_runs_one(command, config)?;
     match command {
         Commands::Inspect { shared: true, .. } => {
             schema::cmd_inspect_shared(config, env, project_dir, database_url).await

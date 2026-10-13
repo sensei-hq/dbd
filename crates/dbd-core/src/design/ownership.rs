@@ -1351,7 +1351,7 @@ pub(crate) struct LiveOwnership {
 
 /// The registry's namespace and kind for an entity type, or `None` for one
 /// nobody owns.
-fn owned_kind(entity_type: EntityType) -> Option<(&'static str, &'static str)> {
+pub(super) fn owned_kind(entity_type: EntityType) -> Option<(&'static str, &'static str)> {
     Some(match entity_type {
         EntityType::Table => ("relation", "table"),
         EntityType::View => ("relation", "view"),
