@@ -776,3 +776,113 @@ fn a_type_another_modules_file_creates_is_reached_through_depends_on() {
         "{err}"
     );
 }
+
+/// The usual spelling — a bare type name on the file's search path — reaches
+/// a type another module's file creates as the qualified one does.
+#[test]
+fn a_bare_reference_to_a_type_another_modules_file_creates_is_a_dependency() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "shared/ddl/table/app/orders.ddl",
+        "set search_path to app;\n\ncreate type order_status as enum ('new', 'paid');\n\n\
+         create table if not exists orders (id integer primary key, status order_status);\n",
+    );
+    write(
+        root,
+        "core/ddl/table/app/items.ddl",
+        &table("items", "id integer primary key\n, status order_status"),
+    );
+
+    write(
+        root,
+        "design.yaml",
+        "project:\n  name: p\n\nschemas:\n  - app\n\nmodules:\n  core: {}\n  shared: {}\n",
+    );
+    let err = load_err(root);
+    assert!(
+        err.contains("dependency gap") && err.contains("app.order_status"),
+        "{err}"
+    );
+
+    write(
+        root,
+        "design.yaml",
+        "project:\n  name: p\n\nschemas:\n  - app\n\nmodules:\n  core:\n    depends_on: [shared]\n  shared: {}\n",
+    );
+    let workspace = load(root).expect("a dependency's type is reachable");
+    let names: Vec<&str> = workspace.modules().iter().filter_map(|m| m.name()).collect();
+    assert_eq!(names, ["shared", "core"]);
+}
+
+/// A quoted `"Status"` is not the `status` Postgres folds an unquoted name
+/// to: a reference to one does not reach the other module's other.
+#[test]
+fn a_quoted_mixed_case_reference_does_not_reach_a_folded_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "design.yaml",
+        "project:\n  name: p\n\nschemas:\n  - app\n\nexternal:\n  - name: app.Status\n\n\
+         modules:\n  shared: {}\n  core: {}\n",
+    );
+    write(
+        root,
+        "shared/ddl/enum/app/status.ddl",
+        "set search_path to app;\n\ncreate type status as enum ('a', 'b');\n",
+    );
+    write(
+        root,
+        "core/ddl/table/app/items.ddl",
+        &table("items", "id integer primary key\n, s app.\"Status\""),
+    );
+
+    load(root).expect("app.\"Status\" is not app.status");
+}
+
+/// A role a module's file declares is reached as a role, though the module
+/// referencing it has a schema of the same name.
+#[test]
+fn a_role_named_like_a_schema_is_still_another_modules_role() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "design.yaml",
+        "project:\n  name: p\n\nschemas:\n  - api\n\nmodules:\n  c: {}\n  a: {}\n",
+    );
+    write(root, "a/ddl/role/api.ddl", "create role api;\n");
+    write(root, "c/ddl/role/web.ddl", "create role web;\ngrant api to web;\n");
+
+    let err = load_err(root);
+    assert!(err.contains("web (c) requires api (a)"), "{err}");
+}
+
+/// A module may be named like a folder a module holds: its folder is its own,
+/// not files left at the root.
+#[test]
+fn a_module_named_like_a_module_folder_holds_its_own_files() {
+    for name in ["import", "ddl", "migrations"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            root,
+            "design.yaml",
+            &format!("project:\n  name: p\n\nschemas:\n  - app\n\nmodules:\n  {name}: {{}}\n"),
+        );
+        write(
+            root,
+            &format!("{name}/ddl/table/app/t.ddl"),
+            &table("t", "id integer primary key"),
+        );
+
+        let workspace = load(root).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(
+            kind_of(workspace.modules()[0].design(), "app.t"),
+            Some(EntityType::Table),
+            "{name}"
+        );
+    }
+}
