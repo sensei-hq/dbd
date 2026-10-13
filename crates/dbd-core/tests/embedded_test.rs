@@ -15233,3 +15233,212 @@ async fn a_reset_keeps_an_extension_another_project_depends_on_undeclared() {
         summary.kept
     );
 }
+
+// ── #7 Phase 2, slice 6: name reuse and transfer ─────────────────────────────
+
+/// A design arriving under an owner name that holds entities here, and
+/// declaring none of them, is another project under a reused name: it took
+/// over that owner's version and history, and its first prune would drop what
+/// it never declared. It is refused at claim time, dry run and reset included
+/// (#7, H3).
+#[tokio::test]
+async fn a_design_reusing_an_owner_name_and_declaring_none_of_its_entities_is_refused() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let (sd, nd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1])
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    let newcomer = named_project(nd.path(), "shop", "", &ORDERS_OWNER_FILES[1..]);
+
+    for dry_run in [true, false] {
+        let err = newcomer
+            .apply(&*shop, None, dry_run, None, Progress::none())
+            .await
+            .expect_err("another project under the name shop")
+            .to_string();
+        assert!(
+            err.contains("owner \"shop\" here owns 1 entity") && err.contains("this design declares none of them"),
+            "{err}"
+        );
+    }
+    let err = newcomer
+        .reset(&*shop, "postgres", true, false, false, None)
+        .await
+        .expect_err("a reset claims too")
+        .to_string();
+    assert!(err.contains("this design declares none of them"), "{err}");
+    assert_table_absent(&*shop, "app", "invoices").await;
+    assert_table_exists(&*shop, "app", "orders").await;
+}
+
+/// `--allow-ownership-change` says the design is that owner now: it runs, and
+/// what it declares is the owner's (#7).
+#[tokio::test]
+async fn allowing_an_ownership_change_lets_a_design_take_an_owner_name() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let (sd, nd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1])
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+
+    named_project(nd.path(), "shop", "", &ORDERS_OWNER_FILES[1..])
+        .allowing_ownership_change()
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("the change is allowed");
+    assert_catalog(
+        &*shop,
+        true,
+        &owned_by("relation", "app", "invoices", "table", "shop"),
+        "shop's app.invoices",
+    )
+    .await;
+}
+
+/// What an owner held and is gone is no sign of another project: a design
+/// declaring none of it is not refused (#7).
+#[tokio::test]
+async fn a_name_reuse_counts_only_entities_that_still_exist() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let (sd, nd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1])
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    shop.execute_script("DROP TABLE app.orders;").await.unwrap();
+
+    named_project(nd.path(), "shop", "", &ORDERS_OWNER_FILES[1..])
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop holds nothing that exists");
+    assert_table_exists(&*shop, "app", "invoices").await;
+}
+
+/// Between two projects in different repositories, the receiver takes an
+/// entity over with `--adopt-from`: it is the receiver's, and the giver's
+/// next prune — its design no longer declaring it — leaves it (#7, T14).
+#[tokio::test]
+async fn adopting_from_an_owner_takes_over_what_the_design_declares() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    named_project(bd.path(), "billing", "", ORDERS_OWNER_FILES)
+        .apply(&*billing, None, false, None, Progress::none())
+        .await
+        .expect("billing's apply");
+    let design = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1]);
+    let err = design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect_err("app.orders is billing's")
+        .to_string();
+    assert!(err.contains("owned by \"billing\""), "{err}");
+
+    let design = design.adopting_from("billing");
+    let adoptions = design.adoptions(&*shop).await.expect("what it would adopt");
+    assert_eq!(
+        adoptions
+            .iter()
+            .map(|h| format!("{}.{} from {}", h.object.schema, h.object.name, h.owner))
+            .collect::<Vec<_>>(),
+        ["app.orders from billing"]
+    );
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop adopts app.orders");
+    assert_catalog(
+        &*shop,
+        true,
+        &owned_by("relation", "app", "orders", "table", "shop"),
+        "shop's app.orders",
+    )
+    .await;
+
+    let giver = Design::from_config_with_dir(
+        &named_project(bd.path(), "billing", "", ORDERS_OWNER_FILES)
+            .project_dir()
+            .join("design.yaml"),
+        "dev",
+        Some(bd.path()),
+    )
+    .unwrap();
+    std::fs::remove_file(bd.path().join(ORDERS_OWNER_FILES[0].0)).unwrap();
+    let giver = Design::from_config_with_dir(&bd.path().join("design.yaml"), "dev", Some(bd.path())).unwrap_or(giver);
+    giver
+        .reconcile(&*billing, false, false, true, None, Progress::none())
+        .await
+        .expect("billing's prune");
+    assert_table_exists(&*shop, "app", "orders").await;
+}
+
+/// `--adopt-from` names one owner: what the design declares that a third
+/// holds still refuses the run, and nothing is adopted (#7).
+#[tokio::test]
+async fn adopting_from_one_owner_takes_nothing_from_another() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let other = connect(&url, "other").await.unwrap();
+    let (sd, bd, od) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    named_project(bd.path(), "billing", "", &ORDERS_OWNER_FILES[..1])
+        .apply(&*billing, None, false, None, Progress::none())
+        .await
+        .expect("billing's apply");
+    named_project(od.path(), "other", "", &ORDERS_OWNER_FILES[1..])
+        .apply(&*other, None, false, None, Progress::none())
+        .await
+        .expect("other's apply");
+
+    let err = named_project(sd.path(), "shop", "", ORDERS_OWNER_FILES)
+        .adopting_from("billing")
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect_err("app.invoices is other's")
+        .to_string();
+    assert!(err.contains("app.invoices is owned by \"other\""), "{err}");
+    assert_catalog(
+        &*shop,
+        true,
+        &owned_by("relation", "app", "orders", "table", "billing"),
+        "billing's app.orders",
+    )
+    .await;
+}
+
+/// A dry run adopting reads, and claims nothing: the entity stays the
+/// giver's (#7).
+#[tokio::test]
+async fn a_dry_run_adopting_claims_nothing() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    named_project(bd.path(), "billing", "", &ORDERS_OWNER_FILES[..1])
+        .apply(&*billing, None, false, None, Progress::none())
+        .await
+        .expect("billing's apply");
+
+    named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1])
+        .adopting_from("billing")
+        .apply(&*shop, None, true, None, Progress::none())
+        .await
+        .expect("the dry run");
+    assert_catalog(
+        &*shop,
+        true,
+        &owned_by("relation", "app", "orders", "table", "billing"),
+        "billing's app.orders",
+    )
+    .await;
+}

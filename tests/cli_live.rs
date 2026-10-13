@@ -2544,3 +2544,65 @@ async fn a_reset_preview_keeps_what_another_project_has() {
     assert!(!out.contains("DROP SCHEMA IF EXISTS \"app\""), "{out}");
     assert!(out.contains("schema app kept") && out.contains("\"other\""), "{out}");
 }
+
+/// `--adopt-from` takes over what the design declares that the named owner
+/// holds, and says what it takes (#7).
+#[tokio::test]
+async fn apply_adopting_from_an_owner_says_what_it_takes() {
+    let (_pg, url) = start_pg().await;
+    let giver = tempfile::tempdir().unwrap();
+    project(giver.path());
+    let applied = dbd(giver.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+
+    let taker = tempfile::tempdir().unwrap();
+    std::fs::write(
+        taker.path().join("design.yaml"),
+        "project:\n  name: taker\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(taker.path().join("ddl/table/app")).unwrap();
+    std::fs::copy(
+        giver.path().join("ddl/table/app/widgets.ddl"),
+        taker.path().join("ddl/table/app/widgets.ddl"),
+    )
+    .unwrap();
+    let refused = dbd(taker.path(), &url, &["apply"]);
+    assert!(!refused.status.success(), "{}", combined(&refused));
+
+    let adopted = dbd(taker.path(), &url, &["apply", "--adopt-from", "clilive"]);
+    let out = combined(&adopted);
+    assert!(adopted.status.success(), "{out}");
+    assert!(out.contains("adopting relation app.widgets from \"clilive\""), "{out}");
+}
+
+/// A design reusing an owner's name is refused, and `--allow-ownership-change`
+/// lets it run (#7).
+#[tokio::test]
+async fn apply_under_a_reused_owner_name_needs_allow_ownership_change() {
+    let (_pg, url) = start_pg().await;
+    let first = tempfile::tempdir().unwrap();
+    project(first.path());
+    let applied = dbd(first.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+
+    let second = tempfile::tempdir().unwrap();
+    std::fs::write(
+        second.path().join("design.yaml"),
+        "project:\n  name: clilive\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(second.path().join("ddl/table/app")).unwrap();
+    std::fs::write(
+        second.path().join("ddl/table/app/gadgets.ddl"),
+        "create table if not exists app.gadgets (id integer primary key);\n",
+    )
+    .unwrap();
+    let refused = dbd(second.path(), &url, &["apply"]);
+    let out = combined(&refused);
+    assert!(!refused.status.success(), "{out}");
+    assert!(out.contains("this design declares none of them"), "{out}");
+
+    let allowed = dbd(second.path(), &url, &["apply", "--allow-ownership-change"]);
+    assert!(allowed.status.success(), "{}", combined(&allowed));
+}
