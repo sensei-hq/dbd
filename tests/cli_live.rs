@@ -2962,3 +2962,119 @@ async fn inspect_shared_reports_the_projects_and_fails_on_a_conflict() {
     assert!(!conflicted.status.success(), "{said}");
     assert!(said.contains("relation app.widgets is owned by \"clilive\""), "{said}");
 }
+
+// ── Workspaces (#7 phase 3) ──────────────────────────────────────────────────
+
+/// `shop` as a workspace: `shared` holds currencies; `core`'s orders and
+/// `dojo`'s sessions reference them.
+fn shop_workspace(dir: &Path) {
+    let files: &[(&str, &str)] = &[
+        (
+            "design.yaml",
+            "project:\n  name: shop\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n  - dojo\n\n\
+             modules:\n  shared: {}\n  core:\n    depends_on: [shared]\n  dojo:\n    depends_on: [shared]\n",
+        ),
+        (
+            "shared/ddl/table/app/currencies.ddl",
+            "set search_path to app;\ncreate table if not exists currencies (code text primary key);\n",
+        ),
+        (
+            "core/ddl/table/app/orders.ddl",
+            "set search_path to app;\ncreate table if not exists orders (\n  id integer primary key\n, \
+             currency text references currencies (code)\n);\n",
+        ),
+        (
+            "dojo/ddl/table/dojo/sessions.ddl",
+            "set search_path to dojo;\ncreate table if not exists sessions (\n  id integer primary key\n, \
+             currency text references app.currencies (code)\n);\n",
+        ),
+    ];
+    for (rel, text) in files {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, text).unwrap();
+    }
+}
+
+/// Where each `module <name> (<owner>)` header is in `text`, in order.
+fn module_headers(text: &str) -> Vec<&str> {
+    text.lines()
+        .filter_map(|l| l.trim().strip_prefix("module "))
+        .filter_map(|l| l.split(' ').next())
+        .collect()
+}
+
+/// Every command that runs a design runs a workspace module by module, in
+/// `depends_on` order, each as its own owner — and `reset` in reverse.
+#[tokio::test]
+async fn a_workspace_runs_module_by_module() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    shop_workspace(dir);
+
+    let o = dbd(dir, &url, &["deploy"]);
+    assert!(o.status.success(), "deploy: {}", combined(&o));
+    assert_eq!(
+        module_headers(&stdout(&o)),
+        ["shared", "core", "dojo"],
+        "{}",
+        combined(&o)
+    );
+
+    for args in [
+        &["apply"][..],
+        &["apply", "--dry-run"],
+        &["diff"],
+        &["reconcile", "--dry-run"],
+        &["migrate", "--status"],
+        &["refresh"],
+        &["policies"],
+        &["import"],
+        &["inspect", "--shared"],
+    ] {
+        let o = dbd(dir, &url, args);
+        assert!(o.status.success(), "{args:?}: {}", combined(&o));
+        assert_eq!(
+            module_headers(&stdout(&o)),
+            ["shared", "core", "dojo"],
+            "{args:?}: {}",
+            combined(&o)
+        );
+    }
+
+    let o = dbd(dir, &url, &["reset", "--force"]);
+    assert!(o.status.success(), "reset: {}", combined(&o));
+    assert_eq!(
+        module_headers(&stdout(&o)),
+        ["dojo", "core", "shared"],
+        "{}",
+        combined(&o)
+    );
+}
+
+/// `--module` runs one module and the modules it depends on — a reset, the
+/// one module alone.
+#[tokio::test]
+async fn module_runs_one_module_and_its_dependencies() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    shop_workspace(dir);
+
+    let o = dbd(dir, &url, &["apply", "--module", "core"]);
+    assert!(o.status.success(), "apply --module core: {}", combined(&o));
+    assert_eq!(module_headers(&stdout(&o)), ["shared", "core"], "{}", combined(&o));
+
+    let o = dbd(dir, &url, &["inspect", "--shared"]);
+    let text = combined(&o);
+    assert!(text.contains("shop/core") && !text.contains("shop/dojo ("), "{text}");
+
+    let o = dbd(dir, &url, &["reset", "--force", "--module", "core"]);
+    assert!(o.status.success(), "reset --module core: {}", combined(&o));
+    assert_eq!(module_headers(&stdout(&o)), ["core"], "{}", combined(&o));
+
+    let o = dbd(dir, &url, &["apply", "--module", "nope"]);
+    assert!(!o.status.success(), "{}", combined(&o));
+    assert!(combined(&o).contains("\"nope\""), "{}", combined(&o));
+}

@@ -183,26 +183,74 @@ fn inspect_refuses_a_scope_on_a_workspace() {
     assert!(text.contains("--deps") && text.contains("modules:"), "{text}");
 }
 
-/// The other commands do not run a workspace yet; each refuses it rather
-/// than run the manifest as a design with no DDL.
+/// The commands that do not run a workspace yet refuse it rather than run
+/// the manifest as a design with no DDL. `format`, `doctor` and `snapshot
+/// --list` read the project without loading a design, and reported a
+/// workspace's empty root clean.
 #[test]
 fn a_command_that_does_not_run_a_workspace_refuses_it() {
     let tmp = tempfile::tempdir().unwrap();
     shop(tmp.path());
 
-    // `format`, `doctor` and `snapshot --list` read the project without
-    // loading a design, and reported a workspace's empty root clean.
-    for args in [
-        &["apply", "--dry-run"][..],
-        &["format", "--check"],
-        &["doctor"],
-        &["snapshot", "--list"],
-    ] {
+    for args in [&["format", "--check"][..], &["doctor"], &["snapshot", "--list"]] {
         let out = dbd(tmp.path(), args);
         let text = text(&out);
         assert!(!out.status.success(), "{args:?}: {text}");
         assert!(text.contains("modules:"), "{args:?}: {text}");
     }
+}
+
+/// A dry run with no database previews each module in `depends_on` order.
+#[test]
+fn an_offline_dry_run_previews_each_module() {
+    let tmp = tempfile::tempdir().unwrap();
+    shop(tmp.path());
+
+    let out = dbd(tmp.path(), &["apply", "--dry-run"]);
+    let text = text(&out);
+    assert!(out.status.success(), "{text}");
+    let shared = text.find("module shared (shop/shared)").expect(&text);
+    let core = text.find("module core (shop/core)").expect(&text);
+    assert!(shared < core, "{text}");
+
+    let out = dbd(tmp.path(), &["apply", "--dry-run", "--module", "shared"]);
+    let text = self::text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains("module shared (shop/shared)") && !text.contains("module core"),
+        "{text}"
+    );
+}
+
+/// `--module` names a module of a workspace; a design without `modules:` has
+/// none to name.
+#[test]
+fn module_on_a_design_without_modules_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "design.yaml",
+        "project:\n  name: plain\n\nschemas:\n  - app\n",
+    );
+    write(tmp.path(), "ddl/table/app/t.ddl", &table("t", "id integer primary key"));
+
+    let out = dbd(tmp.path(), &["apply", "--dry-run", "--module", "core"]);
+    let text = text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("--module") && text.contains("modules:"), "{text}");
+}
+
+/// Scopes select modules in a workspace — not yet: a run refuses one rather
+/// than select within each module as if it were the whole design.
+#[test]
+fn a_scope_on_a_workspace_run_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    shop(tmp.path());
+
+    let out = dbd(tmp.path(), &["apply", "--dry-run", "--scope", "all"]);
+    let text = text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("--scope") && text.contains("modules:"), "{text}");
 }
 
 /// A module's folder is relative to the project directory (`--source`), as
