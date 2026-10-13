@@ -267,15 +267,95 @@ fn a_scope_excluding_what_another_module_needs_is_a_gap() {
         "set search_path to app;\ncreate table if not exists orders (\n  id integer primary key\n, \
          currency text references currencies (id)\n);\n",
     );
-    let err = match load(root).unwrap().under_scope(Some("trim")) {
-        Ok(_) => panic!("app.orders requires what trim leaves out"),
-        Err(e) => e.to_string(),
-    };
+    let err = gaps(root, Some("trim"), None, None).expect_err("app.orders requires what trim leaves out");
     assert!(
         err.contains("app.orders") && err.contains("app.currencies") && err.contains("trim"),
         "{err}"
     );
-    assert_eq!(owners(&scoped(root, Some("dojo"))), ["shop/shared", "shop/dojo"]);
+    gaps(root, Some("dojo"), None, None).expect("dojo has no gap");
+}
+
+/// The run's cross-module gaps, as `targets` checks them: over the modules a
+/// run under `scope` and `module` goes over, each resolving the scope as the
+/// commands do, `deps` included.
+fn gaps(
+    root: &Path,
+    scope: Option<&str>,
+    module: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
+) -> Result<(), String> {
+    let selected = load(root)
+        .map_err(|e| e.to_string())?
+        .under_scope_of(scope, module)
+        .map_err(|e| e.to_string())?
+        .select(module)
+        .map_err(|e| e.to_string())?;
+    dbd_core::design::check_scope_gaps(&selected, scope, deps).map_err(|e| e.to_string())
+}
+
+/// shop, with `app.ranks` in shared and dojo's belts holding a key to it,
+/// through `app.grades` in dojo.
+fn shop_with_ranks(root: &Path, scopes: &str) {
+    shop(root, scopes);
+    write(root, "shared/ddl/table/app/ranks.ddl", &table("ranks"));
+    write(
+        root,
+        "dojo/ddl/table/app/grades.ddl",
+        "set search_path to app;\ncreate table if not exists grades (\n  id integer primary key\n, \
+         rank_id integer references ranks (id)\n);\n",
+    );
+    write(
+        root,
+        "dojo/ddl/table/app/belts.ddl",
+        "set search_path to app;\ncreate table if not exists belts (\n  id integer primary key\n, \
+         grade_id integer references grades (id)\n);\n",
+    );
+}
+
+/// A module the `default` scope leaves out runs on its own, its dependencies
+/// under their `default` — and what that leaves out of them that the module
+/// requires is a gap all the same.
+#[test]
+fn a_module_run_on_its_own_is_checked_for_gaps_too() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    shop_with_ranks(root, "  default:\n    modules: [core]\n    excludes: [app.ranks]\n");
+    let err = gaps(root, None, Some("dojo"), None).expect_err("app.grades requires app.ranks");
+    assert!(err.contains("app.grades (module \"dojo\") requires app.ranks"), "{err}");
+}
+
+/// `--deps include` takes in what an entity needs — and what it takes in may
+/// need what the scope leaves out of another module.
+#[test]
+fn a_deps_override_is_checked_for_gaps_as_the_run_resolves_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    shop_with_ranks(root, "  s:\n    includes: [app.belts]\n    excludes: [app.ranks]\n");
+    gaps(root, Some("s"), None, None).expect("under report, dojo builds belts alone");
+    let err = gaps(root, Some("s"), None, Some(dbd_core::config::DepsPolicy::Include))
+        .expect_err("under include, dojo builds grades, which requires ranks");
+    assert!(err.contains("app.grades (module \"dojo\") requires app.ranks"), "{err}");
+}
+
+/// A scope's refusal in one module names the module; a run not going over
+/// that module is not refused for it.
+#[test]
+fn a_modules_scope_refusal_names_the_module() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    shop(
+        root,
+        "  s:\n    modules: [core, dojo]\n    excludes: [app.notes]\n    deps: include\n",
+    );
+    write(
+        root,
+        "core/ddl/table/app/orders.ddl",
+        "set search_path to app;\ncreate table if not exists orders (\n  id integer primary key\n, \
+         note_id integer references notes (id)\n);\n",
+    );
+    let err = gaps(root, Some("s"), None, None).expect_err("core's closure needs what s excludes");
+    assert!(err.contains("module \"core\""), "{err}");
+    gaps(root, Some("s"), Some("dojo"), None).expect("a run of dojo does not go over core");
 }
 
 /// With no `--scope`, the `default` scope runs the module asked for when it
@@ -404,4 +484,48 @@ fn a_bare_all_scope_selects_and_resolves_in_every_module() {
         let resolved = module.design().resolve_scope(Some("every"), None).expect("resolve");
         assert!(resolved.is_all, "{}", module.owner());
     }
+}
+
+/// A declared schema with nothing in it, included, selects no module — and
+/// the workspace still loads.
+#[test]
+fn including_an_empty_declared_schema_selects_nothing_and_loads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    shop(root, "  rep:\n    modules: [core]\n    includes: [reporting]\n");
+    let manifest = std::fs::read_to_string(root.join("design.yaml")).unwrap();
+    write(
+        root,
+        "design.yaml",
+        &manifest.replace("  - app\n", "  - app\n  - reporting\n"),
+    );
+    assert_eq!(owners(&scoped(root, Some("rep"))), ["shop/shared", "shop/core"]);
+}
+
+/// A link to a module folder from outside the workspace finds it through the
+/// folder the link points at.
+#[cfg(unix)]
+#[test]
+fn a_link_from_outside_to_a_module_folder_finds_its_workspace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    shop(&root, SCOPES);
+    std::os::unix::fs::symlink(root.join("dojo"), outside.path().join("linkdojo")).unwrap();
+    let found = Workspace::locate(&outside.path().join("linkdojo"), Path::new("design.yaml"));
+    assert_eq!(found, Some((root.clone(), Some("dojo".to_string()))));
+}
+
+/// The folder a run is started in names its module before the folder a link
+/// in it points at.
+#[cfg(unix)]
+#[test]
+fn the_folder_a_run_starts_in_names_its_module_before_a_links_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    shop(&root, SCOPES);
+    std::fs::create_dir_all(root.join("shared/vendor")).unwrap();
+    std::os::unix::fs::symlink(root.join("shared/vendor"), root.join("core/vendor")).unwrap();
+    let found = Workspace::locate(&root.join("core/vendor"), Path::new("design.yaml"));
+    assert_eq!(found, Some((root.clone(), Some("core".to_string()))));
 }

@@ -559,3 +559,30 @@ fn deps_reaches_each_modules_scope() {
     let out = dbd(tmp.path(), &["inspect", "--scope", "notes_only", "--deps", "include"]);
     assert!(out.status.success(), "{}", self::text(&out));
 }
+
+/// `--deps include` on a workspace run is checked for gaps as the run
+/// resolves it: what it takes in may need what the scope leaves out of
+/// another module — here notes take in orders, which need currencies.
+#[test]
+fn a_deps_override_reaches_the_workspace_gap_check() {
+    let tmp = tempfile::tempdir().unwrap();
+    shop_scoped(
+        tmp.path(),
+        "  s:\n    includes: [app.notes]\n    excludes: [app.currencies]\n",
+    );
+    write(
+        tmp.path(),
+        "core/ddl/table/app/notes.ddl",
+        &table(
+            "notes",
+            "id integer primary key\n, order_id integer references orders (id)",
+        ),
+    );
+    let out = dbd(tmp.path(), &["inspect", "--scope", "s", "--deps", "include"]);
+    let text = text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("app.orders (module \"core\") requires app.currencies"),
+        "{text}"
+    );
+}
