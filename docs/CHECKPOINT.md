@@ -16,9 +16,12 @@
 
 ## Next
 
-Slice 4 (per-module history): `snapshot`, `release` and `apply`'s migrations
-per module (writing `modules.<name>.version`/`released`), and `format` and
-`doctor` over the modules. Branch `feat/workspaces-history`, red tests first.
+Slice 4 on `feat/workspaces-history`: red tests committed (670bfe6b). Implement:
+`config::update_version_of`/`set_released_of` (edit `modules.<name>.*` in
+place), `create_snapshot`/`create_baseline_snapshot` taking the module,
+`Design::module`, and `snapshot`, `release`, `format`, `doctor` over modules.
+
+    cargo test -p dbd-core --test workspace_history && cargo test --test workspace_history
 
 ## Open
 
