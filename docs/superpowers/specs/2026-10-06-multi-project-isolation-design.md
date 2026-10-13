@@ -181,6 +181,17 @@ and nobody else can claim it by accident.
   `--adopt-from <owner>`, which is explicit and printed. The giver's next run
   sees it no longer owns the entity and does not prune it.
 
+  The adoption happens in the claim's own transaction: `<owner>`'s claims of
+  what the design declares change hands, then the design claims as usual. An
+  entity a third owner holds refuses the run, and the adoption rolls back
+  with it. Each adopted entity is printed before the run, and a dry run
+  prints what it would adopt and claims nothing. An adopted entity is no sign
+  of a rename, so the guards do not read the giver's record as the
+  receiver's — nor do the receiver's own claims, should a run that adopted fail
+  before it wrote its record. A reconcile plans what it adopts as its own. A
+  giver whose design still declares the entity is refused, as any owner
+  declaring another's entity is.
+
 **Uses are guarded.** At deploy time an owner records every reference its
 design makes to another owner's entity, from dbd's parsed references, the same
 ones scopes and the dependency graph use. Parsed references see into function
@@ -285,7 +296,16 @@ entities before it drops any (see Claim). On top of that:
 **Name reuse** (H3) is detected at claim time. Suppose a design arrives under an
 owner name that already owns entities in this database, and it declares none of
 them. dbd refuses with `owner "app" here owns 42 entities; this design declares
-none of them`. `--allow-ownership-change` overrides it.
+none of them`. `--allow-ownership-change` overrides it. Only entities that still
+exist count — a claim of one dropped since is no sign of another project — and
+the check runs wherever ownership is checked or claimed: dry runs, `diff` and
+`reset` too, and before the version guard, which reads the record the name
+keys — the previous design's. Overridden, what the owner held stays the
+owner's, now this design's, and a prune drops it as undeclared; the run passes
+the version guard, the recorded version being the previous design's history,
+but not the environment guard. A project replacing every live entity at once —
+a one-table project renaming its table — reads as a reused name too, and takes
+the override once.
 
 **Backfill.** The first upgraded run of each owner claims the declared entities
 that already exist and nobody owns. Undeclared live entities stay unowned. On a

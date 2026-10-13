@@ -618,6 +618,13 @@ pub struct Design {
     /// telling someone their "verbatim project" cannot be diffed names nothing
     /// they typed.
     dialect: String,
+    /// The owner whose entities this design takes over as it claims them —
+    /// `--adopt-from` (#7). See [`Design::adopting_from`].
+    adopt_from: Option<String>,
+    /// Whether this design may run as an owner that holds entities here it
+    /// declares none of — `--allow-ownership-change` (#7). See
+    /// [`Design::allowing_ownership_change`].
+    allow_ownership_change: bool,
 }
 
 /// The phrase [`warn_if_no_search_path`] reports with, so
@@ -992,6 +999,8 @@ impl Design {
             parser: parser_choice,
             search_path: project_search_path,
             dialect: dialect_label,
+            adopt_from: None,
+            allow_ownership_change: false,
         })
     }
 

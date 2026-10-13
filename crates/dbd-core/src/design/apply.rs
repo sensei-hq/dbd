@@ -304,7 +304,8 @@ impl Design {
         // `dry_run` too, since the database is there to ask. Both read the
         // database's marks without healing the bookkeeping, which is itself a
         // write.
-        self.check_apply_guards(&self.database_marks(adapter).await?)?;
+        self.check_run_guards(adapter, &self.database_marks(adapter).await?)
+            .await?;
         // Also before the first hook, and under `dry_run` (see the function).
         let db_version = adapter.get_db_version().await?;
         let latest_version = self.config.project.version.unwrap_or(0);

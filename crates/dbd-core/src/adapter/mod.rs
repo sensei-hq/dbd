@@ -538,11 +538,26 @@ pub trait DatabaseAdapter: Send + Sync {
     /// Claim `objects` for `owner` — every entity its whole design declares —
     /// in the database's ownership registry, or, with `write` false, only look.
     /// Returns those another owner holds; when there are any, a claim takes
-    /// none of them (#7). A claim runs in the open batch transaction when there
-    /// is one, so it commits with the run's own work and rolls back with it.
-    /// Adapters without a registry claim nothing and find nothing held.
-    async fn claim_objects(&self, owner: &str, objects: &[OwnedObject], write: bool) -> Result<Vec<HeldObject>> {
-        let _ = (owner, objects, write);
+    /// none of them (#7). Those `adopt_from` holds are taken over, in the same
+    /// claim, and not returned. A claim runs in the open batch transaction
+    /// when there is one, so it commits with the run's own work and rolls back
+    /// with it. Adapters without a registry claim nothing and find nothing
+    /// held.
+    async fn claim_objects(
+        &self,
+        owner: &str,
+        objects: &[OwnedObject],
+        write: bool,
+        adopt_from: Option<&str>,
+    ) -> Result<Vec<HeldObject>> {
+        let _ = (owner, objects, write, adopt_from);
+        Ok(Vec::new())
+    }
+
+    /// What `owner` holds in the registry that still exists in the database
+    /// (#7). Reads only. Adapters without a registry hold nothing.
+    async fn owned_objects(&self, owner: &str) -> Result<Vec<OwnedObject>> {
+        let _ = owner;
         Ok(Vec::new())
     }
 

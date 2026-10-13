@@ -160,6 +160,8 @@ pub async fn run(
             dry_run,
             with_policies,
             allow_scope_change,
+            adopt_from,
+            allow_ownership_change,
         } => {
             schema::cmd_apply(
                 config,
@@ -170,6 +172,7 @@ pub async fn run(
                 *dry_run,
                 *with_policies,
                 *allow_scope_change,
+                &OwnershipChange::new(adopt_from.as_deref(), *allow_ownership_change),
                 scope,
                 deps,
                 verbosity,
@@ -215,6 +218,7 @@ pub async fn run(
             extensions,
             clean,
             allow_scope_change,
+            allow_ownership_change,
         } => {
             let opts = migration::ResetOptions {
                 dry_run: *dry_run,
@@ -222,6 +226,7 @@ pub async fn run(
                 drop_schemas: *schemas || *clean,
                 drop_extensions: *extensions || *clean,
                 allow_scope_change: *allow_scope_change,
+                allow_ownership_change: *allow_ownership_change,
             };
             migration::cmd_reset(
                 config,
@@ -262,6 +267,8 @@ pub async fn run(
             no_cache,
             clear_cache,
             allow_scope_change,
+            adopt_from,
+            allow_ownership_change,
         } => {
             // `config` is `--source` joined with `-c`; deploy resolves the source
             // itself (it may be a GitHub ref), so it takes `-c` back off.
@@ -275,6 +282,7 @@ pub async fn run(
                 *no_cache,
                 *clear_cache,
                 *allow_scope_change,
+                &OwnershipChange::new(adopt_from.as_deref(), *allow_ownership_change),
                 scope,
                 deps,
                 verbosity,
@@ -460,6 +468,8 @@ pub async fn run(
             prune,
             prune_unowned,
             allow_scope_change,
+            adopt_from,
+            allow_ownership_change,
         } => {
             project::cmd_reconcile(
                 config,
@@ -474,6 +484,7 @@ pub async fn run(
                     dbd_core::Prune::from(*prune)
                 },
                 *allow_scope_change,
+                &OwnershipChange::new(adopt_from.as_deref(), *allow_ownership_change),
                 scope,
                 deps,
                 verbosity,
@@ -805,6 +816,57 @@ pub(super) fn note_unlisted_migrations(verbosity: Verbosity, project_dir: &Path)
              — pass -d <url>, or set target.url, to list them.",
         );
     }
+}
+
+/// The ownership a run may change (#7): `--adopt-from` and
+/// `--allow-ownership-change`.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct OwnershipChange {
+    adopt_from: Option<String>,
+    allow: bool,
+}
+
+impl OwnershipChange {
+    pub(crate) fn new(adopt_from: Option<&str>, allow: bool) -> Self {
+        Self {
+            adopt_from: adopt_from.map(str::to_string),
+            allow,
+        }
+    }
+
+    /// `design`, changing what these flags let it.
+    pub(crate) fn applied_to(&self, mut design: dbd_core::Design) -> dbd_core::Design {
+        if let Some(owner) = &self.adopt_from {
+            design = design.adopting_from(owner);
+        }
+        if self.allow {
+            design = design.allowing_ownership_change();
+        }
+        design
+    }
+}
+
+/// Say, before a run, each entity it takes over with `--adopt-from` — or,
+/// previewing, would. Always shown: an adoption is never silent (#7). Only
+/// once the run's ownership checks pass: a run refused adopts nothing.
+pub(super) async fn announce_adoptions(
+    design: &dbd_core::Design,
+    adapter: &dyn dbd_core::DatabaseAdapter,
+    dry_run: bool,
+) -> Result<()> {
+    let adoptions = design.adoptions(adapter).await?;
+    if adoptions.is_empty() {
+        return Ok(());
+    }
+    design.check_ownership(adapter).await?;
+    let verb = if dry_run { "[dry-run] would adopt" } else { "adopting" };
+    for held in adoptions {
+        output::always(&format!(
+            "{verb} {} {}.{} from \"{}\"",
+            held.object.namespace, held.object.schema, held.object.name, held.owner
+        ));
+    }
+    Ok(())
 }
 
 fn resolve_env_vars(s: &str) -> String {
@@ -1411,6 +1473,7 @@ mod tests {
                 extensions: false,
                 clean: false,
                 allow_scope_change: false,
+                allow_ownership_change: false,
             },
             &tmp,
         )

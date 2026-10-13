@@ -825,11 +825,13 @@ pub async fn cmd_apply(
     dry_run: bool,
     with_policies: bool,
     allow_scope_change: bool,
+    ownership: &super::OwnershipChange,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
+    let design = ownership
+        .applied_to(Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?);
     warn_if_no_authored_ddl(&design, project_dir);
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
 
@@ -856,10 +858,11 @@ pub async fn cmd_apply(
         if let Some(adapter) = &adapter {
             let marks = design.database_marks(&**adapter).await?;
             Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
-            design.check_apply_guards(&marks)?;
+            design.check_run_guards(&**adapter, &marks).await?;
             // The real run claims the design's entities; its preview refuses
-            // what that claim would (#7).
+            // what that claim would, and names what it would adopt (#7).
             design.check_ownership(&**adapter).await?;
+            super::announce_adoptions(&design, &**adapter, true).await?;
         }
 
         // Built before anything is printed: it refuses where the run does — a
@@ -900,6 +903,7 @@ pub async fn cmd_apply(
     // pinned to (unless the operator opted in to re-point it).
     let marks = design.database_marks(&*adapter).await?;
     Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
+    super::announce_adoptions(&design, &*adapter, false).await?;
 
     // Said before the run, not in its summary: a run that fails never prints
     // one, and a skipped hook is often why it failed. Always shown, whatever
@@ -1723,6 +1727,7 @@ mod tests {
             /*dry_run*/ true,
             /*with_policies*/ false,
             /*allow_scope_change*/ false,
+            &crate::commands::OwnershipChange::default(),
             None,
             None,
             Verbosity::Normal,
@@ -1852,6 +1857,7 @@ mod tests {
             /*dry_run*/ true,
             /*with_policies*/ false,
             /*allow_scope_change*/ false,
+            &crate::commands::OwnershipChange::default(),
             Some("config_only"),
             None,
             Verbosity::Normal,

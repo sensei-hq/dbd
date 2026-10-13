@@ -126,6 +126,26 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   named `dbd: waiting for the write lock` meanwhile. The session turns off
   `idle_session_timeout`, a run that finds its lock lost when it releases it
   fails, and a run dropped part-way gives the lock up.
+- **A project reusing another's name is refused** (#7, phase 2). A design
+  arriving under an owner name that holds entities in the database, and
+  declaring none of them, took over that project's version and history, and
+  its first prune dropped what it never declared. It is refused at claim
+  time, dry runs, `diff` and `reset` included — `owner "shop" here owns 1
+  entity (relation app.orders); this design declares none of them` — counting
+  only what still exists, and before the version guard, which reads the
+  previous design's record. `--allow-ownership-change` (on `apply`, `deploy`,
+  `reconcile` and `reset`) lets a new design run as that owner, passing the
+  version guard — the version recorded is the previous design's — though
+  not the environment guard.
+- **`--adopt-from <owner>` moves entities between projects** (#7, phase 2).
+  On `apply`, `deploy` and `reconcile`, it takes over the entities the design
+  declares that `<owner>` holds, in the claim's own transaction, printing
+  each — `adopting relation app.widgets from "clilive"`; a dry run says what
+  it would — once the run's ownership checks pass. One a third project holds
+  still refuses the run, and nothing is adopted. A reconcile adopting plans
+  the adopted table as its own. The giver's next run neither owns nor prunes
+  it, and declaring it still is refused; and neither the adoption nor a run
+  that adopted and then failed reads as a rename of the giver.
 - **The uses guard sees further** (#7, phase 2). A dependent nobody owns —
   a project's not yet recording its uses — is guarded where a project might
   own it, by `--prune`'s rule: in a schema another project uses, or anywhere
@@ -168,6 +188,10 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   around a run.
   `Dependence::owner` is an `Option` — `None` for a dependent nobody owns —
   and `Dependence::schema` names the dependent's schema.
+- `Design::adopting_from`, `allowing_ownership_change`, `adoptions` and
+  `check_run_guards` — the guards `apply` checks, name reuse first;
+  `DatabaseAdapter::claim_objects` takes `adopt_from`, and the adapter gains
+  `owned_objects` (default: nothing held).
 
 ### Fixed
 

@@ -2544,3 +2544,202 @@ async fn a_reset_preview_keeps_what_another_project_has() {
     assert!(!out.contains("DROP SCHEMA IF EXISTS \"app\""), "{out}");
     assert!(out.contains("schema app kept") && out.contains("\"other\""), "{out}");
 }
+
+/// `--adopt-from` takes over what the design declares that the named owner
+/// holds, and says what it takes (#7).
+#[tokio::test]
+async fn apply_adopting_from_an_owner_says_what_it_takes() {
+    let (_pg, url) = start_pg().await;
+    let giver = tempfile::tempdir().unwrap();
+    project(giver.path());
+    let applied = dbd(giver.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+
+    // Versioned as the giver is, so what refuses it is ownership alone.
+    let taker = tempfile::tempdir().unwrap();
+    std::fs::write(
+        taker.path().join("design.yaml"),
+        "project:\n  name: taker\n  version: 1\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(taker.path().join("ddl/table/app")).unwrap();
+    std::fs::copy(
+        giver.path().join("ddl/table/app/widgets.ddl"),
+        taker.path().join("ddl/table/app/widgets.ddl"),
+    )
+    .unwrap();
+    let refused = dbd(taker.path(), &url, &["apply"]);
+    let out = combined(&refused);
+    assert!(!refused.status.success(), "{out}");
+    assert!(out.contains("owned by \"clilive\""), "{out}");
+
+    let adopted = dbd(taker.path(), &url, &["apply", "--adopt-from", "clilive"]);
+    let out = combined(&adopted);
+    assert!(adopted.status.success(), "{out}");
+    assert!(out.contains("adopting relation app.widgets from \"clilive\""), "{out}");
+}
+
+/// A design reusing an owner's name is refused, and `--allow-ownership-change`
+/// lets it run (#7).
+#[tokio::test]
+async fn apply_under_a_reused_owner_name_needs_allow_ownership_change() {
+    let (_pg, url) = start_pg().await;
+    let first = tempfile::tempdir().unwrap();
+    project(first.path());
+    let applied = dbd(first.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+
+    let second = tempfile::tempdir().unwrap();
+    std::fs::write(
+        second.path().join("design.yaml"),
+        "project:\n  name: clilive\n  version: 1\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(second.path().join("ddl/table/app")).unwrap();
+    std::fs::write(
+        second.path().join("ddl/table/app/gadgets.ddl"),
+        "create table if not exists app.gadgets (id integer primary key);\n",
+    )
+    .unwrap();
+    let refused = dbd(second.path(), &url, &["apply"]);
+    let out = combined(&refused);
+    assert!(!refused.status.success(), "{out}");
+    assert!(out.contains("this design declares none of them"), "{out}");
+
+    let allowed = dbd(second.path(), &url, &["apply", "--allow-ownership-change"]);
+    assert!(allowed.status.success(), "{}", combined(&allowed));
+}
+
+/// A deploy adopting says what it takes, as an apply does (#7).
+#[tokio::test]
+async fn deploy_adopting_from_an_owner_says_what_it_takes() {
+    let (_pg, url) = start_pg().await;
+    let giver = tempfile::tempdir().unwrap();
+    project(giver.path());
+    let applied = dbd(giver.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+    let taker = taker_of_widgets(giver.path());
+
+    let deployed = dbd(taker.path(), &url, &["deploy", "--adopt-from", "clilive"]);
+    let out = combined(&deployed);
+    assert!(deployed.status.success(), "{out}");
+    assert!(out.contains("adopting relation app.widgets from \"clilive\""), "{out}");
+}
+
+/// A run refused — a third project holds an entity the design declares —
+/// adopts nothing, and says nothing of adopting (#7).
+#[tokio::test]
+async fn a_refused_apply_says_nothing_of_adopting() {
+    let (_pg, url) = start_pg().await;
+    let giver = tempfile::tempdir().unwrap();
+    project(giver.path());
+    let applied = dbd(giver.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+    let other = tempfile::tempdir().unwrap();
+    std::fs::write(
+        other.path().join("design.yaml"),
+        "project:\n  name: other\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(other.path().join("ddl/table/app")).unwrap();
+    std::fs::write(
+        other.path().join("ddl/table/app/gadgets.ddl"),
+        "create table if not exists app.gadgets (id integer primary key);\n",
+    )
+    .unwrap();
+    let applied = dbd(other.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+
+    let taker = taker_of_widgets(giver.path());
+    std::fs::copy(
+        other.path().join("ddl/table/app/gadgets.ddl"),
+        taker.path().join("ddl/table/app/gadgets.ddl"),
+    )
+    .unwrap();
+    let refused = dbd(taker.path(), &url, &["apply", "--adopt-from", "clilive"]);
+    let out = combined(&refused);
+    assert!(!refused.status.success(), "{out}");
+    assert!(out.contains("owned by \"other\""), "{out}");
+    assert!(!out.contains("adopting"), "{out}");
+}
+
+/// A project `taker` declaring the `clilive` fixture's `app.widgets`.
+fn taker_of_widgets(giver: &Path) -> tempfile::TempDir {
+    let taker = tempfile::tempdir().unwrap();
+    std::fs::write(
+        taker.path().join("design.yaml"),
+        "project:\n  name: taker\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(taker.path().join("ddl/table/app")).unwrap();
+    std::fs::copy(
+        giver.join("ddl/table/app/widgets.ddl"),
+        taker.path().join("ddl/table/app/widgets.ddl"),
+    )
+    .unwrap();
+    taker
+}
+
+/// A preview adopting says what the run would adopt — apply, deploy and
+/// reconcile alike — and a reconcile adopting what it takes (#7).
+#[tokio::test]
+async fn previews_say_what_they_would_adopt_and_a_reconcile_what_it_takes() {
+    let (_pg, url) = start_pg().await;
+    let giver = tempfile::tempdir().unwrap();
+    project(giver.path());
+    let applied = dbd(giver.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+    let taker = taker_of_widgets(giver.path());
+
+    for command in ["apply", "deploy", "reconcile"] {
+        let previewed = dbd(taker.path(), &url, &[command, "--dry-run", "--adopt-from", "clilive"]);
+        let out = combined(&previewed);
+        assert!(previewed.status.success(), "{command}: {out}");
+        assert!(
+            out.contains("[dry-run] would adopt relation app.widgets from \"clilive\""),
+            "{command}: {out}"
+        );
+    }
+    let reconciled = dbd(taker.path(), &url, &["reconcile", "--adopt-from", "clilive"]);
+    let out = combined(&reconciled);
+    assert!(reconciled.status.success(), "{out}");
+    assert!(out.contains("adopting relation app.widgets from \"clilive\""), "{out}");
+}
+
+/// Under a reused owner name, `deploy`, `reconcile` and `reset` are refused,
+/// and run with `--allow-ownership-change` (#7).
+#[tokio::test]
+async fn deploy_reconcile_and_reset_take_allow_ownership_change() {
+    let (_pg, url) = start_pg().await;
+    let first = tempfile::tempdir().unwrap();
+    project(first.path());
+    let applied = dbd(first.path(), &url, &["apply"]);
+    assert!(applied.status.success(), "{}", combined(&applied));
+
+    for (table, args) in [
+        ("gadgets", &["deploy"][..]),
+        ("sprockets", &["reconcile"]),
+        ("cogs", &["reset", "--force"]),
+    ] {
+        let reuser = tempfile::tempdir().unwrap();
+        std::fs::write(
+            reuser.path().join("design.yaml"),
+            "project:\n  name: clilive\n  version: 1\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(reuser.path().join("ddl/table/app")).unwrap();
+        std::fs::write(
+            reuser.path().join(format!("ddl/table/app/{table}.ddl")),
+            format!("create table if not exists app.{table} (id integer primary key);\n"),
+        )
+        .unwrap();
+        let refused = dbd(reuser.path(), &url, args);
+        let out = combined(&refused);
+        assert!(
+            !refused.status.success() && out.contains("this design declares none of them"),
+            "{args:?}: {out}"
+        );
+        let allowed = dbd(reuser.path(), &url, &[args, &["--allow-ownership-change"]].concat());
+        assert!(allowed.status.success(), "{args:?}: {}", combined(&allowed));
+    }
+}

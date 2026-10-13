@@ -109,6 +109,16 @@ pub enum Commands {
         /// (bypasses the scope guard).
         #[arg(long)]
         allow_scope_change: bool,
+        /// Take over, as this run claims them, the entities this design
+        /// declares that OWNER — another project in this database — holds,
+        /// naming each. OWNER's next run neither owns nor prunes them.
+        #[arg(long, value_name = "OWNER")]
+        adopt_from: Option<String>,
+        /// Run under this project's name although the database holds entities
+        /// under it that this design declares none of — a new design for the
+        /// project, not another project reusing its name.
+        #[arg(long)]
+        allow_ownership_change: bool,
     },
     /// Combine all DDL into one file
     Combine {
@@ -199,6 +209,16 @@ pub enum Commands {
         /// (bypasses the scope guard).
         #[arg(long)]
         allow_scope_change: bool,
+        /// Take over, as this run claims them, the entities this design
+        /// declares that OWNER — another project in this database — holds,
+        /// naming each. OWNER's next run neither owns nor prunes them.
+        #[arg(long, value_name = "OWNER")]
+        adopt_from: Option<String>,
+        /// Run under this project's name although the database holds entities
+        /// under it that this design declares none of — a new design for the
+        /// project, not another project reusing its name.
+        #[arg(long)]
+        allow_ownership_change: bool,
     },
     /// Create a versioned schema snapshot
     Snapshot {
@@ -243,6 +263,11 @@ pub enum Commands {
         /// (bypasses the scope guard).
         #[arg(long)]
         allow_scope_change: bool,
+        /// Run under this project's name although the database holds entities
+        /// under it that this design declares none of — a new design for the
+        /// project, not another project reusing its name.
+        #[arg(long)]
+        allow_ownership_change: bool,
     },
     /// Audit design.yaml for stale entries
     Doctor {
@@ -370,6 +395,16 @@ pub enum Commands {
         /// (bypasses the scope guard).
         #[arg(long)]
         allow_scope_change: bool,
+        /// Take over, as this run claims them, the entities this design
+        /// declares that OWNER — another project in this database — holds,
+        /// naming each. OWNER's next run neither owns nor prunes them.
+        #[arg(long, value_name = "OWNER")]
+        adopt_from: Option<String>,
+        /// Run under this project's name although the database holds entities
+        /// under it that this design declares none of — a new design for the
+        /// project, not another project reusing its name.
+        #[arg(long)]
+        allow_ownership_change: bool,
     },
     /// Release the current version: write a baseline snapshot and lock in the
     /// snapshot/migration workflow (disables `reconcile`)
@@ -626,6 +661,44 @@ mod tests {
             };
             assert!(!flag_off, "{c} allow_scope_change should default false");
         }
+    }
+
+    /// `--allow-ownership-change` parses on every subcommand that claims, and
+    /// `--adopt-from <OWNER>` on those that build (#7).
+    #[test]
+    fn ownership_change_flags_parse() {
+        for c in ["apply", "deploy", "reconcile", "reset"] {
+            let cli = Cli::try_parse_from(["dbd", c, "--allow-ownership-change"])
+                .unwrap_or_else(|e| panic!("`dbd {c} --allow-ownership-change` failed: {e}"));
+            let allowed = match &cli.command {
+                Commands::Apply {
+                    allow_ownership_change, ..
+                }
+                | Commands::Deploy {
+                    allow_ownership_change, ..
+                }
+                | Commands::Reconcile {
+                    allow_ownership_change, ..
+                }
+                | Commands::Reset {
+                    allow_ownership_change, ..
+                } => *allow_ownership_change,
+                _ => unreachable!(),
+            };
+            assert!(allowed, "{c} --allow-ownership-change should be true");
+        }
+        for c in ["apply", "deploy", "reconcile"] {
+            let cli = Cli::try_parse_from(["dbd", c, "--adopt-from", "billing"])
+                .unwrap_or_else(|e| panic!("`dbd {c} --adopt-from billing` failed: {e}"));
+            let from = match &cli.command {
+                Commands::Apply { adopt_from, .. }
+                | Commands::Deploy { adopt_from, .. }
+                | Commands::Reconcile { adopt_from, .. } => adopt_from.clone(),
+                _ => unreachable!(),
+            };
+            assert_eq!(from.as_deref(), Some("billing"), "{c}");
+        }
+        assert!(Cli::try_parse_from(["dbd", "reset", "--adopt-from", "billing"]).is_err());
     }
 
     /// `dbd release` parses, and `dbd baseline` is accepted as a visible alias.

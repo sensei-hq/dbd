@@ -2560,11 +2560,16 @@ ORDER BY 1, 2, 4, 5"#;
         owner: &str,
         objects: &[super::OwnedObject],
         write: bool,
+        adopt_from: Option<&str>,
     ) -> Result<Vec<super::HeldObject>> {
         let mut guard = self.batch.lock().await;
         self.bookkeeping
-            .claim_objects(guard.as_mut(), owner, objects, write)
+            .claim_objects(guard.as_mut(), owner, objects, write, adopt_from)
             .await
+    }
+
+    async fn owned_objects(&self, owner: &str) -> Result<Vec<super::OwnedObject>> {
+        self.bookkeeping.owned_objects(owner).await
     }
 
     async fn record_uses(&self, owner: &str, uses: &[super::Use]) -> Result<()> {
