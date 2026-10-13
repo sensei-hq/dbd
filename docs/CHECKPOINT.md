@@ -1,26 +1,22 @@
 # Checkpoint
 
-**Slice:** #7 Phase 2, slice 4 (the uses guard) on `feat/ownership-guard`, from
-`feat/ownership` — where slices 1–3 landed as PR #50 (`5e6ad4dc`) and PR #51
-(`6196810c`). Phase 1 is on `develop`, unreleased.
+**Slice:** #7 Phase 2, slice 5 (reset rules) on `feat/ownership-reset`, from
+`feat/ownership` — where slices 1–4 landed as PRs #50, #51, #52 (`64e09594`).
+Phase 1 is on `develop`, unreleased.
 
 ## Done
 
-- Slices 1–3 merged into `feat/ownership` (PRs #50, #51): registry, claim,
-  uses, prune by ownership.
-- Slice 4 = PR #52 (impl `9c91df5b`, `968c1293`; fixes `3612a8cf`, `6ebdf47d`,
-  `8092df1a`, `a17e3e56`, `c08bf8d9`):
-  the guard walks pg_depend as a CASCADE reaches, part by part (inherited
-  columns, arrays, domain checks) + dbd.uses (recorded whoever owns the
-  target; routine bodies in any file); reconcile refuses dropped parts, a prune
-  keeps used tables; apply refuses a migration's drops, or an unreadable one.
+- Slices 1–4 in `feat/ownership`: registry, claim, uses; prune by ownership;
+  the uses guard (pg_depend as a CASCADE reaches + dbd.uses) on reconcile's
+  drops and apply's migrations.
 - Embedded 238/238, `cli_live` 48/48, workspace 2005/0, clippy, fmt, doc clean.
 
 ## Next
 
-    # PR #52: regression check + CI green → merge locally into feat/ownership;
-    # then slice 5: reset rules (drops only own; --schemas/--extensions/roles
-    # skip what others use; reset's CASCADE behind the same guard).
+    # slice 5: reset drops only own (claims first — done in slice 1); its
+    # CASCADE behind the uses guard; --schemas only for a schema holding no
+    # other owner's and no unowned entity; --extensions and roles skip what
+    # another owner uses; the prod guard refuses while any owner is prod.
 
 ## Open
 
