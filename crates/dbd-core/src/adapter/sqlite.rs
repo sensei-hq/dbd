@@ -298,6 +298,44 @@ impl SqliteAdapter {
         .await
     }
 
+    /// The ownership registry's tables (#7): `_dbd_objects`, what each owner
+    /// holds, and `_dbd_uses`, what each records it uses.
+    async fn ensure_registry_inner(&self) -> Result<()> {
+        self.execute_script(
+            "CREATE TABLE IF NOT EXISTS _dbd_objects ( \
+                namespace  TEXT NOT NULL CHECK (namespace IN ('relation', 'routine')), \
+                schema     TEXT NOT NULL, \
+                name       TEXT NOT NULL, \
+                kind       TEXT NOT NULL, \
+                owner      TEXT NOT NULL, \
+                claimed_at TEXT NOT NULL DEFAULT (datetime('now')), \
+                PRIMARY KEY (namespace, schema, name) \
+            )",
+        )
+        .await?;
+        self.execute_script(
+            "CREATE TABLE IF NOT EXISTS _dbd_uses ( \
+                owner  TEXT NOT NULL, \
+                kind   TEXT NOT NULL CHECK (kind IN ('schema', 'extension', 'role', 'entity', 'owner')), \
+                target TEXT NOT NULL, \
+                via    TEXT NOT NULL DEFAULT '', \
+                PRIMARY KEY (owner, kind, target, via) \
+            )",
+        )
+        .await
+    }
+
+    /// Whether `table` exists — read via `sqlite_master`, so a missing one is
+    /// no error.
+    async fn has_table(&self, table: &str) -> Result<bool> {
+        let found = sqlx::query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")
+            .bind(table)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("reading {table} failed: {e}")))?;
+        Ok(found.is_some())
+    }
+
     /// Inner body for the meta-table half of `heal_bookkeeping`. Kept as a
     /// private inherent method (not a trait method) so it can be composed with
     /// `ensure_migrations_table_inner` inside `heal_bookkeeping`, and called
@@ -563,7 +601,7 @@ impl DatabaseAdapter for SqliteAdapter {
             "SELECT name FROM sqlite_master \
              WHERE type IN ('table', 'view') \
                AND name NOT LIKE 'sqlite_%' \
-               AND name NOT IN ('_dbd_migrations', '_dbd_meta')",
+               AND name NOT LIKE '\\_dbd\\_%' ESCAPE '\\'",
         )
         .fetch_all(&self.pool)
         .await
@@ -583,7 +621,7 @@ impl DatabaseAdapter for SqliteAdapter {
         let table_rows = sqlx::query(
             "SELECT name, sql FROM sqlite_master \
              WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
-               AND name NOT IN ('_dbd_migrations', '_dbd_meta') \
+               AND name NOT LIKE '\\_dbd\\_%' ESCAPE '\\' \
              ORDER BY name",
         )
         .fetch_all(&self.pool)
@@ -661,7 +699,8 @@ impl DatabaseAdapter for SqliteAdapter {
 
     async fn heal_bookkeeping(&self) -> Result<()> {
         self.ensure_meta_table_inner().await?;
-        self.ensure_migrations_table_inner().await
+        self.ensure_migrations_table_inner().await?;
+        self.ensure_registry_inner().await
     }
 
     async fn get_db_version(&self) -> Result<u32> {
@@ -759,6 +798,272 @@ impl DatabaseAdapter for SqliteAdapter {
         .map_err(|e| DbdError::Config(format!("Set project meta failed: {e}")))?;
         Ok(())
     }
+
+    // ── Ownership registry (#7) ────────────────────────────────
+    //
+    // The same model as Postgres's `dbd.objects` and `dbd.uses`, in SQLite's
+    // one namespace: an object exists when `sqlite_master` names it.
+
+    fn keeps_registry(&self) -> bool {
+        true
+    }
+
+    async fn claim_objects(
+        &self,
+        owner: &str,
+        objects: &[super::OwnedObject],
+        write: bool,
+        adopt_from: Option<&str>,
+    ) -> Result<Vec<super::HeldObject>> {
+        let failed = |e: sqlx::Error| DbdError::Config(format!("ownership claim failed: {e}"));
+        if !write {
+            if !self.has_table("_dbd_objects").await? {
+                return Ok(Vec::new());
+            }
+            let mut conn = self.pool.acquire().await.map_err(failed)?;
+            return held_in(&mut conn, owner, objects, adopt_from).await;
+        }
+        self.ensure_registry_inner().await?;
+        let mut tx = self.pool.begin().await.map_err(failed)?;
+        // What is adopted changes hands first, in the claim's transaction.
+        if let Some(from) = adopt_from {
+            for o in objects {
+                sqlx::query(
+                    "UPDATE _dbd_objects SET owner = ?1, claimed_at = datetime('now') \
+                     WHERE namespace = ?2 AND schema = ?3 AND name = ?4 AND owner = ?5",
+                )
+                .bind(owner)
+                .bind(&o.namespace)
+                .bind(&o.schema)
+                .bind(&o.name)
+                .bind(from)
+                .execute(&mut *tx)
+                .await
+                .map_err(failed)?;
+            }
+        }
+        for o in objects {
+            sqlx::query(
+                "INSERT INTO _dbd_objects (namespace, schema, name, kind, owner) VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT (namespace, schema, name) DO UPDATE SET kind = excluded.kind \
+                 WHERE _dbd_objects.owner = excluded.owner",
+            )
+            .bind(&o.namespace)
+            .bind(&o.schema)
+            .bind(&o.name)
+            .bind(&o.kind)
+            .bind(owner)
+            .execute(&mut *tx)
+            .await
+            .map_err(failed)?;
+        }
+        let held = held_in(&mut tx, owner, objects, None).await?;
+        if held.is_empty() {
+            tx.commit().await.map_err(failed)?;
+        } else {
+            tx.rollback().await.map_err(failed)?;
+        }
+        Ok(held)
+    }
+
+    async fn owned_objects(&self, owner: &str) -> Result<Vec<super::OwnedObject>> {
+        Ok(self
+            .registry()
+            .await?
+            .claims
+            .into_iter()
+            .filter(|h| h.owner == owner)
+            .map(|h| h.object)
+            .collect())
+    }
+
+    async fn record_uses(&self, owner: &str, uses: &[super::Use]) -> Result<()> {
+        let failed = |e: sqlx::Error| DbdError::Config(format!("recording uses failed: {e}"));
+        self.ensure_registry_inner().await?;
+        let mut tx = self.pool.begin().await.map_err(failed)?;
+        sqlx::query("DELETE FROM _dbd_uses WHERE owner = ?1")
+            .bind(owner)
+            .execute(&mut *tx)
+            .await
+            .map_err(failed)?;
+        for u in uses {
+            sqlx::query("INSERT OR IGNORE INTO _dbd_uses (owner, kind, target, via) VALUES (?1, ?2, ?3, ?4)")
+                .bind(owner)
+                .bind(&u.kind)
+                .bind(&u.target)
+                .bind(&u.via)
+                .execute(&mut *tx)
+                .await
+                .map_err(failed)?;
+        }
+        tx.commit().await.map_err(failed)
+    }
+
+    async fn release_objects(&self, owner: &str, declared: &[super::OwnedObject]) -> Result<()> {
+        if !self.has_table("_dbd_objects").await? {
+            return Ok(());
+        }
+        let live: std::collections::HashSet<(String, String, String)> = self
+            .owned_objects(owner)
+            .await?
+            .into_iter()
+            .map(|o| (o.namespace, o.schema, o.name))
+            .collect();
+        let rows: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT namespace, schema, name FROM _dbd_objects WHERE owner = ?1")
+                .bind(owner)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| DbdError::Config(format!("release read failed: {e}")))?;
+        for key in rows {
+            let declares = declared
+                .iter()
+                .any(|d| d.namespace == key.0 && d.schema == key.1 && d.name == key.2);
+            if declares || live.contains(&key) {
+                continue;
+            }
+            sqlx::query("DELETE FROM _dbd_objects WHERE namespace = ?1 AND schema = ?2 AND name = ?3 AND owner = ?4")
+                .bind(&key.0)
+                .bind(&key.1)
+                .bind(&key.2)
+                .bind(owner)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| DbdError::Config(format!("release failed: {e}")))?;
+        }
+        Ok(())
+    }
+
+    async fn ownership(&self, owner: &str, objects: &[super::OwnedObject]) -> Result<super::Ownership> {
+        let registry = self.registry().await?;
+        let mut found = super::Ownership {
+            owners: Vec::new(),
+            ..Default::default()
+        };
+        let read = |e: sqlx::Error| DbdError::Config(format!("ownership read failed: {e}"));
+        if self.has_table("_dbd_objects").await? {
+            for o in objects {
+                let held: Option<String> = sqlx::query_scalar(
+                    "SELECT owner FROM _dbd_objects WHERE namespace = ?1 AND schema = ?2 AND name = ?3",
+                )
+                .bind(&o.namespace)
+                .bind(&o.schema)
+                .bind(&o.name)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(read)?;
+                found.owners.push(held);
+            }
+        } else {
+            found.owners = vec![None; objects.len()];
+        }
+        for u in registry.uses {
+            match u.kind.as_str() {
+                "owner" => {
+                    found.recording.insert(u.owner);
+                }
+                "schema" if u.owner != owner => {
+                    let users = found.schema_users.entry(u.target).or_default();
+                    if !users.contains(&u.owner) {
+                        users.push(u.owner);
+                        users.sort();
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(found)
+    }
+
+    async fn registry(&self) -> Result<super::Registry> {
+        let read = |e: sqlx::Error| DbdError::Config(format!("registry read failed: {e}"));
+        let mut registry = super::Registry::default();
+        if self.has_table("_dbd_objects").await? {
+            let rows: Vec<(String, String, String, String, String)> = sqlx::query_as(
+                "SELECT o.owner, o.namespace, o.schema, o.name, o.kind FROM _dbd_objects o \
+                 WHERE EXISTS (SELECT 1 FROM sqlite_master m WHERE m.name = o.name) \
+                 ORDER BY o.owner, o.namespace, o.schema, o.name",
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(read)?;
+            registry.claims = rows
+                .into_iter()
+                .map(|(owner, namespace, schema, name, kind)| super::HeldObject {
+                    object: super::OwnedObject {
+                        namespace,
+                        schema,
+                        name,
+                        kind,
+                    },
+                    owner,
+                })
+                .collect();
+        }
+        if self.has_table("_dbd_uses").await? {
+            let rows: Vec<(String, String, String, String)> =
+                sqlx::query_as("SELECT owner, kind, target, via FROM _dbd_uses ORDER BY owner, kind, target, via")
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(read)?;
+            registry.uses = rows
+                .into_iter()
+                .map(|(owner, kind, target, via)| super::RecordedUse {
+                    owner,
+                    kind,
+                    target,
+                    via,
+                })
+                .collect();
+        }
+        Ok(registry)
+    }
+
+    async fn users_of(&self, owner: &str, kind: &str, target: &str) -> Result<Vec<String>> {
+        Ok(self
+            .registry()
+            .await?
+            .uses
+            .into_iter()
+            .filter(|u| u.kind == kind && u.target == target && u.owner != owner)
+            .map(|u| u.owner)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect())
+    }
+}
+
+/// The ones of `objects` another owner than `owner` holds in `_dbd_objects` —
+/// passing over those `adopting_from` holds.
+async fn held_in(
+    conn: &mut sqlx::SqliteConnection,
+    owner: &str,
+    objects: &[super::OwnedObject],
+    adopting_from: Option<&str>,
+) -> Result<Vec<super::HeldObject>> {
+    let mut held = Vec::new();
+    for o in objects {
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT kind, owner FROM _dbd_objects WHERE namespace = ?1 AND schema = ?2 AND name = ?3 \
+             AND owner <> ?4 AND (?5 IS NULL OR owner <> ?5)",
+        )
+        .bind(&o.namespace)
+        .bind(&o.schema)
+        .bind(&o.name)
+        .bind(owner)
+        .bind(adopting_from)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| DbdError::Config(format!("ownership read failed: {e}")))?;
+        if let Some((kind, holder)) = row {
+            held.push(super::HeldObject {
+                object: super::OwnedObject { kind, ..o.clone() },
+                owner: holder,
+            });
+        }
+    }
+    held.sort_by(|a, b| a.object.cmp(&b.object));
+    Ok(held)
 }
 
 // ── helpers ────────────────────────────────────────────────────
