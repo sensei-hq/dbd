@@ -15717,3 +15717,116 @@ async fn adopting_from_a_versioned_project_reads_none_of_its_record() {
         .await
         .expect("shop adopts, unversioned, from billing at v1");
 }
+
+// ── #7 Phase 2, slice 7: the shared database, and onboarding beside others ───
+
+/// What shares a database, read from it: each project it records — its env
+/// and version, what it owns, the schemas it uses and what of others' it uses
+/// — and which record no uses yet (#7, `inspect --shared`).
+#[tokio::test]
+async fn the_shared_database_names_each_project_what_it_owns_and_uses() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let design = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1]);
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    billing_reading(
+        bd.path(),
+        &[(
+            "ddl/view/billing/v_orders.ddl",
+            "create or replace view billing.v_orders as select id from app.orders;\n",
+        )],
+    )
+    .apply(&*billing, None, false, None, Progress::none())
+    .await
+    .expect("billing's apply");
+    shop.execute_script("INSERT INTO dbd.meta (project, env, version) VALUES ('oldie', 'prod', 2);")
+        .await
+        .unwrap();
+
+    let shared = design.shared_database(&*shop).await.expect("the report");
+    let names: Vec<&str> = shared.projects.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["billing", "oldie", "shop"]);
+    let project = |name: &str| shared.projects.iter().find(|p| p.name == name).unwrap();
+    let owns = |name: &str| -> Vec<String> {
+        project(name)
+            .owns
+            .iter()
+            .map(|o| format!("{} {}.{}", o.namespace, o.schema, o.name))
+            .collect()
+    };
+    assert_eq!(owns("shop"), ["relation app.orders"]);
+    assert_eq!(owns("billing"), ["relation billing.v_orders"]);
+    assert!(project("shop").schemas.contains(&"app".to_string()));
+    assert!(
+        project("billing")
+            .uses
+            .iter()
+            .any(|u| u.target == "relation:app.orders" && u.via == "view billing.v_orders"),
+        "{:?}",
+        project("billing").uses
+    );
+    assert!(project("shop").recording && project("billing").recording);
+    assert!(!project("oldie").recording);
+    assert_eq!(project("oldie").version, Some(2));
+    assert!(shared.conflicts.is_empty(), "{:?}", shared.conflicts);
+}
+
+/// The report says what would refuse this design: an entity another project
+/// owns, or an owner name it reuses (#7).
+#[tokio::test]
+async fn the_shared_database_names_this_designs_conflicts() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd, nd) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1])
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    named_project(bd.path(), "billing", "", &ORDERS_OWNER_FILES[1..])
+        .apply(&*billing, None, false, None, Progress::none())
+        .await
+        .expect("billing's apply");
+
+    let shared = named_project(sd.path(), "shop", "", ORDERS_OWNER_FILES)
+        .shared_database(&*shop)
+        .await
+        .expect("the report");
+    assert!(
+        shared
+            .conflicts
+            .iter()
+            .any(|c| c.contains("relation app.invoices is owned by \"billing\"")),
+        "{:?}",
+        shared.conflicts
+    );
+    let shared = named_project(
+        nd.path(),
+        "shop",
+        "",
+        &[(
+            "ddl/table/app/gadgets.ddl",
+            "create table if not exists app.gadgets (id int primary key);\n",
+        )],
+    )
+    .shared_database(&*shop)
+    .await
+    .expect("the report");
+    assert!(
+        shared
+            .conflicts
+            .iter()
+            .any(|c| c.contains("this design declares none of them")),
+        "{:?}",
+        shared.conflicts
+    );
+}

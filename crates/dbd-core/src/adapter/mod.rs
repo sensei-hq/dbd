@@ -166,6 +166,25 @@ pub struct HeldObject {
     pub owner: String,
 }
 
+/// What a database's ownership registry holds (#7): every entity an owner
+/// holds that still exists, and every use recorded.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Registry {
+    pub claims: Vec<HeldObject>,
+    pub uses: Vec<RecordedUse>,
+}
+
+/// A use an owner recorded in `dbd.uses` (#7): `kind` `schema`, `extension`,
+/// `role`, `entity` — `target` as `relation:app.orders`, `via` the owner's
+/// entity — or `owner`, marking that it records its uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedUse {
+    pub owner: String,
+    pub kind: String,
+    pub target: String,
+    pub via: String,
+}
+
 /// Something a schema holds that one owner's design does not declare (#7): an
 /// entity — another owner's, or one nobody owns — or an extension installed
 /// in the schema, which stands for all its members.
@@ -559,6 +578,20 @@ pub trait DatabaseAdapter: Send + Sync {
     async fn owned_objects(&self, owner: &str) -> Result<Vec<OwnedObject>> {
         let _ = owner;
         Ok(Vec::new())
+    }
+
+    /// The whole ownership registry: what every owner holds that still
+    /// exists, and every use recorded (#7). Reads only. Adapters without a
+    /// registry have an empty one.
+    async fn registry(&self) -> Result<Registry> {
+        Ok(Registry::default())
+    }
+
+    /// Whether this database keeps an ownership registry (#7) — whether an
+    /// empty [`Self::registry`] means nobody owns anything, or that nothing
+    /// is known. Default: none kept.
+    fn keeps_registry(&self) -> bool {
+        false
     }
 
     /// Record `uses` as everything `owner` uses, replacing what it used before

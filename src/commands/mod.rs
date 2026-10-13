@@ -107,7 +107,10 @@ pub async fn run(
         );
     }
     match command {
-        Commands::Inspect { name, fix, from_db } => {
+        Commands::Inspect { shared: true, .. } => {
+            schema::cmd_inspect_shared(config, env, project_dir, database_url).await
+        }
+        Commands::Inspect { name, fix, from_db, .. } => {
             schema::cmd_inspect(
                 config,
                 env,
@@ -1294,6 +1297,7 @@ mod tests {
                 name: None,
                 fix: false,
                 from_db: false,
+                shared: false,
             },
             &Path::new(source).join("design.yaml"),
             "dev",
