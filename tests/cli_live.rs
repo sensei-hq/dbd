@@ -2754,6 +2754,12 @@ async fn init_from_db_onboards_a_second_project_without_the_firsts_entities() {
     let (_pg, url) = start_pg().await;
     let first = tempfile::tempdir().unwrap();
     project(first.path());
+    std::fs::create_dir_all(first.path().join("ddl/function/app")).unwrap();
+    std::fs::write(
+        first.path().join("ddl/function/app/total.ddl"),
+        "create or replace function app.total() returns int language sql as $$ select 1 $$;\n",
+    )
+    .unwrap();
     assert!(dbd(first.path(), &url, &["apply"]).status.success());
     dbd_core::connect(&url, "setup")
         .await
@@ -2774,9 +2780,47 @@ async fn init_from_db_onboards_a_second_project_without_the_firsts_entities() {
     assert!(second.path().join("ddl/table/app/loose.ddl").exists(), "{said}");
     assert!(!second.path().join("ddl/table/app/widgets.ddl").exists(), "{said}");
     assert!(!second.path().join("ddl/view/app/named.ddl").exists(), "{said}");
+    assert!(!second.path().join("ddl/function/app/total.ddl").exists(), "{said}");
     assert!(
         said.contains("relation app.widgets") && said.contains("\"clilive\""),
         "{said}"
+    );
+    assert!(said.contains("routine app.total (\"clilive\")"), "{said}");
+}
+
+/// What the second project references of the first's — a foreign key's
+/// table, a view's — is declared `external:`, so the references resolve; it
+/// was neither captured nor declared (#7).
+#[tokio::test]
+async fn init_from_db_declares_external_what_it_references_of_another_projects() {
+    let (_pg, url) = start_pg().await;
+    let first = tempfile::tempdir().unwrap();
+    project(first.path());
+    assert!(dbd(first.path(), &url, &["apply"]).status.success());
+    dbd_core::connect(&url, "setup")
+        .await
+        .unwrap()
+        .execute_script(
+            "CREATE TABLE app.parts (id int PRIMARY KEY, widget_id int REFERENCES app.widgets (id)); \
+             CREATE VIEW app.part_names AS SELECT p.id, n.name FROM app.parts p JOIN app.named n ON n.id = p.widget_id;",
+        )
+        .await
+        .unwrap();
+
+    let second = tempfile::tempdir().unwrap();
+    let o = Command::cargo_bin("dbd")
+        .unwrap()
+        .args(["init", "--from-db", "-d", &url, "--name", "second"])
+        .current_dir(second.path())
+        .output()
+        .expect("dbd failed to run");
+    let said = combined(&o);
+    assert!(o.status.success(), "{said}");
+    let config = dbd_core::config::read(&second.path().join("design.yaml")).unwrap();
+    let externals: Vec<&str> = config.external.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        externals.contains(&"app.widgets") && externals.contains(&"app.named"),
+        "{externals:?}\n{said}"
     );
 }
 
@@ -2840,6 +2884,46 @@ async fn merge_leaves_out_what_another_project_owns() {
     assert!(!second.path().join("ddl/table/app/widgets.ddl").exists(), "{said}");
     assert!(
         said.contains("relation app.widgets") && said.contains("\"clilive\""),
+        "{said}"
+    );
+    // Its own is no other project's, nor an orphan.
+    assert!(!said.contains("app.gadgets (\"second\")"), "{said}");
+    assert!(
+        !said.contains("orphan (no DB entity): ddl/table/app/gadgets.ddl"),
+        "{said}"
+    );
+}
+
+/// A file of the project's for an entity another project owns is no orphan:
+/// the entity is there, and `merge` says whose it is (#7).
+#[tokio::test]
+async fn merge_names_the_owner_of_what_it_left_out_that_the_project_has_a_file_for() {
+    let (_pg, url) = start_pg().await;
+    let first = tempfile::tempdir().unwrap();
+    project(first.path());
+    assert!(dbd(first.path(), &url, &["apply"]).status.success());
+    let second = tempfile::tempdir().unwrap();
+    std::fs::write(
+        second.path().join("design.yaml"),
+        "project:\n  name: second\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(second.path().join("ddl/table/app")).unwrap();
+    std::fs::copy(
+        first.path().join("ddl/table/app/widgets.ddl"),
+        second.path().join("ddl/table/app/widgets.ddl"),
+    )
+    .unwrap();
+
+    let merged = dbd(second.path(), &url, &["merge", "--dry-run"]);
+    let said = combined(&merged);
+    assert!(merged.status.success(), "{said}");
+    assert!(
+        !said.contains("orphan (no DB entity): ddl/table/app/widgets.ddl"),
+        "{said}"
+    );
+    assert!(
+        said.contains("ddl/table/app/widgets.ddl") && said.contains("owned by \"clilive\""),
         "{said}"
     );
 }

@@ -1304,6 +1304,36 @@ mod tests {
     use super::*;
     use crate::commands::testutil;
 
+    /// A project the database records that keeps no record of its uses is
+    /// named so, claims or none: it is what `init --from-db` and `merge` refuse
+    /// over, and the report is where a user looks to see why (#7).
+    #[test]
+    fn the_shared_report_names_a_project_that_records_no_uses_whatever_it_holds() {
+        let shared = dbd_core::design::SharedDatabase {
+            projects: vec![dbd_core::design::SharedProject {
+                name: "legacy".to_string(),
+                env: Some("dev".to_string()),
+                version: Some(1),
+                recording: false,
+                owns: vec![dbd_core::adapter::OwnedObject {
+                    namespace: "relation".to_string(),
+                    schema: "app".to_string(),
+                    name: "things".to_string(),
+                    kind: "table".to_string(),
+                }],
+                ..Default::default()
+            }],
+            conflicts: Vec::new(),
+        };
+        let lines = format_shared_database(&shared, "newcomer");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("legacy") && l.contains("records nothing")),
+            "{lines:?}"
+        );
+    }
+
     fn hint(entity: &str, column: &str, values: &[&str]) -> dbd_core::design::EnumHint {
         dbd_core::design::EnumHint {
             entity: entity.into(),
