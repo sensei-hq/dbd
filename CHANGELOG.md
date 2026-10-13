@@ -161,8 +161,12 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   — a foreign key's table, what a view reads — is declared `external:`, so its
   references resolve. Both are refused while a project the database records has
   not run a dbd that records what it owns and uses: its entities cannot be told
-  from nobody's. A SQLite database keeps no registry yet, so neither leaves
-  anything out there, and `init --from-db` refuses one dbd manages, as before.
+  from nobody's.
+- **SQLite keeps the same ownership registry** (#7, phase 2), in
+  `_dbd_objects` and `_dbd_uses`: a second project sharing a SQLite file is
+  refused a table the first owns, a reset cannot drop another's table, name
+  reuse and `--adopt-from` work as on Postgres, `inspect --shared` reads it, and
+  `init --from-db` and `merge` leave another project's tables out.
 - **The uses guard sees further** (#7, phase 2). A dependent nobody owns —
   a project's not yet recording its uses — is guarded where a project might
   own it, by `--prune`'s rule: in a schema another project uses, or anywhere
@@ -210,7 +214,7 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   `Design::shared_database` (`SharedDatabase`, `SharedProject`, `SharedUse`)
   and `design::leave_out_other_owners`; `DatabaseAdapter::registry`
   (`adapter::Registry`, `RecordedUse`; default empty) and `keeps_registry`
-  (default false);
+  (default false; Postgres and SQLite keep one);
   `DatabaseAdapter::claim_objects` takes `adopt_from`, and the adapter gains
   `owned_objects` (default: nothing held).
 
