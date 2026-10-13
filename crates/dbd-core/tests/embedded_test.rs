@@ -13979,6 +13979,192 @@ async fn a_reset_with_schemas_is_refused_when_another_project_depends_on_what_th
     .await;
 }
 
+/// A reset reads what other projects have, then drops `CASCADE`. Another
+/// project's apply committing in between had its table taken by `DROP SCHEMA
+/// … CASCADE`, with both runs reporting success. A reset waits for the
+/// projects writing to the database, and reads after them (#7).
+#[tokio::test]
+async fn a_reset_waits_for_another_projects_apply_in_flight() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let billing = connect(&url, "billing").await.unwrap();
+    let (sd, bd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let design = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1]);
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    // Billing's apply holds its transaction open after creating its table.
+    let slow = named_project(
+        bd.path(),
+        "billing",
+        "",
+        &[(
+            "ddl/table/app/invoices.ddl",
+            "set search_path to app;\ncreate table if not exists invoices (id int primary key);\n\
+             do $$ begin perform pg_sleep(2); end $$;\n",
+        )],
+    );
+    let (billed, reset) = tokio::join!(slow.apply(&*billing, None, false, None, Progress::none()), async {
+        let sleeping = "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event = 'PgSleep') \
+                        THEN RAISE EXCEPTION 'not yet'; END IF; END $$";
+        let mut tries = 0;
+        while shop.execute_script(sleeping).await.is_err() {
+            tries += 1;
+            assert!(tries < 200, "billing's apply never reached its sleep");
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        design.reset(&*shop, "postgres", true, true, false, None).await
+    });
+    billed.expect("billing's apply");
+    let summary = reset.expect("shop's reset");
+    assert_table_exists(&*shop, "app", "invoices").await;
+    assert!(
+        summary.kept.iter().any(|k| k.contains("app.invoices")),
+        "{:?}",
+        summary.kept
+    );
+}
+
+/// A project not yet on a dbd that records its uses claims nothing: its
+/// column of an extension's type depends on nobody's entity. `--extensions`
+/// dropped the extension `CASCADE`, and the column with it — while the same
+/// rule as `--prune`'s kept its tables: an unowned entity might be a project's
+/// that does not say (#7).
+#[tokio::test]
+async fn a_reset_keeps_an_extension_a_project_not_recording_its_uses_depends_on() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    let with_citext = "target:\n  postgres:\n    url: $DATABASE_URL\n    extensions:\n      - citext\n";
+    let design = named_project(sd.path(), "shop", with_citext, &ORDERS_OWNER_FILES[..1]);
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    shop.execute_script(
+        "INSERT INTO dbd.meta (project, env, version) VALUES ('billing', 'dev', 0); \
+         CREATE SCHEMA billing; CREATE TABLE billing.contacts (id int PRIMARY KEY, email public.citext);",
+    )
+    .await
+    .unwrap();
+
+    let summary = design
+        .reset(&*shop, "postgres", true, false, true, None)
+        .await
+        .expect("shop's reset");
+    assert_catalog(
+        &*shop,
+        true,
+        "SELECT 1 FROM information_schema.columns WHERE table_schema = 'billing' \
+         AND table_name = 'contacts' AND column_name = 'email'",
+        "billing.contacts.email",
+    )
+    .await;
+    assert!(
+        summary
+            .kept
+            .iter()
+            .any(|k| k.contains("extension citext") && k.contains("billing.contacts")),
+        "{:?}",
+        summary.kept
+    );
+}
+
+/// Nor is an entity dropped `CASCADE` when what depends on it might be such a
+/// project's: the reset is refused, naming it (#7).
+#[tokio::test]
+async fn a_reset_is_refused_when_what_nobody_owns_depends_on_it_and_a_project_does_not_record_its_uses() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    let design = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1]);
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    shop.execute_script(
+        "INSERT INTO dbd.meta (project, env, version) VALUES ('billing', 'dev', 0); \
+         CREATE SCHEMA billing; CREATE VIEW billing.v_orders AS SELECT id FROM app.orders;",
+    )
+    .await
+    .unwrap();
+
+    let err = design
+        .reset(&*shop, "postgres", true, false, false, None)
+        .await
+        .expect_err("billing records no uses, and the view may be its")
+        .to_string();
+    assert!(
+        err.contains("app.orders") && err.contains("view billing.v_orders"),
+        "{err}"
+    );
+    assert!(err.contains("\"billing\""), "{err}");
+    assert_catalog(
+        &*shop,
+        true,
+        "SELECT 1 FROM pg_views WHERE schemaname = 'billing' AND viewname = 'v_orders'",
+        "the view",
+    )
+    .await;
+}
+
+/// With every project recording its uses, what nobody owns in a schema no
+/// other project uses is nobody's to protect: a reset's `CASCADE` takes it,
+/// as it always did (#7).
+#[tokio::test]
+async fn a_reset_drops_what_nobody_owns_where_no_other_project_could_own_it() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    let design = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1]);
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    shop.execute_script("CREATE SCHEMA scratch; CREATE VIEW scratch.v_orders AS SELECT id FROM app.orders;")
+        .await
+        .unwrap();
+
+    design
+        .reset(&*shop, "postgres", true, false, false, None)
+        .await
+        .expect("shop's reset");
+    assert_table_absent(&*shop, "app", "orders").await;
+    assert_catalog(
+        &*shop,
+        false,
+        "SELECT 1 FROM pg_views WHERE schemaname = 'scratch' AND viewname = 'v_orders'",
+        "the hand-made view",
+    )
+    .await;
+}
+
+/// An env dbd does not know is not proof a database is not prod: another
+/// project's record saying `PROD` refuses an unforced reset (#7).
+#[tokio::test]
+async fn a_reset_is_refused_while_another_projects_record_has_an_env_dbd_does_not_know() {
+    let (_pg, url) = start_pg().await;
+    let shop = connect(&url, "shop").await.unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    let design = named_project(sd.path(), "shop", "", &ORDERS_OWNER_FILES[..1]);
+    design
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    shop.execute_script("INSERT INTO dbd.meta (project, env, version) VALUES ('billing', 'PROD', 0);")
+        .await
+        .unwrap();
+
+    let err = design
+        .reset(&*shop, "postgres", false, false, false, None)
+        .await
+        .expect_err("billing's record says PROD")
+        .to_string();
+    assert!(err.contains("billing") && err.contains("PROD"), "{err}");
+    assert_table_exists(&*shop, "app", "orders").await;
+}
+
 /// A design may install an extension into a schema of its own. The
 /// extension's members are the extension's, and the extension the design's:
 /// `--schemas` drops the schema, and the extension with it, as it did (#7).
