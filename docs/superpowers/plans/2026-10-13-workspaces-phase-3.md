@@ -288,6 +288,18 @@ Taken in slice 6, `dbd split --from-scopes` (its second PR):
   the workspace to check it. A module folder that already holds files, an
   invalid name, a workspace and a design without scopes are refused before
   anything moves.
+- Review: `--write` is whole or not at all. It first makes what the split
+  would make in a scratch folder — import data as empty files — and refuses
+  unless that workspace loads and deploys, under each scope and with none,
+  what the project does. It writes the new manifest aside, records each
+  move and on any failure puts every one back — a file git tracks moved by
+  `git mv` or not at all — then puts the manifest in place. Refused before
+  anything moves, besides: an earlier split's leftovers, a plan of no
+  modules, two files onto one path or a taken one, names equal but for case,
+  a folder it cannot read, a file that does not parse, a schema only a file's
+  path names (add it to `schemas:`), and a scope that leaves out what its
+  entities need (as modules it would deploy them). What a file creates
+  beside its entity is its module's, as the gap check reads it (T20).
 
 ## Slices
 

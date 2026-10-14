@@ -20,9 +20,8 @@
 
 ## Next
 
-Slice 6a merged (PR #67, the transfer rule). Slice 6b on
-`feat/workspaces-split-scopes`: `dbd split --from-scopes` (40210d4c), T23/T24
-green. Next: PR, review, CI, merge; then slice 7 (docs).
+Slice 6a merged (PR #67). Slice 6b PR #68: `dbd split --from-scopes`; review
+fixed (1c5a02ed: whole or not at all, scratch check). Next: CI, merge; slice 7.
 
 ## Open
 

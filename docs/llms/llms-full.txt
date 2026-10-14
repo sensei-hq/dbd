@@ -688,12 +688,17 @@ then the scopes as they become (`-v` lists each module's entities and each file'
 `--write` moves each DDL file to the folder of the module its entity is in, and each import data
 file and policy file to the folder of the module its table is in — with `git mv` in a git work
 tree — moves the manifest's `import.after` scripts under `import/` to `scripts/`, rewriting their
-paths, and writes `modules:` and the new `scopes:` into design.yaml in place, the rest as it was;
-then it loads the workspace to check it. Refused before anything moves: a workspace, a design
-without scopes, a project with `snapshots/` or `migrations/` (a migration does not divide by module
-— split before the first release), a file of `ddl/`, `import/` or `policies/` that maps to no
-module or to two, a module name that cannot name an owner, a module folder already holding files,
-and — for `--write` — dependencies that would cycle. On each database, each module's first deploy
+paths, and writes `modules:` and the new `scopes:` into design.yaml in place, the rest as it was —
+comments and line endings included. It is whole or not at all: it first makes the workspace in a
+scratch folder and refuses unless that loads and deploys, under each scope and with none, what the
+project does; it writes the new manifest aside, and a move that fails — or a file git tracks that
+`git mv` will not move — puts back every move before it. Refused before anything moves: a
+workspace, a design without scopes, a project with `snapshots/` or `migrations/` (a migration does
+not divide by module — split before the first release), a file that does not parse, a schema only a
+file's path names (add it to `schemas:`), a scope that leaves out what its entities need, a file of
+`ddl/`, `import/` or `policies/` that maps to no module or to two, two files onto one path, a module
+name that cannot name an owner or that differs from another only in case, a module folder already
+holding files, an earlier split's leftovers, and — for `--write` — dependencies that would cycle. On each database, each module's first deploy
 takes over what it declares from the project as it was, and retires the project's record once its
 modules hold everything it held (the workspace transfer rule).
 
