@@ -218,6 +218,44 @@ Taken in slice 5:
   An unknown scope reads the same in all five commands — `diagram` no longer
   says "Failed to resolve scope:" first.
 
+Taken in slice 6, the workspace transfer rule (its first PR; `dbd split`
+follows in a second):
+
+- A project's own owners hand over to each other. A module of a workspace
+  takes over, as it claims, what it declares that the project's other owners
+  hold: the project before it had modules (`<project>`, the predecessor) and
+  the workspace's other modules (`<project>/<module>` for each module in
+  `modules:`, run or not). As `--adopt-from` does — in the claim's
+  transaction, previewed and said the same way (`adopting … from
+  "<owner>"`), its held entities the run's own to plan against. Nothing else
+  changes hands: an owner by any other name (`shopx`, `billing`) still
+  refuses the run. A project without modules takes over from nobody.
+- A module does not prune what another module of the workspace declares: it
+  is moving there, and that module's run takes it over (T22). Moved either
+  way, nothing is dropped or created afresh: the module running first either
+  takes it over or leaves it for the one that does.
+- The predecessor's record is retired once nothing of it is left: when a
+  module's run leaves the predecessor holding nothing that still exists, its
+  `dbd.meta` row, its `dbd.uses`, its claims of what is gone and its
+  materialized-view stamps go, in the run's claim — its `dbd.migrations`
+  stay, as history. Until then it is an owner like any other.
+- What another module declares is no sign of another project under a
+  module's name either: a module whose entities all moved holds none it
+  declares, and still runs.
+- Review: what an entity uses goes with it when it changes hands — in the
+  take-over's transaction its giver's `dbd.uses` rows through it become the
+  taker's — and a module's run keeps the uses of what it still holds and
+  hands over until the taker records its own: until then they are all that
+  guards what the entity reads. A reset keeps a schema holding what another
+  module declares. A retire is housekeeping: in a savepoint, bounded as a
+  claim is, and left to a later run when another session holds its rows.
+- The adapter takes over from several owners at once through
+  `claim_objects_from(owner, objects, write, from)` — by default
+  `claim_objects`, taking over from the one of them that holds anything, so
+  an adapter written before, or keeping no registry, keeps working; refused
+  only when several hold what the claim takes — and retires an owner through
+  `retire_owner(owner)`.
+
 ## Slices
 
 Each is red tests first, then the implementation, a focused review, CI, and a

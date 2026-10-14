@@ -15,21 +15,21 @@
   walking up from a module folder (`Workspace::locate`).
 - Slice 4 merged (PR #64): per-module history — `snapshot`, `release`,
   `format`, `doctor`; reconcile leaves released modules out.
+- Slice 5 merged (PR #66): `Reading` — dbml, diagram, graph, combine, emit
+  over a workspace; the viewer groups by module.
 
 ## Next
 
-Slice 5 PR #66 (`feat/workspaces-viewer` → `feat/workspaces`): review fixed
-(71a9a3df, tests 010fcb4a), viewer checked in a browser; rustls 0.23.46 for
-today's RUSTSEC advisories (4dffc24d). Next: suites, CI, merge; slice 6.
+Slice 6a PR #67 (`feat/workspaces-split`): the transfer rule; review fixed
+(1e04bf2d, a4745e60). Next: suites, CI, merge; then 6b, `dbd split` (T23).
 
-    gh pr checks 66
+    gh pr checks 67
 
 ## Open
 
 - main needs the rustls 0.23.46 bump too (cargo audit fails there).
 - `dbd init --dry-run` writes design.yaml and the scaffold (not #7; unfiled).
-- Issue #60: reconcile re-emits a mixed-case or quoted `nextval('App.Seq')`
-  default every run — probe pg_get_expr before fixing.
+- Issue #60: reconcile re-emits a mixed-case `nextval('App.Seq')` default.
 - Declined: best-effort batch rollback error; dropping the old `dbd.import_tmp`;
   migrating a branch build's `dbd.uses` CHECK (no `owner`) — rebuild those.
 - Delete by hand: `/tmp/dbd-*` scratch and review dirs; `git worktree remove

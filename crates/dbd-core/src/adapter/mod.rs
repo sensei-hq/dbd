@@ -582,6 +582,54 @@ pub trait DatabaseAdapter: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// [`Self::claim_objects`], taking over what any of `from` holds of
+    /// `objects` — a module of a workspace takes over from its project's other
+    /// owners (#7). By default [`Self::claim_objects`], taking over from the
+    /// one of them that holds anything — so an adapter written before it, or
+    /// one keeping no registry, keeps working — and refusing when several do;
+    /// an adapter keeping a registry takes over from several at once.
+    async fn claim_objects_from(
+        &self,
+        owner: &str,
+        objects: &[OwnedObject],
+        write: bool,
+        from: &[String],
+    ) -> Result<Vec<HeldObject>> {
+        match from {
+            [] => self.claim_objects(owner, objects, write, None).await,
+            [one] => self.claim_objects(owner, objects, write, Some(one)).await,
+            // Of several, the ones that hold anything this claim takes: rarely
+            // more than one, and none for an adapter that keeps no registry.
+            _ => {
+                let mut holding: Vec<String> = Vec::new();
+                for held in self.claim_objects(owner, objects, false, None).await? {
+                    if from.contains(&held.owner) && !holding.contains(&held.owner) {
+                        holding.push(held.owner);
+                    }
+                }
+                match holding.as_slice() {
+                    [] => self.claim_objects(owner, objects, write, None).await,
+                    [one] => self.claim_objects(owner, objects, write, Some(one)).await,
+                    _ => Err(crate::error::DbdError::Config(format!(
+                        "this database's adapter takes over from one owner at a time — {} each hold something \
+                         {owner} takes; take each over in a run of its own (--adopt-from)",
+                        holding.join(", ")
+                    ))),
+                }
+            }
+        }
+    }
+
+    /// Retire `owner` once it holds nothing that still exists: its record,
+    /// its uses, its claims of what is gone — in the open batch when there is
+    /// one (#7: a project split into modules, whose modules took everything
+    /// over). Whether it was retired. Adapters without a registry retire
+    /// nothing.
+    async fn retire_owner(&self, owner: &str) -> Result<bool> {
+        let _ = owner;
+        Ok(false)
+    }
+
     /// What `owner` holds in the registry that still exists in the database
     /// (#7). Reads only. Adapters without a registry hold nothing.
     async fn owned_objects(&self, owner: &str) -> Result<Vec<OwnedObject>> {

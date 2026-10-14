@@ -505,8 +505,9 @@ pub async fn cmd_deploy(
         return deploy_workspace(targets, &emptied, &run).await;
     }
     for (i, target) in targets.into_iter().enumerate() {
-        let (design, dir) = target.enter(i == 0);
-        deploy_design(design, &dir, &run).await?;
+        let (mut design, dir) = target.enter(i == 0);
+        deploy_design(&mut design, &dir, &run).await?;
+        super::say_if_retired(&design);
     }
     Ok(())
 }
@@ -558,6 +559,7 @@ async fn deploy_workspace(targets: Vec<super::Target>, emptied: &super::Emptied,
                 super::format_grants(&grants)
             ),
         );
+        super::say_if_retired(&design);
         built.push((label, design, adapter, resolved));
     }
 
@@ -641,7 +643,7 @@ struct DeployRun<'a> {
 }
 
 /// [`cmd_deploy`] for one design: the project's, or one module's.
-async fn deploy_design(mut design: Design, project_dir: &Path, run: &DeployRun<'_>) -> Result<()> {
+async fn deploy_design(design: &mut Design, project_dir: &Path, run: &DeployRun<'_>) -> Result<()> {
     let &DeployRun {
         config_path,
         database_url,
@@ -680,7 +682,7 @@ async fn deploy_design(mut design: Design, project_dir: &Path, run: &DeployRun<'
             // The real run claims the design's entities; its preview refuses
             // what that claim would, and names what it would adopt (#7).
             design.check_ownership(&**adapter).await?;
-            super::announce_adoptions(&design, &**adapter, true).await?;
+            super::announce_adoptions(design, &**adapter, true).await?;
         }
         // The migrations its apply phase executes first, built before anything
         // is printed: it refuses where the run does — an unresolved `-- TODO`
@@ -729,7 +731,7 @@ async fn deploy_design(mut design: Design, project_dir: &Path, run: &DeployRun<'
 
         // The policy phase's own scope filter, counted the way the real
         // deploy's summary counts it.
-        let policy_ws = super::schema::policy_working_set(&design, &resolved)?;
+        let policy_ws = super::schema::policy_working_set(design, &resolved)?;
         let policies =
             dbd_core::design::plan_policies(project_dir, policy_ws.as_ref().map(|(n, ws)| (n.as_str(), ws)))?;
         output::info(
@@ -750,7 +752,7 @@ async fn deploy_design(mut design: Design, project_dir: &Path, run: &DeployRun<'
     let adapter = get_adapter(config_path, database_url, design.owner()).await?;
     let marks = design.database_marks(&*adapter).await?;
     Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
-    super::announce_adoptions(&design, &*adapter, false).await?;
+    super::announce_adoptions(design, &*adapter, false).await?;
 
     // Said before the run, not in its summary: a deploy that fails never
     // prints one, and a skipped hook is often why it failed.
@@ -877,7 +879,7 @@ pub async fn cmd_reconcile(
     for (i, target) in targets.into_iter().enumerate() {
         let (design, _) = target.enter(i == 0);
         reconcile_design(
-            design,
+            &design,
             config,
             database_url,
             dry_run,
@@ -889,6 +891,7 @@ pub async fn cmd_reconcile(
             verbosity,
         )
         .await?;
+        super::say_if_retired(&design);
     }
     Ok(())
 }
@@ -914,7 +917,7 @@ fn refuse_a_released_reconcile(design: &Design) -> Result<()> {
 /// [`cmd_reconcile`] for one design: the project's, or one module's.
 #[allow(clippy::too_many_arguments)]
 async fn reconcile_design(
-    design: Design,
+    design: &Design,
     config: &Path,
     database_url: Option<&str>,
     dry_run: bool,
@@ -925,7 +928,7 @@ async fn reconcile_design(
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    refuse_a_released_reconcile(&design)?;
+    refuse_a_released_reconcile(design)?;
 
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
     let (kept, total) = design.scope_counts(&resolved)?;
@@ -955,7 +958,7 @@ async fn reconcile_design(
     };
     reconcile_with_adapter(
         &*adapter,
-        &design,
+        design,
         &resolved,
         dry_run,
         allow_destructive,

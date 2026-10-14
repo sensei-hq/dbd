@@ -2579,10 +2579,26 @@ ORDER BY 1, 2, 4, 5"#;
         write: bool,
         adopt_from: Option<&str>,
     ) -> Result<Vec<super::HeldObject>> {
+        let from: Vec<String> = adopt_from.into_iter().map(str::to_string).collect();
+        self.claim_objects_from(owner, objects, write, &from).await
+    }
+
+    async fn claim_objects_from(
+        &self,
+        owner: &str,
+        objects: &[super::OwnedObject],
+        write: bool,
+        from: &[String],
+    ) -> Result<Vec<super::HeldObject>> {
         let mut guard = self.batch.lock().await;
         self.bookkeeping
-            .claim_objects(guard.as_mut(), owner, objects, write, adopt_from)
+            .claim_objects(guard.as_mut(), owner, objects, write, from)
             .await
+    }
+
+    async fn retire_owner(&self, owner: &str) -> Result<bool> {
+        let mut guard = self.batch.lock().await;
+        self.bookkeeping.retire_owner(guard.as_mut(), owner).await
     }
 
     async fn owned_objects(&self, owner: &str) -> Result<Vec<super::OwnedObject>> {

@@ -901,6 +901,17 @@ impl DatabaseAdapter for SqliteAdapter {
         write: bool,
         adopt_from: Option<&str>,
     ) -> Result<Vec<super::HeldObject>> {
+        let from: Vec<String> = adopt_from.into_iter().map(str::to_string).collect();
+        self.claim_objects_from(owner, objects, write, &from).await
+    }
+
+    async fn claim_objects_from(
+        &self,
+        owner: &str,
+        objects: &[super::OwnedObject],
+        write: bool,
+        adopt_from: &[String],
+    ) -> Result<Vec<super::HeldObject>> {
         let failed = |e: sqlx::Error| DbdError::Config(format!("ownership claim failed: {e}"));
         if !write {
             if !self.has_table("_dbd_objects").await? {
@@ -911,8 +922,24 @@ impl DatabaseAdapter for SqliteAdapter {
         }
         self.ensure_registry_inner().await?;
         let mut tx = self.pool.begin().await.map_err(failed)?;
-        // What is adopted changes hands first, in the claim's transaction.
-        if let Some(from) = adopt_from {
+        // What is adopted changes hands first, in the claim's transaction —
+        // and what each entity taken over uses goes with it: recorded under
+        // its giver, the use guards what it reads until the taker records its
+        // own (#7).
+        let mut taken: Vec<(String, String)> = Vec::new();
+        for o in objects {
+            let held: Option<(String, String, String)> =
+                sqlx::query_as("SELECT kind, schema, owner FROM _dbd_objects WHERE namespace = ?1 AND name = ?2")
+                    .bind(&o.namespace)
+                    .bind(&o.name)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(failed)?;
+            if let Some((kind, schema, giver)) = held.filter(|(_, _, giver)| adopt_from.contains(giver)) {
+                taken.push((giver, format!("{kind} {schema}.{}", o.name)));
+            }
+        }
+        for from in adopt_from {
             for o in objects {
                 sqlx::query(
                     "UPDATE _dbd_objects SET owner = ?1, claimed_at = datetime('now') \
@@ -925,6 +952,31 @@ impl DatabaseAdapter for SqliteAdapter {
                 .execute(&mut *tx)
                 .await
                 .map_err(failed)?;
+            }
+        }
+        let uses_table: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_dbd_uses'")
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(failed)?;
+        if !taken.is_empty() && uses_table > 0 {
+            for (giver, via) in &taken {
+                sqlx::query(
+                    "INSERT OR IGNORE INTO _dbd_uses (owner, kind, target, via) \
+                     SELECT ?1, kind, target, via FROM _dbd_uses WHERE owner = ?2 AND via = ?3",
+                )
+                .bind(owner)
+                .bind(giver)
+                .bind(via)
+                .execute(&mut *tx)
+                .await
+                .map_err(failed)?;
+                sqlx::query("DELETE FROM _dbd_uses WHERE owner = ?1 AND via = ?2")
+                    .bind(giver)
+                    .bind(via)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(failed)?;
             }
         }
         for o in objects {
@@ -942,13 +994,48 @@ impl DatabaseAdapter for SqliteAdapter {
             .await
             .map_err(failed)?;
         }
-        let held = held_in(&mut tx, owner, objects, None).await?;
+        let held = held_in(&mut tx, owner, objects, &[]).await?;
         if held.is_empty() {
             tx.commit().await.map_err(failed)?;
         } else {
             tx.rollback().await.map_err(failed)?;
         }
         Ok(held)
+    }
+
+    async fn retire_owner(&self, owner: &str) -> Result<bool> {
+        let failed = |e: sqlx::Error| DbdError::Config(format!("retire {owner}: {e}"));
+        if !self.has_table("_dbd_objects").await? || !self.owned_objects(owner).await?.is_empty() {
+            return Ok(false);
+        }
+        if !self.has_table("_dbd_meta").await? {
+            return Ok(false);
+        }
+        let recorded: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _dbd_meta WHERE project = ?1")
+            .bind(owner)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(failed)?;
+        if recorded == 0 {
+            return Ok(false);
+        }
+        let mut tx = self.pool.begin().await.map_err(failed)?;
+        let mut statements = vec![
+            "DELETE FROM _dbd_objects WHERE owner = ?1",
+            "DELETE FROM _dbd_meta WHERE project = ?1",
+        ];
+        if self.has_table("_dbd_uses").await? {
+            statements.insert(0, "DELETE FROM _dbd_uses WHERE owner = ?1");
+        }
+        for statement in statements {
+            sqlx::query(statement)
+                .bind(owner)
+                .execute(&mut *tx)
+                .await
+                .map_err(failed)?;
+        }
+        tx.commit().await.map_err(failed)?;
+        Ok(true)
     }
 
     async fn owned_objects(&self, owner: &str) -> Result<Vec<super::OwnedObject>> {
@@ -1120,22 +1207,19 @@ async fn held_in(
     conn: &mut sqlx::SqliteConnection,
     owner: &str,
     objects: &[super::OwnedObject],
-    adopting_from: Option<&str>,
+    adopting_from: &[String],
 ) -> Result<Vec<super::HeldObject>> {
     let mut held = Vec::new();
     for o in objects {
-        let row: Option<(String, String)> = sqlx::query_as(
-            "SELECT kind, owner FROM _dbd_objects WHERE namespace = ?1 AND name = ?2 \
-             AND owner <> ?3 AND (?4 IS NULL OR owner <> ?4)",
-        )
-        .bind(&o.namespace)
-        .bind(&o.name)
-        .bind(owner)
-        .bind(adopting_from)
-        .fetch_optional(&mut *conn)
-        .await
-        .map_err(|e| DbdError::Config(format!("ownership read failed: {e}")))?;
-        if let Some((kind, holder)) = row {
+        let row: Option<(String, String)> =
+            sqlx::query_as("SELECT kind, owner FROM _dbd_objects WHERE namespace = ?1 AND name = ?2 AND owner <> ?3")
+                .bind(&o.namespace)
+                .bind(&o.name)
+                .bind(owner)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(|e| DbdError::Config(format!("ownership read failed: {e}")))?;
+        if let Some((kind, holder)) = row.filter(|(_, holder)| !adopting_from.contains(holder)) {
             held.push(super::HeldObject {
                 object: super::OwnedObject { kind, ..o.clone() },
                 owner: holder,

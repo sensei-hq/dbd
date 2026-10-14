@@ -1186,6 +1186,18 @@ impl OwnershipChange {
     }
 }
 
+/// Say a module's run retired the project as it was before it had modules:
+/// its claim took over the last of what that project held (#7).
+pub(super) fn say_if_retired(design: &dbd_core::Design) {
+    if design.retired_predecessor()
+        && let Some(predecessor) = design.predecessor()
+    {
+        output::always(&format!(
+            "project \"{predecessor}\" is retired — its modules hold everything it held"
+        ));
+    }
+}
+
 /// Say, before a run, each entity it takes over with `--adopt-from` — or,
 /// previewing, would. Always shown: an adoption is never silent (#7). Only
 /// once the run's ownership checks pass: a run refused adopts nothing.

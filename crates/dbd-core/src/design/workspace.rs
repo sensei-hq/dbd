@@ -180,6 +180,23 @@ impl Workspace {
                     || manifest_externals.contains(e.name.as_str())
                     || declared.of_name(&e.name).is_none_or(|by| by.iter().any(reaches))
             });
+            // The project's other owners hand over to this module what it now
+            // declares, and what they declare is moving to them (#7, the
+            // workspace transfer rule).
+            design.transfer_from = std::iter::once(manifest.project.name.clone())
+                .chain(
+                    order
+                        .iter()
+                        .filter(|m| **m != name)
+                        .map(|m| format!("{}/{m}", manifest.project.name)),
+                )
+                .collect();
+            design.declared_elsewhere = order
+                .iter()
+                .zip(&objects)
+                .filter(|(m, _)| **m != name)
+                .flat_map(|(m, objects)| objects.iter().map(|o| (m.clone(), o.clone())))
+                .collect();
             modules.push(Module {
                 depends_on: manifest.modules[&name].depends_on.clone(),
                 name: Some(name),
