@@ -126,6 +126,13 @@ pub fn cmd_split(
              scopes"
         );
     }
+    if let Some(journal) = dbd_core::split::interrupted(project_dir) {
+        anyhow::bail!(
+            "a dbd split was interrupted here — its journal {} lists the files it moved: run `dbd split --undo` to \
+             put them back, then split again",
+            journal.display()
+        );
+    }
     if let Ok(read) = dbd_core::config::read(config)
         && !read.modules.is_empty()
     {
@@ -224,6 +231,16 @@ pub fn cmd_split(
          declares from \"{}\".",
         config.display(),
         plan.project
+    ));
+    Ok(())
+}
+
+/// `dbd split --undo` (#7): what an interrupted `--write` moved, put back.
+pub fn cmd_split_undo(config: &Path, project_dir: &Path) -> Result<()> {
+    let moved = dbd_core::split::undo(project_dir)?;
+    output::always(&format!(
+        "Put back {moved} files; {} is as it was before the split.",
+        config.display()
     ));
     Ok(())
 }

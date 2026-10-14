@@ -790,10 +790,12 @@ pub async fn run(
 
         Commands::Format { check } => schema::cmd_format(config, project_dir, module, *check, verbosity),
 
+        Commands::Split { undo: true, .. } => project::cmd_split_undo(config, project_dir),
         Commands::Split {
             from_scopes,
             write,
             rename,
+            undo: false,
         } => project::cmd_split(config, env, project_dir, *from_scopes, *write, rename, verbosity),
 
         Commands::Policies { dry_run } => {

@@ -250,7 +250,11 @@ pub fn plan_from_scopes(design: &Design, renames: &[(String, String)]) -> Result
         }
         // A module name is `[A-Za-z0-9_][A-Za-z0-9_-]*` (checked above): a folder of the project's.
         // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-        if holds_files(&root.join(name)) {
+        if holds_files(&root.join(name))
+            || ["ddl", "import", "policies"]
+                .iter()
+                .any(|sub| holds_any_file(&root.join(name).join(sub)))
+        {
             return Err(DbdError::Config(format!(
                 "{name}/ already holds files — module {name}'s folder would be it; move them, or give the \
                  module another name with --rename {name}=<name>"
@@ -559,6 +563,21 @@ fn file_moves(design: &Design, module_of: &dyn Fn(&str) -> Option<String>) -> Re
         }
     }
 
+    // Only the project's own files: one reached through a link to a folder
+    // outside it is another's to keep.
+    let canonical_root = std::fs::canonicalize(root)
+        .map_err(|e| DbdError::Config(format!("read the project folder {}: {e}", root.display())))?;
+    for m in &moves {
+        let inside = std::fs::canonicalize(root.join(&m.from)).is_ok_and(|real| real.starts_with(&canonical_root));
+        if !inside {
+            refusals.push(format!(
+                "{} is outside the project — reached through a link — and the split moves only the project's own \
+                 files; copy it in first",
+                m.from.display()
+            ));
+        }
+    }
+
     // No two files onto one path, nor onto one taken.
     let mut onto: HashMap<&Path, Vec<&Path>> = HashMap::new();
     for m in &moves {
@@ -639,15 +658,43 @@ fn leftovers(root: &Path) -> Result<Vec<String>> {
         if own || name.starts_with('.') || !entry.path().is_dir() {
             continue;
         }
-        for folder in ["ddl", "import", "policies"] {
-            if holds_files(&entry.path().join(folder)) {
-                found.push(format!("{name}/{folder}/"));
-                break;
-            }
+        if holds_module_ddl(&entry.path().join("ddl")) {
+            found.push(format!("{name}/ddl/"));
         }
     }
     found.sort();
     Ok(found)
+}
+
+/// Whether `ddl` holds DDL as a module's does: a file in a folder named for
+/// an entity type — `ddl/table/app/orders.ddl` — that the scanner would read.
+fn holds_module_ddl(ddl: &Path) -> bool {
+    let Ok(types) = std::fs::read_dir(ddl) else {
+        return false;
+    };
+    types.flatten().any(|t| {
+        t.path().is_dir()
+            && EntityType::from_folder_name(&t.file_name().to_string_lossy()).is_some()
+            && walkdir::WalkDir::new(t.path())
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .any(|e| {
+                    e.file_type().is_file()
+                        && e.path()
+                            .extension()
+                            .and_then(|x| x.to_str())
+                            .is_some_and(|x| x == "ddl" || x == "sql")
+                })
+    })
+}
+
+/// Whether `dir` holds a file, a dotfile included — the scanner reads one.
+fn holds_any_file(dir: &Path) -> bool {
+    dir.is_dir()
+        && walkdir::WalkDir::new(dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_type().is_file())
 }
 
 /// Whether `dir` holds a file, dotfiles aside.
@@ -660,12 +707,18 @@ fn holds_files(dir: &Path) -> bool {
             .any(|e| e.file_type().is_file())
 }
 
+/// The journal a split keeps while it moves files, in the project folder:
+/// while it is there the project is half-split, every load is refused, and
+/// `dbd split --undo` puts the files back.
+pub const JOURNAL: &str = ".dbd-split";
+
 /// Carry `plan` out, whole or not at all: check first, in a scratch copy of
 /// what the split would make, that the workspace loads and deploys under
-/// each scope what the project does; write the new manifest aside; move the
-/// files — with `git mv` in a git work tree — each recorded, and on any
-/// failure put each back; then put the new manifest in place. Refused while
-/// the plan's dependencies cycle.
+/// each scope what the project does; write the new manifest aside and a
+/// journal of the moves; move the files — with `git mv` in a git work tree —
+/// and on any failure put each back; then put the manifest in place, check
+/// the workspace again, and drop the journal. Refused while the plan's
+/// dependencies cycle.
 pub fn write_split(plan: &SplitPlan, config_path: &Path, project_dir: &Path) -> Result<()> {
     if let Some(cycle) = &plan.cycle {
         return Err(DbdError::Config(format!(
@@ -673,53 +726,199 @@ pub fn write_split(plan: &SplitPlan, config_path: &Path, project_dir: &Path) -> 
             cycle.join(" → ")
         )));
     }
+    // design.yaml written through a link, as the file it links to.
+    let manifest = std::fs::canonicalize(config_path)
+        .map_err(|e| DbdError::Config(format!("Cannot read {}: {e}", config_path.display())))?;
     // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    let text = std::fs::read_to_string(config_path)
+    let text = std::fs::read_to_string(&manifest)
         .map_err(|e| DbdError::Config(format!("Cannot read {}: {e}", config_path.display())))?;
     let written = rewrite_manifest(&text, plan)?;
-    check_in_scratch(plan, config_path, project_dir, &written)?;
+    let was = deploys(config_path, project_dir, plan)?;
+    check_in_scratch(plan, config_path, project_dir, &written, &was)?;
 
     // The new manifest, aside: a split that cannot write it moves nothing.
-    let aside = config_path.with_file_name(format!(
-        "{}.dbd-split",
-        config_path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
-    ));
-    write_new(&aside, &written)?;
+    let aside = aside_of(&manifest);
+    write_like(&aside, &written, &manifest)?;
+    // The manifest as it was, kept until the split is done — what `--undo`
+    // puts back should the split stop once design.yaml is the new one.
+    let was_kept = was_of(&manifest);
+    if let Err(e) = write_like(&was_kept, &text, &manifest) {
+        let _ = std::fs::remove_file(&aside);
+        return Err(e);
+    }
+    if let Err(e) = begin_journal_at(plan, project_dir, &aside, &was_kept, &manifest) {
+        let _ = std::fs::remove_file(&aside);
+        let _ = std::fs::remove_file(&was_kept);
+        return Err(e);
+    }
 
     let git = in_git_work_tree(project_dir);
     let mut done: Vec<&FileMove> = Vec::new();
+    let fail = |e: String, done: &[&FileMove], manifest_state: &str| -> DbdError {
+        let undo = put_back(project_dir, done, git);
+        let _ = std::fs::remove_file(&aside);
+        if undo.failed.is_empty() {
+            let _ = std::fs::remove_file(&was_kept);
+            let _ = std::fs::remove_file(project_dir.join(JOURNAL));
+        }
+        DbdError::Config(format!("{e} — {}", undo.said(done.len(), manifest_state)))
+    };
     for m in &plan.moves {
         if let Err(e) = move_one(project_dir, m, git) {
-            let undo = put_back(project_dir, &done, git);
-            let _ = std::fs::remove_file(&aside);
-            return Err(DbdError::Config(format!(
-                "{e} — {}",
-                undo_said(&undo, done.len(), "design.yaml is as it was")
-            )));
+            return Err(fail(e.to_string(), &done, "design.yaml is as it was"));
         }
         done.push(m);
     }
-    if let Err(e) = std::fs::rename(&aside, config_path) {
-        let undo = put_back(project_dir, &done, git);
-        let _ = std::fs::remove_file(&aside);
-        return Err(DbdError::Config(format!(
-            "design.yaml could not be replaced: {e} — {}",
-            undo_said(&undo, done.len(), "design.yaml is as it was")
-        )));
+    if let Err(e) = std::fs::rename(&aside, &manifest) {
+        return Err(fail(
+            format!("design.yaml could not be replaced: {e}"),
+            &done,
+            "design.yaml is as it was",
+        ));
     }
-    if let Err(e) = crate::design::Workspace::load(config_path, "dev", Some(project_dir)) {
-        let restored = write_new(&aside, &text).and_then(|()| {
-            std::fs::rename(&aside, config_path).map_err(|e| DbdError::Config(format!("restore design.yaml: {e}")))
-        });
-        let undo = put_back(project_dir, &done, git);
-        let manifest = match restored {
+    if let Err(e) = deploys_as(config_path, project_dir, &was) {
+        let restored = std::fs::copy(&was_kept, &aside)
+            .map_err(|e| DbdError::Config(format!("restore design.yaml: {e}")))
+            .and_then(|_| {
+                std::fs::rename(&aside, &manifest).map_err(|e| DbdError::Config(format!("restore design.yaml: {e}")))
+            });
+        let state = match restored {
             Ok(()) => "design.yaml is as it was".to_string(),
             Err(e) => format!("design.yaml could not be put back ({e})"),
         };
+        return Err(fail(e.to_string(), &done, &state));
+    }
+    let _ = std::fs::remove_file(&was_kept);
+    std::fs::remove_file(project_dir.join(JOURNAL))
+        .map_err(|e| DbdError::Config(format!("the split is done; remove its journal {JOURNAL} by hand: {e}")))?;
+    Ok(())
+}
+
+/// Where the manifest as it was is kept while a split moves files.
+fn was_of(manifest: &Path) -> PathBuf {
+    manifest.with_file_name(format!(
+        "{}.dbd-split-was",
+        manifest.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
+    ))
+}
+
+/// Where the new manifest is written first: beside the file `manifest` is.
+fn aside_of(manifest: &Path) -> PathBuf {
+    manifest.with_file_name(format!(
+        "{}.dbd-split",
+        manifest.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
+    ))
+}
+
+/// Begin the journal of `plan`'s moves in `project_dir` — refused while one is
+/// there already. For a test standing in for a split interrupted mid-way.
+pub fn begin_journal(plan: &SplitPlan, project_dir: &Path) -> Result<()> {
+    begin_journal_at(plan, project_dir, Path::new(""), Path::new(""), Path::new(""))
+}
+
+/// The journal: where the new manifest is aside, where the manifest as it
+/// was is kept and where it goes back to, then each move, `from\tto`.
+fn begin_journal_at(plan: &SplitPlan, project_dir: &Path, aside: &Path, was: &Path, manifest: &Path) -> Result<()> {
+    let mut text = format!(
+        "aside\t{}\nwas\t{}\nmanifest\t{}\n",
+        aside.display(),
+        was.display(),
+        manifest.display()
+    );
+    for m in &plan.moves {
+        text.push_str(&format!("{}\t{}\n", m.from.display(), m.to.display()));
+    }
+    write_new(&project_dir.join(JOURNAL), &text).map_err(|e| {
+        DbdError::Config(format!(
+            "{e} — a split's journal is there already: put its files back with dbd split --undo first"
+        ))
+    })
+}
+
+/// The journal of a split interrupted in `project_dir`, if there is one.
+pub fn interrupted(project_dir: &Path) -> Option<PathBuf> {
+    let journal = project_dir.join(JOURNAL);
+    journal.exists().then_some(journal)
+}
+
+/// Refuse a project a split was interrupted in: some of its files have moved
+/// and its design.yaml may not declare the modules yet, so read as it is it
+/// is missing what moved — and a prune would drop it.
+pub(crate) fn refuse_a_half_split(project_dir: &Path) -> Result<()> {
+    match interrupted(project_dir) {
+        Some(journal) => Err(DbdError::Config(format!(
+            "a dbd split was interrupted here — its journal {} lists the files it moved, and design.yaml may not \
+             declare the modules yet: run `dbd split --undo` to put them back, then split again",
+            journal.display()
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Put back what an interrupted split moved, from its journal: each file
+/// found where it was moving to, moved back — newest first — then the new
+/// manifest aside and the journal removed. What could not be put back is
+/// said, and the journal kept.
+pub fn undo(project_dir: &Path) -> Result<usize> {
+    let journal = project_dir.join(JOURNAL);
+    let text = std::fs::read_to_string(&journal)
+        .map_err(|e| DbdError::Config(format!("no split to undo here — {}: {e}", journal.display())))?;
+    let (mut aside, mut was, mut manifest) = (None, None, None);
+    let mut moved: Vec<FileMove> = Vec::new();
+    for line in text.lines() {
+        let Some((from, to)) = line.split_once('\t') else {
+            continue;
+        };
+        let path = (!to.is_empty()).then(|| PathBuf::from(to));
+        match from {
+            "aside" => aside = path,
+            "was" => was = path,
+            "manifest" => manifest = path,
+            _ => {}
+        }
+        if ["aside", "was", "manifest"].contains(&from) {
+            continue;
+        }
+        let m = FileMove {
+            from: PathBuf::from(from),
+            to: PathBuf::from(to),
+        };
+        if project_dir.join(&m.to).exists() && !project_dir.join(&m.from).exists() {
+            moved.push(m);
+        }
+    }
+    let git = in_git_work_tree(project_dir);
+    let done: Vec<&FileMove> = moved.iter().collect();
+    let undo = put_back(project_dir, &done, git);
+    if !undo.failed.is_empty() {
         return Err(DbdError::Config(format!(
-            "the workspace does not load: {e} — {}",
-            undo_said(&undo, done.len(), &manifest)
+            "these could not be put back, and {JOURNAL} is kept:\n  {}",
+            undo.failed.join("\n  ")
         )));
+    }
+    // The manifest as it was, back in place if the new one was.
+    if let (Some(was), Some(manifest)) = (&was, &manifest)
+        && was.exists()
+    {
+        std::fs::rename(was, manifest)
+            .map_err(|e| DbdError::Config(format!("put design.yaml back from {}: {e}", was.display())))?;
+    }
+    if let Some(aside) = aside {
+        let _ = std::fs::remove_file(aside);
+    }
+    std::fs::remove_file(&journal).map_err(|e| DbdError::Config(format!("remove {}: {e}", journal.display())))?;
+    for note in &undo.notes {
+        eprintln!("{note}");
+    }
+    Ok(moved.len())
+}
+
+/// `text` written to `path`, which must not exist yet, with the permissions
+/// `like` has.
+fn write_like(path: &Path, text: &str, like: &Path) -> Result<()> {
+    write_new(path, text)?;
+    if let Ok(meta) = std::fs::metadata(like) {
+        let _ = std::fs::set_permissions(path, meta.permissions());
     }
     Ok(())
 }
@@ -731,12 +930,12 @@ fn write_new(path: &Path, text: &str) -> Result<()> {
         .write(true)
         .create_new(true)
         .open(path)
-        .map_err(|e| DbdError::Config(format!("write the new design.yaml beside it, {}: {e}", path.display())))?;
+        .map_err(|e| DbdError::Config(format!("write {}: {e}", path.display())))?;
     file.write_all(text.as_bytes())
         .and_then(|()| file.sync_all())
         .map_err(|e| {
             let _ = std::fs::remove_file(path);
-            DbdError::Config(format!("write the new design.yaml beside it, {}: {e}", path.display()))
+            DbdError::Config(format!("write {}: {e}", path.display()))
         })
 }
 
@@ -766,38 +965,155 @@ fn move_one(project_dir: &Path, m: &FileMove, git: bool) -> Result<()> {
         .map_err(|e| DbdError::Config(format!("move {} to {}: {e}", m.from.display(), m.to.display())))
 }
 
-/// Each of `done` put back, newest first — what could not be, said.
-fn put_back(project_dir: &Path, done: &[&FileMove], git: bool) -> Vec<String> {
-    let mut failed = Vec::new();
+/// What putting moves back came to: what could not be, and what was put back
+/// by hand because git would not.
+struct PutBack {
+    failed: Vec<String>,
+    notes: Vec<String>,
+}
+
+impl PutBack {
+    /// What a failed split says of it.
+    fn said(&self, moved: usize, manifest: &str) -> String {
+        let notes = if self.notes.is_empty() {
+            String::new()
+        } else {
+            format!("; {}", self.notes.join("; "))
+        };
+        if self.failed.is_empty() {
+            format!("every move before it ({moved}) was put back, and {manifest}{notes}")
+        } else {
+            format!(
+                "of the {moved} moves before it, these could not be put back, and {manifest} — put them back with \
+                 dbd split --undo once the cause is fixed{notes}:\n  {}",
+                self.failed.join("\n  ")
+            )
+        }
+    }
+}
+
+/// Each of `done` put back, newest first: by `git mv` as it was moved — tried
+/// again a few times, git's lock being another git's for a moment — else by
+/// hand, saying git's index needs fixing.
+fn put_back(project_dir: &Path, done: &[&FileMove], git: bool) -> PutBack {
+    let mut out = PutBack {
+        failed: Vec::new(),
+        notes: Vec::new(),
+    };
+    let mut by_hand = 0;
     for m in done.iter().rev() {
         let back = FileMove {
             from: m.to.clone(),
             to: m.from.clone(),
         };
-        if let Err(e) = move_one(project_dir, &back, git) {
-            failed.push(e.to_string());
+        let mut result = move_one(project_dir, &back, git);
+        for _ in 0..4 {
+            if result.is_ok() || !git {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            result = move_one(project_dir, &back, git);
+        }
+        if result.is_err() && git {
+            result = std::fs::rename(project_dir.join(&back.from), project_dir.join(&back.to))
+                .map_err(|e| DbdError::Config(format!("move {} back: {e}", back.from.display())));
+            if result.is_ok() {
+                by_hand += 1;
+            }
+        }
+        if let Err(e) = result {
+            out.failed.push(e.to_string());
         }
     }
-    failed
+    if by_hand > 0 {
+        out.notes.push(format!(
+            "git would not move {by_hand} file(s) back, so they were moved back by hand — run `git add -A` to set \
+             git's index right"
+        ));
+    }
+    out
 }
 
-/// What a failed split says of what it put back.
-fn undo_said(failed: &[String], moved: usize, manifest: &str) -> String {
-    if failed.is_empty() {
-        format!("every move before it ({moved}) was put back, and {manifest}")
+/// What the project deploys under each scope of `plan` and with none —
+/// what the workspace must deploy too.
+type Deploys = Vec<(Option<String>, BTreeSet<String>)>;
+
+fn deploys(config_path: &Path, project_dir: &Path, plan: &SplitPlan) -> Result<Deploys> {
+    let before = crate::Design::from_config_with_dir(config_path, "dev", Some(project_dir))?;
+    std::iter::once(None)
+        .chain(plan.scopes.iter().map(|s| Some(s.name.clone())))
+        .map(|scope| {
+            let resolved = before.resolve_scope(scope.as_deref(), None)?;
+            let names = before
+                .scoped_entities(&resolved)?
+                .into_iter()
+                .filter(|e| e.entity_type != EntityType::External)
+                .map(|e| e.name)
+                .collect();
+            Ok((scope, names))
+        })
+        .collect()
+}
+
+/// Whether the workspace at `manifest`, in `dir`, loads and deploys under
+/// each scope what `was` says the project did.
+fn deploys_as(manifest: &Path, dir: &Path, was: &Deploys) -> Result<()> {
+    let mut differences = Vec::new();
+    for (scope, was) in was {
+        let reading = crate::design::Workspace::load_unguarded(manifest, "dev", Some(dir))
+            .map_err(|e| DbdError::Config(format!("the workspace would not load: {e}")))?
+            .reading(None, scope.as_deref(), None)?;
+        let now: BTreeSet<String> = reading
+            .entities()?
+            .into_iter()
+            .filter(|e| e.entity_type != EntityType::External)
+            .map(|e| e.name)
+            .collect();
+        if *was != now {
+            let named = scope
+                .as_ref()
+                .map_or("with no --scope".to_string(), |s| format!("scope {s}"));
+            let gone: Vec<&String> = was.difference(&now).collect();
+            let new: Vec<&String> = now.difference(was).collect();
+            differences.push(format!(
+                "{named} would deploy{}{}",
+                if new.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {} it does not now", list(&new))
+                },
+                if gone.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "{} not {}, which it does now",
+                        if new.is_empty() { "" } else { ", and" },
+                        list(&gone)
+                    )
+                }
+            ));
+        }
+    }
+    if differences.is_empty() {
+        Ok(())
     } else {
-        format!(
-            "of the {moved} moves before it, these could not be put back, and {manifest}:\n  {}",
-            failed.join("\n  ")
-        )
+        Err(DbdError::Config(format!(
+            "as a workspace, the project would not deploy what it does:\n  {}",
+            differences.join("\n  ")
+        )))
     }
 }
 
 /// What the split would make, made in a scratch folder — its manifest, each
 /// file moved (import data as an empty file: only its name is read) — then
-/// loaded: refused unless the workspace loads and deploys under each scope,
-/// and with none given, what the project does.
-fn check_in_scratch(plan: &SplitPlan, config_path: &Path, project_dir: &Path, written: &str) -> Result<()> {
+/// checked: refused unless the workspace loads and deploys what `was` says.
+fn check_in_scratch(
+    plan: &SplitPlan,
+    config_path: &Path,
+    project_dir: &Path,
+    written: &str,
+    was: &Deploys,
+) -> Result<()> {
     let scratch = std::env::temp_dir().join(format!(
         "dbd-split-{}-{}",
         std::process::id(),
@@ -827,59 +1143,7 @@ fn check_in_scratch(plan: &SplitPlan, config_path: &Path, project_dir: &Path, wr
                 std::fs::copy(project_dir.join(&m.from), &to).map_err(|e| fail("copy a file", e))?;
             }
         }
-        let before = crate::Design::from_config_with_dir(config_path, "dev", Some(project_dir))?;
-        let scopes: Vec<Option<&str>> = std::iter::once(None)
-            .chain(plan.scopes.iter().map(|s| Some(s.name.as_str())))
-            .collect();
-        let mut differences = Vec::new();
-        for scope in scopes {
-            let resolved = before.resolve_scope(scope, None)?;
-            let was: BTreeSet<String> = before
-                .scoped_entities(&resolved)?
-                .into_iter()
-                .filter(|e| e.entity_type != EntityType::External)
-                .map(|e| e.name)
-                .collect();
-            let reading = crate::design::Workspace::load(&manifest, "dev", Some(&scratch))
-                .map_err(|e| DbdError::Config(format!("the workspace would not load: {e}")))?
-                .reading(None, scope, None)?;
-            let now: BTreeSet<String> = reading
-                .entities()?
-                .into_iter()
-                .filter(|e| e.entity_type != EntityType::External)
-                .map(|e| e.name)
-                .collect();
-            if was != now {
-                let named = scope.map_or("with no --scope".to_string(), |s| format!("scope {s}"));
-                let gone: Vec<&String> = was.difference(&now).collect();
-                let new: Vec<&String> = now.difference(&was).collect();
-                differences.push(format!(
-                    "{named} would deploy{}{}",
-                    if new.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" {} it does not now", list(&new))
-                    },
-                    if gone.is_empty() {
-                        String::new()
-                    } else {
-                        format!(
-                            "{} not {}, which it does now",
-                            if new.is_empty() { "" } else { ", and" },
-                            list(&gone)
-                        )
-                    }
-                ));
-            }
-        }
-        if differences.is_empty() {
-            Ok(())
-        } else {
-            Err(DbdError::Config(format!(
-                "as a workspace, the project would not deploy what it does:\n  {}",
-                differences.join("\n  ")
-            )))
-        }
+        deploys_as(&manifest, &scratch, was)
     })();
     let _ = std::fs::remove_dir_all(&scratch);
     outcome

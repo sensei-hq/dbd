@@ -373,6 +373,9 @@ pub enum Commands {
         /// Name a module of the plan otherwise: `--rename shared=common`
         #[arg(long, value_name = "MODULE=NAME")]
         rename: Vec<String>,
+        /// Put back what an interrupted `--write` moved, from its journal
+        #[arg(long, conflicts_with_all = ["from_scopes", "write", "rename"])]
+        undo: bool,
     },
     /// Format DDL files
     Format {

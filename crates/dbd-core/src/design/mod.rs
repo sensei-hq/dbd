@@ -865,6 +865,7 @@ impl Design {
         let project_dir = project_dir
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| config_path.parent().unwrap_or(Path::new(".")).to_path_buf());
+        crate::split::refuse_a_half_split(&project_dir)?;
 
         let design_config = config::read(config_path)?;
         if !design_config.modules.is_empty() {
