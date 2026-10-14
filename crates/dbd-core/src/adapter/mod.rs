@@ -584,9 +584,10 @@ pub trait DatabaseAdapter: Send + Sync {
 
     /// [`Self::claim_objects`], taking over what any of `from` holds of
     /// `objects` — a module of a workspace takes over from its project's other
-    /// owners (#7). By default [`Self::claim_objects`] with none or one of
-    /// them, so an adapter written before it keeps working; an adapter keeping
-    /// a registry takes over from several at once.
+    /// owners (#7). By default [`Self::claim_objects`], taking over from the
+    /// one of them that holds anything — so an adapter written before it, or
+    /// one keeping no registry, keeps working — and refusing when several do;
+    /// an adapter keeping a registry takes over from several at once.
     async fn claim_objects_from(
         &self,
         owner: &str,
@@ -597,10 +598,25 @@ pub trait DatabaseAdapter: Send + Sync {
         match from {
             [] => self.claim_objects(owner, objects, write, None).await,
             [one] => self.claim_objects(owner, objects, write, Some(one)).await,
-            _ => Err(crate::error::DbdError::Config(format!(
-                "this database's adapter takes over from one owner at a time, not from {}",
-                from.join(", ")
-            ))),
+            // Of several, the ones that hold anything this claim takes: rarely
+            // more than one, and none for an adapter that keeps no registry.
+            _ => {
+                let mut holding: Vec<String> = Vec::new();
+                for held in self.claim_objects(owner, objects, false, None).await? {
+                    if from.contains(&held.owner) && !holding.contains(&held.owner) {
+                        holding.push(held.owner);
+                    }
+                }
+                match holding.as_slice() {
+                    [] => self.claim_objects(owner, objects, write, None).await,
+                    [one] => self.claim_objects(owner, objects, write, Some(one)).await,
+                    _ => Err(crate::error::DbdError::Config(format!(
+                        "this database's adapter takes over from one owner at a time — {} each hold something \
+                         {owner} takes; take each over in a run of its own (--adopt-from)",
+                        holding.join(", ")
+                    ))),
+                }
+            }
         }
     }
 
