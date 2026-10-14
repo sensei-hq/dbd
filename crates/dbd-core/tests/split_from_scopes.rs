@@ -90,7 +90,10 @@ fn plan(root: &Path, renames: &[(&str, &str)]) -> SplitPlan {
     plan_from_scopes(&design(root), &renames).expect("plan")
 }
 
-fn modules(plan: &SplitPlan) -> Vec<(String, Vec<String>, Vec<String>, Vec<String>)> {
+/// A module as the tests compare it: name, region, entities, depends_on.
+type ModuleRow = (String, Vec<String>, Vec<String>, Vec<String>);
+
+fn modules(plan: &SplitPlan) -> Vec<ModuleRow> {
     plan.modules
         .iter()
         .map(|m| {
@@ -198,8 +201,7 @@ fn a_module_can_be_renamed() {
     );
 
     let err = plan_from_scopes(&design(tmp.path()), &[("nope".to_string(), "x".to_string())])
-        .err()
-        .expect("no module nope")
+        .expect_err("no module nope")
         .to_string();
     assert!(err.contains("nope"), "{err}");
 }
