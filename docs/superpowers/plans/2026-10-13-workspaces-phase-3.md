@@ -300,6 +300,15 @@ Taken in slice 6, `dbd split --from-scopes` (its second PR):
   path names (add it to `schemas:`), and a scope that leaves out what its
   entities need (as modules it would deploy them). What a file creates
   beside its entity is its module's, as the gap check reads it (T20).
+- Re-review: until it is done, `--write` keeps a journal of its moves in
+  the project folder (`.dbd-split`) and the manifest as it was; while the
+  journal is there every load is refused, and `dbd split --undo` puts the
+  files and design.yaml back — an interrupted split is never read as a
+  project missing what moved. A file reached through a link from outside
+  the project is refused; a linked design.yaml is written through its link,
+  its mode kept; a move git will not put back is tried again, then made by
+  hand, saying the index needs fixing. Only a folder holding a module's DDL
+  (`ddl/<type>/…`) is taken for an earlier split's leftovers.
 
 ## Slices
 
