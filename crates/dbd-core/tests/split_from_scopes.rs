@@ -769,3 +769,114 @@ mod reading {
         );
     }
 }
+
+/// What a split left half-done, and what is not the project's own, after the
+/// re-review (#7).
+mod guarding {
+    use super::*;
+
+    /// A split interrupted after some moves left its journal: every load is
+    /// refused, naming it, until `dbd split --undo` puts the files back.
+    #[test]
+    fn an_interrupted_split_is_refused_until_undone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        sensei_like(root);
+        let plan = plan(root, &[]);
+        dbd_core::split::begin_journal(&plan, root).expect("the journal");
+        // Interrupted after two moves.
+        for m in plan.moves.iter().take(2) {
+            let to = root.join(&m.to);
+            std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+            std::fs::rename(root.join(&m.from), to).unwrap();
+        }
+        let err = match Design::from_config_with_dir(&root.join("design.yaml"), "dev", Some(root)) {
+            Ok(_) => panic!("the project is half-split"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("dbd split --undo"), "{err}");
+
+        dbd_core::split::undo(root).expect("undo");
+        for m in &plan.moves {
+            assert!(root.join(&m.from).exists(), "{} is back", m.from.display());
+        }
+        design(root);
+    }
+
+    /// A `ddl/` linked to a folder outside the project is not the project's
+    /// to empty: refused, the folder untouched.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_linked_from_outside_the_project_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let common = tmp.path().join("common");
+        let root = tmp.path().join("sensei");
+        sensei_like(&root);
+        std::fs::rename(root.join("ddl"), &common).unwrap();
+        std::os::unix::fs::symlink(&common, root.join("ddl")).unwrap();
+        let err = match plan_from_scopes(&design(&root), &[]) {
+            Ok(plan) => match write_split(&plan, &root.join("design.yaml"), &root) {
+                Ok(()) => panic!("ddl/ is another folder's"),
+                Err(e) => e.to_string(),
+            },
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("outside the project"), "{err}");
+        assert!(
+            common.join("table/app/lookups.ddl").exists(),
+            "the linked folder keeps its files"
+        );
+    }
+
+    /// A design.yaml that is a link stays a link — what it links to is the
+    /// manifest written — and keeps its mode.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_manifest_is_written_through_the_link() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("sensei");
+        sensei_like(&root);
+        let real = tmp.path().join("sensei.yaml");
+        std::fs::rename(root.join("design.yaml"), &real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o640)).unwrap();
+        std::os::unix::fs::symlink(&real, root.join("design.yaml")).unwrap();
+        let plan = plan(&root, &[]);
+        write_split(&plan, &root.join("design.yaml"), &root).expect("write");
+        assert!(
+            std::fs::symlink_metadata(root.join("design.yaml"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(std::fs::read_to_string(&real).unwrap().contains("modules:"));
+        assert_eq!(std::fs::metadata(&real).unwrap().permissions().mode() & 0o777, 0o640);
+    }
+
+    /// Folders that only look like a module's — docs, tests, examples — do
+    /// not hold up the split.
+    #[test]
+    fn folders_that_are_no_modules_do_not_hold_it_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        sensei_like(root);
+        write(root, "docs/policies/README.md", "notes");
+        write(root, "tests/import/users.csv", "id\n");
+        write(root, "examples/ddl/demo.sql", "select 1;");
+        plan(root, &[]);
+    }
+
+    /// A hidden DDL file already in a would-be module's folder — which the
+    /// scanner reads — is a file there: refused.
+    #[test]
+    fn a_hidden_file_in_a_modules_folder_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        sensei_like(root);
+        write(root, "core/ddl/.wip/scratchpad.ddl", "select 1;");
+        let err = plan_from_scopes(&design(root), &[])
+            .expect_err("core/ holds a file")
+            .to_string();
+        assert!(err.contains("core/"), "{err}");
+    }
+}

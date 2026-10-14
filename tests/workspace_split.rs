@@ -216,3 +216,62 @@ fn the_plan_shows_what_it_writes() {
         assert!(text.contains(wanted), "{wanted}: {text}");
     }
 }
+
+/// A file git will not move back is moved back by hand, and the run says the
+/// index needs fixing — not left where it was moved to.
+#[cfg(unix)]
+#[test]
+fn a_put_back_git_refuses_is_moved_back_by_hand() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("sensei");
+    sensei_like(&dir);
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(["-c", "user.name=test", "-c", "user.email=test@example.com"])
+            .args(args)
+            .current_dir(&dir)
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "the project"]);
+    // A git whose `mv` works twice and then fails, forward and back.
+    let real = String::from_utf8(std::process::Command::new("which").arg("git").output().unwrap().stdout).unwrap();
+    let bin = tmp.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let count = tmp.path().join("mv-count");
+    fs::write(
+        bin.join("git"),
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = mv ]; then n=$(cat {count} 2>/dev/null || echo 0); n=$((n+1)); echo $n > {count}; \
+             if [ $n -gt 2 ]; then echo 'fatal: Unable to create index.lock' >&2; exit 128; fi; fi\nexec {} \"$@\"\n",
+            real.trim(),
+            count = count.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("git"), fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let out = Command::cargo_bin("dbd")
+        .unwrap()
+        .env_remove("DATABASE_URL")
+        .env("PATH", path)
+        .arg("-s")
+        .arg(&dir)
+        .args(["split", "--from-scopes", "--write"])
+        .output()
+        .unwrap();
+    let text = text(&out);
+    assert!(!out.status.success(), "{text}");
+    for file in [
+        "ddl/table/app/lookups.ddl",
+        "ddl/table/app/orders.ddl",
+        "ddl/table/dojo/sessions.ddl",
+    ] {
+        assert!(dir.join(file).exists(), "{file} is back: {text}");
+    }
+    assert!(text.contains("git add"), "{text}");
+}
