@@ -226,9 +226,14 @@ pub fn cmd_split(
         return Ok(());
     }
     dbd_core::split::write_split(&plan, config, project_dir)?;
+    let moved = match scripts {
+        0 => format!("Moved {files} files into the modules' folders"),
+        1 => format!("Moved {files} files into the modules' folders, and 1 import script to scripts/"),
+        n => format!("Moved {files} files into the modules' folders, and {n} import scripts to scripts/"),
+    };
     output::always(&format!(
-        "Moved: {moving}; wrote modules: and scopes: into {}. Each module's first deploy takes over what it \
-         declares from \"{}\".",
+        "{moved}, and wrote modules: and scopes: into {}. Each module's first deploy takes over what it declares \
+         from \"{}\".",
         config.display(),
         plan.project
     ));
