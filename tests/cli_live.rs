@@ -3763,3 +3763,66 @@ async fn reconcile_runs_the_manifests_hooks_around_what_it_reconciles() {
         "{said}"
     );
 }
+
+/// A project split into modules (#7 phase 3, slice 6): each module's first
+/// deploy says what it takes over from the project as it was, and the run
+/// says the project's record is retired once its modules hold everything.
+#[tokio::test]
+async fn a_project_split_into_modules_says_what_each_takes_over() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let write = |rel: &str, text: &str| {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+    let currencies = "set search_path to app;\ncreate table if not exists currencies (code text primary key);\n";
+    let orders = "set search_path to app;\ncreate table if not exists orders (\n  id integer primary key\n, \
+                  currency text references currencies (code)\n);\n";
+    write(
+        "design.yaml",
+        "project:\n  name: shop\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n",
+    );
+    write("ddl/table/app/currencies.ddl", currencies);
+    write("ddl/table/app/orders.ddl", orders);
+    let o = dbd(dir, &url, &["deploy"]);
+    assert!(o.status.success(), "the project's deploy: {}", combined(&o));
+
+    std::fs::remove_file(dir.join("ddl/table/app/currencies.ddl")).unwrap();
+    std::fs::remove_file(dir.join("ddl/table/app/orders.ddl")).unwrap();
+    write("shared/ddl/table/app/currencies.ddl", currencies);
+    write("core/ddl/table/app/orders.ddl", orders);
+    write(
+        "design.yaml",
+        "project:\n  name: shop\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n\n\
+         modules:\n  shared: {}\n  core:\n    depends_on: [shared]\n",
+    );
+
+    let o = dbd(dir, &url, &["deploy", "--dry-run"]);
+    let text = combined(&o);
+    assert!(o.status.success(), "{text}");
+    for line in [
+        "[dry-run] would adopt relation app.currencies from \"shop\"",
+        "[dry-run] would adopt relation app.orders from \"shop\"",
+    ] {
+        assert!(text.contains(line), "{line}: {text}");
+    }
+
+    let o = dbd(dir, &url, &["deploy"]);
+    let text = combined(&o);
+    assert!(o.status.success(), "{text}");
+    assert!(text.contains("adopting relation app.orders from \"shop\""), "{text}");
+    assert!(
+        text.contains("project \"shop\" is retired — its modules hold everything it held"),
+        "{text}"
+    );
+    let owners = owners_listed(dir, &url);
+    assert!(!owners.iter().any(|o| o.starts_with("shop (")), "{owners:?}");
+    assert!(
+        owners
+            .iter()
+            .any(|o| o == "shop/core (prod, v0) — owns 1: relation app.orders"),
+        "{owners:?}"
+    );
+}

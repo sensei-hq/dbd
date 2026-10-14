@@ -16158,3 +16158,268 @@ async fn a_workspace_reconcile_runs_its_manifests_hooks_once_around_its_modules(
     )
     .await;
 }
+
+// ── The workspace transfer rule (#7 phase 3, slice 6) ────────────────────────
+
+/// Write `files` under `root`.
+fn write_tree(root: &std::path::Path, files: &[(&str, &str)]) {
+    for (rel, text) in files {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, text).unwrap();
+    }
+}
+
+/// Move the file at `from` to `to`, under `root` — an entity changing module.
+fn move_file(root: &std::path::Path, from: &str, to: &str) {
+    let to = root.join(to);
+    std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+    std::fs::rename(root.join(from), to).unwrap();
+}
+
+const CURRENCIES: &str = "set search_path to app;\ncreate table if not exists currencies (code text primary key);\n";
+const COUNTRIES: &str = "set search_path to app;\ncreate table if not exists countries (code text primary key);\n";
+const ORDERS: &str = "set search_path to app;\ncreate table if not exists orders (\n  id integer primary key\n, \
+                      currency text references currencies (code)\n);\n";
+const SHOP_MODULES: &str = "project:\n  name: shop\n\nschemas:\n  - app\n\n\
+                            modules:\n  shared: {}\n  core:\n    depends_on: [shared]\n";
+
+fn load_shop(root: &std::path::Path) -> Vec<dbd_core::design::Module> {
+    dbd_core::design::Workspace::load(&root.join("design.yaml"), "dev", Some(root))
+        .expect("load the workspace")
+        .select(None)
+        .expect("select")
+}
+
+/// T22: a table moved from `shared` to `core` keeps its rows through a
+/// pruning reconcile — one nothing else uses, which the uses guard does not
+/// keep: `shared`, run first, leaves it for `core`, and `core` takes it over;
+/// neither drops it, nor creates it afresh.
+#[tokio::test]
+async fn t22_a_table_moved_to_a_dependent_module_keeps_its_rows() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_tree(
+        root,
+        &[
+            ("design.yaml", SHOP_MODULES),
+            ("shared/ddl/table/app/currencies.ddl", CURRENCIES),
+            ("shared/ddl/table/app/countries.ddl", COUNTRIES),
+            ("core/ddl/table/app/orders.ddl", ORDERS),
+        ],
+    );
+    deploy_modules(&url, &load_shop(root)).await;
+    let adapter = connect(&url, "shop/shared").await.unwrap();
+    adapter
+        .execute_script("INSERT INTO app.countries (code) VALUES ('NZ')")
+        .await
+        .unwrap();
+
+    move_file(
+        root,
+        "shared/ddl/table/app/countries.ddl",
+        "core/ddl/table/app/countries.ddl",
+    );
+    for module in load_shop(root) {
+        let adapter = connect(&url, module.owner()).await.unwrap();
+        module
+            .design()
+            .reconcile(
+                &*adapter,
+                false,
+                true,
+                dbd_core::design::Prune::On,
+                None,
+                Progress::none(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{}'s reconcile: {e}", module.owner()));
+    }
+
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.countries WHERE code = 'NZ'",
+        "the moved table's row",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        &owned_by("relation", "app", "countries", "table", "shop/core"),
+        "app.countries owned by shop/core",
+    )
+    .await;
+}
+
+/// T22, the other way: a table moved from `core` to `shared`, which runs
+/// first, is taken over by `shared` — not refused as `core`'s.
+#[tokio::test]
+async fn t22_a_table_moved_to_a_dependency_is_taken_over_by_it() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_tree(
+        root,
+        &[
+            ("design.yaml", SHOP_MODULES),
+            ("shared/ddl/table/app/currencies.ddl", CURRENCIES),
+            ("core/ddl/table/app/orders.ddl", ORDERS),
+            ("core/ddl/table/app/countries.ddl", COUNTRIES),
+        ],
+    );
+    deploy_modules(&url, &load_shop(root)).await;
+    let adapter = connect(&url, "shop/core").await.unwrap();
+    adapter
+        .execute_script("INSERT INTO app.currencies (code) VALUES ('USD'); INSERT INTO app.orders VALUES (1, 'USD')")
+        .await
+        .unwrap();
+
+    move_file(root, "core/ddl/table/app/orders.ddl", "shared/ddl/table/app/orders.ddl");
+    deploy_modules(&url, &load_shop(root)).await;
+
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.orders WHERE id = 1",
+        "the moved table's row",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        &owned_by("relation", "app", "orders", "table", "shop/shared"),
+        "app.orders owned by shop/shared",
+    )
+    .await;
+}
+
+/// T24's database side: a project split into modules hands its entities to
+/// them — each module takes over what it declares from the project as it
+/// was — and its record is retired once nothing of it is left.
+#[tokio::test]
+async fn t24_a_project_split_into_modules_hands_its_entities_over_and_retires() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_tree(
+        root,
+        &[
+            ("design.yaml", "project:\n  name: shop\n\nschemas:\n  - app\n"),
+            ("ddl/table/app/currencies.ddl", CURRENCIES),
+            ("ddl/table/app/orders.ddl", ORDERS),
+        ],
+    );
+    let project = Design::from_config_with_dir(&root.join("design.yaml"), "dev", Some(root)).expect("load");
+    let adapter = connect(&url, "shop").await.unwrap();
+    project
+        .deploy(&*adapter, false, None, |_| {})
+        .await
+        .expect("deploy shop");
+    adapter
+        .execute_script("INSERT INTO app.currencies (code) VALUES ('USD'); INSERT INTO app.orders VALUES (1, 'USD')")
+        .await
+        .unwrap();
+
+    move_file(
+        root,
+        "ddl/table/app/currencies.ddl",
+        "shared/ddl/table/app/currencies.ddl",
+    );
+    move_file(root, "ddl/table/app/orders.ddl", "core/ddl/table/app/orders.ddl");
+    std::fs::write(root.join("design.yaml"), SHOP_MODULES).unwrap();
+    let modules = load_shop(root);
+
+    let shared = connect(&url, "shop/shared").await.unwrap();
+    let preview: Vec<(String, String)> = modules[0]
+        .design()
+        .adoptions(&*shared)
+        .await
+        .expect("adoptions")
+        .into_iter()
+        .map(|h| (format!("{}.{}", h.object.schema, h.object.name), h.owner))
+        .collect();
+    assert_eq!(preview, [("app.currencies".to_string(), "shop".to_string())]);
+
+    // shared alone: shop still holds the orders, so its record stays.
+    deploy_modules(&url, &modules[..1]).await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM dbd.meta WHERE project = 'shop'",
+        "shop's record",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        &owned_by("relation", "app", "currencies", "table", "shop/shared"),
+        "app.currencies owned by shop/shared",
+    )
+    .await;
+
+    deploy_modules(&url, &modules).await;
+    for (what, predicate) in [
+        ("shop's record", "SELECT 1 FROM dbd.meta WHERE project = 'shop'"),
+        ("shop's claims", "SELECT 1 FROM dbd.objects WHERE owner = 'shop'"),
+        ("shop's uses", "SELECT 1 FROM dbd.uses WHERE owner = 'shop'"),
+    ] {
+        assert_catalog(&*adapter, false, predicate, what).await;
+    }
+    assert_catalog(
+        &*adapter,
+        true,
+        &owned_by("relation", "app", "orders", "table", "shop/core"),
+        "app.orders owned by shop/core",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.orders WHERE id = 1",
+        "the orders' row",
+    )
+    .await;
+}
+
+/// Only the project's own owners hand over: an owner by another name — even
+/// one the project's name begins — still refuses a module declaring what it
+/// holds.
+#[tokio::test]
+async fn a_module_takes_over_from_no_owner_outside_its_project() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let other = tmp.path().join("shopx");
+    write_tree(
+        &other,
+        &[
+            ("design.yaml", "project:\n  name: shopx\n\nschemas:\n  - app\n"),
+            ("ddl/table/app/countries.ddl", COUNTRIES),
+        ],
+    );
+    let shopx = Design::from_config_with_dir(&other.join("design.yaml"), "dev", Some(&other)).expect("load");
+    let adapter = connect(&url, "shopx").await.unwrap();
+    shopx
+        .deploy(&*adapter, false, None, |_| {})
+        .await
+        .expect("deploy shopx");
+
+    let root = tmp.path().join("shop");
+    write_tree(
+        &root,
+        &[
+            ("design.yaml", SHOP_MODULES),
+            ("shared/ddl/table/app/currencies.ddl", CURRENCIES),
+            ("shared/ddl/table/app/countries.ddl", COUNTRIES),
+            ("core/ddl/table/app/orders.ddl", ORDERS),
+        ],
+    );
+    let modules = load_shop(&root);
+    let shared = connect(&url, "shop/shared").await.unwrap();
+    let err = match modules[0].design().deploy(&*shared, false, None, |_| {}).await {
+        Ok(_) => panic!("app.countries is shopx's"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("app.countries") && err.contains("\"shopx\""), "{err}");
+}
