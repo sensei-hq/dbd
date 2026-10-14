@@ -12,6 +12,7 @@ All commands accept these options:
 | `--source` | `-s` | `.` | Project directory (`dbd deploy` also takes a GitHub repo) |
 | `--scope` | | (all) | Named scope from `scopes:` in design.yaml |
 | `--deps` | | (scope default) | Override scope's `deps` setting: `report` or `include` |
+| `--module` | | (every module) | In a [workspace](#workspaces), run this module and the modules it depends on — `reset` and `export`, this module alone |
 | `--verbose` | `-v` | | Show all details (entity list, full JSON) |
 | `--help` | `-h` | | Print help |
 | `--version` | `-V` | | Print version |
@@ -162,6 +163,79 @@ To host multiple modules in one database, define a scope in `design.yaml` that i
 Which commands filter by `--scope`, which also refuse on a dependency gap, and
 which ignore it is set out in [scopes](07-scopes.md#which-commands-honour-scope).
 
+### Workspaces
+
+A design.yaml that declares `modules:` is a **workspace**: each module is a design
+of its own, in its own folder, recorded in the database as its own owner,
+`<project>/<module>` (see [design.yaml](03-design-yaml.md) for the `modules:`
+block, and [scopes](07-scopes.md) for scopes that select modules). Every command
+runs one but `init` and `merge` (`install` reads no project).
+
+**Module by module.** A run goes over the modules in `depends_on` order — of
+those whose dependencies are in place, the one `modules:` lists first — each
+connecting as its own owner, under a header naming it:
+
+```
+$ dbd inspect
+module shared (shop/shared)
+Everything looks ok
+
+1 entities — no issues
+
+module core (shop/core)
+Everything looks ok
+
+1 entities — no issues
+```
+
+Each module keeps its own record in the database — its env, version and scope
+pin — and its own claims, and the guards read its own. A run over more than one
+module checks every module's run as its dry run checks it — scope pin, guards,
+claims, migrations, hook files, imports — before the first module writes, so a
+refusal any module would meet comes first. A statement the database refuses
+past those checks still stops the run with the modules before it applied, as
+one project's run stops with its earlier statements committed. The manifest's
+own `apply.before` runs once, before the first module's own hooks; its
+`apply.after` and `import.after` run once, after the last module's.
+
+**`--module <name>`** narrows the run to one module and the modules it depends
+on — `reset` and `export` take the module alone: a reset never drops a
+dependency's entities, which are another owner's, and an export only reads. An
+unknown name is refused naming the modules, and on a design without `modules:`
+the flag is refused:
+
+```
+Error: Config error: no module "nope" — design.yaml's modules: are shared, core
+Error: --module core: ./design.yaml declares no modules:
+```
+
+Under `--scope`, `--module` must be one of the scope's modules. With no
+`--scope`, a module asked for — `--module`, or the folder dbd runs in — that the
+`default` scope leaves out still runs, with its dependencies, each resolving its
+own `default`, else `all`.
+
+**`-n` in a workspace** runs the module declaring that entity, alone, with the
+manifest's hooks around it. One `--module` leaves out is refused, naming its
+module: `app.orders is module "core"'s, and --module shared does not select it`.
+
+**Inside a module's folder.** Run in a module's folder — one with no
+design.yaml of its own — dbd walks up, along the path the run was started in,
+to the nearest design.yaml that declares `modules:` and runs that module, as
+`--module` would, unless `--module` says otherwise; `-s <module folder>` does
+the same. Run in a folder of the workspace that no module holds, it runs the
+workspace. `init` and `install` do not walk up, and a design without modules is
+never looked for above.
+
+**`init` and `merge`** onboard a project into one design, so they refuse a
+workspace and say where one comes from:
+
+```
+Error: ./design.yaml declares modules: — init and merge onboard a project into one design; a project becomes a workspace with dbd split --from-scopes
+```
+
+A project becomes a workspace with [`dbd split`](#dbd-split); each database's
+first deploy afterwards hands each module what it declares.
+
 ---
 
 ## `dbd inspect`
@@ -190,7 +264,9 @@ whole design.
 it owns, the schemas it uses and what of other projects' it uses — which projects have not yet run a
 dbd that records what they own, and what would refuse this design there: an entity another project
 owns, or an owner name it reuses. It exits non-zero over any such conflict. It reports sharing
-only: it does not validate the design, and reads no `--scope`. See
+only: it does not validate the design, and reads no `--scope`. In a
+[workspace](#workspaces) it lists what shares the database once, then each
+module's conflicts under its header. See
 [sharing a database](14-sharing-a-database.md#seeing-what-shares-a-database).
 
 **`--from-db`** resolves "Unresolved reference" warnings against the live database catalog (tables, views, enums), using the `-d`/`--database` connection — useful when DDL references objects created outside the project. The resolved catalog is cached to `<project>/.dbd/refcache.json`, so subsequent **offline** `inspect` runs consult the cache and stay quiet without a connection.
@@ -413,6 +489,12 @@ applies them always.
 **Materialized views.** After entities apply, `dbd apply` (and `dbd deploy`) records a `dbd:hash` drift stamp for any matview it just created — and for one the database already had with no stamp, when its deployed query and index keys are the design's, so a brownfield project (`init --from-db`) diffs clean; one whose definition differs stays unstamped, since a stamp would vouch for a definition the design does not have. The stamp lives in `dbd.matview_stamps`, not in the matview's comment, which stays the author's own `COMMENT ON MATERIALIZED VIEW` (dbd before 0.25 kept the stamp *as* the comment; on upgrade the first `apply`, `deploy`, `reconcile` or `reset` copies it into `dbd.matview_stamps` before the file's own `COMMENT ON` can erase it, and leaves the comment for you to replace). The run also **syncs pg_cron refresh jobs** to match the `materialized_views:` config (jobs named `dbd-refresh:<project>:<schema>.<name>`, the project's own only; requires the `pg_cron` extension when a schedule is set). Matview DDL should be idempotent (`create materialized view if not exists …` + `create [unique] index if not exists …`) so a re-`apply` is safe.
 
 **Scope guard.** `apply` (like `deploy`/`reconcile`) refuses to run under a different scope than the database is pinned to, and pins the scope on every successful run. Pass `--allow-scope-change` to re-point the database — see [Scope guard](#scope-guard).
+
+**In a workspace** each module applies in turn, as its own owner, every module's
+run checked before the first writes (see [workspaces](#workspaces)), and
+`apply -n` applies the module declaring the entity. A module's migrations are
+its own: its `snapshots/` and `migrations/` are in its folder, and its version
+is `modules.<name>.version`.
 
 ---
 
@@ -689,6 +771,12 @@ from documented syntax, not run against a server. The full mapping and the repor
 
 Downgrades do not fail the run; assert on the `--report` count instead.
 
+**In a workspace** `emit` translates the modules a run selects — every one, or
+`--module`'s and what it depends on, or a scope's — as one schema: a key into a
+dependency's table is kept, the script creating that table too, and each
+module's statements follow a comment naming it (`-- module shared
+(shop/shared)`). A schema's grants, which every module has, are noted once.
+
 ## `dbd combine`
 
 Combine all DDL into a single SQL file.
@@ -705,6 +793,27 @@ dbd combine --scope hub --deps include  # Expand to the dependency closure first
 **In the project's dialect.** The files are concatenated as written, and the statements dbd generates around them follow `source.dialect`: `CREATE SCHEMA IF NOT EXISTS` for PostgreSQL; for T-SQL a guarded `IF SCHEMA_ID(N'x') IS NULL EXEC(N'CREATE SCHEMA [x]');`, with every entity's DDL then ending its own batch with `GO` — SQL Server needs `CREATE VIEW`, `CREATE PROCEDURE` and `CREATE TRIGGER` first in their batch, and a file that already ends in `GO` keeps its own; nothing for MySQL and SQLite, which have no schemas. Extensions and roles are PostgreSQL-only, so in a T-SQL, MySQL or SQLite script each becomes a comment saying it was not created. A file that does not parse is left out without a message — run `dbd inspect` first.
 
 **The `search_path` apply runs.** On a PostgreSQL project, after each top-level `SET search_path` whose path leaves `public` out, the output gets a statement of its own setting the same path with `public` added, exactly as `apply` runs the file — extensions are often installed in `public` — and a file that states no path gets the [`source.search_path`](03-design-yaml.md#search_path) one ahead of it (`SET search_path TO "app", "public";`), so `psql -f init.sql` succeeds where `apply` does and creates each object where `apply` would. The file's own text is copied unchanged: the statements are found in the parse tree, so a function's `SET search_path TO ''` clause, a body or a string literal is never touched. `-f` must resolve inside the project, as for `emit`; a bare name resolves against the project root.
+
+**In a workspace** `combine` writes one script over the modules a run selects,
+in `depends_on` order, each module's statements after a comment naming it, each
+entity once — the manifest's schemas included:
+
+```sql
+-- module shared (shop/shared)
+CREATE SCHEMA IF NOT EXISTS "app";
+set search_path to app;
+SET search_path TO "app", "public";
+create table if not exists currencies (code text primary key);
+
+
+-- module core (shop/core)
+set search_path to app;
+SET search_path TO "app", "public";
+create table if not exists orders (id integer primary key, currency text references currencies (code));
+```
+
+The `scope '…': N of M entities` line counts what the run writes, each entity
+once.
 
 ---
 
@@ -762,6 +871,23 @@ Table "auth"."users" {
 
 **Multi-document.** If `design.yaml` declares multiple `dbml.<key>` entries (each with its own `include`/`exclude`, `output`, `auto_group_by_schema`, `groups`), `dbd dbml` writes one file per key into the parent directory of `-f`, using each key's `output` (default `<key>.dbml`). See [design.yaml reference](03-design-yaml.md#dbml) for the full schema.
 
+**In a workspace** `dbml` documents the modules a run selects as one design:
+each table is defined once, from the module declaring it, so a Ref into a
+dependency's table lands on that table — and one a scope leaves out is a stub,
+typed from its module. A document with no groups of its own — no `groups`, no
+`auto_group_by_schema` — gets one `TableGroup` per module, each holding that
+module's tables (DBML puts a table in one group):
+
+```
+TableGroup "shared" {
+  "app"."currencies"
+}
+
+TableGroup "core" {
+  "app"."orders"
+}
+```
+
 ---
 
 ## `dbd graph`
@@ -782,6 +908,18 @@ Everything but the JSON goes to stderr, so `dbd graph | jq` — and `dbd graph -
 
 **`scope` (added in v0.12.0)** names the scope the graph was narrowed to, or is `null` for an unscoped run. It lives in the JSON rather than being printed beside it, because stdout here is a contract (`dbd graph | jq`) — and a graph silently missing a schema is indistinguishable from a complete one. Every other command that takes a scope — `inspect`, `apply`, `deploy`, `import`, `reconcile`, `diff`, `combine`, `emit`, `dbml`, `diagram`, `export`, `refresh`, `policies` and `reset`, and their dry runs — prints `scope '<name>': <kept> of <total> entities` instead (`diff --json` prints it on stderr, keeping stdout JSON); unscoped runs print nothing.
 
+**In a workspace** the graph spans the modules a run selects, and each node
+names the module declaring it:
+
+```json
+{ "module": "core", "name": "app.orders", "schema": "app", "type": "table" }
+```
+
+`-n` is the entity's subgraph across those modules — the entity and what it
+needs, whichever module declares it. An entity of a module the run does not
+select is refused naming it: `app.orders is module "core"'s, which the run does
+not select`.
+
 ---
 
 ## `dbd diagram`
@@ -797,6 +935,12 @@ dbd diagram --scope hub            # scope-aware (the scope's working set, its h
 ```
 
 `dbd diagram` prints the URL and opens your default browser; on a headless machine use `--print-url`. The `--json` output is the dbd-native schema model; drag the file onto the site's `/diagram` page, or feed it to other tooling. A `deps: include` scope whose closure needs something the scope excludes is refused, as every command refuses it, rather than drawn as an empty model. A file that does not parse is named (`⚠ … could not be parsed, so <entity> is left out: …`) and the rest is drawn, as `dbd dbml` does.
+
+**In a workspace** the model is the workspace's — the modules a run selects,
+each entity drawn once, in the module declaring it — and it names the modules
+and each entity's; the viewer groups its sidebar by module and tints the
+diagram by module or by schema. Each module's changelog is its own. See
+[the schema viewer](11-schema-viewer.md).
 
 ### The model JSON
 
@@ -969,6 +1113,15 @@ A table's policies, and a table's or a view's triggers, go with it, so they are 
 calling a function the scope also drops — a policy from `policies/`, or a trigger written in its
 function's file — does not refuse the reset. One on a table outside the scope still does.
 
+**In a workspace** reset drops each module before the modules it depends on —
+reverse `depends_on` order — each as its own owner, and `--module` resets that
+module alone, never its dependencies, which are other owners. Every module's
+reset is previewed first, each beside the modules reset before it — their uses
+and holdings do not hold it back, their prod marks still do — and the run is
+refused whole or run whole; its `--dry-run` passes where it passes. A schema
+that still holds a table another module now declares — moved there, not yet
+taken over — is kept, naming it.
+
 ---
 
 ## `dbd snapshot`
@@ -991,6 +1144,12 @@ Data corrections (*.data.sql) are generated automatically where possible. Non-de
 A table removed from the design is written as its `DROP TABLE … CASCADE` in `migrations/<NNN>/<schema>/<table>.sql`, the file every per-table migration uses, and the next `dbd apply` runs it. A hand-written `<table>.drop.sql` there takes precedence. The drop runs only where the table still exists, and the summary counts only the drops that ran. (Before 0.25 apply looked only for `<table>.drop.sql`, so a generated drop never ran while the migration was recorded as applied.)
 
 `dbd snapshot` sets `project.version` by editing `design.yaml` in place: its comments, blank lines and flow-style lists stay as you wrote them.
+
+**In a workspace** each module is snapshotted on its own, in its folder, at its
+own version — every module, or the one `--module` names, never a scope: a
+snapshot records the design — and its version is written under
+`modules.<name>.version`, in place. `--list` lists each module's snapshots
+under its header.
 
 ---
 
@@ -1022,6 +1181,9 @@ A database [pinned](#scope-guard) to a scope is noted — `note: this database i
 the whole project's.
 
 Use `dbd apply` to execute pending migrations. There is no separate migrate --apply.
+
+**In a workspace** each module's status is shown under its header: each module
+has its own version.
 
 ---
 
@@ -1117,6 +1279,37 @@ SQLite file that does not exist yet is not created; with none configured it
 stays offline. Like `apply`, the run and its preview name each DDL file that
 states no `SET search_path`, and a run without `-e` that promotes a dev
 database to prod says so.
+
+**In a workspace** a deploy goes over the modules twice — every module's schema
+(its apply and grants), then every module's data (its import and policies) — so
+no module migrates after the import has emptied the tables it reloads:
+
+```
+Deploying from source: .
+module shared (shop/shared)
+Applying schema...
+1 entities applied (no project.version — the database is not versioned).
+
+module core (shop/core)
+Applying schema...
+1 entities applied (no project.version — the database is not versioned).
+
+Loading data...
+module shared (shop/shared)
+Import complete — 1 table(s) loaded, 0 procedure(s) called, 0 after script(s) run. 0 policy file(s) applied.
+
+module core (shop/core)
+Import complete — 1 table(s) loaded, 0 procedure(s) called, 0 after script(s) run. 0 policy file(s) applied.
+```
+
+The import reloads as one project's does: the first module's import empties,
+together, every table the run reloads that exists by then, in load order by the
+database's keys, and the others empty none — so `shared`'s reference data
+reloads with the `core` tables that hold keys to it. `deploy --module shared`
+alone cannot empty `shared`'s tables under `core`'s keys, and fails before its
+import empties anything — on PostgreSQL naming the keys that hold them. An import that fails
+partway names what it emptied and did not reload: `the import emptied … to
+reload them and stopped before it did — run it again once this is fixed`.
 
 ---
 
@@ -1269,6 +1462,20 @@ Because introspected and hand-written DDL can spell a default or exotic type dif
 reconcile may occasionally emit a redundant (harmless) `ALTER … SET DEFAULT`/`TYPE`; review with
 `--dry-run` first.
 
+**In a workspace** reconcile goes over the modules a run selects, each as its own
+owner. A released module changes by snapshot and `dbd apply`: the module
+`--module` names is refused if it is released, and a released module the run
+takes in otherwise — a dependency included — is left out, saying so, before the
+manifest's hooks attach, so they run around the modules reconciled:
+
+```
+module shared is released — it changes by `dbd snapshot` and `dbd apply`; reconcile leaves it out.
+```
+
+A module's `--prune` keeps what another module of the workspace declares: it is
+moving there, and that module's run takes it over (see
+[`dbd split`](#dbd-split) and [sharing a database](14-sharing-a-database.md)).
+
 ---
 
 ## `dbd diff`
@@ -1327,6 +1534,16 @@ pooled connection can inherit from an earlier DDL file, so a bare `nextval('s')`
 still read as drift now and then. A negative default (`-1`, which Postgres reports as
 `'-1'::integer`) and a `varbit` column read as drift on every run.
 
+**In a workspace** `diff` answers for every module the run selects, under its
+header. `--exit-code` exits 2 when any module drifts, and `--json` writes one
+document, each module's diff under its name — a project's is its diff, as
+before — with the headers on stderr:
+
+```json
+{ "modules": [ { "module": "shared", "owner": "shop/shared", "diff": { … } },
+               { "module": "core", "owner": "shop/core", "diff": { … } } ] }
+```
+
 ---
 
 ## `dbd release` (alias `dbd baseline`)
@@ -1352,6 +1569,14 @@ when `project.version` disagrees with the latest snapshot. See
 
 `dbd release` sets `released: true` by editing `design.yaml` in place, keeping its comments,
 blank lines and flow-style lists.
+
+**In a workspace** each module releases on its own, at its own version, its
+baseline in its folder, written under `modules.<name>.released`: `--module`
+releases that module; a bare `dbd release` releases every module not yet
+released, saying of each that is (`module shared is already released.`), and
+refuses only when every module is (`Every module is already released.`). Every
+module is checked before any is written, so a release refused for one module
+leaves design.yaml as it was.
 
 ---
 
@@ -1404,6 +1629,11 @@ entry the scope leaves out is named (`export: X is outside scope 'S' — not exp
 counts what it writes by kind — `Exporting 2 table(s) and 1 view(s)...`. A database
 [pinned](#scope-guard) to another scope is refused before a file is written. See
 [import and export](10-data.md#export).
+
+**In a workspace** export reads every module, or `--module`'s alone, each into
+its own folder (`Files written to ./shared/export`); `-n` exports from the
+module declaring the table, and a table no module the run selects declares is
+refused (`no module selected declares app.x`).
 
 ---
 
@@ -1773,6 +2003,142 @@ unset). The only thing this changes is whether the merge proceeds at all:
 
 ---
 
+## `dbd split`
+
+Divide a project into a [workspace](#workspaces) of modules. `--from-scopes` is
+the one way it divides one yet: each region of the project's scopes becomes a
+module.
+
+```sh
+dbd split --from-scopes                          # print the plan; change nothing
+dbd split --from-scopes -v                       # … with each module's entities and each file's move
+dbd split --from-scopes --rename shared=common   # name a module of the plan otherwise
+dbd split --from-scopes --write                  # move the files, write modules: and scopes:
+dbd split --undo                                 # put back what an interrupted --write moved
+```
+
+**The regions.** Each scope's entities are taken with their dependencies —
+`deps: include`, whatever the scope says — and an entity's region is the set of
+scopes holding it. What every scope deploys — a role from `ddl/role/` — is in
+all of them; the manifest's schemas and extensions are every module's. The
+region every scope holds (of two or more) is `shared`; a region only one scope
+holds is named for that scope, `default` as `core`; one several hold, their
+names joined with `-`; one no scope holds, `unscoped`. Empty regions are
+dropped. `--rename <module>=<name>` names a module of the plan otherwise, each a
+valid module name.
+
+**The plan.** Without `--write`, `split` prints the plan and changes nothing:
+
+```
+sensei splits into 3 modules, by its scopes:
+  shared   in default and dojo   1 entity
+  core     only in default       1 entity   depends on shared
+  dojo     only in dojo          1 entity   depends on shared
+Its scopes become:
+  default: modules [core], excludes [dojo]
+  dojo: modules [dojo]
+4 files move into the modules' folders, and 1 import script to scripts/. Run again with --write to move them and write modules: and scopes: into design.yaml.
+```
+
+Each module `depends_on` the modules its entities reference — a type a file
+creates beside its table is that table's module's, as the workspace's gap check
+reads it. Each scope becomes `modules:` — the modules of the regions it holds,
+less those another of them depends on, which it takes along — keeping its
+`extensions:`, with `excludes:` naming the manifest's schemas it did not deploy
+(every module has them); an `all` scope stays `all`. A cycle among the modules'
+dependencies is shown, and refuses `--write`.
+
+**`--write`** moves each DDL file to the folder of the module its entity is in,
+and each import data file and policy file to the folder of the module its table
+is in — with `git mv` in a git work tree, so history follows the files — moves
+the manifest's `import.after` scripts under `import/` to `scripts/`, rewriting
+their paths, and writes `modules:` and the new `scopes:` into design.yaml in
+place, the rest as it was — comments and line endings included, and through its
+link if design.yaml is one:
+
+```yaml
+import:
+  after:
+    - scripts/loader.sql
+
+modules:
+  shared: {}
+  core:
+    depends_on: [shared]
+  dojo:
+    depends_on: [shared]
+
+scopes:
+  default:
+    modules: [core]
+    excludes: [dojo]
+  dojo:
+    modules: [dojo]
+```
+
+It is whole or not at all. It first makes the workspace in a scratch folder and
+refuses unless it loads and deploys — under each scope, and with none — exactly
+what the project does now (`as a workspace, the project would not deploy what it
+does: …`, naming each difference). It writes the new manifest aside and keeps a
+journal of its moves, `.dbd-split`, in the project folder, with the manifest as
+it was; a move that fails — or a file git tracks that `git mv` will not move —
+puts back every move before it, and a move git will not put back is made by
+hand, saying to run `git add -A`. The journal goes when the split is done; while
+it is there, every command is refused:
+
+```
+Error: Failed to load design: Config error: a dbd split was interrupted here — its journal ./.dbd-split lists the files it moved, and design.yaml may not declare the modules yet: run `dbd split --undo` to put them back, then split again
+```
+
+`dbd split --undo` puts back each file the journal lists that has moved, newest
+first, puts design.yaml back as it was, and removes the journal.
+
+**Refused before anything moves:**
+
+- a workspace (`declares modules: — it is a workspace already`), or a design
+  without scopes;
+- a project with `snapshots/` or `migrations/`: a migration is SQL over several
+  tables and does not divide by module, so a project splits before its first
+  release;
+- a file that does not parse, since what it references — and so its module — is
+  unknown;
+- a schema only a file's path names — add it to `schemas:` first;
+- a scope that leaves out what its entities need (`deps: report` with a gap) —
+  as modules it would deploy that too; include it, or give the scope
+  `deps: include`;
+- a file of `ddl/`, `import/` or `policies/` that maps to no module, a DDL file
+  declaring entities of two modules, two files moving onto one path, or onto a
+  path already taken;
+- a module name that cannot name an owner or a folder (give it another with
+  `--rename`), or one that differs from another only in case;
+- a module folder that already holds files, and a folder holding a module's DDL
+  — an earlier split's leftovers;
+- a file reached through a link from outside the project, which is another
+  folder's to keep.
+
+**Each database's first deploy** after the split runs the workspace transfer
+rule: each module takes over, as it claims, what it declares from the project as
+it was — and from the workspace's other modules, which is how an entity moved
+between modules later changes hands — and says so, as `--adopt-from` does
+(`[dry-run] would adopt …` in a preview):
+
+```
+adopting relation app.orders from "sensei"
+```
+
+Once its modules hold everything the project held, the project's record is
+retired — its `dbd.meta` row, its uses and its claims of what is gone; its
+`dbd.migrations` rows stay, as history:
+
+```
+project "sensei" is retired — its modules hold everything it held
+```
+
+Nothing else changes hands: an owner by any other name still refuses the run.
+See [sharing a database](14-sharing-a-database.md).
+
+---
+
 ## `dbd format`
 
 Format DDL files to project conventions.
@@ -1836,6 +2202,9 @@ User's `.pre-commit-config.yaml`:
 ```
 
 Both set `pass_filenames: false` — the hook scans the project itself, so pre-commit invokes it with no positional args.
+
+**In a workspace** format goes over each module's folder — or `--module`'s, or
+the module folder dbd runs in — reading files, not designs.
 
 ---
 
@@ -1904,6 +2273,10 @@ A file that is not in `policies/<schema>/<table>.sql` form has no derivable
 target and always applies — scope filtering is a correctness aid, not a
 security boundary. Do not rely on a scope to *prevent* a policy running.
 
+**In a workspace** each module applies its own `policies/`. A policy failing in
+one module is reported, the modules after it still run, and the run fails at
+the end.
+
 ---
 
 ## `dbd doctor`
@@ -1954,6 +2327,11 @@ Extension and schema files must be replaced by hand (see above).
 
 `--fix` leaves these too, and counts them the way it counts what it found —
 `0 issues fixed, 3 left to fix by hand.` `doctor` always exits 0.
+
+**In a workspace** doctor audits each module's folder, or `--module`'s. A
+design.yaml that declares `modules:` is never migrated — the migration would
+rebuild it without them — so its old entries are reported, to fix by hand, and
+a design.yaml it cannot read is named as an issue, with the error.
 
 ---
 

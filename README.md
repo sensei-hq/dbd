@@ -273,6 +273,35 @@ scope 'hub': 7 of 12 entities
 Error: 1 dependency gap(s) in scope 'hub' — add them to the scope, or run with --deps include
 ```
 
+## Workspaces
+
+A project that has outgrown one design becomes a **workspace**: a `modules:`
+block divides it into modules, each a design of its own — its own folder,
+owner (`<project>/<module>`), version and history — deployed in `depends_on`
+order. A module references what its dependencies declare without `external:`
+entries; a reference past `depends_on`, or two modules declaring one entity, is
+refused before any database is touched.
+
+```yaml
+modules:
+  shared: {}                 # shared/ddl/…, shared/import/…
+  core:
+    depends_on: [shared]
+  dojo:
+    depends_on: [shared]
+
+scopes:
+  dojo:
+    modules: [dojo]          # dojo and what it depends on
+```
+
+Every command runs the modules in order (`reset` in reverse); `--module core`
+runs one with its dependencies, and running inside a module's folder runs that
+module. A scoped project becomes a workspace with `dbd split --from-scopes`
+(`--write` to move the files); on each database, the modules take over the
+project's entities on their first deploy. See [design.yaml](docs/guide/03-design-yaml.md)
+and [sharing a database](docs/guide/14-sharing-a-database.md).
+
 ## Materialized views
 
 Materialized views are a first-class entity type, discovered from

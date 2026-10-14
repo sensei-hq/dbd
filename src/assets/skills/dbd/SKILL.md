@@ -84,6 +84,7 @@ policy on N table(s) in exposed schema(s)" report.
 |---|---|
 | `dbd init` | Scaffold a project (`--target postgres\|supabase`); or reverse-engineer one with `--from-db <conn>` (a Supabase DB gets a `supabase` target, and only there are its platform schemas left out; extensions go in the target's `extensions:`, FK targets outside the project in `external:`; every schema left out is named, and a schema nothing was captured in is left out of `schemas:` unless `--schema` named it; re-runnable DDL — an enum inside `DO … EXCEPTION WHEN duplicate_object` — so it applies back to its own DB, and to a fresh one, with an empty `diff` — for what dbd models: a domain or composite type is neither captured nor named, so a column typed with one fails on a fresh DB; identity `START`/`INCREMENT`, storage parameters, column `STORAGE`, RLS and its policies, and comments on constraints, indexes and functions are dropped without a word; a default holding a backslash reads as drift). It captures a table's triggers into its file (`CREATE OR REPLACE TRIGGER`; a constraint trigger after `DROP TRIGGER IF EXISTS`) and a view's `INSTEAD OF` triggers into the view's, EXCLUDE constraints, column collations, and a FK's `DEFERRABLE`/`INITIALLY DEFERRED`/`MATCH FULL`; leaves out every object an extension owns; folds a partitioned table's partitions into it as one plain table; and names, as a warning, what it cannot carry — `NOT VALID`/`NOT ENFORCED`/`NO INHERIT`, a PK's or UNIQUE's deferral, `UNLOGGED`, inheritance, partitioning, a disabled trigger. `--schema X` declares the extensions the captured objects use (in `public` or a captured schema) and prints a `needs:` line, naming the users, for every other type, function or table they need from outside — the empty diff then holds on a database that has those. `--from-dbml <file>` reads DBML as @dbml/core does (aliases, inline `ref:`, multi-line notes, `Note { }`, one-line tables @dbml/core accepts — anything after a column, an enum value or a header on its line is refused, naming it — a bare `pk`/`unique` after a type, a `pk` index entry, `Ref name:`, index `type:`), every name read back as itself; a one-to-one `Ref: a - b` keys `b`, an inline `[ref: - t.c]` its own column; a `<>` Ref or a `TablePartial` is refused; a `dbd dbml` stub comes back as `external:`; refuses a DB dbd manages for this project — use `merge` — but onboards beside another project's, leaving out (named) what other projects own and declaring `external:` what it depends on of theirs; refused while a project there has not run a dbd that records what it owns |
 | `dbd merge` | Sync a live DB / DBML back into the project (reverse + reconcile; edits only `project.version` in `design.yaml`). Never captures a table `design.yaml` declares `external:` (names it, left out), never tells you to declare external a table the project builds, keeps a table file's triggers (a SQLite table's too; `merge --from-dbml`, whose document holds none, keeps the triggers written in each table or view file it rewrites, with their `SET search_path`), warns about an undeclared extension or external table for you to add, and names only the schemas it wrote files into. Leaves out what other projects own in the DB, naming each, and says whose a file's entity is rather than calling it an orphan. `merge --schema` prints no `needs:` lines |
+| `dbd split --from-scopes` | Divide a scoped project into a **workspace** (see below): each region of its scopes becomes a module — `shared` for the one every scope holds, the scope's name for one a scope alone holds (`default` → `core`), `unscoped` for none — with `depends_on` inferred and each scope rewritten as `modules:`. Prints the plan; `--write` moves the files (`git mv` in a git work tree) and writes `modules:`/`scopes:` into design.yaml in place, whole or not at all; `--undo` puts back an interrupted `--write`; `--rename module=name`. Refuses a project with `snapshots/`/`migrations/` — split before the first release |
 | `dbd inspect` | **Validate**: report entity errors/warnings + scope gaps. **Exits 1 on blocking errors** (since v0.12.0 — was always 0). Under `--scope`, splits errors (and warnings) into the scope's vs out-of-scope and runs its advisory checks over the scope; `-n` counts and advises on that entity alone (an `external:` name is refused); `--fix --scope` formats only the scope's files; a `ddl/extension/` or unlisted `ddl/schema/` file is an error (declare it in design.yaml). `--from-db` resolves refs against the live catalog and caches to `.dbd/refcache.json`. **Offline & no SQL execution** — except `--shared`, which reads the DB: each project, what it owns and uses, and this design's conflicts there (exit 1 over any) |
 | `dbd apply` | Apply schemas + entities + pending migrations (blocks on migration TODOs) — one dependency sort, one transaction on PostgreSQL (`DBD_NO_TX` opts out) except where a version adds enum values (see below) — then `apply.after`, then grants. `--with-policies` also applies RLS. Names each DDL file that states no `SET search_path` before it runs. **Refuses** a `-e dev` run on a DB marked prod, a project older than the DB (`version guard: the database is at v3, but this project is at v2` — no override, but for a reused owner name taken over with `--allow-ownership-change`), and `-n <entity>` while migrations are pending (it would record versions it never ran — run `dbd apply` first). `--dry-run` runs apply's own gates (a missing hook file and a migration TODO included), refuses where apply would, and names the hooks a scope would skip; given a database it also checks the pin, the env and version guards and the `-n` refusal, and lists pending migrations in run order (`⚠` on drops) — a SQLite file that does not exist yet is not created, and reads as no database. Scope-guarded — `--allow-scope-change` to re-pin. **Beside other projects**: claims every entity the whole design declares; refused for one another project owns, under an owner name whose entities it declares none of (`--allow-ownership-change`), or for a migration dropping what another project depends on; `--adopt-from <owner>` takes over what the design declares that `<owner>` holds, printed |
 | `dbd deploy --source owner/repo/path` | Fetch → apply → **grants** → import → **apply RLS policies**. The only command that takes a GitHub source (`GITHUB_TOKEN` for private repos, sent to `api.github.com` only); others refuse one. `--no-cache` / `--clear-cache`. What the import phase would refuse (`import.staging`, a loader tie, a loader the scope leaves out) is refused before anything is applied, as are apply's guards (`-e dev` on a prod DB, an older project). Names each DDL file that states no `SET search_path`, as `apply` does. `--dry-run` gates like the real run and reports after scope filtering — given a database, the pin, the env and version guards and pending migrations too. Scope-guarded — `--allow-scope-change` to re-pin. `--adopt-from`, `--allow-ownership-change` as on `apply` |
@@ -132,11 +133,12 @@ A PostgreSQL URL that cannot be reached fails within 5 seconds, naming its
 `host:port` (never the URL, which may hold a password).
 
 **Global scope flags**: `--scope <name>` selects a `scopes:` subset; `--deps
-report|include` overrides its gap policy. **Gap-gated** (refuse on a dependency
+report|include` overrides its gap policy. In a workspace, `--module <name>` runs
+that module and the modules it depends on (`reset`/`export`: that module alone). **Gap-gated** (refuse on a dependency
 gap under `report`): `inspect`/`apply`/`import`/`deploy`/`reconcile`/`diff`.
 **Filter-only**: `dbml`/`combine`/`emit`/`graph`/`diagram`/`export`/`reset`/
 `refresh`/`policies`. **Ignored with a warning** (`--scope` or `--deps` alike):
-`snapshot`/`release`/`migrate`/`doctor`/`init`/`merge`/`format`/`install`. `all`
+`snapshot`/`release`/`migrate`/`doctor`/`init`/`merge`/`split`/`format`/`install`. `all`
 and `default` are reserved scope names (`--scope all` = full set; `default` =
 what a run without `--scope` builds). One design → many DBs:
 `dbd deploy --scope hub --database $HUB_URL`. Every command that takes a scope
@@ -189,9 +191,9 @@ bypass — none re-pins, so run them under the pinned scope or re-point the data
 with `apply` first).
 Databases created before this feature are unpinned and aren't blocked until their
 next write pins them; a missing `--scope` resolves to the `default` scope (or
-`all`) and pins on first write. To legitimately host multiple modules in one
-database, define a named scope in `design.yaml` that includes them, rather than
-re-pinning back and forth.
+`all`) and pins on first write. To legitimately host several parts of a project
+in one database, define a named scope in `design.yaml` that includes them — or
+make them a workspace's modules — rather than re-pinning back and forth.
 
 ## Critical gotcha — inspect ≠ apply
 
@@ -393,6 +395,53 @@ most). Move an entity with `--adopt-from <owner>`; take over a reused name with
 `--allow-ownership-change`; see what shares a database with `dbd inspect
 --shared`. Guide: https://dbd.sensei-hq.com/guide/sharing-a-database
 
+## Workspaces and modules
+
+A `modules:` block in design.yaml makes the project a **workspace**: modules, each
+a design of its own, deployed in `depends_on` order. A design without `modules:`
+is unchanged.
+
+```yaml
+modules:
+  shared: {}                     # folder shared/ — its own ddl/, import/, policies/, snapshots/, migrations/
+  core:
+    depends_on: [shared]         # may reference what shared declares — no external: needed
+  dojo:
+    depends_on: [shared]
+    path: dojo-db                # folder (default: the module's name)
+    version: 2                   # each module's own version and `released:` live here
+scopes:
+  dojo:
+    modules: [dojo]              # dojo + what it depends on, whole
+```
+
+- **Each module is its own owner** — `<project>/<module>` — with its own record,
+  entities, version, `snapshots/` and `migrations/`. `project.version` and
+  `project.released` are refused in a workspace; `dbd snapshot`/`release` write
+  `modules.<name>.version`/`released`. A released module changes by `dbd snapshot
+  --module <name>` + `dbd apply`; `reconcile` leaves it out (or refuses it, when
+  asked for it).
+- **Files live in the module's folder**, never in a root `ddl/`, `import/`,
+  `policies/`, `snapshots/` or `migrations/` — those refuse the workspace.
+- **References follow `depends_on`**: a module referencing another it does not
+  depend on (directly or through a dependency) is refused at load, naming the
+  module to add (`✗ dependency gap: … — add dojo to modules.core.depends_on`); two
+  modules declaring one entity are refused too. Fix by adding the dependency or
+  moving the file — never with `external:`.
+- **Running**: every command but `init`/`merge` runs the modules in order, each
+  headed `module <name> (<owner>)` (`reset` in reverse). `--module <name>` narrows
+  to it and its dependencies; run inside a module's folder, dbd walks up to the
+  workspace and runs that module. The manifest's `apply:` hooks run once around
+  the run; `modules.<name>.apply` is the module's own. `dbml`/`diagram`/`graph`/
+  `combine`/`emit` read the modules as one design; the viewer groups by module.
+- **Moving an entity between modules is safe**: move its file. Each module takes
+  over what it declares from the other modules — and, after a split, from the
+  project as it was, whose record is retired once nothing of it is left (the
+  workspace transfer rule) — so a moved table keeps its rows and nothing is pruned.
+- **Converting**: `dbd split --from-scopes` (print the plan, then `--write`) on a
+  pre-release project; its next deploy on each database hands the old project's
+  entities to the modules. Guide: https://dbd.sensei-hq.com/guide/design-yaml
+
 ## Self-check before you touch a dbd project
 
 - **Right workflow for the release state** (above) — the #1 mistake is `reconcile` on a released project or hand-migrations on a pre-release one.
@@ -406,6 +455,7 @@ most). Move an entity with `--adopt-from <owner>`; take over a reused name with
 - **CSV headers name columns.** A CSV/TSV loads by its header on both engines; a header naming a column the table lacks (or with a space after a comma) is refused. With `import.staging` set, every data file must sit under one of its schemas.
 - **Post-DDL SQL belongs in `apply.after`, not `import.after`** — `import.after` runs only with the import phase (`dbd import`, `dbd deploy`), so on `dbd apply` it silently does nothing. Move any "run once every entity exists" hook (realtime publications, grants) to `apply.after`, and declare `writes:` when the tables are `format()`/`array[…]` data rather than SQL identifiers.
 - **`dbd inspect` exits 1 on blocking errors** (v0.12.0+). Safe to use as a CI gate; a pipeline that relied on it always exiting 0 will now fail on a broken design.
+- **A workspace?** (`modules:` in design.yaml) Put each file in its module's folder, add a module to `depends_on` when one references another, and run one module with `--module` (or from its folder). Version and release per module (`modules.<name>.version`), never `project.version`.
 - **Sharing a database?** Never declare another project's table — reference it under `external:`; move one with `--adopt-from`. Check `dbd inspect --shared` before a deploy, and expect a refusal, not a silent drop, when another project depends on what you remove.
 - **Don't rename `project.name` on a deployed project.** dbd keys its record of a database on it: the guards hold a renamed project to the old record, and the ownership registry refuses it the entities its old name holds (`--adopt-from <old name>` takes them over); in a DB from before the registry, a run that trips none records a second row, and a design ahead of the old version is planned as a fresh install — its pending migrations never run.
 - **Scoped prune needs dbd ≥ 0.24.1.** Never run `reconcile --prune --scope …` with an older binary — it dropped the design's own out-of-scope tables (#40).

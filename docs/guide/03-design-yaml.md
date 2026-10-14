@@ -87,6 +87,10 @@ releases it at the version its latest snapshot reached. See
 `dbd snapshot` and `dbd release` change these two keys by editing `design.yaml`
 in place — its comments, blank lines and flow-style lists stay as written.
 
+In a design with [`modules:`](#modules) each module has a version and a release
+state of its own, so `project.version` and `project.released` are refused there
+— set `modules.<name>.version` / `released` instead.
+
 ### `source`
 
 | Field     | Type   | Default      | Description |
@@ -344,6 +348,136 @@ and never a [scope](#scopes) dependency gap; `dbd dbml` draws it as a stub
 table. Only `name` is read — `note` documents it for people, and a `columns:`
 list is parsed but not used.
 
+### `modules`
+
+A project that has grown into parts — shared reference data, the core
+application, an add-on with its own database — can declare them as
+**modules**. A `design.yaml` with a `modules:` block is a **workspace**: each
+module is a design of its own, in a folder of its own, with its own owner,
+version and history in the database. A `design.yaml` without one is a workspace
+of one, exactly as before.
+
+```yaml
+project:
+  name: shop
+
+schemas:
+  - app
+  - dojo
+
+apply:
+  after: [hooks/publications.sql]   # runs once, around the whole run
+
+modules:
+  shared:
+    note: Reference data every part reads
+  core:
+    depends_on: [shared]
+    apply:
+      after: [hooks/core-after.sql] # core/hooks/core-after.sql
+  dojo:
+    depends_on: [shared]
+    path: addons/dojo                # default: dojo/
+```
+
+```
+shop/
+  design.yaml          # the manifest
+  hooks/publications.sql
+  shared/
+    ddl/table/app/currencies.ddl
+    import/app/currencies.csv
+  core/
+    ddl/table/app/orders.ddl
+    policies/app/orders.sql
+    hooks/core-after.sql
+    snapshots/  migrations/
+  addons/dojo/
+    ddl/table/dojo/sessions.ddl
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `note` | string | — | The module's description — markdown, carried into the schema model `dbd diagram --json` writes |
+| `depends_on` | list | `[]` | The modules this one references, deployed before it |
+| `path` | string | `<name>/` | Its folder, relative to the project directory |
+| `version` | u32 | — | As `project.version`, for this module — written by `dbd snapshot` and `dbd release` |
+| `released` | bool | `false` | As `project.released`, for this module — set by `dbd release` |
+| `apply` | object | — | This module's own `apply.before` / `apply.after` hooks, read from its folder |
+
+An unknown key in a module's block is refused, so a misspelt `depends_on` cannot
+quietly leave a module without its dependencies.
+
+**A module's folder** holds what a project's root holds: `ddl/`, `import/`,
+`policies/`, `snapshots/`, `migrations/` and its hook scripts. Everything else is
+the manifest's and shared by every module — `source`, `target`, `schemas`,
+`external`, `import` options, `export`, `ignore`, `dbml`, `format`,
+`materialized_views`. The folder is the project directory's (`--source`, as
+`ddl/` is), and it is a folder of its own: not the project's own (`path: .`),
+not inside another module's, not shared — a module that moves to a repository
+of its own takes its folder with it.
+
+**Owners.** Each module runs as the owner `<project>/<module>` — `shop/core` —
+with its own record in the database, its own claims and its own uses, as two
+projects sharing a database keep theirs (see
+[sharing a database](14-sharing-a-database.md)). A module references what the
+modules it depends on declare without `external:` entries: their entities
+resolve its references, and are never its own to build, claim or drop.
+
+**Run order.** A run goes over every module in `depends_on` order — of the
+modules whose dependencies are in place, the one `modules:` lists first — each
+as its owner, under a heading `module core (shop/core)`; `reset` goes in
+reverse. `--module <name>` runs one module with every module it depends on
+(`reset` and `export` take the module alone). The manifest's own `apply:` hooks
+run once around the whole run — `apply.before` ahead of the first module's,
+`apply.after` behind the last's — read from the project folder; so does
+`import.after`, once, after the last module's import. A module's own `apply:`
+runs with that module. Each `export:` entry is exported by the module declaring
+its entity.
+
+**Running inside a module's folder.** Run from a folder that holds no
+`design.yaml` of its own, dbd walks up to the nearest `design.yaml` that declares
+`modules:` — as Cargo finds its workspace — and runs the module whose folder you
+are in (`--module` says otherwise). `-s <module folder>` does the same. Run in a
+folder of the workspace no module holds, it runs the whole workspace. `init` and
+`install` never walk up, and a design without modules is not looked for above.
+
+**What is refused when the workspace loads** — by every command, before any
+database is involved:
+
+- a module name outside `[A-Za-z0-9_][A-Za-z0-9_-]*`, or one YAML reads as
+  other than a string (`2024`, `true`, `no`, `null`) — it names an owner and a
+  folder;
+- `project.version` or `project.released`;
+- a `depends_on` naming a module `modules:` does not declare, or a cycle,
+  named: `modules depend on each other in a cycle: core → dojo → core`;
+- a folder outside the project, the project's own, inside another module's,
+  shared with another, or missing;
+- files in a root `ddl/`, `import/`, `policies/`, `snapshots/` or
+  `migrations/` (dotfiles such as `.gitkeep` aside) — they belong to no module;
+- **two modules declaring the same entity** — an entity belongs to one module:
+  keep it in one, and list that module in the `depends_on` of the others that
+  use it;
+- **a reference past `depends_on`** — a module references only its own entities
+  and those of the modules it depends on, directly or through theirs. The
+  refusal names the module to add:
+
+  ```
+  ✗ dependency gap: app.orders (core) requires dojo.sessions (dojo) — add dojo to modules.core.depends_on
+  ```
+
+  This counts what a file creates beside its entity too — a type created in a
+  table's file is that table's module's.
+
+**Becoming a workspace.** `init` and `merge` onboard a project into one design
+and refuse a workspace; a project that already divides its work with
+[scopes](#scopes) becomes a workspace with
+[`dbd split --from-scopes`](07-scopes.md#from-scopes-to-modules-dbd-split),
+which makes a module of each region of its scopes and moves the files. On each
+database, a module's first run takes over what it declares from the project as
+it was, and retires the project's record once its modules hold everything it
+held — see [sharing a database](14-sharing-a-database.md).
+
 ### `scopes`
 
 Named subsets of entities, so one design can build several databases. The full
@@ -365,6 +499,7 @@ scopes:
 
 | Field        | Type   | Default  | Description |
 |--------------|--------|----------|-------------|
+| `modules`    | list   | (none)   | In a design with [`modules:`](#modules): the modules the scope selects, each with every module it depends on, whole. Refused in a design without modules |
 | `includes`   | list   | (all)    | Schema names, qualified entities, or `schema.*` wildcards to include |
 | `excludes`   | list   | (none)   | Schema names, qualified entities, or `schema.*` wildcards to remove from the set |
 | `deps`       | string | `report` | `report`: error on dependency gaps; `include`: auto-expand to transitive closure |

@@ -8,6 +8,7 @@ dbd (Database Designer) is a tool for managing database schemas as code. You wri
 - **Documentation** — DBML generation for dbdocs.io / dbdiagram.io, and a hosted schema viewer (`dbd diagram`)
 - **Multi-target deployment** — PostgreSQL, Supabase, SQLite, and Convex (TypeScript codegen)
 - **Scoped deployments** — deploy a subset of the schema (a named "scope") to different databases from one design, with dependency-gap checking
+- **Workspaces** — divide a large project into modules, each with its own folder, owner, version and history, deployed in dependency order
 - **Access control** — schema grants and row-level-security policies, kept as code
 
 ## Core concepts
@@ -72,6 +73,18 @@ This generates:
 - `migrations/002/config/lookup_values.sql` — the ALTER TABLE statement
 
 Next time you run `dbd apply`, the migration runs automatically.
+
+### A project can grow into a workspace
+
+When one design holds parts that deploy to different databases, or change on
+different schedules, a `modules:` block in design.yaml divides it into
+**modules** — each a design of its own, in its own folder, with its own version
+and history, recorded in the database as its own owner (`shop/core`). Modules
+deploy in `depends_on` order, and a module references what its dependencies
+declare and nothing else. A project already divided by [scopes](07-scopes.md)
+becomes a workspace with `dbd split --from-scopes`. See
+[design.yaml](03-design-yaml.md) and
+[recommended workflows](06-recommended-workflows.md).
 
 ### Adapters handle the target
 

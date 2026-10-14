@@ -268,6 +268,10 @@ export const commands = {
 			cmd: 'dbd doctor',
 			body: 'Audit the project: old config keys, stale files, plural type folders, misfiled view DDL.'
 		},
+		{
+			cmd: 'dbd split',
+			body: 'Divide a project into a workspace of modules, one per region of its scopes — each its own owner, version and history.'
+		},
 		{ cmd: 'dbd reset', body: "Drop the project's managed objects, with safety guards." },
 		{ cmd: 'dbd combine', body: 'Combine all DDL into a single SQL file.' },
 		{ cmd: 'dbd graph', body: 'Output the dependency graph as JSON.' },

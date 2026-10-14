@@ -9,6 +9,7 @@ link.
 dbd diagram                                  # build the model and open it in your browser
 dbd diagram --print-url                      # print the link instead (headless machines, CI)
 dbd diagram --scope hub                      # only the hub scope's working set and its history
+dbd diagram --module core                    # in a workspace: core and the modules it depends on
 dbd diagram --site http://localhost:5173     # another viewer (or set $DBD_DIAGRAM_URL)
 dbd diagram --json -f schema.json            # write the model as JSON instead
 ```
@@ -51,7 +52,7 @@ The viewer opens on the project, with four tabs:
 | Tab | Shows |
 |---|---|
 | **Overview** | The database, the model version, counts — schemas, tables, each kind of view, routine and sequence present, enums, references — the rest of the project note as markdown, the three most recent changes, and a table of schemas |
-| **Diagram** | The ER diagram: tables and their foreign keys, tinted by schema, with a schema legend. A foreign key into a table the model does not carry lands on that table's stub |
+| **Diagram** | The ER diagram: tables and their foreign keys, tinted by schema, with a schema legend — in a [workspace](#a-workspace), by module or by schema. A foreign key into a table the model does not carry lands on that table's stub |
 | **Entities** | Every table, with its column and reference counts and its comment |
 | **Changelog** | What each snapshot changed — see [below](#the-changelog) |
 
@@ -68,7 +69,8 @@ Every entity is listed in the sidebar, grouped by schema: tables, views,
 materialized views, functions, procedures, triggers, sequences and enums. A box at the top
 finds an entity by name, and — when the project has more than one kind — a row
 of toggles filters by kind, each showing its count. The project name at the top
-returns to the root view.
+returns to the root view. A [workspace](#a-workspace)'s sidebar is grouped by
+module first.
 
 ## Entity pages
 
@@ -131,6 +133,33 @@ scope's working set, the `deps: include` closure too, so it matches what the
 diagram draws. If a snapshot cannot be read, `dbd diagram` warns and opens the viewer
 without a changelog rather than show one with a hole in it.
 
+## A workspace
+
+In a workspace — a design.yaml that declares `modules:` — `dbd diagram` draws
+the modules a run selects (every one, `--module`'s and what it depends on, or a
+scope's) as one design: each entity once, in the module declaring it and from
+its definition, so a foreign key into a dependency's table lands on that table,
+not on a stub. A table a scope leaves out of a dependency is a stub —
+`out_of_scope`, typed from its module, and named its. The project is the
+manifest's: its name and note.
+
+- **The sidebar** is grouped by module, in `depends_on` order, then by schema
+  within each — each module, and each schema in it, collapsing on its own, with
+  its count. A search, or a kind switched off, leaves out a module with nothing
+  left to show, as it leaves out a schema.
+- **The diagram** has a switch, top left: **By module** tints each table, and
+  keys the legend, by the module declaring it; **By schema** by its schema. It
+  opens by module. A project's diagram has no switch: it is tinted by schema.
+- **Entity pages** — a table's, a view's or routine's, an enum's, and a stub's
+  the scope left out — carry a badge naming the module.
+- **The changelog** lists each module's versions in turn, in `depends_on`
+  order, each newest first — every module has its own — each card naming its
+  module. The Overview's recent changes are the newest across the modules, by
+  when each was cut, each naming its module.
+- **An entity's changelog** is its module's: its baseline is that module's
+  first snapshot, and a module with no snapshots says so (`No snapshots of
+  module core yet`) though another module has some.
+
 ## The model
 
 `dbd diagram --json` writes the model the viewer reads — `SchemaModel`, from
@@ -147,8 +176,9 @@ tables, and it states its own `version`, currently `3`:
 | `stubs` | The tables `refs` land on that `tables` does not carry: table-shaped, only the referenced columns, `kind` `external`, `out_of_scope` or `unresolved` — omitted when there are none |
 | `entities` | Views, materialized views, functions, procedures, triggers and sequences |
 | `deps` | `{from, to, kind}` — what reads, writes, calls, uses (a column's enum or sequence) or is a member of what |
-| `history` | What each snapshot changed, oldest first — omitted when there are no snapshots |
+| `history` | What each snapshot changed, oldest first — omitted when there are no snapshots. In a workspace each module's in turn, each entry naming its `module` |
 | `enums` | Enum types with their values in order and their comment — omitted when there are none |
+| `modules` | A workspace's modules, in `depends_on` order: `name`, `owner` (`<project>/<module>`), `depends_on` and `note`. Each table, entity, enum and `out_of_scope` stub names the module declaring it in its `module`. Omitted for a project |
 
 `entities` and `deps` are separate from `tables` and `refs` on purpose: an ER
 renderer wants foreign keys, a call-graph renderer wants dependencies, and
@@ -162,7 +192,10 @@ Comments reach every kind: for tables, views, routines, sequences and enums
 whole comment.
 
 The fields 0.25 added — `stubs`, sequences, `checks`, `where`, `identity`,
-`generated` — are optional, so every earlier version-3 model still reads. Models
+`generated` — and those workspaces added — `modules`, and `module` on tables,
+entities, enums, stubs and history entries — are optional, so every earlier
+version-3 model still reads, and a project's model is as it was. A `modules`
+entry without a `name` is refused. Models
 of version 1 and 2 open too, with the panels their fields allow. A model of a
 version newer than the viewer reads is refused, with a message to open it on the
 current site, rather than shown with whatever the new version added silently
