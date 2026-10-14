@@ -337,3 +337,249 @@ fn what_cannot_divide_is_refused_before_anything_moves() {
         "scopes",
     );
 }
+
+/// What `--write` refuses before it moves anything, and what it puts back
+/// when it cannot finish — the split is whole or not at all (#7).
+mod writing {
+    use super::*;
+
+    fn split_err(root: &Path, renames: &[(&str, &str)]) -> String {
+        let renames: Vec<(String, String)> = renames.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
+        match plan_from_scopes(&design(root), &renames) {
+            Ok(plan) => match write_split(&plan, &root.join("design.yaml"), root) {
+                Ok(()) => panic!("refused"),
+                Err(e) => e.to_string(),
+            },
+            Err(e) => e.to_string(),
+        }
+    }
+
+    fn untouched(root: &Path, manifest: &str) {
+        assert_eq!(
+            std::fs::read_to_string(root.join("design.yaml")).unwrap(),
+            manifest,
+            "design.yaml as it was"
+        );
+        for file in [
+            "ddl/table/app/lookups.ddl",
+            "ddl/table/app/orders.ddl",
+            "ddl/table/dojo/sessions.ddl",
+            "import/app/lookups.csv",
+        ] {
+            assert!(root.join(file).exists(), "{file} where it was");
+        }
+        for module in ["shared", "core", "dojo"] {
+            assert!(walkdir(root.join(module)).is_empty(), "{module}/ holds nothing");
+        }
+    }
+
+    /// An earlier split's leftovers — a module folder holding files the plan
+    /// does not make a module of — are refused, named, not split around.
+    #[test]
+    fn an_earlier_splits_leftovers_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        sensei_like(root);
+        move_into(root, "ddl/table/app/orders.ddl", "core/ddl/table/app/orders.ddl");
+        move_into(
+            root,
+            "ddl/table/app/rule_packs.ddl",
+            "core/ddl/table/app/rule_packs.ddl",
+        );
+        let err = split_err(root, &[]);
+        assert!(err.contains("core/"), "{err}");
+    }
+
+    /// A project with nothing left to divide is refused, not written as a
+    /// workspace of no modules.
+    #[test]
+    fn a_plan_of_no_modules_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            root,
+            "design.yaml",
+            "project:\n  name: sensei\n\nschemas:\n  - app\n\nscopes:\n  default:\n    includes: [app]\n",
+        );
+        let err = split_err(root, &[]);
+        assert!(err.contains("no module"), "{err}");
+        assert!(
+            !std::fs::read_to_string(root.join("design.yaml"))
+                .unwrap()
+                .contains("modules:")
+        );
+    }
+
+    /// Two files planned onto one path are refused, naming both — neither
+    /// overwrites the other.
+    #[test]
+    fn two_files_onto_one_path_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            root,
+            "design.yaml",
+            "project:\n  name: sensei\n\nschemas:\n  - app\n\nimport:\n  after:\n    - import/ddl/table/app/lookups.ddl\n\n\
+             scopes:\n  scripts:\n    includes: [app]\n",
+        );
+        write(
+            root,
+            "ddl/table/app/lookups.ddl",
+            "set search_path to app;\ncreate table if not exists lookups (code text primary key);\n",
+        );
+        write(
+            root,
+            "import/ddl/table/app/lookups.ddl",
+            "-- a loader script\nselect 1;\n",
+        );
+        let err = split_err(root, &[]);
+        assert!(
+            err.contains("ddl/table/app/lookups.ddl") && err.contains("import/ddl/table/app/lookups.ddl"),
+            "{err}"
+        );
+        assert!(
+            std::fs::read_to_string(root.join("ddl/table/app/lookups.ddl"))
+                .unwrap()
+                .contains("create table"),
+            "the DDL is not overwritten"
+        );
+    }
+
+    /// Module names equal but for case would share a folder on a
+    /// case-insensitive filesystem.
+    #[test]
+    fn names_equal_but_for_case_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        sensei_like(tmp.path());
+        let err = split_err(tmp.path(), &[("dojo", "Core")]);
+        assert!(err.contains("Core") && err.contains("core"), "{err}");
+    }
+
+    /// A DDL file the scanner reads is moved, whatever its name — a dotfile
+    /// included: left behind, its entity was gone from the workspace.
+    #[test]
+    fn every_file_an_entity_is_declared_in_moves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        sensei_like(root);
+        write(
+            root,
+            "ddl/table/app/.audit.ddl",
+            "set search_path to app;\ncreate table if not exists audit (id integer primary key);\n",
+        );
+        let entities = |root: &Path| design(root).entities().iter().filter(|e| e.file.is_some()).count();
+        if !design(root)
+            .entities()
+            .iter()
+            .any(|e| e.file.as_ref().is_some_and(|f| f.ends_with(".audit.ddl")))
+        {
+            return; // the scanner does not read it: nothing to move
+        }
+        let before = entities(root);
+        let plan = plan(root, &[]);
+        assert!(
+            plan.moves
+                .iter()
+                .any(|m| m.from == Path::new("ddl/table/app/.audit.ddl")),
+            "{:?}",
+            plan.moves
+        );
+        write_split(&plan, &root.join("design.yaml"), root).expect("write");
+        let after: usize = Workspace::load(&root.join("design.yaml"), "dev", Some(root))
+            .unwrap()
+            .modules()
+            .iter()
+            .map(|m| m.design().entities().iter().filter(|e| e.file.is_some()).count())
+            .sum();
+        assert_eq!(after, before);
+    }
+
+    /// The manifest is written aside first: a split that cannot write it
+    /// moves nothing.
+    #[test]
+    fn a_manifest_that_cannot_be_written_moves_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        sensei_like(root);
+        let manifest = std::fs::read_to_string(root.join("design.yaml")).unwrap();
+        // Where the new manifest is written first, taken by a folder.
+        std::fs::create_dir_all(root.join("design.yaml.dbd-split")).unwrap();
+        let err = split_err(root, &[]);
+        assert!(err.contains("design.yaml"), "{err}");
+        untouched(root, &manifest);
+    }
+
+    /// A move that fails puts back every move before it, and design.yaml is
+    /// as it was.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_move_puts_back_every_move_before_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        sensei_like(root);
+        let manifest = std::fs::read_to_string(root.join("design.yaml")).unwrap();
+        let plan = plan(root, &[]);
+        // dojo's files sort after app's: its folder, unwritable, fails them.
+        let dojo = root.join("ddl/table/dojo");
+        std::fs::set_permissions(&dojo, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let outcome = write_split(&plan, &root.join("design.yaml"), root);
+        std::fs::set_permissions(&dojo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = outcome.expect_err("dojo's folder is not writable").to_string();
+        assert!(err.contains("dojo/sessions.ddl"), "{err}");
+        assert!(err.contains("put back"), "{err}");
+        untouched(root, &manifest);
+    }
+
+    /// A folder the split cannot read is refused: walked past, its files
+    /// stayed at the root, and the workspace was refused once they were read.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_it_cannot_read_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        sensei_like(root);
+        let policies = root.join("policies/app");
+        std::fs::set_permissions(&policies, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let outcome = plan_from_scopes(&design(root), &[]);
+        std::fs::set_permissions(&policies, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = outcome.expect_err("policies/app cannot be read").to_string();
+        assert!(err.contains("policies"), "{err}");
+    }
+
+    /// In a git work tree a file git will not move fails the split, saying
+    /// why — not moved by hand behind git's back — and nothing is left moved.
+    #[test]
+    fn a_file_git_will_not_move_fails_the_split() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        sensei_like(root);
+        let manifest = std::fs::read_to_string(root.join("design.yaml")).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-c", "user.name=test", "-c", "user.email=test@example.com"])
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        assert!(git(&["add", "-A"]).status.success());
+        assert!(git(&["commit", "-q", "-m", "the project"]).status.success());
+        std::fs::write(root.join(".git/index.lock"), "").unwrap();
+        let plan = plan(root, &[]);
+        let err = write_split(&plan, &root.join("design.yaml"), root)
+            .expect_err("git's index is locked")
+            .to_string();
+        std::fs::remove_file(root.join(".git/index.lock")).unwrap();
+        assert!(err.contains("index.lock"), "{err}");
+        untouched(root, &manifest);
+    }
+
+    fn move_into(root: &Path, from: &str, to: &str) {
+        let to = root.join(to);
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        std::fs::rename(root.join(from), to).unwrap();
+    }
+}
