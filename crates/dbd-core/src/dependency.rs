@@ -15,6 +15,8 @@ pub struct GraphNode {
     pub name: String,
     pub entity_type: String,
     pub schema: Option<String>,
+    /// The module declaring it, in a workspace's graph (#7).
+    pub module: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -280,6 +282,7 @@ pub fn graph_from_entities(entities: &[Entity], scope: Option<&str>) -> GraphRes
             name: e.name.clone(),
             entity_type: format!("{:?}", e.entity_type).to_lowercase(),
             schema: e.schema.clone(),
+            module: None,
         })
         .collect();
 

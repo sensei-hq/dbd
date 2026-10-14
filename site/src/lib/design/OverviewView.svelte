@@ -9,13 +9,15 @@
   import Markdown from './Markdown.svelte';
   import { splitLead } from './md';
   import { databaseLabel, overviewCounts, schemaRows, OVERVIEW_ICONS } from './overview';
-  import { newestFirst, summaryParts, versionDate, versionLabel, versionSummary } from './changelog';
+  import { latest, summaryParts, versionDate, versionKey, versionLabel, versionSummary } from './changelog';
+  import ModuleBadge from './ModuleBadge.svelte';
   import type { SchemaModel } from './model';
 
   let { model, onTab }: { model: SchemaModel; onTab?: (id: string) => void } = $props();
 
-  // The latest three — the overview's glance at the changelog, not a second copy of it.
-  const recent = $derived(newestFirst(model.history ?? []).slice(0, 3));
+  // The latest three — the overview's glance at the changelog, not a second copy of it; a
+  // workspace's across its modules, each naming its module (#7).
+  const recent = $derived(latest(model.history ?? [], 3));
 
   const counts = $derived(overviewCounts(model));
   const schemas = $derived(schemaRows(model));
@@ -68,13 +70,15 @@
       <section data-section="recent" class="mt-8">
         <h2 class="font-mono text-label uppercase text-faint">Recent changes</h2>
         <div class="mt-3 flex max-w-3xl flex-col">
-          {#each recent as entry (entry.version)}
+          {#each recent as entry (versionKey(entry))}
             {@const parts = summaryParts(versionSummary(entry)).filter((p) => p.op !== 'fields')}
             <div
               data-version={entry.version}
+              data-module={entry.module}
               class="flex flex-wrap items-baseline gap-x-3 gap-y-1 border-b border-line-soft py-2.5 text-sm"
             >
               <span class="ds-badge">{versionLabel(entry)}</span>
+              <ModuleBadge module={entry.module} />
               <span class="text-fg">{entry.description || 'Untitled version'}</span>
               <span class="ml-auto font-mono text-xs text-faint">
                 {#if entry.baseline}baseline{:else if parts.length}{parts

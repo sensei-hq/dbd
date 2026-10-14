@@ -85,36 +85,10 @@ fn warn_if_scope_ignored(command: &Commands, scope: Option<&str>, deps: Option<d
     }
 }
 
-/// Whether `command` runs a workspace — a `design.yaml` with `modules:`, a
-/// design per module (#7) — module by module. `install` reads no project.
-fn runs_a_workspace(command: &Commands) -> bool {
-    matches!(
-        command,
-        Commands::Inspect { .. }
-            | Commands::Apply { .. }
-            | Commands::Deploy { .. }
-            | Commands::Reconcile { .. }
-            | Commands::Diff { .. }
-            | Commands::Import { .. }
-            | Commands::Export { .. }
-            | Commands::Policies { .. }
-            | Commands::Refresh { .. }
-            | Commands::Migrate { .. }
-            | Commands::Reset { .. }
-            | Commands::Snapshot { .. }
-            | Commands::Release { .. }
-            | Commands::Format { .. }
-            | Commands::Doctor { .. }
-            | Commands::Install { .. }
-    )
-}
-
-/// Refuse what a run cannot select (#7): a workspace in a command that does not
-/// run one yet — loading it as one design is refused by `Design::from_config`,
-/// but `format`, `doctor` and `snapshot --list` read the project without
-/// loading one, and reported a workspace's empty root clean; and `--module` on
-/// a design without modules. A config dbd cannot read is left to the command
-/// to report.
+/// Refuse what a run cannot select (#7): a workspace in `init` and `merge`,
+/// which onboard a project into one design; and `--module` on a design
+/// without modules. A config dbd cannot read is left to the command to
+/// report.
 fn check_workspace_selection(command: &Commands, config: &Path, module: Option<&str>) -> Result<()> {
     if matches!(command, Commands::Install { .. }) {
         return Ok(());
@@ -135,13 +109,23 @@ fn check_workspace_selection(command: &Commands, config: &Path, module: Option<&
             config.display()
         );
     }
-    if !runs_a_workspace(command) {
-        anyhow::bail!(
-            "{} declares modules: — this command does not run a design with modules: yet",
-            config.display()
-        );
-    }
     Ok(())
+}
+
+/// What a command writing an artifact of the design reads (#7): the project's
+/// design, or the modules `scope` and `module` select, as one — see
+/// [`dbd_core::design::Reading`].
+pub(super) fn reading(
+    config: &Path,
+    env: &str,
+    project_dir: &Path,
+    module: Option<&str>,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
+) -> Result<dbd_core::design::Reading> {
+    Ok(Workspace::load(config, env, Some(project_dir))
+        .context("Failed to load design")?
+        .reading(module, scope, deps)?)
 }
 
 /// Which way a run goes over a workspace's modules — see [`targets`].
@@ -468,7 +452,9 @@ pub async fn run(
             .await
         }
 
-        Commands::Combine { file } => schema::cmd_combine(config, env, project_dir, file, scope, deps, verbosity),
+        Commands::Combine { file } => {
+            schema::cmd_combine(config, env, project_dir, file, module, scope, deps, verbosity)
+        }
 
         Commands::Emit { dialect, file, report } => schema::cmd_emit(
             config,
@@ -477,6 +463,7 @@ pub async fn run(
             dialect,
             file,
             report.as_deref(),
+            module,
             scope,
             deps,
             verbosity,
@@ -497,9 +484,16 @@ pub async fn run(
             .await
         }
 
-        Commands::Graph { name } => {
-            project::cmd_graph(config, env, project_dir, name.as_deref(), scope, deps, verbosity)
-        }
+        Commands::Graph { name } => project::cmd_graph(
+            config,
+            env,
+            project_dir,
+            name.as_deref(),
+            module,
+            scope,
+            deps,
+            verbosity,
+        ),
 
         Commands::Apply {
             name,
@@ -657,7 +651,7 @@ pub async fn run(
             .await
         }
 
-        Commands::Dbml { file } => project::cmd_dbml(config, env, project_dir, file, scope, deps, verbosity),
+        Commands::Dbml { file } => project::cmd_dbml(config, env, project_dir, file, module, scope, deps, verbosity),
 
         Commands::Diagram {
             json,
@@ -672,6 +666,7 @@ pub async fn run(
             file,
             *print_url,
             site.as_deref(),
+            module,
             scope,
             deps,
             verbosity,

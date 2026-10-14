@@ -901,6 +901,7 @@ pub fn cmd_emit(
     dialect: &str,
     file: &Path,
     report: Option<&Path>,
+    module: Option<&str>,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
@@ -911,12 +912,11 @@ pub fn cmd_emit(
     // path does not leave the script behind. See `cmd_combine` for the rule.
     let dest = safe_canonicalize_within(project_dir, file)?;
     let report_dest = report.map(|r| safe_canonicalize_within(project_dir, r)).transpose()?;
-    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
-    let resolved = design.resolve_scope(scope, deps)?;
-    let (kept, total) = design.scope_counts(&resolved)?;
-    output::scope_filtered(&resolved, kept, total);
+    let reading = super::reading(config, env, project_dir, module, scope, deps)?;
+    let (kept, total) = reading.counts()?;
+    output::scope_filtered(reading.scope(), kept, total);
 
-    let (sql, downgrades) = dbd_core::emit_dialect::emit_schema(&design, target, Some(&resolved))?;
+    let (sql, downgrades) = dbd_core::emit_dialect::emit_reading(&reading, target)?;
     std::fs::write(&dest, sql).with_context(|| format!("Failed to write {}", file.display()))?;
     output::info(verbosity, &format!("Generated {}", file.display()));
 
@@ -946,11 +946,13 @@ pub fn cmd_emit(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_combine(
     config: &Path,
     env: &str,
     project_dir: &Path,
     file: &Path,
+    module: Option<&str>,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
@@ -962,11 +964,10 @@ pub fn cmd_combine(
     // tree — overwrote a file dbd does not own without a word. Output wanted
     // outside the project is written inside it and moved.
     let dest = safe_canonicalize_within(project_dir, file)?;
-    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
-    let resolved = design.resolve_scope(scope, deps)?;
-    let (kept, total) = design.scope_counts(&resolved)?;
-    output::scope_filtered(&resolved, kept, total);
-    design.combine(&dest, Some(&resolved))?;
+    let reading = super::reading(config, env, project_dir, module, scope, deps)?;
+    let (kept, total) = reading.counts()?;
+    output::scope_filtered(reading.scope(), kept, total);
+    std::fs::write(&dest, reading.combined()?).with_context(|| format!("Failed to write {}", file.display()))?;
     output::info(verbosity, &format!("Generated {}", file.display()));
     Ok(())
 }
@@ -2028,6 +2029,7 @@ mod tests {
             "dev",
             tmp.path(),
             &out,
+            None,
             None,
             None,
             Verbosity::Normal,

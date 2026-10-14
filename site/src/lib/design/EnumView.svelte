@@ -5,6 +5,7 @@
    */
   import Tabs from './Tabs.svelte';
   import Markdown from './Markdown.svelte';
+  import ModuleBadge from './ModuleBadge.svelte';
   import EntityChangelog from './EntityChangelog.svelte';
   import { noteBlocks } from './md';
   import { KIND_ICON } from './entities';
@@ -46,6 +47,7 @@
             <h1 class="font-display text-h3 font-semibold tracking-tight">{en.name}</h1>
           </div>
           <span data-kind-badge class="ds-badge">enum</span>
+          <ModuleBadge module={en.module} />
           <span class="ds-badge">{en.values.length} values</span>
         </div>
       </div>

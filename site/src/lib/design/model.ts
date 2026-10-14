@@ -47,6 +47,8 @@ export type Table = {
   indexes?: Index[];
   /** v3. CHECK constraints, inline ones first. */
   checks?: Check[];
+  /** v3, a workspace's model (#7): the module declaring it — a stub's when it is `out_of_scope`. */
+  module?: string;
 };
 export type RefEnd = { s: string; t: string; c: string };
 export type Ref = { from: RefEnd; to: RefEnd; action?: string };
@@ -75,6 +77,8 @@ export type EntityNode = {
   kind: string;
   note?: string;
   noteMd?: string;
+  /** v3, a workspace's model (#7): the module declaring it. */
+  module?: string;
 };
 
 /** v2. One dependency edge: a view reading a table, a routine calling a routine. */
@@ -98,6 +102,8 @@ export type EnumNode = {
   values: string[];
   note?: string;
   noteMd?: string;
+  /** v3, a workspace's model (#7): the module declaring it. */
+  module?: string;
 };
 
 /** v3. What happened to an entity or a field in one version. */
@@ -137,7 +143,15 @@ export type HistoryEntry = {
   timestamp: string;
   baseline?: { tables: number; enums: number };
   changes: EntityChange[];
+  /** A workspace's model (#7): the module whose version it is — each module has its own. */
+  module?: string;
 };
+
+/**
+ * v3. One module of a workspace (#7): its name, the owner its entities are recorded under, what it
+ * depends on and its note.
+ */
+export type ModuleInfo = { name: string; owner: string; depends_on?: string[]; note?: string };
 
 /**
  * A schema is two graphs, and this type keeps them apart on purpose.
@@ -171,6 +185,11 @@ export type SchemaModel = {
   history?: HistoryEntry[];
   /** v3. Enum types with their values. Absent when the project has none. */
   enums?: EnumNode[];
+  /**
+   * v3, a workspace's model (#7): its modules, in `depends_on` order. Each table, entity, enum
+   * and stub a module declares names it in `module`. Absent for a project's model.
+   */
+  modules?: ModuleInfo[];
 };
 
 export type ValidationResult = { ok: true; model: SchemaModel } | { ok: false; error: string };
@@ -212,7 +231,15 @@ export function validateModel(value: unknown): ValidationResult {
     return { ok: false, error: 'history must be an array' };
   if (v.enums !== undefined && !Array.isArray(v.enums))
     return { ok: false, error: 'enums must be an array' };
+  // The sidebar groups by each module's name, so a module without one is refused here rather
+  // than throwing there.
+  if (v.modules !== undefined && !(Array.isArray(v.modules) && v.modules.every(isNamed)))
+    return { ok: false, error: 'modules must be an array of named modules' };
   return { ok: true, model: value as SchemaModel };
+}
+
+function isNamed(m: unknown): boolean {
+  return typeof m === 'object' && m !== null && typeof (m as Record<string, unknown>).name === 'string';
 }
 
 function isTableShaped(t: unknown): boolean {

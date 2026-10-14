@@ -21,6 +21,7 @@ mod import;
 mod marks;
 mod ownership;
 mod plan;
+mod reading;
 mod reconcile;
 mod reset;
 mod scope;
@@ -29,6 +30,7 @@ mod workspace;
 pub use marks::DatabaseMarks;
 pub use ownership::{Prune, SharedDatabase, SharedProject, SharedUse, leave_out_other_owners};
 pub use plan::{ApplyStrategy, ExecutionPlan, ExecutionStep, build_execution_plan};
+pub use reading::Reading;
 pub use reset::{KeptRole, ResetComplete};
 pub use workspace::{Module, Workspace, check_scope_gaps};
 
@@ -1476,6 +1478,13 @@ impl Design {
             Some(s) => self.scoped_entities(s)?,
             None => self.entities.clone(),
         };
+        std::fs::write(file, self.combined_ddl_of(&entities))?;
+        Ok(())
+    }
+
+    /// `entities`' DDL as one script, in their order — a file that did not
+    /// parse and an external left out.
+    pub(crate) fn combined_ddl_of(&self, entities: &[Entity]) -> String {
         // The script is for this project's own engine, so dbd's generated
         // statements are written in its dialect too (see `combined_ddl`).
         let dialect = crate::parser::Dialect::from_label(&self.dialect).unwrap_or_default();
@@ -1485,31 +1494,41 @@ impl Design {
             .filter(|e| e.entity_type != EntityType::External)
             .filter_map(|e| script::combined_ddl(e, dialect))
             .collect();
-
-        std::fs::write(file, combined.join("\n"))?;
-        Ok(())
+        combined.join("\n")
     }
 
     /// Get the dependency graph for visualization. `name` narrows to one entity's
     /// subgraph; `scope` filters to that scope's working set (`None` ⇒ full set).
     pub fn graph(&self, name: Option<&str>, scope: Option<&ResolvedScope>) -> Result<dependency::GraphResult> {
+        if let Some(n) = name {
+            self.check_graph_name(n, scope)?;
+        }
+        Ok(dependency::graph_from_entities(&self.graph_entities(scope)?, name))
+    }
+
+    /// Refuse a `-n` the graph cannot center on: one it does not know or the
+    /// scope leaves out, or an external.
+    pub(crate) fn check_graph_name(&self, name: &str, scope: Option<&ResolvedScope>) -> Result<()> {
         // An unknown or out-of-scope name produced an empty graph — a valid
         // document, indistinguishable from an entity with no dependencies. So
         // did an `external:` one: dbd has no DDL for it, so it is no node of
         // the graph, and `inspect -n` and `apply -n` refuse it alike.
-        if let Some(n) = name
-            && self.resolve_name(n, scope)?.entity_type == EntityType::External
-        {
+        if self.resolve_name(name, scope)?.entity_type == EntityType::External {
             return Err(DbdError::Config(format!(
-                "{n} is declared `external:` — dbd has no DDL for it, so it has no place in the dependency \
+                "{name} is declared `external:` — dbd has no DDL for it, so it has no place in the dependency \
                  graph; it only resolves references to it"
             )));
         }
+        Ok(())
+    }
+
+    /// The entities the graph is drawn over under `scope`.
+    pub(crate) fn graph_entities(&self, scope: Option<&ResolvedScope>) -> Result<Vec<Entity>> {
         // A file dbd could not parse is left out, as `dbd graph` tells the user
         // it is (`Design::unparsed`): kept as a node, it sat in a layer and at
         // the end of an edge although nothing about it was read.
         let graphable = |e: &Entity| crate::scope::is_scopable(e) && e.errors.is_empty();
-        let non_meta: Vec<Entity> = match scope {
+        Ok(match scope {
             Some(s) => {
                 let ws = self.working_set(s)?;
                 self.entities
@@ -1519,8 +1538,7 @@ impl Design {
                     .collect()
             }
             None => self.entities.iter().filter(|e| graphable(e)).cloned().collect(),
-        };
-        Ok(dependency::graph_from_entities(&non_meta, name))
+        })
     }
 
     /// Every materialized view's qualified name paired with its resolved

@@ -102,8 +102,9 @@ Taken in slice 2:
   `{"modules": [{"module", "owner", "diff"}]}` (a project's is its diff, as
   before); a policy failing in one module is reported, the modules after it
   still run, and the run fails at the end.
-- Still refusing a workspace: `format`, `doctor`, `snapshot` and `release`
-  (slice 4), `combine`, `emit`, `graph`, `dbml` and `diagram` (slice 5).
+- Still refusing a workspace then: `format`, `doctor`, `snapshot` and
+  `release` (slice 4), `combine`, `emit`, `graph`, `dbml` and `diagram`
+  (slice 5) — since slice 5 every command runs one but `init` and `merge`.
   `init` and `merge` onboard a project into one design and refuse a
   workspace, pointing at `dbd split` (slice 6).
 
@@ -171,6 +172,51 @@ Taken in slice 4:
 - `doctor` does not migrate a design.yaml that declares `modules:` — the
   migration would rebuild it without them; its old entries are fixed by hand.
   A design.yaml it cannot read is named as an issue, with the error.
+
+Taken in slice 5:
+
+- `dbml`, `diagram`, `graph`, `combine` and `emit` go over the modules a run
+  selects (`--module`, `--scope`, the folder dbd runs in), in `depends_on`
+  order, each through its own scope, as one design: what each module keeps
+  in view, together — so a key, a type or a read into a dependency lands on
+  its entity, drawn and written once, in its module, from its module's
+  definition. Without the gap check: a table a scope leaves out of a
+  dependency is a stub (`out_of_scope`), as in one design.
+- The schema model (still v3, additive) carries `modules` — each module's
+  `name`, `owner`, `depends_on` and `note`, in load order — and `module` on
+  each table, entity, enum and stub a module declares; each history entry
+  carries its module, the modules' histories one after another in load
+  order. A project's model is as it was: no `modules`, no `module`. Its
+  `project` is the manifest's.
+- `graph`'s nodes carry `module` in a workspace; `-n` is the entity's
+  subgraph across the modules in view, refused for one none declares.
+- `dbml` documents the workspace in one document (or one per `dbml:` doc); a
+  document with no groups of its own (no `groups`, no
+  `auto_group_by_schema`) gets one `TableGroup` per module — DBML puts a
+  table in one group.
+- `combine` and `emit` write one script; a comment heads each module's
+  statements, `module <name> (<owner>)`.
+- The viewer groups the sidebar by module, then schema; the diagram is tinted
+  by module or by schema — a switch, module first for a workspace's model;
+  an entity's page and each changelog entry name their module.
+- What these commands read is `Workspace::reading` — a `Reading`, the
+  selected modules each with its resolved scope; a project is a reading of
+  one, its output as before. `schema_model::build_reading`,
+  `dbml::generate_reading` and `emit_dialect::emit_reading` read it;
+  `DbmlMultiParams`, `generate_all` and `emit_schema` are unchanged for an
+  embedder.
+- The changelog lists each module's versions in turn, in `depends_on`
+  order, newest first; an entity's changelog is its module's, dated from
+  that module's baseline, and says when its module has none.
+- Review: an entity is its module's by kind and name (a function and a
+  view may share a name across modules), a graph node's included; the scope
+  line counts what the run writes, each entity once; `emit` notes a schema's
+  grants once, each module's policies its own; a module's refusal reads
+  `module "<name>": …`, as the gap check's does, and `-n` of an entity a
+  module the run does not select declares names that module. The overview's
+  recent changes are the newest across the modules, by when each was cut.
+  An unknown scope reads the same in all five commands — `diagram` no longer
+  says "Failed to resolve scope:" first.
 
 ## Slices
 
