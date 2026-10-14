@@ -275,3 +275,29 @@ fn a_put_back_git_refuses_is_moved_back_by_hand() {
     }
     assert!(text.contains("git add"), "{text}");
 }
+
+/// A project a split was interrupted in refuses every command but
+/// `dbd split --undo`, which puts it back as it was.
+#[test]
+fn an_interrupted_split_is_undone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sensei_like(dir);
+    let manifest = fs::read_to_string(dir.join("design.yaml")).unwrap();
+    let design = dbd_core::Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).unwrap();
+    let plan = dbd_core::split::plan_from_scopes(&design, &[]).unwrap();
+    dbd_core::split::begin_journal(&plan, dir).unwrap();
+    let first = &plan.moves[0];
+    fs::create_dir_all(dir.join(&first.to).parent().unwrap()).unwrap();
+    fs::rename(dir.join(&first.from), dir.join(&first.to)).unwrap();
+
+    let out = dbd(dir, &["inspect"]);
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("dbd split --undo"), "{}", text(&out));
+
+    let out = dbd(dir, &["split", "--undo"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(dir.join(&first.from).exists());
+    assert_eq!(fs::read_to_string(dir.join("design.yaml")).unwrap(), manifest);
+    assert!(dbd(dir, &["inspect"]).status.success());
+}
