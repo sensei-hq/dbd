@@ -5,11 +5,22 @@
    * One card per version: its number, description and date; how many tables and enums it
    * added, modified or removed; and each of them, with the column, index, constraint and
    * enum-value edits inside a modified one a click away. The history is computed by dbd
-   * from `snapshots/` (`crates/dbd-core/src/history.rs`) — this only renders it.
+   * from `snapshots/` (`crates/dbd-core/src/history.rs`) — this only renders it. A
+   * workspace's lists each module's versions in turn, each card naming its module (#7).
    */
   import { OVERVIEW_ICONS } from './overview';
   import FieldEdits from './FieldEdits.svelte';
-  import { newestFirst, OP_CLASS, OP_MARK, summaryParts, versionDate, versionLabel, versionSummary } from './changelog';
+  import ModuleBadge from './ModuleBadge.svelte';
+  import {
+    newestFirst,
+    OP_CLASS,
+    OP_MARK,
+    summaryParts,
+    versionDate,
+    versionKey,
+    versionLabel,
+    versionSummary,
+  } from './changelog';
   import type { SchemaModel } from './model';
 
   let { model, onNav }: { model: SchemaModel; onNav?: (key: string) => void } = $props();
@@ -47,11 +58,12 @@
       </section>
     {:else}
       <div class="flex max-w-4xl flex-col gap-4">
-        {#each entries as entry (entry.version)}
+        {#each entries as entry (versionKey(entry))}
           {@const parts = summaryParts(versionSummary(entry))}
-          <article data-version={entry.version} class="rounded-app border border-line bg-paper">
+          <article data-version={entry.version} data-module={entry.module} class="rounded-app border border-line bg-paper">
             <header class="flex flex-wrap items-baseline gap-x-3 gap-y-1 border-b border-line-soft px-5 py-3">
               <span class="ds-badge ds-badge-accent">{versionLabel(entry)}</span>
+              <ModuleBadge module={entry.module} />
               <h2 class="font-display text-base font-semibold text-fg">{entry.description || 'Untitled version'}</h2>
               <span class="ml-auto font-mono text-xs text-faint">{versionDate(entry)}</span>
             </header>

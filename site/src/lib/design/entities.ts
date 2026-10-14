@@ -51,25 +51,27 @@ export const KIND_ICON: Record<Kind, string> = {
   enum: OVERVIEW_ICONS.enums,
 };
 
-export type EntityItem = { key: string; kind: Kind; schema: string; name: string; note?: string };
+export type EntityItem = { key: string; kind: Kind; schema: string; name: string; note?: string; module?: string };
 
 const rank = (k: Kind) => KIND_ORDER.indexOf(k);
 
 /** Every entity, ordered by schema, then kind, then name. */
 export function allEntities(model: SchemaModel): EntityItem[] {
-  const item = (kind: Kind, schema: string, name: string, note?: string): EntityItem => ({
-    key: `${schema}.${name}`,
+  const item = (
+    kind: Kind,
+    e: { schema: string; name: string; note?: string; module?: string },
+  ): EntityItem => ({
+    key: `${e.schema}.${e.name}`,
     kind,
-    schema,
-    name,
-    note,
+    schema: e.schema,
+    name: e.name,
+    note: e.note,
+    ...(e.module === undefined ? {} : { module: e.module }),
   });
   const items = [
-    ...model.tables.map((t) => item('table', t.schema, t.name, t.note)),
-    ...(model.entities ?? [])
-      .filter((e) => KIND_ORDER.includes(e.kind as Kind))
-      .map((e) => item(e.kind as Kind, e.schema, e.name, e.note)),
-    ...(model.enums ?? []).map((e) => item('enum', e.schema, e.name, e.note)),
+    ...model.tables.map((t) => item('table', t)),
+    ...(model.entities ?? []).filter((e) => KIND_ORDER.includes(e.kind as Kind)).map((e) => item(e.kind as Kind, e)),
+    ...(model.enums ?? []).map((e) => item('enum', e)),
   ];
   return items.sort(
     (a, b) => a.schema.localeCompare(b.schema) || rank(a.kind) - rank(b.kind) || a.name.localeCompare(b.name),

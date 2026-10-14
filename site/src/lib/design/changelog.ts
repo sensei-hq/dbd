@@ -31,10 +31,22 @@ export function summaryParts(sum: Summary): SummaryPart[] {
   return parts;
 }
 
-/** The history newest first, as a changelog reads. A copy: the model stays oldest first. */
+/**
+ * The history newest first, as a changelog reads. A copy: the model stays oldest first.
+ *
+ * A workspace's (#7) is each module's history in turn, in the model's order — `depends_on`
+ * order — each newest first: a module's versions are its own, so they read as one sequence
+ * and are not interleaved with another's.
+ */
 export function newestFirst(history: HistoryEntry[]): HistoryEntry[] {
-  return [...history].sort((a, b) => b.version - a.version);
+  const modules = [...new Set(history.map((h) => h.module))];
+  return [...history].sort(
+    (a, b) => modules.indexOf(a.module) - modules.indexOf(b.module) || b.version - a.version,
+  );
 }
+
+/** A key for a version, unique across a workspace's modules — each has its own v1. */
+export const versionKey = (entry: HistoryEntry) => `${entry.module ?? ''}:${entry.version}`;
 
 /** `v2`, or `v3–4` for a version cut in stages. */
 export function versionLabel(entry: HistoryEntry): string {
@@ -78,11 +90,14 @@ export type EntityHistory = {
  * as well as name, so a table and an enum that share a name are two histories.
  */
 export function entityHistory(
-  history: HistoryEntry[],
+  all: HistoryEntry[],
   kind: EntityChange['kind'],
   schema: string,
   name: string,
+  module?: string,
 ): EntityHistory {
+  // In a workspace (#7), the entity's module's history: its baseline is that module's.
+  const history = module === undefined ? all : all.filter((h) => h.module === module);
   const rows = newestFirst(history).flatMap((entry) => {
     const change = entry.changes.find((c) => c.kind === kind && c.schema === schema && c.name === name);
     return change ? [{ entry, change }] : [];

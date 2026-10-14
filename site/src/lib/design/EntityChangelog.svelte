@@ -2,18 +2,26 @@
   /**
    * One table's or enum's changelog (#33): the versions that changed it, newest first, each
    * with what happened to it and the edits inside. The project changelog narrowed by
-   * `entityHistory`, so the two can never disagree.
+   * `entityHistory`, so the two can never disagree — in a workspace, its module's (#7).
    */
   import FieldEdits from './FieldEdits.svelte';
-  import { entityHistory, OP_CLASS, OP_MARK, versionDate, versionLabel } from './changelog';
+  import { entityHistory, OP_CLASS, OP_MARK, versionDate, versionKey, versionLabel } from './changelog';
   import type { SchemaModel } from './model';
 
   let { model, kind, schema, name }: { model: SchemaModel; kind: string; schema: string; name: string } = $props();
 
   // Snapshots record tables and enums; every other kind has no history to narrow.
   const tracked = $derived(kind === 'table' || kind === 'enum');
+  // The module declaring it, in a workspace: a stub left out of scope is still its module's.
+  const module = $derived(
+    (kind === 'enum' ? (model.enums ?? []) : [...model.tables, ...(model.stubs ?? [])]).find(
+      (e) => e.schema === schema && e.name === name,
+    )?.module,
+  );
+  // Its module's versions — each module of a workspace has its own — or the project's.
+  const own = $derived((model.history ?? []).filter((h) => module === undefined || h.module === module));
   const history = $derived(
-    tracked ? entityHistory(model.history ?? [], kind as 'table' | 'enum', schema, name) : { rows: [] },
+    tracked ? entityHistory(model.history ?? [], kind as 'table' | 'enum', schema, name, module) : { rows: [] },
   );
 </script>
 
@@ -25,15 +33,15 @@
         No history for a {kind.replace(/_/g, ' ')} yet — snapshots record tables and enums only, so
         what changed in views and routines is not kept.
       </p>
-    {:else if !model.history?.length}
+    {:else if !own.length}
       <p class="mt-3 max-w-2xl text-sm text-faint">
-        No snapshots yet, so there is no history to show. It begins with the first snapshot —
+        No snapshots{module ? ` of module ${module}` : ''} yet, so there is no history to show. It begins with the first snapshot —
         <code class="rounded bg-code-bg px-1 font-mono text-accent-2" style="font-size: 0.85em;">dbd release</code>
         cuts it.
       </p>
     {:else}
       <div class="mt-3 flex max-w-4xl flex-col">
-        {#each history.rows as { entry, change } (entry.version)}
+        {#each history.rows as { entry, change } (versionKey(entry))}
           <div data-version={entry.version} data-op={change.op} class="border-b border-line-soft py-3">
             <div class="flex flex-wrap items-baseline gap-x-3 gap-y-1">
               <span class="ds-badge">{versionLabel(entry)}</span>

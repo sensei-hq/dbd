@@ -13,22 +13,30 @@ pub fn cmd_graph(
     env: &str,
     project_dir: &Path,
     name: Option<&str>,
+    module: Option<&str>,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
-    let resolved = design.resolve_scope(scope, deps)?;
-    let graph = design.graph(name, Some(&resolved))?;
+    let reading = super::reading(config, env, project_dir, module, scope, deps)?;
+    let resolved = reading.scope();
+    let graph = reading.graph(name)?;
     // A file dbd could not parse is missing from the nodes, as it is from the
     // DBML and the diagram, and is named the same way — on stderr, which
     // `left_out_unparsed` writes to, so stdout stays the JSON document.
-    output::left_out_unparsed(&design.unparsed(&resolved)?);
+    output::left_out_unparsed(&reading.unparsed()?);
 
     let json = serde_json::json!({
-        "nodes": graph.nodes.iter().map(|n| serde_json::json!({
-            "name": n.name, "type": n.entity_type, "schema": n.schema,
-        })).collect::<Vec<_>>(),
+        "nodes": graph.nodes.iter().map(|n| {
+            let mut node = serde_json::json!({
+                "name": n.name, "type": n.entity_type, "schema": n.schema,
+            });
+            // A workspace's node names the module declaring it (#7).
+            if let Some(module) = reading.module_of(&n.name) {
+                node["module"] = module.into();
+            }
+            node
+        }).collect::<Vec<_>>(),
         "edges": graph.edges.iter().map(|e| serde_json::json!({
             "from": e.from, "to": e.to,
         })).collect::<Vec<_>>(),
@@ -54,35 +62,26 @@ pub fn cmd_graph(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_dbml(
     config: &Path,
     env: &str,
     project_dir: &Path,
     file: &Path,
+    module: Option<&str>,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
+    // Filtered to the scope's working set, so the generated DBML documents only
+    // the entities that deploy under this scope — each module's, in a
+    // workspace. The all-scope keeps everything.
+    let reading = super::reading(config, env, project_dir, module, scope, deps)?;
+    let (kept, total) = reading.counts()?;
+    output::scope_filtered(reading.scope(), kept, total);
+    output::left_out_unparsed(&reading.unparsed()?);
 
-    // Filter to the scope's working set so the generated DBML documents only the
-    // entities that deploy under this scope. The all-scope keeps everything.
-    let resolved = design.resolve_scope(scope, deps)?;
-    let entities = design.scoped_entities(&resolved)?;
-    let (kept, total) = design.scope_counts(&resolved)?;
-    output::scope_filtered(&resolved, kept, total);
-    output::left_out_unparsed(&design.unparsed(&resolved)?);
-
-    let docs = dbd_core::dbml::generate_all(&dbd_core::dbml::DbmlMultiParams {
-        entities: &entities,
-        // The whole design, not the scope: a stub for an out-of-scope parent
-        // takes its column types from here.
-        design_entities: design.entities(),
-        project_name: &design.config().project.name,
-        database_type: &design.config().source.dialect,
-        project_note: design.config().project.note.as_deref(),
-        docs: &design.config().dbml,
-    });
+    let docs = dbd_core::dbml::generate_reading(&reading)?;
 
     // Single document → use the user-supplied path verbatim. Multiple
     // documents → write each to `<parent_of(file)>/<doc.file_name>`,
@@ -1364,6 +1363,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Verbosity::Verbose,
         )
         .unwrap();
@@ -1376,7 +1376,7 @@ mod tests {
         let proj = testutil::copy_fixture_project();
         let cfg = proj.path().join("design.yaml");
         let out = proj.path().join("schema.dbml");
-        cmd_dbml(&cfg, "dev", proj.path(), &out, None, None, Verbosity::Normal).unwrap();
+        cmd_dbml(&cfg, "dev", proj.path(), &out, None, None, None, Verbosity::Normal).unwrap();
     }
 
     /// Under `--scope`, a Ref to a table the scope leaves out still needs that
@@ -1395,6 +1395,7 @@ mod tests {
             "dev",
             proj.path(),
             &out,
+            None,
             Some("incomplete"),
             None,
             Verbosity::Normal,
@@ -1879,7 +1880,7 @@ mod tests {
         std::fs::write(&cfg_path, patched).unwrap();
 
         let out = proj.path().join("schema.dbml"); // filename ignored in the multi-doc branch; only its dir matters
-        cmd_dbml(&cfg_path, "dev", proj.path(), &out, None, None, Verbosity::Normal).unwrap();
+        cmd_dbml(&cfg_path, "dev", proj.path(), &out, None, None, None, Verbosity::Normal).unwrap();
 
         assert!(proj.path().join("base.dbml").exists());
         let extra_path = proj.path().join("extra.dbml");
