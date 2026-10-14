@@ -16423,3 +16423,291 @@ async fn a_module_takes_over_from_no_owner_outside_its_project() {
     };
     assert!(err.contains("app.countries") && err.contains("\"shopx\""), "{err}");
 }
+
+/// `billing`, owning `billing.rates (code, rate)`, applied as its own owner.
+async fn billing_rates(url: &str, dir: &std::path::Path) -> Box<dyn dbd_core::DatabaseAdapter> {
+    write_tree(
+        dir,
+        &[
+            ("design.yaml", "project:\n  name: billing\n\nschemas:\n  - billing\n"),
+            (
+                "ddl/table/billing/rates.ddl",
+                "create table if not exists billing.rates (code text primary key, rate numeric);\n",
+            ),
+        ],
+    );
+    let billing = connect(url, "billing").await.unwrap();
+    Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir))
+        .unwrap()
+        .apply(&*billing, None, false, None, Progress::none())
+        .await
+        .expect("billing's apply");
+    billing
+}
+
+/// `billing`'s reconcile dropping `rates.rate` — refused while a use of it is
+/// recorded.
+async fn billing_drops_rate(billing: &dyn dbd_core::DatabaseAdapter, dir: &std::path::Path) -> Result<(), String> {
+    std::fs::write(
+        dir.join("ddl/table/billing/rates.ddl"),
+        "create table if not exists billing.rates (code text primary key);\n",
+    )
+    .unwrap();
+    Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir))
+        .unwrap()
+        .reconcile(
+            billing,
+            false,
+            true,
+            dbd_core::design::Prune::Off,
+            None,
+            Progress::none(),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+const CONVERT: &str = "create or replace function app.convert() returns numeric language sql \
+                       as $$ select sum(rate) from billing.rates $$;\n";
+
+/// A schema reset drops `CASCADE` keeps the schema while it holds a table
+/// another module of the workspace declares — moving there, not this
+/// module's to drop — even before that module has run.
+#[tokio::test]
+async fn a_reset_keeps_a_schema_holding_a_table_another_module_declares() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_tree(
+        root,
+        &[
+            (
+                "design.yaml",
+                "project:\n  name: shop\n\nschemas:\n  - ref\n\nmodules:\n  shared: {}\n",
+            ),
+            (
+                "shared/ddl/table/ref/currencies.ddl",
+                "set search_path to ref;\ncreate table if not exists currencies (code text primary key);\n",
+            ),
+            (
+                "shared/ddl/table/ref/countries.ddl",
+                "set search_path to ref;\ncreate table if not exists countries (code text primary key);\n",
+            ),
+        ],
+    );
+    deploy_modules(&url, &load_shop(root)).await;
+    let shared = connect(&url, "shop/shared").await.unwrap();
+    shared
+        .execute_script("INSERT INTO ref.countries VALUES ('NZ')")
+        .await
+        .unwrap();
+
+    std::fs::write(
+        root.join("design.yaml"),
+        "project:\n  name: shop\n\nschemas:\n  - ref\n\nmodules:\n  shared: {}\n  core:\n    depends_on: [shared]\n",
+    )
+    .unwrap();
+    move_file(
+        root,
+        "shared/ddl/table/ref/countries.ddl",
+        "core/ddl/table/ref/countries.ddl",
+    );
+    let modules = load_shop(root);
+    let summary = modules[0]
+        .design()
+        .reset(&*shared, "postgres", false, true, false, None)
+        .await
+        .expect("shared's reset");
+
+    assert_catalog(
+        &*shared,
+        true,
+        "SELECT 1 FROM ref.countries WHERE code = 'NZ'",
+        "core's table and its row",
+    )
+    .await;
+    assert!(
+        summary.kept.iter().any(|k| k.contains("ref.countries")),
+        "the schema is kept, naming what it holds: {:?}",
+        summary.kept
+    );
+}
+
+/// A module's run keeps the uses of what it still holds and hands over: the
+/// module taking it over has not run yet, and until it does the giver's
+/// record is all that guards what the entity reads.
+#[tokio::test]
+async fn a_givers_run_keeps_the_uses_of_what_it_hands_over() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let billing_dir = tmp.path().join("billing");
+    let billing = billing_rates(&url, &billing_dir).await;
+
+    let root = tmp.path().join("shop");
+    write_tree(
+        &root,
+        &[
+            (
+                "design.yaml",
+                "project:\n  name: shop\n\nschemas:\n  - app\n\nexternal:\n  - name: billing.rates\n\n\
+                 modules:\n  shared: {}\n  core:\n    depends_on: [shared]\n",
+            ),
+            ("shared/ddl/table/app/currencies.ddl", CURRENCIES),
+            ("shared/ddl/function/app/convert.ddl", CONVERT),
+            ("core/ddl/table/app/countries.ddl", COUNTRIES),
+        ],
+    );
+    deploy_modules(&url, &load_shop(&root)).await;
+
+    move_file(
+        &root,
+        "shared/ddl/function/app/convert.ddl",
+        "core/ddl/function/app/convert.ddl",
+    );
+    deploy_modules(&url, &load_shop(&root)[..1]).await;
+
+    let err = billing_drops_rate(&*billing, &billing_dir)
+        .await
+        .expect_err("app.convert still reads billing.rates.rate");
+    assert!(err.contains("app.convert"), "{err}");
+}
+
+/// A take-over carries the uses of what it takes: a module whose claim took
+/// an entity over, and whose run then failed before recording its uses, is
+/// still recorded using what the entity reads — so retiring the project it
+/// took it from leaves the use guarded.
+#[tokio::test]
+async fn a_takeover_carries_the_uses_of_what_it_takes() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let billing_dir = tmp.path().join("billing");
+    let billing = billing_rates(&url, &billing_dir).await;
+
+    let root = tmp.path().join("shop");
+    write_tree(
+        &root,
+        &[
+            (
+                "design.yaml",
+                "project:\n  name: shop\n\nschemas:\n  - app\n\nexternal:\n  - name: billing.rates\n",
+            ),
+            ("ddl/table/app/currencies.ddl", CURRENCIES),
+            ("ddl/function/app/convert.ddl", CONVERT),
+        ],
+    );
+    let shop = connect(&url, "shop").await.unwrap();
+    Design::from_config_with_dir(&root.join("design.yaml"), "dev", Some(&root))
+        .unwrap()
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+
+    // The split: core's reconcile claims app.convert, then its hook fails.
+    move_file(
+        &root,
+        "ddl/table/app/currencies.ddl",
+        "shared/ddl/table/app/currencies.ddl",
+    );
+    move_file(
+        &root,
+        "ddl/function/app/convert.ddl",
+        "core/ddl/function/app/convert.ddl",
+    );
+    write_tree(&root, &[("core/hooks/fail.sql", "select 1/0;\n")]);
+    std::fs::write(
+        root.join("design.yaml"),
+        "project:\n  name: shop\n\nschemas:\n  - app\n\nexternal:\n  - name: billing.rates\n\n\
+         modules:\n  shared: {}\n  core:\n    depends_on: [shared]\n    apply:\n      before: [hooks/fail.sql]\n",
+    )
+    .unwrap();
+    let modules = load_shop(&root);
+    let core = connect(&url, "shop/core").await.unwrap();
+    modules[1]
+        .design()
+        .reconcile(
+            &*core,
+            false,
+            false,
+            dbd_core::design::Prune::Off,
+            None,
+            Progress::none(),
+        )
+        .await
+        .expect_err("core's before hook fails");
+    deploy_modules(&url, &modules[..1]).await;
+    assert_catalog(
+        &*shop,
+        false,
+        "SELECT 1 FROM dbd.meta WHERE project = 'shop'",
+        "shop's record",
+    )
+    .await;
+
+    let err = billing_drops_rate(&*billing, &billing_dir)
+        .await
+        .expect_err("app.convert, core's now, still reads billing.rates.rate");
+    assert!(err.contains("app.convert"), "{err}");
+}
+
+/// A retire is housekeeping: another session's open write to the record it
+/// would delete does not hold the run up — it finishes, and a later run
+/// retires the project.
+#[tokio::test]
+async fn a_retire_held_up_by_another_session_waits_for_a_later_run() {
+    use sqlx::Connection as _;
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_tree(
+        root,
+        &[
+            ("design.yaml", "project:\n  name: shop\n\nschemas:\n  - app\n"),
+            ("ddl/table/app/currencies.ddl", CURRENCIES),
+            ("ddl/table/app/countries.ddl", COUNTRIES),
+        ],
+    );
+    let project = Design::from_config_with_dir(&root.join("design.yaml"), "dev", Some(root)).unwrap();
+    let shop = connect(&url, "shop").await.unwrap();
+    project.deploy(&*shop, false, None, |_| {}).await.expect("deploy shop");
+
+    move_file(
+        root,
+        "ddl/table/app/currencies.ddl",
+        "shared/ddl/table/app/currencies.ddl",
+    );
+    move_file(root, "ddl/table/app/countries.ddl", "core/ddl/table/app/countries.ddl");
+    std::fs::write(root.join("design.yaml"), SHOP_MODULES).unwrap();
+    let modules = load_shop(root);
+    deploy_modules(&url, &modules[..1]).await;
+
+    let mut holder = sqlx::PgConnection::connect(&url).await.unwrap();
+    sqlx::query("BEGIN").execute(&mut holder).await.unwrap();
+    sqlx::query("UPDATE dbd.meta SET updated_at = now() WHERE project = 'shop'")
+        .execute(&mut holder)
+        .await
+        .unwrap();
+    let core = connect(&url, "shop/core").await.unwrap();
+    let run = modules[1].design().deploy(&*core, false, None, |_| {});
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(20), run)
+        .await
+        .expect("core's deploy is not held up by the retire");
+    outcome.expect("core's deploy");
+    sqlx::query("ROLLBACK").execute(&mut holder).await.unwrap();
+    assert_catalog(
+        &*core,
+        true,
+        "SELECT 1 FROM dbd.meta WHERE project = 'shop'",
+        "shop's record, for now",
+    )
+    .await;
+
+    deploy_modules(&url, &modules[1..]).await;
+    assert_catalog(
+        &*core,
+        false,
+        "SELECT 1 FROM dbd.meta WHERE project = 'shop'",
+        "shop's record",
+    )
+    .await;
+}
