@@ -666,6 +666,46 @@ it — comes back as an `external:` entry, never a table to build, and its schem
 `schemas:` (a Ref adds no schema either); each is named as it is declared. Before 0.25 a stub came
 back as a one-column managed table, so the next `apply` built a copy of somebody else's table.
 
+### dbd split
+
+Divide a project into a workspace of modules (#7). `--from-scopes` is the one way it divides one
+yet: each region of the project's scopes — their Venn diagram over each scope's entities with their
+dependencies — becomes a module. The region every scope (of two or more) holds is `shared`, the one
+a scope alone holds is named for it (`default` as `core`), one several hold their names joined with
+`-`, and one no scope holds `unscoped`. What every scope deploys — a role — is `shared`'s. Each
+module `depends_on` the modules its entities reference, and each scope becomes `modules:` — the
+modules of the regions it holds, less those another of them depends on — keeping its `extensions:`,
+and `excludes:` the manifest's schemas it did not deploy.
+
+```sh
+dbd split --from-scopes                       # print the plan; change nothing
+dbd split --from-scopes --rename shared=common   # name a module of the plan otherwise
+dbd split --from-scopes --write               # move the files and write modules: and scopes:
+dbd split --undo                              # put back what an interrupted --write moved
+```
+
+The plan names each module, the scopes its region is in, its entity count and what it depends on,
+then the scopes as they become (`-v` lists each module's entities and each file's move).
+`--write` moves each DDL file to the folder of the module its entity is in, and each import data
+file and policy file to the folder of the module its table is in — with `git mv` in a git work
+tree — moves the manifest's `import.after` scripts under `import/` to `scripts/`, rewriting their
+paths, and writes `modules:` and the new `scopes:` into design.yaml in place, the rest as it was —
+comments and line endings included. It is whole or not at all: it first makes the workspace in a
+scratch folder and refuses unless that loads and deploys, under each scope and with none, what the
+project does; it writes the new manifest aside, and a move that fails — or a file git tracks that
+`git mv` will not move — puts back every move before it. Until it is done it keeps a journal of
+its moves (`.dbd-split`) and the manifest as it was: while the journal is there every command is
+refused, and `dbd split --undo` puts the files and design.yaml back. A file reached through a link
+from outside the project is refused, and a linked design.yaml is written through its link. Refused before anything moves: a
+workspace, a design without scopes, a project with `snapshots/` or `migrations/` (a migration does
+not divide by module — split before the first release), a file that does not parse, a schema only a
+file's path names (add it to `schemas:`), a scope that leaves out what its entities need, a file of
+`ddl/`, `import/` or `policies/` that maps to no module or to two, two files onto one path, a module
+name that cannot name an owner or that differs from another only in case, a module folder already
+holding files, an earlier split's leftovers, and — for `--write` — dependencies that would cycle. On each database, each module's first deploy
+takes over what it declares from the project as it was, and retires the project's record once its
+modules hold everything it held (the workspace transfer rule).
+
 ### dbd inspect
 
 ```sh

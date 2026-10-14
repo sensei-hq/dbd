@@ -98,6 +98,16 @@ impl Workspace {
     /// entries: their entities resolve its references as externals — never
     /// its own to build, claim or own; their definitions stay in their module.
     pub fn load(config_path: &Path, env: &str, project_dir: Option<&Path>) -> Result<Self> {
+        let dir = project_dir
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| config_path.parent().unwrap_or(Path::new(".")).to_path_buf());
+        crate::split::refuse_a_half_split(&dir)?;
+        Self::load_unguarded(config_path, env, project_dir)
+    }
+
+    /// [`Self::load`], not refused while a split's journal is there — for
+    /// the split's own check of what it has just written.
+    pub(crate) fn load_unguarded(config_path: &Path, env: &str, project_dir: Option<&Path>) -> Result<Self> {
         let project_dir = project_dir
             .map(Path::to_path_buf)
             .unwrap_or_else(|| config_path.parent().unwrap_or(Path::new(".")).to_path_buf());
@@ -1019,7 +1029,7 @@ fn check_manifest(manifest: &DesignConfig, project_dir: &Path) -> Result<IndexMa
 /// `[A-Za-z0-9_][A-Za-z0-9_-]*`, and read by YAML as a string: what can
 /// follow `<project>/` in an owner, name a folder, and key its block,
 /// unambiguously.
-fn is_module_name(name: &str) -> bool {
+pub(crate) fn is_module_name(name: &str) -> bool {
     name.chars()
         .next()
         .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')

@@ -354,6 +354,29 @@ pub enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Divide a project into a workspace of modules
+    ///
+    /// With --from-scopes, each region of the project's scopes — their Venn
+    /// diagram, each scope's entities with their dependencies — becomes a
+    /// module: the region every scope holds is `shared`, the one a scope
+    /// alone holds is named for it (`default` as `core`). Each module depends
+    /// on what its entities reference, and each scope becomes the modules it
+    /// holds. Without --write it prints the plan and changes nothing.
+    Split {
+        /// Divide by the project's scopes
+        #[arg(long)]
+        from_scopes: bool,
+        /// Move the files into the modules' folders (`git mv` in a git work
+        /// tree) and write modules: and scopes: into design.yaml
+        #[arg(long)]
+        write: bool,
+        /// Name a module of the plan otherwise: `--rename shared=common`
+        #[arg(long, value_name = "MODULE=NAME")]
+        rename: Vec<String>,
+        /// Put back what an interrupted `--write` moved, from its journal
+        #[arg(long, conflicts_with_all = ["from_scopes", "write", "rename"])]
+        undo: bool,
+    },
     /// Format DDL files
     Format {
         /// Check formatting without modifying files (exit 1 if unformatted)

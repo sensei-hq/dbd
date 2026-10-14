@@ -7,7 +7,7 @@ use crate::error::{DbdError, Result};
 const DDL_EXTENSIONS: &[&str] = &["ddl", "sql"];
 
 /// Allowed import data file extensions.
-const IMPORT_EXTENSIONS: &[&str] = &["csv", "tsv", "json", "jsonl"];
+pub(crate) const IMPORT_EXTENSIONS: &[&str] = &["csv", "tsv", "json", "jsonl"];
 
 /// Allowed policy file extensions.
 const POLICY_EXTENSIONS: &[&str] = &["ddl", "sql"];

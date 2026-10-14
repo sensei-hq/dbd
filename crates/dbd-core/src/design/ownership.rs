@@ -75,7 +75,7 @@ impl Design {
     /// it gives a table, a view and a materialized view a row type, so none of
     /// them can share a name with an enum, a composite, a domain or a range.
     /// Routines are owned by name, their overloads one entity.
-    pub(super) fn entity_keys(&self) -> Vec<(&Entity, Vec<OwnedObject>)> {
+    pub(crate) fn entity_keys(&self) -> Vec<(&Entity, Vec<OwnedObject>)> {
         // Read as the loader reads the design: `supabase`, and anything else
         // libpg_query parses, is Postgres.
         let postgres =
@@ -102,7 +102,7 @@ impl Design {
                 let created: Vec<(Created, Option<String>, String)> = postgres
                     .then_some(e.file.as_ref())
                     .flatten()
-                    .and_then(|file| crate::source_text::read_to_string(&self.project_dir.join(file)).ok())
+                    .and_then(|file| crate::source_text::read_to_string(&self.source_file(file)).ok())
                     .map(|sql| crate::parser::pg::created_identities(&sql))
                     .unwrap_or_default();
                 let mut keys: Vec<OwnedObject> = created
@@ -479,7 +479,7 @@ impl Design {
             let Some(sql) = e
                 .file
                 .as_ref()
-                .and_then(|file| crate::source_text::read_to_string(&self.project_dir.join(file)).ok())
+                .and_then(|file| crate::source_text::read_to_string(&self.source_file(file)).ok())
             else {
                 continue;
             };

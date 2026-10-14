@@ -894,3 +894,45 @@ fn a_module_named_like_a_module_folder_holds_its_own_files() {
         );
     }
 }
+
+/// What a file creates beside its entity is read from the file wherever the
+/// project folder is named from: relative, a type beside a table was not read
+/// at all, and a reference to it into a module outside `depends_on` loaded
+/// (#7, T20).
+#[test]
+fn a_type_created_beside_a_table_is_read_from_a_relative_project_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    for (rel, text) in [
+        (
+            "design.yaml",
+            "project:\n  name: shop\n\nschemas:\n  - app\n  - dojo\n\nmodules:\n  shared: {}\n  dojo: {}\n",
+        ),
+        (
+            "shared/ddl/table/app/lookups.ddl",
+            "set search_path to app;\ncreate type lookup_kind as enum ('a', 'b');\n\
+             create table if not exists lookups (code text primary key, kind lookup_kind);\n",
+        ),
+        (
+            "dojo/ddl/table/dojo/sessions.ddl",
+            "set search_path to dojo;\ncreate table if not exists sessions (id integer primary key, kind app.lookup_kind);\n",
+        ),
+    ] {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    let cwd = std::env::current_dir().unwrap();
+    let mut relative = std::path::PathBuf::new();
+    for _ in 0..cwd.components().count() - 1 {
+        relative.push("..");
+    }
+    let relative = relative.join(root.strip_prefix("/").unwrap());
+    for dir in [root.to_path_buf(), relative] {
+        let err = match Workspace::load(&dir.join("design.yaml"), "dev", Some(&dir)) {
+            Ok(_) => panic!("{}: dojo uses shared's type without depending on it", dir.display()),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("app.lookup_kind"), "{}: {err}", dir.display());
+    }
+}

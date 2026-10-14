@@ -3854,3 +3854,80 @@ async fn a_workspace_never_one_project_retires_nothing() {
     assert!(o.status.success(), "{text}");
     assert_eq!(text.matches("is retired").count(), 0, "{text}");
 }
+
+/// Every relation `inspect --shared` lists as owned, by anyone.
+fn relations_owned(dir: &Path, url: &str) -> std::collections::BTreeSet<String> {
+    owners_listed(dir, url)
+        .iter()
+        .filter_map(|line| line.split_once(": ").map(|(_, owned)| owned.to_string()))
+        .flat_map(|owned| owned.split(", ").map(str::to_string).collect::<Vec<_>>())
+        .collect()
+}
+
+/// T24: a project deployed to two databases under two scopes, split from its
+/// scopes, deploys to each what it did — the project's record retired, a
+/// record for each module there.
+#[tokio::test]
+async fn t24_a_split_project_deploys_what_it_did_to_each_database() {
+    let (pg, url) = start_pg().await;
+    pg.create_database("dojo").await.expect("the Dōjō's database");
+    let dojo_url = pg.settings().url("dojo");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let write = |rel: &str, text: &str| {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+    write(
+        "design.yaml",
+        "project:\n  name: sensei\n\nsource:\n  dialect: postgresql\n\nschemas:\n  - app\n  - dojo\n\n\
+         scopes:\n  default:\n    excludes: [dojo]\n  dojo:\n    includes: [dojo, app.lookups]\n",
+    );
+    write(
+        "ddl/table/app/lookups.ddl",
+        "set search_path to app;\ncreate table if not exists lookups (code text primary key);\n",
+    );
+    write(
+        "ddl/table/app/orders.ddl",
+        "set search_path to app;\ncreate table if not exists orders (\n  id integer primary key\n, \
+         kind text references lookups (code)\n);\n",
+    );
+    write(
+        "ddl/table/dojo/sessions.ddl",
+        "set search_path to dojo;\ncreate table if not exists sessions (\n  id integer primary key\n, \
+         kind text references app.lookups (code)\n);\n",
+    );
+    for (url, args) in [(&url, &["deploy"][..]), (&dojo_url, &["deploy", "--scope", "dojo"])] {
+        let o = dbd(dir, url, args);
+        assert!(o.status.success(), "{args:?}: {}", combined(&o));
+    }
+    let before = (relations_owned(dir, &url), relations_owned(dir, &dojo_url));
+    assert!(before.0.contains("relation app.orders") && !before.0.contains("relation dojo.sessions"));
+    assert!(before.1.contains("relation dojo.sessions") && !before.1.contains("relation app.orders"));
+
+    let o = dbd(dir, &url, &["split", "--from-scopes", "--write"]);
+    assert!(o.status.success(), "the split: {}", combined(&o));
+    for (url, args) in [(&url, &["deploy"][..]), (&dojo_url, &["deploy", "--scope", "dojo"])] {
+        let o = dbd(dir, url, args);
+        assert!(o.status.success(), "{args:?} after the split: {}", combined(&o));
+    }
+
+    assert_eq!((relations_owned(dir, &url), relations_owned(dir, &dojo_url)), before);
+    for (url, modules) in [
+        (&url, ["sensei/shared", "sensei/core"]),
+        (&dojo_url, ["sensei/shared", "sensei/dojo"]),
+    ] {
+        let owners = owners_listed(dir, url);
+        assert!(
+            !owners.iter().any(|o| o.starts_with("sensei (")),
+            "sensei is retired: {owners:?}"
+        );
+        for module in modules {
+            assert!(
+                owners.iter().any(|o| o.starts_with(&format!("{module} ("))),
+                "{module}: {owners:?}"
+            );
+        }
+    }
+}

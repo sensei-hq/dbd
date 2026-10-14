@@ -32,6 +32,7 @@ pub use ownership::{Prune, SharedDatabase, SharedProject, SharedUse, leave_out_o
 pub use plan::{ApplyStrategy, ExecutionPlan, ExecutionStep, build_execution_plan};
 pub use reading::Reading;
 pub use reset::{KeptRole, ResetComplete};
+pub(crate) use workspace::is_module_name;
 pub use workspace::{Module, Workspace, check_scope_gaps};
 
 /// Summary passed to the `on_complete` callback of `apply()`.
@@ -864,6 +865,7 @@ impl Design {
         let project_dir = project_dir
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| config_path.parent().unwrap_or(Path::new(".")).to_path_buf());
+        crate::split::refuse_a_half_split(&project_dir)?;
 
         let design_config = config::read(config_path)?;
         if !design_config.modules.is_empty() {
@@ -1225,6 +1227,18 @@ impl Design {
     pub fn emptying_for_import(mut self, tables: Vec<String>) -> Self {
         self.import_truncates = Some(tables);
         self
+    }
+
+    /// Where an entity's `file` is read from. A scanned file's path already
+    /// starts with the project directory — the scan is rooted there — so
+    /// joining it on again doubled a relative `-s proj` into `proj/proj/ddl/…`;
+    /// only a path not under it is resolved against it.
+    pub(crate) fn source_file(&self, file: &Path) -> PathBuf {
+        if file.starts_with(&self.project_dir) {
+            file.to_path_buf()
+        } else {
+            self.project_dir.join(file)
+        }
     }
 
     /// The module this design is in its workspace's manifest (#7) — what its
