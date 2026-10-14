@@ -75,7 +75,7 @@ impl Design {
     /// it gives a table, a view and a materialized view a row type, so none of
     /// them can share a name with an enum, a composite, a domain or a range.
     /// Routines are owned by name, their overloads one entity.
-    pub(super) fn entity_keys(&self) -> Vec<(&Entity, Vec<OwnedObject>)> {
+    pub(crate) fn entity_keys(&self) -> Vec<(&Entity, Vec<OwnedObject>)> {
         // Read as the loader reads the design: `supabase`, and anything else
         // libpg_query parses, is Postgres.
         let postgres =

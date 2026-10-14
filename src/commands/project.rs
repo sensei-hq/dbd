@@ -180,7 +180,16 @@ pub fn cmd_split(
                 } else {
                     format!(", excludes [{}]", s.excludes.join(", "))
                 };
-                output::always(&format!("  {}: modules [{}]{excludes}", s.name, modules.join(", ")));
+                let extensions = s
+                    .extensions
+                    .as_ref()
+                    .map(|e| format!(", extensions [{}]", e.join(", ")))
+                    .unwrap_or_default();
+                output::always(&format!(
+                    "  {}: modules [{}]{excludes}{extensions}",
+                    s.name,
+                    modules.join(", ")
+                ));
             }
         }
     }
@@ -196,19 +205,23 @@ pub fn cmd_split(
             cycle.join(" → ")
         ));
     }
+    let scripts = plan.script_paths.len();
+    let files = plan.moves.len() - scripts;
+    let moving = match scripts {
+        0 => format!("{files} files move into the modules' folders"),
+        1 => format!("{files} files move into the modules' folders, and 1 import script to scripts/"),
+        n => format!("{files} files move into the modules' folders, and {n} import scripts to scripts/"),
+    };
     if !write {
         output::always(&format!(
-            "{} files move into the modules' folders. Run again with --write to move them and write modules: and \
-             scopes: into design.yaml.",
-            plan.moves.len()
+            "{moving}. Run again with --write to move them and write modules: and scopes: into design.yaml."
         ));
         return Ok(());
     }
     dbd_core::split::write_split(&plan, config, project_dir)?;
     output::always(&format!(
-        "Moved {} files and wrote modules: and scopes: into {}. Each module's first deploy takes over what it \
+        "Moved: {moving}; wrote modules: and scopes: into {}. Each module's first deploy takes over what it \
          declares from \"{}\".",
-        plan.moves.len(),
         config.display(),
         plan.project
     ));
