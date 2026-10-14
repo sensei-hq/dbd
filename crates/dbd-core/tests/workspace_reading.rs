@@ -176,6 +176,33 @@ fn a_module_views_itself_and_its_dependencies() {
     assert_eq!(modules, ["shared"]);
     let tables: Vec<&str> = model.tables.iter().map(|t| t.name.as_str()).collect();
     assert_eq!(tables, ["currencies"]);
+
+    let model = dbd_core::schema_model::build_reading(&reading(tmp.path(), Some("core"), None)).expect("model");
+    let modules: Vec<&str> = model.modules.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(modules, ["shared", "core"]);
+    let tables: Vec<&str> = model.tables.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(tables, ["currencies", "orders"]);
+    assert!(model.stubs.is_empty(), "{:?}", model.stubs);
+}
+
+/// A scope that selects a module reads it with what it depends on — and
+/// nothing else.
+#[test]
+fn a_scope_selecting_a_module_reads_it_with_its_dependencies() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    shop(root);
+    let manifest = std::fs::read_to_string(root.join("design.yaml")).unwrap();
+    write(
+        root,
+        "design.yaml",
+        &format!("{manifest}  ref:\n    modules: [shared]\n"),
+    );
+    let model = dbd_core::schema_model::build_reading(&reading(root, None, Some("ref"))).expect("model");
+    let modules: Vec<&str> = model.modules.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(modules, ["shared"]);
+    let tables: Vec<&str> = model.tables.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(tables, ["currencies"]);
 }
 
 /// A project's model is as it was: no modules, no module on anything.
@@ -423,4 +450,106 @@ fn a_named_entity_of_a_module_not_read_names_its_module() {
         Err(e) => e.to_string(),
     };
     assert!(err.contains("app.orders") && err.contains("\"core\""), "{err}");
+}
+
+/// `-n` narrows the graph to the entity and what it needs: the currencies
+/// need nothing, and the orders need the currencies, not the view reading
+/// them.
+#[test]
+fn the_graph_narrows_to_an_entity_and_what_it_needs() {
+    let tmp = tempfile::tempdir().unwrap();
+    shop(tmp.path());
+    let reading = reading(tmp.path(), None, None);
+    let currencies = reading.graph(Some("app.currencies")).expect("graph");
+    assert_eq!(graph_nodes(&currencies), [("app.currencies", Some("shared"))]);
+    let orders = reading.graph(Some("app.orders")).expect("graph");
+    let names: Vec<&str> = orders.nodes.iter().map(|n| n.name.as_str()).collect();
+    assert!(names.contains(&"app.currencies"), "{names:?}");
+    assert!(!names.contains(&"app.order_currencies"), "{names:?}");
+}
+
+/// SQL Server refuses a key to a table that is not there yet, so an emitted
+/// script creates each module's tables after its dependencies'.
+#[test]
+fn an_emitted_script_creates_each_module_after_its_dependencies() {
+    let tmp = tempfile::tempdir().unwrap();
+    shop(tmp.path());
+    let (sql, _) = dbd_core::emit_dialect::emit_reading(&reading(tmp.path(), None, None), Dialect::TSql).expect("emit");
+    let at = |needle: &str| sql.find(needle).unwrap_or_else(|| panic!("{needle}: {sql}"));
+    assert!(
+        at("-- module shared (shop/shared)") < at("CREATE TABLE [app].[currencies]")
+            && at("CREATE TABLE [app].[currencies]") < at("-- module core (shop/core)")
+            && at("-- module core (shop/core)") < at("CREATE TABLE [app].[orders]"),
+        "{sql}"
+    );
+}
+
+/// Each entity once: the manifest's schema is created once, and under a scope
+/// a read into a dependency's table it leaves out is unresolved — the stand-in
+/// for it is no entity of the reading's.
+#[test]
+fn each_entity_is_read_once_and_a_stand_in_is_not_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    shop(tmp.path());
+    let script = reading(tmp.path(), None, None).combined().expect("combine");
+    assert_eq!(script.matches("CREATE SCHEMA IF NOT EXISTS").count(), 1, "{script}");
+
+    let model = dbd_core::schema_model::build_reading(&reading(tmp.path(), None, Some("lean"))).expect("model");
+    let read = model
+        .deps
+        .iter()
+        .find(|d| d.from.n == "order_currencies" && d.to.n == "currencies")
+        .expect("the view reads the currencies");
+    assert!(read.unresolved, "the scope leaves the currencies out: {read:?}");
+}
+
+/// A project is a reading of one: what each command writes reads as its
+/// design's, before workspaces.
+#[test]
+fn a_projects_reading_writes_as_its_design_does() {
+    let config = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/design.yaml");
+    let dir = config.parent().unwrap().to_path_buf();
+    let design = dbd_core::Design::from_config_with_dir(&config, "dev", Some(&dir)).expect("design");
+    let scope = design.resolve_scope(None, None).expect("scope");
+    let reading = Workspace::load(&config, "dev", Some(&dir))
+        .expect("load")
+        .reading(None, None, None)
+        .expect("reading");
+
+    let out = tempfile::tempdir().unwrap();
+    let file = out.path().join("combined.sql");
+    design.combine(&file, Some(&scope)).expect("combine");
+    assert_eq!(
+        reading.combined().expect("combined"),
+        std::fs::read_to_string(&file).unwrap()
+    );
+
+    for dialect in [Dialect::MySql, Dialect::TSql, Dialect::Sqlite] {
+        let ours = dbd_core::emit_dialect::emit_reading(&reading, dialect).expect("emit");
+        let its = dbd_core::emit_dialect::emit_schema(&design, dialect, Some(&scope)).expect("emit");
+        assert_eq!(ours, its, "{dialect:?}");
+    }
+
+    let ours = serde_json::to_string(&dbd_core::schema_model::build_reading(&reading).expect("model")).unwrap();
+    let its = serde_json::to_string(&dbd_core::schema_model::build(&design, Some(&scope)).expect("model")).unwrap();
+    assert_eq!(ours, its);
+
+    let entities = design.scoped_entities(&scope).expect("entities");
+    let its: Vec<String> = dbd_core::dbml::generate_all(&dbd_core::dbml::DbmlMultiParams {
+        entities: &entities,
+        design_entities: design.entities(),
+        project_name: &design.config().project.name,
+        database_type: &design.config().source.dialect,
+        project_note: design.config().project.note.as_deref(),
+        docs: &design.config().dbml,
+    })
+    .into_iter()
+    .map(|d| format!("{}\n{}", d.file_name, d.content))
+    .collect();
+    let ours: Vec<String> = dbd_core::dbml::generate_reading(&reading)
+        .expect("dbml")
+        .into_iter()
+        .map(|d| format!("{}\n{}", d.file_name, d.content))
+        .collect();
+    assert_eq!(ours, its);
 }

@@ -91,6 +91,29 @@ describe('the sidebar of a workspace', () => {
     ]);
   });
 
+  const keys = (container: Element) => attr(container.querySelectorAll('[data-entity-key]'), 'data-entity-key');
+
+  it('searches across the modules, leaving out a module with no match', async () => {
+    const container = open(workspace);
+    await fireEvent.input(container.querySelector('input')!, { target: { value: 'orders' } });
+    expect(attr(container.querySelectorAll('[data-module-group]'), 'data-module-group')).toEqual(['core']);
+    expect(keys(container)).toEqual(['app.orders']);
+  });
+
+  it("collapses a module, and a module's schema without another module's", async () => {
+    const container = open(workspace);
+    await fireEvent.click(container.querySelector('[data-module-group="shared"] [data-schema-group="app"] button')!);
+    expect(keys(container)).toEqual(['ref.countries', 'app.orders', 'app.order_totals']);
+    await fireEvent.click(container.querySelector('[data-module-group="shared"] > button')!);
+    expect(keys(container)).toEqual(['app.orders', 'app.order_totals']);
+  });
+
+  it('says when nothing matches', async () => {
+    const container = open(sampleModel);
+    await fireEvent.input(container.querySelector('input')!, { target: { value: 'zzzz' } });
+    expect(container.textContent).toContain('Nothing matches');
+  });
+
   it('groups a project by schema alone', () => {
     const container = open(sampleModel);
     expect(container.querySelector('[data-module-group]')).toBeNull();
@@ -133,7 +156,31 @@ describe("an entity's page in a workspace", () => {
 
   it("of a project's names none", () => {
     const { container } = render(EntityView, { props: { model: sampleModel, entityKey: 'shop.orders', onNav: () => {} } });
-    expect(container.querySelector('[data-module]')).toBeNull();
+    expect(container.querySelector('[data-module-badge]')).toBeNull();
+  });
+
+  it("of a stub reads its module's history", async () => {
+    const stubbed: SchemaModel = {
+      ...workspace,
+      tables: workspace.tables.filter((t) => t.name !== 'currencies'),
+      stubs: [
+        {
+          schema: 'app',
+          name: 'currencies',
+          kind: 'out_of_scope',
+          module: 'shared',
+          columns: [{ name: 'code', type: 'text' }],
+        },
+      ],
+      history: [
+        { version: 3, description: 'core', timestamp: '2026-10-01T00:00:00Z', module: 'core', changes: [], baseline: { tables: 1, enums: 0 } },
+      ],
+    };
+    const { container } = render(EntityView, { props: { model: stubbed, entityKey: 'app.currencies', onNav: () => {} } });
+    await fireEvent.click(await findByRole(container, 'button', { name: 'Changelog' }));
+    expect(container.querySelector('[data-entity-changelog]')?.textContent).toContain(
+      'No snapshots of module shared yet',
+    );
   });
 });
 

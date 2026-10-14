@@ -118,6 +118,130 @@ fn graph_in_a_module_folder_is_that_modules() {
     let names: Vec<String> = nodes(&graph).into_iter().map(|(n, _)| n).collect();
     assert!(names.contains(&"app.currencies".to_string()), "{names:?}");
     assert!(!names.contains(&"app.orders".to_string()), "{names:?}");
+
+    // core's, with shared's it depends on.
+    let graph = json(&ok(&tmp.path().join("core"), &["graph"]));
+    let mut found = nodes(&graph);
+    found.sort();
+    assert!(found.contains(&("app.currencies".into(), "shared".into())), "{found:?}");
+    assert!(found.contains(&("app.orders".into(), "core".into())), "{found:?}");
+}
+
+/// `-n` is the entity and what it needs, from its module.
+#[test]
+fn graph_of_an_entity_is_it_and_what_it_needs() {
+    let tmp = tempfile::tempdir().unwrap();
+    shop(tmp.path());
+    let graph = json(&ok(tmp.path(), &["graph", "-n", "app.currencies"]));
+    assert_eq!(nodes(&graph), [("app.currencies".to_string(), "shared".to_string())]);
+}
+
+/// A scope selecting a module is that module and what it depends on.
+#[test]
+fn graph_under_a_scope_selecting_a_module_is_that_modules() {
+    let tmp = tempfile::tempdir().unwrap();
+    shop(tmp.path());
+    let manifest = fs::read_to_string(tmp.path().join("design.yaml")).unwrap();
+    write(
+        tmp.path(),
+        "design.yaml",
+        &format!("{manifest}\nscopes:\n  ref:\n    modules: [shared]\n"),
+    );
+    let graph = json(&ok(tmp.path(), &["graph", "--scope", "ref"]));
+    let names: Vec<String> = nodes(&graph).into_iter().map(|(n, _)| n).collect();
+    assert!(names.contains(&"app.currencies".to_string()), "{names:?}");
+    assert!(!names.contains(&"app.orders".to_string()), "{names:?}");
+}
+
+/// dbml, the diagram and emit run in a module's folder are that module's.
+#[test]
+fn every_artifact_in_a_module_folder_is_that_modules() {
+    let tmp = tempfile::tempdir().unwrap();
+    shop(tmp.path());
+    let shared = tmp.path().join("shared");
+
+    ok(&shared, &["dbml", "-f", "shared.dbml"]);
+    let dbml = fs::read_to_string(tmp.path().join("shared.dbml")).unwrap();
+    assert!(
+        dbml.contains("\"currencies\"") && !dbml.contains("\"orders\""),
+        "{dbml}"
+    );
+
+    ok(&shared, &["diagram", "--json", "-f", "shared.json"]);
+    let model: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(tmp.path().join("shared.json")).unwrap()).unwrap();
+    let tables: Vec<&str> = model["tables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(tables, ["currencies"]);
+
+    ok(&shared, &["emit", "--dialect", "sqlite", "-f", "shared.sql"]);
+    let sql = fs::read_to_string(tmp.path().join("shared.sql")).unwrap();
+    assert!(sql.contains("currencies") && !sql.contains("orders"), "{sql}");
+}
+
+/// A later module's policies are reported as not carried, as one design's.
+#[test]
+fn emit_reports_each_modules_policies() {
+    let tmp = tempfile::tempdir().unwrap();
+    shop(tmp.path());
+    write(
+        tmp.path(),
+        "core/policies/app/orders.sql",
+        "alter table app.orders enable row level security;\n",
+    );
+    ok(
+        tmp.path(),
+        &[
+            "emit",
+            "--dialect",
+            "sqlite",
+            "-f",
+            "shop.sql",
+            "--report",
+            "report.json",
+        ],
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(tmp.path().join("report.json")).unwrap()).unwrap();
+    assert!(
+        report.as_array().unwrap().iter().any(|d| d["entity"] == "app.orders"
+            && d["to"] == "nothing"
+            && d["from"].as_str().unwrap().contains("policies/app/orders.sql")),
+        "{report}"
+    );
+}
+
+/// Each configured document without groups of its own gets one per module
+/// it holds tables of; one with its own groups keeps just them.
+#[test]
+fn every_dbml_document_groups_by_module_unless_it_groups_its_own_way() {
+    let tmp = tempfile::tempdir().unwrap();
+    shop(tmp.path());
+    let manifest = fs::read_to_string(tmp.path().join("design.yaml")).unwrap();
+    write(
+        tmp.path(),
+        "design.yaml",
+        &format!(
+            "{manifest}\ndbml:\n  shop: {{}}\n  ref:\n    include:\n      tables: [app.currencies]\n  \
+             own:\n    groups:\n      - name: mine\n        tables: [app.orders]\n"
+        ),
+    );
+    ok(tmp.path(), &["dbml", "-f", "x.dbml"]);
+    let groups = |doc: &str| -> Vec<String> {
+        fs::read_to_string(tmp.path().join(doc))
+            .unwrap()
+            .lines()
+            .filter_map(|l| l.strip_prefix("TableGroup "))
+            .map(|g| g.trim_end_matches(" {").to_string())
+            .collect()
+    };
+    assert_eq!(groups("shop.dbml"), ["\"shared\"", "\"core\""]);
+    assert_eq!(groups("ref.dbml"), ["\"shared\""]);
+    assert_eq!(groups("own.dbml"), ["\"mine\""]);
 }
 
 #[test]
