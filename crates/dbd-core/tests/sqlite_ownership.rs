@@ -430,3 +430,63 @@ async fn sqlite_modules_take_over_from_their_project_and_from_each_other() {
         "items is kept"
     );
 }
+
+/// On SQLite as on Postgres, the project keeps its record — and its claim —
+/// while it holds a table its modules have not taken over yet.
+#[tokio::test]
+async fn sqlite_keeps_the_project_until_its_last_table_is_taken_over() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("shop.db");
+    let root = tmp.path().join("shop");
+    let table = |name: &str| format!("CREATE TABLE IF NOT EXISTS {name} (id INTEGER PRIMARY KEY);\n");
+    let write = |rel: &str, text: &str| {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+    write(
+        "design.yaml",
+        "project:\n  name: shop\n\nsource:\n  dialect: sqlite\n\nschemas: []\n",
+    );
+    write("ddl/table/items.ddl", &table("items"));
+    write("ddl/table/orders.ddl", &table("orders"));
+    let shop = connect(&file, "shop").await;
+    Design::from_config_with_dir(&root.join("design.yaml"), "dev", Some(&root))
+        .unwrap()
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    std::fs::remove_file(root.join("ddl/table/items.ddl")).unwrap();
+    std::fs::remove_file(root.join("ddl/table/orders.ddl")).unwrap();
+    write("shared/ddl/table/items.ddl", &table("items"));
+    write("core/ddl/table/orders.ddl", &table("orders"));
+    write(
+        "design.yaml",
+        "project:\n  name: shop\n\nsource:\n  dialect: sqlite\n\nschemas: []\n\n\
+         modules:\n  shared: {}\n  core:\n    depends_on: [shared]\n",
+    );
+    let modules = dbd_core::design::Workspace::load(&root.join("design.yaml"), "dev", Some(&root))
+        .unwrap()
+        .select(None)
+        .unwrap();
+    modules[0]
+        .design()
+        .apply(
+            &*connect(&file, "shop/shared").await,
+            None,
+            false,
+            None,
+            Progress::none(),
+        )
+        .await
+        .expect("shared's apply");
+    assert!(!modules[0].design().retired_predecessor(), "shop still holds orders");
+    let owned: Vec<String> = shop
+        .owned_objects("shop")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|o| o.name)
+        .collect();
+    assert_eq!(owned, ["orders"]);
+}

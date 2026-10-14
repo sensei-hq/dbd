@@ -3802,6 +3802,11 @@ async fn a_project_split_into_modules_says_what_each_takes_over() {
     let o = dbd(dir, &url, &["deploy", "--dry-run"]);
     let text = combined(&o);
     assert!(o.status.success(), "{text}");
+    assert_eq!(
+        text.matches("is retired").count(),
+        0,
+        "a dry run retires nothing: {text}"
+    );
     for line in [
         "[dry-run] would adopt relation app.currencies from \"shop\"",
         "[dry-run] would adopt relation app.orders from \"shop\"",
@@ -3813,9 +3818,19 @@ async fn a_project_split_into_modules_says_what_each_takes_over() {
     let text = combined(&o);
     assert!(o.status.success(), "{text}");
     assert!(text.contains("adopting relation app.orders from \"shop\""), "{text}");
-    assert!(
-        text.contains("project \"shop\" is retired — its modules hold everything it held"),
+    assert_eq!(
+        text.matches("project \"shop\" is retired — its modules hold everything it held")
+            .count(),
+        1,
         "{text}"
+    );
+    let o = dbd(dir, &url, &["deploy"]);
+    let text = combined(&o);
+    assert!(o.status.success(), "{text}");
+    assert_eq!(
+        text.matches("is retired").count(),
+        0,
+        "a redeploy retires nothing: {text}"
     );
     let owners = owners_listed(dir, &url);
     assert!(!owners.iter().any(|o| o.starts_with("shop (")), "{owners:?}");
@@ -3825,4 +3840,17 @@ async fn a_project_split_into_modules_says_what_each_takes_over() {
             .any(|o| o == "shop/core (prod, v0) — owns 1: relation app.orders"),
         "{owners:?}"
     );
+}
+
+/// A workspace that was never one project retires nothing.
+#[tokio::test]
+async fn a_workspace_never_one_project_retires_nothing() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    shop_workspace(dir);
+    let o = dbd(dir, &url, &["deploy"]);
+    let text = combined(&o);
+    assert!(o.status.success(), "{text}");
+    assert_eq!(text.matches("is retired").count(), 0, "{text}");
 }
