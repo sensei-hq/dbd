@@ -20,10 +20,10 @@
 
 ## Next
 
-Slice 6 on `feat/workspaces-split`: `dbd split --from-scopes` and the
-workspace transfer rule (T22–T24). Found: `reconcile --prune` drops a table
-moved from shared to core (shared prunes it first, core recreates it empty)
-— T22 must close that. Next: decisions in the plan, then red tests.
+Slice 6a on `feat/workspaces-split`: the workspace transfer rule (98390afa) —
+modules take over from the project and each other, prune none of a sibling's,
+retire the project; T22/T24 green on Postgres and SQLite. Next: PR, review,
+CI, merge; then 6b, `dbd split --from-scopes` (T23).
 
 ## Open
 

@@ -239,6 +239,9 @@ follows in a second):
   `dbd.meta` row, its `dbd.uses`, its claims of what is gone and its
   materialized-view stamps go, in the run's claim — its `dbd.migrations`
   stay, as history. Until then it is an owner like any other.
+- What another module declares is no sign of another project under a
+  module's name either: a module whose entities all moved holds none it
+  declares, and still runs.
 - The adapter takes over from several owners at once through
   `claim_objects_from(owner, objects, write, from)` — by default
   `claim_objects` for none or one, so an adapter written before keeps
