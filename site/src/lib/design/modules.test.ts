@@ -1,12 +1,13 @@
 import { it, expect, describe } from 'vitest';
-import { render, fireEvent } from '@testing-library/svelte';
+import { render, fireEvent, findByRole } from '@testing-library/svelte';
 import Sidebar from './Sidebar.svelte';
 import DiagramView from './DiagramView.svelte';
 import EntityView from './EntityView.svelte';
 import ObjectView from './ObjectView.svelte';
 import EnumView from './EnumView.svelte';
 import ChangelogView from './ChangelogView.svelte';
-import { validateModel, type SchemaModel } from './model';
+import { validateModel, type HistoryEntry, type SchemaModel } from './model';
+import { entityHistory } from './changelog';
 import { sampleModel } from './data';
 
 // A workspace's model (#7 phase 3, slice 5): `modules` in load order, and each table, entity
@@ -135,5 +136,48 @@ describe("a workspace's changelog", () => {
       ['1', 'core'],
     ]);
     expect(cards[1].querySelector('[data-module-badge]')?.textContent?.trim()).toBe('core');
+  });
+});
+
+describe("a workspace's history", () => {
+  const entry = (module: string, version: number, baseline = false): HistoryEntry => ({
+    version,
+    description: `${module} v${version}`,
+    timestamp: '2026-10-01T00:00:00Z',
+    module,
+    changes: [],
+    ...(baseline ? { baseline: { tables: 1, enums: 0 } } : {}),
+  });
+
+  it("reads each module's versions newest first, the modules in depends_on order", () => {
+    const history = [entry('shared', 1, true), entry('core', 1, true), entry('core', 2)];
+    const { container } = render(ChangelogView, { props: { model: { ...workspace, history } } });
+    const cards = [...container.querySelectorAll('[data-version]')];
+    expect(cards.map((c) => `${c.getAttribute('data-module')} v${c.getAttribute('data-version')}`)).toEqual([
+      'shared v1',
+      'core v2',
+      'core v1',
+    ]);
+  });
+
+  it("dates an entity from its own module's baseline", async () => {
+    const history = [entry('shared', 1, true), entry('core', 3, true)];
+    expect(entityHistory(history, 'table', 'app', 'orders', 'core').sinceBaseline).toBe(3);
+    const { container } = render(EntityView, {
+      props: { model: { ...workspace, history }, entityKey: 'app.orders', onNav: () => {} },
+    });
+    await fireEvent.click(await findByRole(container, 'button', { name: 'Changelog' }));
+    expect(container.querySelector('[data-entity-changelog]')?.textContent).toContain('Present since v3, the baseline');
+  });
+
+  it('says when its module has no snapshots, though another module has', async () => {
+    const history = [entry('shared', 1, true)];
+    const { container } = render(EntityView, {
+      props: { model: { ...workspace, history }, entityKey: 'app.orders', onNav: () => {} },
+    });
+    await fireEvent.click(await findByRole(container, 'button', { name: 'Changelog' }));
+    expect(container.querySelector('[data-entity-changelog]')?.textContent).toContain(
+      'No snapshots of module core yet',
+    );
   });
 });
