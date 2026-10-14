@@ -18,11 +18,11 @@
 
 ## Next
 
-Slice 5 on `feat/workspaces-viewer`: decisions in the plan; red tests in
-ede5e71d (core `Reading`, CLI artifacts, site `modules.test.ts`). Next: the
-implementation — core, then CLI, then the viewer.
-    cargo test -p dbd-core --test workspace_reading; cargo test --test workspace_artifacts
-    (cd site && bun run test -- src/lib/design/modules.test.ts)
+Slice 5 on `feat/workspaces-viewer`: implemented (43a25efb) — `Reading`, the
+five artifact commands over a workspace, the viewer by module; every suite
+green. Next: PR into `feat/workspaces`, adversarial review, fix test-first.
+
+    gh pr checks <slice 5 PR>
 
 ## Open
 

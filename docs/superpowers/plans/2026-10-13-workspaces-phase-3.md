@@ -102,8 +102,9 @@ Taken in slice 2:
   `{"modules": [{"module", "owner", "diff"}]}` (a project's is its diff, as
   before); a policy failing in one module is reported, the modules after it
   still run, and the run fails at the end.
-- Still refusing a workspace: `format`, `doctor`, `snapshot` and `release`
-  (slice 4), `combine`, `emit`, `graph`, `dbml` and `diagram` (slice 5).
+- Still refusing a workspace then: `format`, `doctor`, `snapshot` and
+  `release` (slice 4), `combine`, `emit`, `graph`, `dbml` and `diagram`
+  (slice 5) — since slice 5 every command runs one but `init` and `merge`.
   `init` and `merge` onboard a project into one design and refuse a
   workspace, pointing at `dbd split` (slice 6).
 
@@ -198,6 +199,15 @@ Taken in slice 5:
 - The viewer groups the sidebar by module, then schema; the diagram is tinted
   by module or by schema — a switch, module first for a workspace's model;
   an entity's page and each changelog entry name their module.
+- What these commands read is `Workspace::reading` — a `Reading`, the
+  selected modules each with its resolved scope; a project is a reading of
+  one, its output as before. `schema_model::build_reading`,
+  `dbml::generate_reading` and `emit_dialect::emit_reading` read it;
+  `DbmlMultiParams`, `generate_all` and `emit_schema` are unchanged for an
+  embedder.
+- The changelog lists each module's versions in turn, in `depends_on`
+  order, newest first; an entity's changelog is its module's, dated from
+  that module's baseline, and says when its module has none.
 
 ## Slices
 
