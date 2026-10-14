@@ -188,3 +188,31 @@ fn split_refuses_a_workspace() {
     assert!(!out.status.success(), "{text}");
     assert!(text.contains("modules:"), "{text}");
 }
+
+/// The plan says what `--write` writes: each scope's `extensions:`, the
+/// import scripts apart from the files going to modules, and a scope that
+/// is `all`.
+#[test]
+fn the_plan_shows_what_it_writes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sensei_like(dir);
+    write(
+        dir,
+        "design.yaml",
+        "project:\n  name: sensei\n\nschemas:\n  - app\n  - dojo\n\nimport:\n  after:\n    - import/loader.sql\n\n\
+         scopes:\n  default:\n    excludes: [dojo]\n  dojo:\n    includes: [dojo, app.lookups]\n    extensions: [pgcrypto]\n  \
+         everything: all\n",
+    );
+    write(dir, "import/loader.sql", "select 1;\n");
+    let out = dbd(dir, &["split", "--from-scopes"]);
+    let text = text(&out);
+    assert!(out.status.success(), "{text}");
+    for wanted in [
+        "dojo: modules [dojo], extensions [pgcrypto]",
+        "everything: all",
+        "4 files move into the modules' folders, and 1 import script to scripts/",
+    ] {
+        assert!(text.contains(wanted), "{wanted}: {text}");
+    }
+}

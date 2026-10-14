@@ -583,3 +583,189 @@ mod writing {
         std::fs::rename(root.join(from), to).unwrap();
     }
 }
+
+/// What the plan must read right for the workspace to deploy what each scope
+/// did (#7).
+mod reading {
+    use super::*;
+
+    /// `path` as a path relative to the folder the tests run in.
+    pub(super) fn relative_to_cwd(path: &Path) -> PathBuf {
+        let cwd = std::env::current_dir().unwrap();
+        let depth = cwd.components().count() - 1;
+        let mut relative = PathBuf::new();
+        for _ in 0..depth {
+            relative.push("..");
+        }
+        relative.join(path.strip_prefix("/").unwrap())
+    }
+
+    /// A type a file creates beside its table is that table's module's: a
+    /// column of it elsewhere depends on that module, as the workspace's gap
+    /// check says.
+    #[test]
+    fn a_type_created_beside_its_table_is_that_modules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            root,
+            "design.yaml",
+            "project:\n  name: sensei\n\nschemas:\n  - app\n  - dojo\n\n\
+             scopes:\n  default:\n    excludes: [dojo]\n  dojo:\n    includes: [dojo, app.lookups]\n",
+        );
+        write(
+            root,
+            "ddl/table/app/lookups.ddl",
+            "set search_path to app;\ncreate type lookup_kind as enum ('a', 'b');\n\
+             create table if not exists lookups (code text primary key, kind lookup_kind);\n",
+        );
+        write(
+            root,
+            "ddl/table/dojo/sessions.ddl",
+            "set search_path to dojo;\ncreate table if not exists sessions (id integer primary key, kind app.lookup_kind);\n",
+        );
+        let plan = plan(root, &[]);
+        let dojo = plan.modules.iter().find(|m| m.name == "dojo").expect("dojo");
+        assert_eq!(dojo.depends_on, ["shared"]);
+        write_split(&plan, &root.join("design.yaml"), root).expect("write");
+        Workspace::load(&root.join("design.yaml"), "dev", Some(root)).expect("the workspace loads");
+    }
+
+    /// A project named by a relative path divides as one named absolutely.
+    #[test]
+    fn a_relative_project_folder_divides_as_an_absolute_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        sensei_like(root);
+        let absolute = plan(root, &[]).moves;
+        let relative = relative_to_cwd(root);
+        let design = Design::from_config_with_dir(&relative.join("design.yaml"), "dev", Some(&relative)).expect("load");
+        let moves = plan_from_scopes(&design, &[]).expect("plan").moves;
+        assert_eq!(moves, absolute);
+    }
+
+    /// A schema dbd adds for a file's path, not in `schemas:`, is no
+    /// manifest's schema every module has — named, to declare first.
+    #[test]
+    fn a_schema_only_a_files_path_names_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        sensei_like(root);
+        write(
+            root,
+            "ddl/table/attic/old.ddl",
+            "set search_path to attic;\ncreate table if not exists old (id integer primary key);\n",
+        );
+        let err = plan_from_scopes(&design(root), &[])
+            .expect_err("attic is in no schemas:")
+            .to_string();
+        assert!(err.contains("attic") && err.contains("schemas:"), "{err}");
+    }
+
+    /// A file that does not parse is refused: its references are unknown, so
+    /// is its region.
+    #[test]
+    fn a_file_that_does_not_parse_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        sensei_like(root);
+        write(
+            root,
+            "ddl/view/dojo/order_report.ddl",
+            "set search_path to dojo;\ncreate or replace view order_report as selec id from app.orders;\n",
+        );
+        let err = plan_from_scopes(&design(root), &[])
+            .expect_err("it does not parse")
+            .to_string();
+        assert!(err.contains("order_report"), "{err}");
+    }
+
+    /// A scope that leaves out what its entities need (`deps: report`, with a
+    /// gap) would deploy it as modules — refused, naming it, rather than
+    /// changed without a word.
+    #[test]
+    fn a_scope_with_a_gap_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        sensei_like(root);
+        let text = std::fs::read_to_string(root.join("design.yaml")).unwrap();
+        write(
+            root,
+            "design.yaml",
+            &text.replace(
+                "  dojo:\n    includes: [dojo, app.lookups, staging.tenants]\n    deps: include\n",
+                "  dojo:\n    includes: [dojo, staging.tenants]\n",
+            ),
+        );
+        let err = plan_from_scopes(&design(root), &[])
+            .expect_err("dojo.sessions needs app.lookups")
+            .to_string();
+        assert!(err.contains("app.lookups") && err.contains("dojo"), "{err}");
+    }
+
+    /// An `import.after` path written `./import/…` keeps its `./`.
+    #[test]
+    fn a_script_path_written_with_dot_slash_is_rewritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        sensei_like(root);
+        let text = std::fs::read_to_string(root.join("design.yaml")).unwrap();
+        write(
+            root,
+            "design.yaml",
+            &text.replace("- import/loader.sql", "- ./import/loader.sql"),
+        );
+        let plan = plan(root, &[]);
+        write_split(&plan, &root.join("design.yaml"), root).expect("write");
+        let written = std::fs::read_to_string(root.join("design.yaml")).unwrap();
+        assert!(written.contains("- ./scripts/loader.sql"), "{written}");
+    }
+
+    /// A schema named like a number is written as the name it is.
+    #[test]
+    fn a_name_yaml_would_read_as_a_number_is_quoted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            root,
+            "design.yaml",
+            "project:\n  name: sensei\n\nschemas:\n  - app\n  - \"2024\"\n\n\
+             scopes:\n  default:\n    excludes: [\"2024\"]\n  archive:\n    includes: [\"2024\", app.lookups]\n",
+        );
+        write(
+            root,
+            "ddl/table/app/lookups.ddl",
+            "set search_path to app;\ncreate table if not exists lookups (code text primary key);\n",
+        );
+        write(
+            root,
+            "ddl/table/2024/orders.ddl",
+            "set search_path to \"2024\";\ncreate table if not exists orders (id integer primary key);\n",
+        );
+        let plan = plan(root, &[]);
+        write_split(&plan, &root.join("design.yaml"), root).expect("write");
+        let manifest = dbd_core::config::read(&root.join("design.yaml")).expect("it reads");
+        let excludes = match &manifest.scopes["default"] {
+            dbd_core::config::ScopeEntry::Spec(spec) => spec.excludes.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(excludes, ["2024"]);
+    }
+
+    /// A manifest written with CRLF line endings keeps them.
+    #[test]
+    fn crlf_line_endings_are_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        sensei_like(root);
+        let text = std::fs::read_to_string(root.join("design.yaml")).unwrap();
+        write(root, "design.yaml", &text.replace('\n', "\r\n"));
+        let plan = plan(root, &[]);
+        write_split(&plan, &root.join("design.yaml"), root).expect("write");
+        let written = std::fs::read_to_string(root.join("design.yaml")).unwrap();
+        assert!(
+            written.contains("modules:\r\n") && !written.replace("\r\n", "").contains('\n'),
+            "{written:?}"
+        );
+    }
+}
