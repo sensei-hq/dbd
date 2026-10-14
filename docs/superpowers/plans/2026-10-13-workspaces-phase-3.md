@@ -208,6 +208,15 @@ Taken in slice 5:
 - The changelog lists each module's versions in turn, in `depends_on`
   order, newest first; an entity's changelog is its module's, dated from
   that module's baseline, and says when its module has none.
+- Review: an entity is its module's by kind and name (a function and a
+  view may share a name across modules), a graph node's included; the scope
+  line counts what the run writes, each entity once; `emit` notes a schema's
+  grants once, each module's policies its own; a module's refusal reads
+  `module "<name>": …`, as the gap check's does, and `-n` of an entity a
+  module the run does not select declares names that module. The overview's
+  recent changes are the newest across the modules, by when each was cut.
+  An unknown scope reads the same in all five commands — `diagram` no longer
+  says "Failed to resolve scope:" first.
 
 ## Slices
 
