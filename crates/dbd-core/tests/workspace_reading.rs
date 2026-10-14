@@ -115,7 +115,10 @@ fn what_a_module_uses_of_a_dependency_lands_on_its_entity() {
 
     assert!(model.stubs.is_empty(), "{:?}", model.stubs);
     assert!(
-        model.refs.iter().any(|r| r.from.t == "orders" && r.to.t == "currencies"),
+        model
+            .refs
+            .iter()
+            .any(|r| r.from.t == "orders" && r.to.t == "currencies"),
         "{:?}",
         model.refs
     );
@@ -244,7 +247,8 @@ fn an_emitted_script_keeps_a_key_into_a_dependency() {
         .map(|(at, _)| at)
         .find(|&at| sql[at..].lines().next().unwrap().contains("orders"))
         .expect(&sql);
-    let orders = &sql[start..start + sql[start..].find(';').unwrap()];
+    // To the statement's end: a downgrade's comment inside it may hold a `;`.
+    let orders = &sql[start..start + sql[start..].find(");").unwrap()];
     assert!(orders.contains("REFERENCES") && orders.contains("currencies"), "{sql}");
 }
 
