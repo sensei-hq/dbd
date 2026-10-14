@@ -251,8 +251,10 @@ follows in a second):
   claim is, and left to a later run when another session holds its rows.
 - The adapter takes over from several owners at once through
   `claim_objects_from(owner, objects, write, from)` — by default
-  `claim_objects` for none or one, so an adapter written before keeps
-  working — and retires an owner through `retire_owner(owner)`.
+  `claim_objects`, taking over from the one of them that holds anything, so
+  an adapter written before, or keeping no registry, keeps working; refused
+  only when several hold what the claim takes — and retires an owner through
+  `retire_owner(owner)`.
 
 ## Slices
 

@@ -20,10 +20,11 @@
 
 ## Next
 
-Slice 6a on `feat/workspaces-split`: the workspace transfer rule (98390afa) —
-modules take over from the project and each other, prune none of a sibling's,
-retire the project; T22/T24 green on Postgres and SQLite. Next: PR, review,
-CI, merge; then 6b, `dbd split --from-scopes` (T23).
+Slice 6a PR #67 (`feat/workspaces-split`): the workspace transfer rule; review
+fixed (1e04bf2d uses follow take-overs, a4745e60 the adapter default), tests
+8314523e. Next: suites, CI, merge; then 6b, `dbd split --from-scopes` (T23).
+
+    gh pr checks 67
 
 ## Open
 
