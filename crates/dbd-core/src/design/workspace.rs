@@ -195,7 +195,7 @@ impl Workspace {
                 .iter()
                 .zip(&objects)
                 .filter(|(m, _)| **m != name)
-                .flat_map(|(_, objects)| objects.iter().cloned())
+                .flat_map(|(m, objects)| objects.iter().map(|o| (m.clone(), o.clone())))
                 .collect();
             modules.push(Module {
                 depends_on: manifest.modules[&name].depends_on.clone(),

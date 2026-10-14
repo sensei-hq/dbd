@@ -638,20 +638,49 @@ impl Bookkeeping {
         // What is adopted changes hands first, in the claim's transaction: a
         // claim refused for a third owner's entity rolls the adoption back.
         if !adopt_from.is_empty() {
-            sqlx::query(
+            let taken: Vec<(String, String, String)> = sqlx::query_as(
                 "UPDATE dbd.objects o SET owner = $4, claimed_at = now() \
                  FROM unnest($1::text[], $2::text[], $3::text[]) AS d(namespace, schema, name) \
                  WHERE o.namespace = d.namespace AND o.schema = d.schema AND o.name = d.name \
-                   AND o.owner = ANY($5)",
+                   AND o.owner = ANY($5) \
+                 RETURNING o.kind, o.schema, o.name",
             )
             .bind(column(|o| &o.namespace))
             .bind(column(|o| &o.schema))
             .bind(column(|o| &o.name))
             .bind(owner)
             .bind(adopt_from)
-            .execute(&mut **tx)
+            .fetch_all(&mut **tx)
             .await
             .map_err(|e| registry_error(&e, "dbd.objects", "adopt"))?;
+            // What an entity uses goes with it: recorded under its giver, the
+            // use guards what it reads until the taker records its own — and
+            // a giver retired, or a taker whose run fails before it records
+            // them, must not leave the use unguarded (#7).
+            let vias: Vec<String> = taken
+                .iter()
+                .map(|(kind, schema, name)| format!("{kind} {schema}.{name}"))
+                .collect();
+            if !vias.is_empty() {
+                sqlx::query(
+                    "INSERT INTO dbd.uses (owner, kind, target, via) \
+                       SELECT $1, u.kind, u.target, u.via FROM dbd.uses u \
+                       WHERE u.owner = ANY($2) AND u.via = ANY($3) \
+                     ON CONFLICT DO NOTHING",
+                )
+                .bind(owner)
+                .bind(adopt_from)
+                .bind(&vias)
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| registry_error(&e, "dbd.uses", "adopt"))?;
+                sqlx::query("DELETE FROM dbd.uses WHERE owner = ANY($1) AND via = ANY($2)")
+                    .bind(adopt_from)
+                    .bind(&vias)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|e| registry_error(&e, "dbd.uses", "adopt"))?;
+            }
         }
         sqlx::query(
             "INSERT INTO dbd.objects (namespace, schema, name, kind, owner) \
@@ -1538,10 +1567,40 @@ async fn held_objects(
         .collect())
 }
 
-/// [`Bookkeeping::retire_owner`]'s statements, in `tx`: nothing, if `owner`
-/// holds anything that still exists, or has no record.
+/// [`Bookkeeping::retire_owner`]'s statements, in `tx`, in a savepoint of
+/// their own: nothing, if `owner` holds anything that still exists, or has no
+/// record — nor if another session's open write holds a row they delete past
+/// [`HEAL_LOCK_TIMEOUT`]. A retire is housekeeping: the run it ends does not
+/// wait on it or fail for it, and a later run retires the owner.
 async fn retire_in(tx: &mut Transaction<'static, Postgres>, owner: &str) -> Result<bool> {
-    let failed = |e: sqlx::Error| DbdError::Config(format!("retire {owner}: {e}"));
+    use sqlx::Executor as _;
+    let failed = |e: sqlx::Error| registry_error(&e, "dbd.meta", &format!("retire {owner}"));
+    (&mut **tx).execute("SAVEPOINT dbd_retire").await.map_err(failed)?;
+    bounded_wait(tx, "dbd.meta", true).await?;
+    let outcome = retire_steps(tx, owner).await;
+    let retired = match outcome {
+        Ok(retired) => {
+            (&mut **tx)
+                .execute("RELEASE SAVEPOINT dbd_retire")
+                .await
+                .map_err(failed)?;
+            retired
+        }
+        Err(e) if sqlstate(&e).as_deref() == Some("55P03") => {
+            (&mut **tx)
+                .execute("ROLLBACK TO SAVEPOINT dbd_retire")
+                .await
+                .map_err(failed)?;
+            false
+        }
+        Err(e) => return Err(failed(e)),
+    };
+    bounded_wait(tx, "dbd.meta", false).await?;
+    Ok(retired)
+}
+
+/// What [`retire_in`] runs in its savepoint.
+async fn retire_steps(tx: &mut Transaction<'static, Postgres>, owner: &str) -> std::result::Result<bool, sqlx::Error> {
     let holds: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM dbd.objects o WHERE o.owner = $1 \
            AND CASE o.namespace \
@@ -1555,30 +1614,24 @@ async fn retire_in(tx: &mut Transaction<'static, Postgres>, owner: &str) -> Resu
     )
     .bind(owner)
     .fetch_one(&mut **tx)
-    .await
-    .map_err(failed)?;
+    .await?;
     if holds {
         return Ok(false);
     }
     let recorded: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM dbd.meta WHERE project = $1)")
         .bind(owner)
         .fetch_one(&mut **tx)
-        .await
-        .map_err(failed)?;
+        .await?;
     if !recorded {
         return Ok(false);
     }
     for statement in [
+        "DELETE FROM dbd.meta WHERE project = $1",
         "DELETE FROM dbd.uses WHERE owner = $1",
         "DELETE FROM dbd.objects WHERE owner = $1",
         "DELETE FROM dbd.matview_stamps WHERE project = $1",
-        "DELETE FROM dbd.meta WHERE project = $1",
     ] {
-        sqlx::query(statement)
-            .bind(owner)
-            .execute(&mut **tx)
-            .await
-            .map_err(failed)?;
+        sqlx::query(statement).bind(owner).execute(&mut **tx).await?;
     }
     Ok(true)
 }

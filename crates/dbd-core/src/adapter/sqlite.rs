@@ -922,7 +922,23 @@ impl DatabaseAdapter for SqliteAdapter {
         }
         self.ensure_registry_inner().await?;
         let mut tx = self.pool.begin().await.map_err(failed)?;
-        // What is adopted changes hands first, in the claim's transaction.
+        // What is adopted changes hands first, in the claim's transaction —
+        // and what each entity taken over uses goes with it: recorded under
+        // its giver, the use guards what it reads until the taker records its
+        // own (#7).
+        let mut taken: Vec<(String, String)> = Vec::new();
+        for o in objects {
+            let held: Option<(String, String, String)> =
+                sqlx::query_as("SELECT kind, schema, owner FROM _dbd_objects WHERE namespace = ?1 AND name = ?2")
+                    .bind(&o.namespace)
+                    .bind(&o.name)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(failed)?;
+            if let Some((kind, schema, giver)) = held.filter(|(_, _, giver)| adopt_from.contains(giver)) {
+                taken.push((giver, format!("{kind} {schema}.{}", o.name)));
+            }
+        }
         for from in adopt_from {
             for o in objects {
                 sqlx::query(
@@ -936,6 +952,31 @@ impl DatabaseAdapter for SqliteAdapter {
                 .execute(&mut *tx)
                 .await
                 .map_err(failed)?;
+            }
+        }
+        let uses_table: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_dbd_uses'")
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(failed)?;
+        if !taken.is_empty() && uses_table > 0 {
+            for (giver, via) in &taken {
+                sqlx::query(
+                    "INSERT OR IGNORE INTO _dbd_uses (owner, kind, target, via) \
+                     SELECT ?1, kind, target, via FROM _dbd_uses WHERE owner = ?2 AND via = ?3",
+                )
+                .bind(owner)
+                .bind(giver)
+                .bind(via)
+                .execute(&mut *tx)
+                .await
+                .map_err(failed)?;
+                sqlx::query("DELETE FROM _dbd_uses WHERE owner = ?1 AND via = ?2")
+                    .bind(giver)
+                    .bind(via)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(failed)?;
             }
         }
         for o in objects {

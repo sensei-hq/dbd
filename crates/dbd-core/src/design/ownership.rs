@@ -197,8 +197,59 @@ impl Design {
     pub(crate) fn relations_elsewhere(&self) -> impl Iterator<Item = (String, String)> + '_ {
         self.declared_elsewhere
             .iter()
-            .filter(|o| o.namespace != "routine")
-            .map(|o| (o.schema.clone(), o.name.clone()))
+            .filter(|(_, o)| o.namespace != "routine")
+            .map(|(_, o)| (o.schema.clone(), o.name.clone()))
+    }
+
+    /// The other module of the workspace that declares `object`, if one does.
+    pub(crate) fn declaring_elsewhere(&self, adapter: &dyn DatabaseAdapter, object: &OwnedObject) -> Option<&str> {
+        self.declared_elsewhere
+            .iter()
+            .find(|(_, o)| adapter.same_object(o, object))
+            .map(|(m, _)| m.as_str())
+    }
+
+    /// What this owner still holds that another module of the workspace now
+    /// declares — handed over, not yet taken (#7).
+    async fn handing_over(&self, adapter: &dyn DatabaseAdapter) -> Result<Vec<(String, OwnedObject)>> {
+        if self.declared_elsewhere.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(adapter
+            .owned_objects(self.owner())
+            .await?
+            .into_iter()
+            .filter_map(|h| self.declaring_elsewhere(adapter, &h).map(|m| (m.to_string(), h)))
+            .collect())
+    }
+
+    /// The uses this owner recorded through what it hands over: kept until
+    /// the module taking it over records its own — until then they are all
+    /// that guards what the entity reads (#7).
+    async fn uses_handed_over(&self, adapter: &dyn DatabaseAdapter) -> Result<Vec<Use>> {
+        let vias: std::collections::HashSet<String> = self
+            .handing_over(adapter)
+            .await?
+            .into_iter()
+            .map(|(_, o)| format!("{} {}.{}", o.kind, o.schema, o.name))
+            .collect();
+        if vias.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(adapter
+            .registry()
+            .await?
+            .uses
+            .into_iter()
+            .filter(|u| u.owner == self.owner() && vias.contains(&u.via))
+            // Recorded, its target is resolved: kept as it is.
+            .map(|u| Use {
+                kind: u.kind,
+                target: u.target,
+                via: u.via,
+                search_path: Vec::new(),
+            })
+            .collect())
     }
 
     /// Whether a run of this design retired its predecessor's record — its
@@ -221,7 +272,7 @@ impl Design {
             .owned_objects(self.owner())
             .await?
             .into_iter()
-            .filter(|h| !self.declared_elsewhere.iter().any(|d| adapter.same_object(d, h)))
+            .filter(|h| self.declaring_elsewhere(adapter, h).is_none())
             .collect();
         let declares_any = held.iter().any(|h| declared.iter().any(|d| adapter.same_object(d, h)));
         Ok((!held.is_empty() && !declares_any).then_some(held))
@@ -544,7 +595,9 @@ impl Design {
     /// it no longer declares and is gone. The uses describe what is, so a run
     /// that fails keeps the record it had (#7).
     pub(crate) async fn settle(&self, adapter: &dyn DatabaseAdapter) -> Result<()> {
-        adapter.record_uses(self.owner(), &self.declared_uses()).await?;
+        let mut uses = self.declared_uses();
+        uses.extend(self.uses_handed_over(adapter).await?);
+        adapter.record_uses(self.owner(), &uses).await?;
         adapter.release_objects(self.owner(), &self.declared_objects()).await?;
         // The project before it had modules is retired once its modules hold
         // everything it held — in the claim's transaction, which took over
@@ -953,6 +1006,16 @@ impl Design {
                     && self.extension_users(adapter, &member.name).await?.is_none();
                 if !own_extension {
                     others.push(member.label(schema));
+                }
+            }
+            // What this owner still holds there that another module now
+            // declares is that module's, moving — not this reset's to drop.
+            for (module, held) in self.handing_over(adapter).await? {
+                if held.schema == *schema {
+                    others.push(format!(
+                        "{} {}.{} (module {module} declares it)",
+                        held.kind, held.schema, held.name
+                    ));
                 }
             }
             let users = self.users_besides(adapter, "schema", schema).await?;

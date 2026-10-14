@@ -629,9 +629,10 @@ pub struct Design {
     /// — its predecessor, first — and the workspace's other modules (#7, the
     /// workspace transfer rule). Empty for a project.
     transfer_from: Vec<String>,
-    /// What the workspace's other modules declare: moving there, so never
-    /// this module's to prune, nor a sign of another project under its name.
-    declared_elsewhere: Vec<crate::adapter::OwnedObject>,
+    /// What the workspace's other modules declare, each with the module
+    /// declaring it: moving there, so never this module's to prune or drop,
+    /// nor a sign of another project under its name.
+    declared_elsewhere: Vec<(String, crate::adapter::OwnedObject)>,
     /// Whether a run of this design retired its predecessor — see
     /// [`Design::retired_predecessor`].
     retired: std::sync::atomic::AtomicBool,
