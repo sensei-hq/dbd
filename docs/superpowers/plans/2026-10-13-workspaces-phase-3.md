@@ -242,6 +242,13 @@ follows in a second):
 - What another module declares is no sign of another project under a
   module's name either: a module whose entities all moved holds none it
   declares, and still runs.
+- Review: what an entity uses goes with it when it changes hands — in the
+  take-over's transaction its giver's `dbd.uses` rows through it become the
+  taker's — and a module's run keeps the uses of what it still holds and
+  hands over until the taker records its own: until then they are all that
+  guards what the entity reads. A reset keeps a schema holding what another
+  module declares. A retire is housekeeping: in a savepoint, bounded as a
+  claim is, and left to a later run when another session holds its rows.
 - The adapter takes over from several owners at once through
   `claim_objects_from(owner, objects, write, from)` — by default
   `claim_objects` for none or one, so an adapter written before keeps
