@@ -51,7 +51,11 @@ fn shop(root: &Path) {
 }
 
 fn graph_nodes(graph: &GraphResult) -> Vec<(&str, Option<&str>)> {
-    graph.nodes.iter().map(|n| (n.name.as_str(), n.module.as_deref())).collect()
+    graph
+        .nodes
+        .iter()
+        .map(|n| (n.name.as_str(), n.module.as_deref()))
+        .collect()
 }
 
 fn reading(root: &Path, module: Option<&str>, scope: Option<&str>) -> Reading {
@@ -201,7 +205,8 @@ fn the_graph_spans_the_modules_read() {
     let reading = reading(tmp.path(), None, None);
     assert_eq!(reading.module_of("app.currencies", EntityType::Table), Some("shared"));
     assert_eq!(reading.module_of("app.orders", EntityType::Table), Some("core"));
-    let modules: Vec<(&str, Option<&str>)> = graph_nodes(&reading.graph(None).expect("graph"));
+    let whole = reading.graph(None).expect("graph");
+    let modules: Vec<(&str, Option<&str>)> = graph_nodes(&whole);
     assert!(modules.contains(&("app.currencies", Some("shared"))), "{modules:?}");
     assert!(modules.contains(&("app.orders", Some("core"))), "{modules:?}");
 
@@ -319,7 +324,10 @@ fn each_entity_is_its_own_modules_though_another_kind_shares_its_name() {
         "set search_path to app;\n\ncreate or replace view order_totals as select count(*) as n from orders;\n",
     );
     let reading = reading(root, None, None);
-    assert_eq!(reading.module_of("app.order_totals", EntityType::Function), Some("shared"));
+    assert_eq!(
+        reading.module_of("app.order_totals", EntityType::Function),
+        Some("shared")
+    );
     assert_eq!(reading.module_of("app.order_totals", EntityType::View), Some("core"));
 
     let model = dbd_core::schema_model::build_reading(&reading).expect("model");
@@ -371,7 +379,10 @@ fn an_emitted_script_notes_a_schemas_grants_once() {
     write(root, "design.yaml", &manifest);
     let (sql, downgrades) =
         dbd_core::emit_dialect::emit_reading(&reading(root, None, None), Dialect::Sqlite).expect("emit");
-    let grants: Vec<_> = downgrades.iter().filter(|d| d.from.starts_with("grants on schema")).collect();
+    let grants: Vec<_> = downgrades
+        .iter()
+        .filter(|d| d.from.starts_with("grants on schema"))
+        .collect();
     assert_eq!(grants.len(), 1, "{grants:?}");
     assert_eq!(sql.matches("grants on schema").count(), 1, "{sql}");
 }
