@@ -203,3 +203,35 @@ fn the_diagram_model_names_the_modules() {
     assert_eq!(tables, [("currencies", "shared"), ("orders", "core")]);
     assert!(model.get("stubs").is_none(), "the key lands on shared's table: {model}");
 }
+
+/// The scope line counts what the run writes — the manifest's schema once,
+/// as it is written once.
+#[test]
+fn the_scope_line_counts_each_entity_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    shop(tmp.path());
+    let manifest = fs::read_to_string(tmp.path().join("design.yaml")).unwrap();
+    write(
+        tmp.path(),
+        "design.yaml",
+        &format!("{manifest}\nscopes:\n  lean:\n    modules: [core]\n    excludes: [app.currencies]\n"),
+    );
+    let out = ok(tmp.path(), &["combine", "-f", "lean.sql", "--scope", "lean"]);
+    // app and orders, of app, currencies and orders.
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("scope 'lean': 2 of 3 entities"),
+        "{}",
+        text(&out)
+    );
+}
+
+/// `-n` of an entity `--module` leaves out names the module declaring it.
+#[test]
+fn graph_of_an_entity_outside_the_module_names_its_module() {
+    let tmp = tempfile::tempdir().unwrap();
+    shop(tmp.path());
+    let out = dbd(tmp.path(), &["graph", "--module", "shared", "-n", "app.orders"]);
+    let text = text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("app.orders") && text.contains("\"core\""), "{text}");
+}

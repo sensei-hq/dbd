@@ -3,6 +3,8 @@
 //! modules a run selects, each through its scope — every entity drawn and
 //! written once, in the module declaring it, from that module's definition.
 
+use dbd_core::EntityType;
+use dbd_core::dependency::GraphResult;
 use dbd_core::design::{Reading, Workspace};
 use dbd_core::parser::Dialect;
 use std::path::Path;
@@ -46,6 +48,10 @@ fn shop(root: &Path) {
         "set search_path to app;\n\ncreate or replace view order_currencies as\n\
          select o.id, c.name from orders o join currencies c on c.code = o.currency;\n",
     );
+}
+
+fn graph_nodes(graph: &GraphResult) -> Vec<(&str, Option<&str>)> {
+    graph.nodes.iter().map(|n| (n.name.as_str(), n.module.as_deref())).collect()
 }
 
 fn reading(root: &Path, module: Option<&str>, scope: Option<&str>) -> Reading {
@@ -193,8 +199,11 @@ fn the_graph_spans_the_modules_read() {
     let tmp = tempfile::tempdir().unwrap();
     shop(tmp.path());
     let reading = reading(tmp.path(), None, None);
-    assert_eq!(reading.module_of("app.currencies"), Some("shared"));
-    assert_eq!(reading.module_of("app.orders"), Some("core"));
+    assert_eq!(reading.module_of("app.currencies", EntityType::Table), Some("shared"));
+    assert_eq!(reading.module_of("app.orders", EntityType::Table), Some("core"));
+    let modules: Vec<(&str, Option<&str>)> = graph_nodes(&reading.graph(None).expect("graph"));
+    assert!(modules.contains(&("app.currencies", Some("shared"))), "{modules:?}");
+    assert!(modules.contains(&("app.orders", Some("core"))), "{modules:?}");
 
     let graph = reading.graph(Some("app.orders")).expect("graph");
     let nodes: Vec<&str> = graph.nodes.iter().map(|n| n.name.as_str()).collect();
@@ -289,4 +298,118 @@ fn each_history_entry_names_its_module() {
     let history = reading(root, None, None).history().expect("history");
     let entries: Vec<(Option<&str>, u32)> = history.iter().map(|h| (h.module.as_deref(), h.version)).collect();
     assert_eq!(entries, [(Some("shared"), 1), (Some("core"), 1)]);
+}
+
+/// A function in one module and a view of the same name in another are two
+/// entities, each its module's — not both the first module's.
+#[test]
+fn each_entity_is_its_own_modules_though_another_kind_shares_its_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    shop(root);
+    write(
+        root,
+        "shared/ddl/function/app/order_totals.ddl",
+        "set search_path to app;\n\ncreate or replace function order_totals() returns integer\n\
+         language sql as $$ select 1 $$;\n",
+    );
+    write(
+        root,
+        "core/ddl/view/app/order_totals.ddl",
+        "set search_path to app;\n\ncreate or replace view order_totals as select count(*) as n from orders;\n",
+    );
+    let reading = reading(root, None, None);
+    assert_eq!(reading.module_of("app.order_totals", EntityType::Function), Some("shared"));
+    assert_eq!(reading.module_of("app.order_totals", EntityType::View), Some("core"));
+
+    let model = dbd_core::schema_model::build_reading(&reading).expect("model");
+    let order_totals: Vec<(&str, Option<&str>)> = model
+        .entities
+        .iter()
+        .filter(|e| e.name == "order_totals")
+        .map(|e| (e.kind.as_str(), e.module.as_deref()))
+        .collect();
+    assert!(order_totals.contains(&("function", Some("shared"))), "{order_totals:?}");
+    assert!(order_totals.contains(&("view", Some("core"))), "{order_totals:?}");
+
+    let graph = reading.graph(None).expect("graph");
+    let view = graph
+        .nodes
+        .iter()
+        .find(|n| n.name == "app.order_totals" && n.entity_type == "view")
+        .expect("the view's node");
+    assert_eq!(view.module.as_deref(), Some("core"));
+}
+
+/// The count a scoped run prints is of what it reads: the manifest's schema
+/// once, as it is written once — not once per module.
+#[test]
+fn the_counts_are_of_the_entities_read_each_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    shop(tmp.path());
+    let lean = reading(tmp.path(), None, Some("lean"));
+    // app, status, orders, order_currencies of app, currencies, status,
+    // orders, order_currencies.
+    assert_eq!(lean.counts().expect("counts"), (4, 5));
+    let all = reading(tmp.path(), None, None);
+    assert_eq!(all.counts().expect("counts"), (5, 5));
+}
+
+/// A schema's grants are the manifest's, every module's: an emitted script
+/// says once that it does not carry them.
+#[test]
+fn an_emitted_script_notes_a_schemas_grants_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    shop(root);
+    let manifest = std::fs::read_to_string(root.join("design.yaml"))
+        .unwrap()
+        .replace(
+            "schemas:\n  - app\n",
+            "schemas:\n  - app:\n      grants:\n        reader: [usage]\n\ntarget:\n  dev:\n    roles:\n      - name: reader\n",
+        );
+    write(root, "design.yaml", &manifest);
+    let (sql, downgrades) =
+        dbd_core::emit_dialect::emit_reading(&reading(root, None, None), Dialect::Sqlite).expect("emit");
+    let grants: Vec<_> = downgrades.iter().filter(|d| d.from.starts_with("grants on schema")).collect();
+    assert_eq!(grants.len(), 1, "{grants:?}");
+    assert_eq!(sql.matches("grants on schema").count(), 1, "{sql}");
+}
+
+/// What one module's scope refuses is said to be that module's.
+#[test]
+fn a_modules_refusal_names_the_module() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    shop(root);
+    write(
+        root,
+        "core/ddl/table/app/order_items.ddl",
+        "set search_path to app;\n\ncreate table if not exists order_items (\n  id integer primary key\n\
+         , order_id integer references orders (id)\n);\n",
+    );
+    let manifest = std::fs::read_to_string(root.join("design.yaml")).unwrap();
+    write(
+        root,
+        "design.yaml",
+        &format!("{manifest}  bad:\n    modules: [core]\n    excludes: [app.orders]\n    deps: include\n"),
+    );
+    let err = match reading(root, None, Some("bad")).entities() {
+        Ok(_) => panic!("order_items needs the orders the scope excludes"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("module \"core\""), "{err}");
+}
+
+/// `-n` of an entity a module the run does not read declares names that
+/// module.
+#[test]
+fn a_named_entity_of_a_module_not_read_names_its_module() {
+    let tmp = tempfile::tempdir().unwrap();
+    shop(tmp.path());
+    let err = match reading(tmp.path(), Some("shared"), None).graph(Some("app.orders")) {
+        Ok(_) => panic!("app.orders is core's"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("app.orders") && err.contains("\"core\""), "{err}");
 }

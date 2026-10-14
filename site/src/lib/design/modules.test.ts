@@ -6,6 +6,7 @@ import EntityView from './EntityView.svelte';
 import ObjectView from './ObjectView.svelte';
 import EnumView from './EnumView.svelte';
 import ChangelogView from './ChangelogView.svelte';
+import OverviewView from './OverviewView.svelte';
 import { validateModel, type HistoryEntry, type SchemaModel } from './model';
 import { entityHistory } from './changelog';
 import { sampleModel } from './data';
@@ -56,7 +57,16 @@ describe('a workspace model', () => {
 
   it('is refused when its modules are not a list', () => {
     const bad = { ...workspace, modules: { shared: {} } };
-    expect(validateModel(bad)).toEqual({ ok: false, error: 'modules must be an array' });
+    expect(validateModel(bad)).toEqual({ ok: false, error: 'modules must be an array of named modules' });
+  });
+
+  it('is refused when a module has no name', () => {
+    for (const modules of [[null], [{}], [{ name: 3 }]]) {
+      expect(validateModel({ ...workspace, modules })).toEqual({
+        ok: false,
+        error: 'modules must be an array of named modules',
+      });
+    }
   });
 });
 
@@ -179,5 +189,36 @@ describe("a workspace's history", () => {
     expect(container.querySelector('[data-entity-changelog]')?.textContent).toContain(
       'No snapshots of module core yet',
     );
+  });
+});
+
+describe("a workspace's overview", () => {
+  const entry = (module: string, version: number, timestamp: string): HistoryEntry => ({
+    version,
+    description: `${module} v${version}`,
+    timestamp,
+    module,
+    changes: [],
+  });
+
+  it('shows the newest versions across the modules, each naming its module', () => {
+    const history = [
+      entry('shared', 1, '2026-10-01T00:00:00Z'),
+      entry('core', 1, '2026-10-02T00:00:00Z'),
+      entry('core', 2, '2026-10-03T00:00:00Z'),
+      entry('shared', 2, '2026-10-04T00:00:00Z'),
+    ];
+    const { container } = render(OverviewView, { props: { model: { ...workspace, history } } });
+    const rows = [...container.querySelectorAll('[data-section="recent"] [data-version]')];
+    expect(rows.map((r) => `${r.getAttribute('data-module')} v${r.getAttribute('data-version')}`)).toEqual([
+      'shared v2',
+      'core v2',
+      'core v1',
+    ]);
+    expect(rows.map((r) => r.querySelector('[data-module-badge]')?.textContent?.trim())).toEqual([
+      'shared',
+      'core',
+      'core',
+    ]);
   });
 });
