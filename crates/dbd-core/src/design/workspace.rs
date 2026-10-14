@@ -1019,7 +1019,7 @@ fn check_manifest(manifest: &DesignConfig, project_dir: &Path) -> Result<IndexMa
 /// `[A-Za-z0-9_][A-Za-z0-9_-]*`, and read by YAML as a string: what can
 /// follow `<project>/` in an owner, name a folder, and key its block,
 /// unambiguously.
-fn is_module_name(name: &str) -> bool {
+pub(crate) fn is_module_name(name: &str) -> bool {
     name.chars()
         .next()
         .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')

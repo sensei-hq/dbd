@@ -32,6 +32,7 @@ pub use ownership::{Prune, SharedDatabase, SharedProject, SharedUse, leave_out_o
 pub use plan::{ApplyStrategy, ExecutionPlan, ExecutionStep, build_execution_plan};
 pub use reading::Reading;
 pub use reset::{KeptRole, ResetComplete};
+pub(crate) use workspace::is_module_name;
 pub use workspace::{Module, Workspace, check_scope_gaps};
 
 /// Summary passed to the `on_complete` callback of `apply()`.

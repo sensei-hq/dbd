@@ -54,6 +54,7 @@ fn command_honors_scope(command: &Commands) -> bool {
         Commands::Doctor { .. }
         | Commands::Init { .. }
         | Commands::Merge { .. }
+        | Commands::Split { .. }
         | Commands::Format { .. }
         | Commands::Install { .. } => false,
     }
@@ -105,7 +106,7 @@ fn check_workspace_selection(command: &Commands, config: &Path, module: Option<&
     if matches!(command, Commands::Init { .. } | Commands::Merge { .. }) {
         anyhow::bail!(
             "{} declares modules: — init and merge onboard a project into one design; a project becomes a \
-             workspace with dbd split",
+             workspace with dbd split --from-scopes",
             config.display()
         );
     }
@@ -788,6 +789,12 @@ pub async fn run(
         }
 
         Commands::Format { check } => schema::cmd_format(config, project_dir, module, *check, verbosity),
+
+        Commands::Split {
+            from_scopes,
+            write,
+            rename,
+        } => project::cmd_split(config, env, project_dir, *from_scopes, *write, rename, verbosity),
 
         Commands::Policies { dry_run } => {
             schema::cmd_policies(

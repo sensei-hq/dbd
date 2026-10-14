@@ -108,6 +108,128 @@ pub fn cmd_dbml(
     Ok(())
 }
 
+/// `dbd split --from-scopes` (#7): the plan, and with `--write` the project
+/// made a workspace of it.
+#[allow(clippy::too_many_arguments)]
+pub fn cmd_split(
+    config: &Path,
+    env: &str,
+    project_dir: &Path,
+    from_scopes: bool,
+    write: bool,
+    renames: &[String],
+    verbosity: Verbosity,
+) -> Result<()> {
+    if !from_scopes {
+        anyhow::bail!(
+            "dbd split needs --from-scopes — the one way it divides a project yet: a module for each region of its \
+             scopes"
+        );
+    }
+    if let Ok(read) = dbd_core::config::read(config)
+        && !read.modules.is_empty()
+    {
+        anyhow::bail!("{} declares modules: — it is a workspace already", config.display());
+    }
+    let renames: Vec<(String, String)> = renames
+        .iter()
+        .map(|r| {
+            r.split_once('=')
+                .map(|(from, to)| (from.to_string(), to.to_string()))
+                .ok_or_else(|| anyhow::anyhow!("--rename {r}: write it MODULE=NAME, as --rename shared=common"))
+        })
+        .collect::<Result<_>>()?;
+    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
+    let plan = dbd_core::split::plan_from_scopes(&design, &renames)?;
+
+    let width = plan.modules.iter().map(|m| m.name.len()).max().unwrap_or(0);
+    let regions: Vec<String> = plan.modules.iter().map(|m| region_phrase(&m.region, &plan)).collect();
+    let region_width = regions.iter().map(String::len).max().unwrap_or(0);
+    output::always(&format!(
+        "{} splits into {} modules, by its scopes:",
+        plan.project,
+        plan.modules.len()
+    ));
+    for (m, region) in plan.modules.iter().zip(&regions) {
+        let count = match m.entities.len() {
+            1 => "1 entity".to_string(),
+            n => format!("{n} entities"),
+        };
+        let depends = if m.depends_on.is_empty() {
+            String::new()
+        } else {
+            format!("   depends on {}", m.depends_on.join(", "))
+        };
+        output::always(&format!(
+            "  {:width$}   {region:region_width$}   {count}{depends}",
+            m.name
+        ));
+        if verbosity.is_verbose() {
+            for entity in &m.entities {
+                output::always(&format!("      {entity}"));
+            }
+        }
+    }
+    output::always("Its scopes become:");
+    for s in &plan.scopes {
+        match &s.modules {
+            None => output::always(&format!("  {}: all", s.name)),
+            Some(modules) => {
+                let excludes = if s.excludes.is_empty() {
+                    String::new()
+                } else {
+                    format!(", excludes [{}]", s.excludes.join(", "))
+                };
+                output::always(&format!("  {}: modules [{}]{excludes}", s.name, modules.join(", ")));
+            }
+        }
+    }
+    if verbosity.is_verbose() {
+        for m in &plan.moves {
+            output::always(&format!("  {} → {}", m.from.display(), m.to.display()));
+        }
+    }
+    if let Some(cycle) = &plan.cycle {
+        output::warn(&format!(
+            "the modules' dependencies would cycle — {} — move entities so they run one way; --write is refused \
+             until they do",
+            cycle.join(" → ")
+        ));
+    }
+    if !write {
+        output::always(&format!(
+            "{} files move into the modules' folders. Run again with --write to move them and write modules: and \
+             scopes: into design.yaml.",
+            plan.moves.len()
+        ));
+        return Ok(());
+    }
+    dbd_core::split::write_split(&plan, config, project_dir)?;
+    output::always(&format!(
+        "Moved {} files and wrote modules: and scopes: into {}. Each module's first deploy takes over what it \
+         declares from \"{}\".",
+        plan.moves.len(),
+        config.display(),
+        plan.project
+    ));
+    Ok(())
+}
+
+/// Which scopes a module's region is in, as the plan says it.
+fn region_phrase(region: &[String], plan: &dbd_core::split::SplitPlan) -> String {
+    let scopes = plan.scopes.iter().filter(|s| s.modules.is_some()).count();
+    let listed = match region {
+        [] => return "in no scope".to_string(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    };
+    if region.len() == scopes && scopes > 1 {
+        format!("in {listed}")
+    } else {
+        format!("only in {listed}")
+    }
+}
+
 pub fn cmd_doctor(
     config: &Path,
     source_dir: &Path,
