@@ -20,9 +20,8 @@
 
 ## Next
 
-Slice 6a PR #67 (`feat/workspaces-split`): the workspace transfer rule; review
-fixed (1e04bf2d uses follow take-overs, a4745e60 the adapter default), tests
-8314523e. Next: suites, CI, merge; then 6b, `dbd split --from-scopes` (T23).
+Slice 6a PR #67 (`feat/workspaces-split`): the transfer rule; review fixed
+(1e04bf2d, a4745e60). Next: suites, CI, merge; then 6b, `dbd split` (T23).
 
     gh pr checks 67
 
