@@ -256,6 +256,38 @@ follows in a second):
   only when several hold what the claim takes — and retires an owner through
   `retire_owner(owner)`.
 
+Taken in slice 6, `dbd split --from-scopes` (its second PR):
+
+- The regions are the scopes' Venn diagram over each scope's entities with
+  their dependencies (`deps: include`, whatever the scope says): an entity's
+  region is the scopes holding it. What every scope deploys — schemas,
+  extensions, roles — is in every scope. A region in every scope (of two or
+  more) is `shared`; in one, that scope's name (`default` becomes `core`);
+  in several, their names joined with `-`; in none, `unscoped`. Empty regions
+  are dropped. `--rename <module>=<name>` renames one, each a module name.
+- Each module `depends_on` the modules its entities reference; a cycle is
+  shown and refuses `--write`. Each scope becomes `modules:` — the modules of
+  the regions it holds, less those another of them depends on — keeping its
+  `extensions:`; an `all` scope stays `all`.
+- What moves, each to the folder of the module owning it: each DDL file —
+  by its entity, refused if it holds entities of two regions — each import
+  data file and each policy file, by its table. The manifest's
+  `import.after` scripts under `import/` move to `scripts/`, their paths
+  rewritten. A file of `ddl/`, `import/` or `policies/` that maps to no
+  module refuses the split, named: a workspace refuses a root folder left
+  holding files.
+- A project with snapshots or migrations is refused: a migration is SQL over
+  several tables, and does not divide by module, and a module's snapshots
+  without its migrations would leave its history inconsistent — so a
+  project splits before its first release (sensei has neither). The plan
+  said they would be split by owning module; this is why they are not.
+- Without `--write` it prints the plan and changes nothing. `--write` moves
+  the files — `git mv` in a git work tree — and writes `modules:` and the new
+  `scopes:` into design.yaml in place, keeping the rest as it was, then loads
+  the workspace to check it. A module folder that already holds files, an
+  invalid name, a workspace and a design without scopes are refused before
+  anything moves.
+
 ## Slices
 
 Each is red tests first, then the implementation, a focused review, CI, and a
