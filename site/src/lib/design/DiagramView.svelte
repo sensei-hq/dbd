@@ -58,8 +58,9 @@
 </script>
 
 {#if hasModules}
+  <!-- Below the page's top-centred hint, which a narrow canvas would otherwise run into. -->
   <div
-    class="absolute top-4 left-4 z-20 flex items-center gap-1 rounded-full border border-line bg-paper p-1 text-xs"
+    class="absolute top-16 left-4 z-20 flex items-center gap-1 rounded-full border border-line bg-paper p-1 text-xs"
     role="group"
     aria-label="Tint the diagram by"
   >
