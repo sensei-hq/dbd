@@ -268,7 +268,8 @@ Taken in slice 6, `dbd split --from-scopes` (its second PR):
 - Each module `depends_on` the modules its entities reference; a cycle is
   shown and refuses `--write`. Each scope becomes `modules:` — the modules of
   the regions it holds, less those another of them depends on — keeping its
-  `extensions:`; an `all` scope stays `all`.
+  `extensions:`, and `excludes:` the manifest's schemas it did not deploy,
+  which every module has; an `all` scope stays `all`.
 - What moves, each to the folder of the module owning it: each DDL file —
   by its entity, refused if it holds entities of two regions — each import
   data file and each policy file, by its table. The manifest's

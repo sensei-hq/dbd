@@ -20,10 +20,9 @@
 
 ## Next
 
-Slice 6a PR #67 (`feat/workspaces-split`): the transfer rule; review fixed
-(1e04bf2d, a4745e60). Next: suites, CI, merge; then 6b, `dbd split` (T23).
-
-    gh pr checks 67
+Slice 6a merged (PR #67, the transfer rule). Slice 6b on
+`feat/workspaces-split-scopes`: `dbd split --from-scopes` (40210d4c), T23/T24
+green. Next: PR, review, CI, merge; then slice 7 (docs).
 
 ## Open
 
