@@ -32,8 +32,8 @@ pub fn cmd_graph(
                 "name": n.name, "type": n.entity_type, "schema": n.schema,
             });
             // A workspace's node names the module declaring it (#7).
-            if let Some(module) = reading.module_of(&n.name) {
-                node["module"] = module.into();
+            if let Some(module) = &n.module {
+                node["module"] = module.as_str().into();
             }
             node
         }).collect::<Vec<_>>(),

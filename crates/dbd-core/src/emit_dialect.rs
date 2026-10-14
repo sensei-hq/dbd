@@ -445,15 +445,24 @@ fn emit_sections(
         }
     }
 
-    // Last, where they would apply: after every object they name.
+    // Last, where they would apply: after every object they name. A schema's
+    // grants are the manifest's, every module's, so each is noted once; each
+    // module's policies are its own files.
+    let mut grants: Vec<Downgrade> = Vec::new();
     for (design, scope) in designs {
-        for d in grants_not_carried(design, *scope, target)?
-            .into_iter()
-            .chain(policies_not_carried(design, *scope, target)?)
-        {
-            out.push(d.comment(target));
-            report.push(d);
+        for d in grants_not_carried(design, *scope, target)? {
+            if !grants.contains(&d) {
+                grants.push(d);
+            }
         }
+    }
+    let mut policies = Vec::new();
+    for (design, scope) in designs {
+        policies.extend(policies_not_carried(design, *scope, target)?);
+    }
+    for d in grants.into_iter().chain(policies) {
+        out.push(d.comment(target));
+        report.push(d);
     }
 
     Ok((join_script(&header, &out, target), report))

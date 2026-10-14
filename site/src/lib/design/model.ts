@@ -231,9 +231,15 @@ export function validateModel(value: unknown): ValidationResult {
     return { ok: false, error: 'history must be an array' };
   if (v.enums !== undefined && !Array.isArray(v.enums))
     return { ok: false, error: 'enums must be an array' };
-  if (v.modules !== undefined && !Array.isArray(v.modules))
-    return { ok: false, error: 'modules must be an array' };
+  // The sidebar groups by each module's name, so a module without one is refused here rather
+  // than throwing there.
+  if (v.modules !== undefined && !(Array.isArray(v.modules) && v.modules.every(isNamed)))
+    return { ok: false, error: 'modules must be an array of named modules' };
   return { ok: true, model: value as SchemaModel };
+}
+
+function isNamed(m: unknown): boolean {
+  return typeof m === 'object' && m !== null && typeof (m as Record<string, unknown>).name === 'string';
 }
 
 function isTableShaped(t: unknown): boolean {

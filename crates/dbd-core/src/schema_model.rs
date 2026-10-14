@@ -295,7 +295,7 @@ pub fn build(design: &Design, scope: Option<&ResolvedScope>) -> Result<SchemaMod
             db: design.config().source.dialect.clone(),
             note: design.config().project.note.clone(),
         },
-        module_of: &|_| None,
+        module_of: &|_, _| None,
     }))
 }
 
@@ -316,7 +316,7 @@ pub fn build_reading(reading: &Reading) -> Result<SchemaModel> {
             db: reading.dialect().to_string(),
             note: reading.project_note().map(str::to_string),
         },
-        module_of: &|name| reading.module_of(name).map(str::to_string),
+        module_of: &|name, kind| reading.module_of(name, kind).map(str::to_string),
     });
     model.modules = reading
         .modules()
@@ -341,8 +341,8 @@ struct Input<'a> {
     declared: &'a [Entity],
     externals: &'a [ExternalEntry],
     project: ProjectInfo,
-    /// The module declaring an entity, by qualified name.
-    module_of: &'a dyn Fn(&str) -> Option<String>,
+    /// The module declaring an entity, by qualified name and kind.
+    module_of: &'a dyn Fn(&str, EntityType) -> Option<String>,
 }
 
 fn build_from(input: &Input) -> SchemaModel {
@@ -355,7 +355,7 @@ fn build_from(input: &Input) -> SchemaModel {
     for e in entities.iter().filter(|e| e.entity_type == EntityType::Table) {
         let Some(def) = &e.table_def else { continue };
         tables.push(TableNode {
-            module: (input.module_of)(&e.name),
+            module: (input.module_of)(&e.name, e.entity_type),
             ..build_table_node(e, def, &enum_names)
         });
         refs.extend(collect_table_refs(e, def));
@@ -397,7 +397,7 @@ fn build_from(input: &Input) -> SchemaModel {
                 kind: kind.to_string(),
                 note: note_first_line(e.comment.as_deref()),
                 note_md: e.comment.clone(),
-                module: (input.module_of)(&e.name),
+                module: (input.module_of)(&e.name, e.entity_type),
             })
         })
         .collect();
@@ -413,7 +413,7 @@ fn build_from(input: &Input) -> SchemaModel {
             values: e.enum_values.iter().map(|v| v.name.clone()).collect(),
             note: note_first_line(e.comment.as_deref()),
             note_md: e.comment.clone(),
-            module: (input.module_of)(&e.name),
+            module: (input.module_of)(&e.name, e.entity_type),
         })
         .collect();
     enums.sort_by(|a, b| (a.schema.as_str(), a.name.as_str()).cmp(&(b.schema.as_str(), b.name.as_str())));
@@ -571,7 +571,7 @@ fn stub_node(
             columns: pick(full.columns),
             indexes: Vec::new(),
             checks: Vec::new(),
-            module: (input.module_of)(&qualified),
+            module: (input.module_of)(&qualified, EntityType::Table),
             ..full
         },
         None => TableNode {

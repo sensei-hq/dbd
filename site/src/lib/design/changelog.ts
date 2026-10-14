@@ -45,6 +45,16 @@ export function newestFirst(history: HistoryEntry[]): HistoryEntry[] {
   );
 }
 
+/**
+ * The `n` latest versions — a workspace's (#7) by when each was cut, across its modules, a
+ * project's as `newestFirst` reads them.
+ */
+export function latest(history: HistoryEntry[], n: number): HistoryEntry[] {
+  if (!history.some((h) => h.module !== undefined)) return newestFirst(history).slice(0, n);
+  const order = newestFirst(history);
+  return [...order].sort((a, b) => b.timestamp.localeCompare(a.timestamp) || order.indexOf(a) - order.indexOf(b)).slice(0, n);
+}
+
 /** A key for a version, unique across a workspace's modules — each has its own v1. */
 export const versionKey = (entry: HistoryEntry) => `${entry.module ?? ''}:${entry.version}`;
 
