@@ -102,7 +102,7 @@ impl Design {
                 let created: Vec<(Created, Option<String>, String)> = postgres
                     .then_some(e.file.as_ref())
                     .flatten()
-                    .and_then(|file| crate::source_text::read_to_string(&self.project_dir.join(file)).ok())
+                    .and_then(|file| crate::source_text::read_to_string(&self.source_file(file)).ok())
                     .map(|sql| crate::parser::pg::created_identities(&sql))
                     .unwrap_or_default();
                 let mut keys: Vec<OwnedObject> = created
@@ -479,7 +479,7 @@ impl Design {
             let Some(sql) = e
                 .file
                 .as_ref()
-                .and_then(|file| crate::source_text::read_to_string(&self.project_dir.join(file)).ok())
+                .and_then(|file| crate::source_text::read_to_string(&self.source_file(file)).ok())
             else {
                 continue;
             };

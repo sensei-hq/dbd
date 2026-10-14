@@ -1228,6 +1228,18 @@ impl Design {
         self
     }
 
+    /// Where an entity's `file` is read from. A scanned file's path already
+    /// starts with the project directory — the scan is rooted there — so
+    /// joining it on again doubled a relative `-s proj` into `proj/proj/ddl/…`;
+    /// only a path not under it is resolved against it.
+    pub(crate) fn source_file(&self, file: &Path) -> PathBuf {
+        if file.starts_with(&self.project_dir) {
+            file.to_path_buf()
+        } else {
+            self.project_dir.join(file)
+        }
+    }
+
     /// The module this design is in its workspace's manifest (#7) — what its
     /// version and release state are written under, `modules.<module>` —
     /// or `None` for a project's own design.
