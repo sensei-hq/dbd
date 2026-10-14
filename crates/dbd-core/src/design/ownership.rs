@@ -156,17 +156,56 @@ impl Design {
         self
     }
 
+    /// The owners this design takes over from as it claims: the one it
+    /// adopts from ([`Self::adopting_from`]) and, for a module of a workspace,
+    /// its project's other owners — the project before it had modules and
+    /// the workspace's other modules (#7, the workspace transfer rule).
+    pub(crate) fn taking_over_from(&self) -> Vec<String> {
+        let mut owners: Vec<String> = self.adopt_from.iter().cloned().collect();
+        for owner in &self.transfer_from {
+            if !owners.contains(owner) {
+                owners.push(owner.clone());
+            }
+        }
+        owners
+    }
+
     /// What this design would adopt in the database `adapter` reaches: what it
-    /// declares that the owner it adopts from holds — none without
-    /// [`Self::adopting_from`]. Reads only.
+    /// declares that an owner it takes over from holds — none without
+    /// [`Self::adopting_from`], for a project. Reads only.
     pub async fn adoptions(&self, adapter: &dyn DatabaseAdapter) -> Result<Vec<HeldObject>> {
-        let Some(from) = &self.adopt_from else {
+        let from = self.taking_over_from();
+        if from.is_empty() {
             return Ok(Vec::new());
-        };
+        }
         let held = adapter
             .claim_objects(self.owner(), &self.declared_objects(), false, None)
             .await?;
-        Ok(held.into_iter().filter(|h| &h.owner == from).collect())
+        Ok(held.into_iter().filter(|h| from.contains(&h.owner)).collect())
+    }
+
+    /// The project as it was before it had modules, for a module of a
+    /// workspace: the owner whose record a run retires once its modules hold
+    /// everything it held (#7).
+    pub fn predecessor(&self) -> Option<&str> {
+        self.module.as_ref().and(self.transfer_from.first().map(String::as_str))
+    }
+
+    /// The tables, views and types the workspace's other modules declare, as
+    /// a reconcile keys the live schema — `(schema, name)`: moving there, so
+    /// no orphan of this module's to prune (#7, T22).
+    pub(crate) fn relations_elsewhere(&self) -> impl Iterator<Item = (String, String)> + '_ {
+        self.declared_elsewhere
+            .iter()
+            .filter(|o| o.namespace != "routine")
+            .map(|o| (o.schema.clone(), o.name.clone()))
+    }
+
+    /// Whether a run of this design retired its predecessor's record — its
+    /// claim took over the last of what the project held before it had
+    /// modules (#7).
+    pub fn retired_predecessor(&self) -> bool {
+        self.retired.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// What the owner holds that still exists, when this design declares none
@@ -176,7 +215,14 @@ impl Design {
         adapter: &dyn DatabaseAdapter,
         declared: &[OwnedObject],
     ) -> Result<Option<Vec<OwnedObject>>> {
-        let held = adapter.owned_objects(self.owner()).await?;
+        // What another module of the workspace declares is moving there — a
+        // module whose entities all moved is no other project under its name.
+        let held: Vec<OwnedObject> = adapter
+            .owned_objects(self.owner())
+            .await?
+            .into_iter()
+            .filter(|h| !self.declared_elsewhere.iter().any(|d| adapter.same_object(d, h)))
+            .collect();
         let declares_any = held.iter().any(|h| declared.iter().any(|d| adapter.same_object(d, h)));
         Ok((!held.is_empty() && !declares_any).then_some(held))
     }
@@ -261,7 +307,7 @@ impl Design {
 
         let declared = self.declared_objects();
         let mut conflicts: Vec<String> = adapter
-            .claim_objects(self.owner(), &declared, false, self.adopt_from.as_deref())
+            .claim_objects_from(self.owner(), &declared, false, &self.taking_over_from())
             .await?
             .iter()
             .map(|h| {
@@ -405,7 +451,7 @@ impl Design {
         }
         let declared = self.declared_objects();
         let held = adapter
-            .claim_objects(self.owner(), &declared, false, self.adopt_from.as_deref())
+            .claim_objects_from(self.owner(), &declared, false, &self.taking_over_from())
             .await?;
         if !held.is_empty() {
             return Err(self.held_error(adapter, &held, &declared).await?);
@@ -485,7 +531,7 @@ impl Design {
         let declared = self.declared_objects();
         self.check_name_reuse(adapter, &declared).await?;
         let held = adapter
-            .claim_objects(self.owner(), &declared, true, self.adopt_from.as_deref())
+            .claim_objects_from(self.owner(), &declared, true, &self.taking_over_from())
             .await?;
         if !held.is_empty() {
             return Err(self.held_error(adapter, &held, &declared).await?);
@@ -499,7 +545,16 @@ impl Design {
     /// that fails keeps the record it had (#7).
     pub(crate) async fn settle(&self, adapter: &dyn DatabaseAdapter) -> Result<()> {
         adapter.record_uses(self.owner(), &self.declared_uses()).await?;
-        adapter.release_objects(self.owner(), &self.declared_objects()).await
+        adapter.release_objects(self.owner(), &self.declared_objects()).await?;
+        // The project before it had modules is retired once its modules hold
+        // everything it held — in the claim's transaction, which took over
+        // the last of it (#7).
+        if let Some(predecessor) = self.predecessor()
+            && adapter.retire_owner(predecessor).await?
+        {
+            self.retired.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     /// Who owns each table and enum of `live`, and what a prune of unowned
@@ -531,16 +586,13 @@ impl Design {
         };
         // What the run adopts is its own to plan against: the claim that moves
         // it comes before the run writes.
-        let adopted: std::collections::HashSet<(String, String)> = match &self.adopt_from {
-            Some(_) => self
-                .adoptions(adapter)
-                .await?
-                .into_iter()
-                .filter(|h| h.object.namespace == "relation")
-                .map(|h| (h.object.schema, h.object.name))
-                .collect(),
-            None => std::collections::HashSet::new(),
-        };
+        let adopted: std::collections::HashSet<(String, String)> = self
+            .adoptions(adapter)
+            .await?
+            .into_iter()
+            .filter(|h| h.object.namespace == "relation")
+            .map(|h| (h.object.schema, h.object.name))
+            .collect();
         for (key, owner) in keys.into_iter().zip(found.owners) {
             match owner {
                 Some(owner) if owner == self.owner() || adopted.contains(&key) => {

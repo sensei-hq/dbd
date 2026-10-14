@@ -1012,7 +1012,8 @@ pub async fn cmd_apply(
         let in_module = target.module.is_some();
         let (design, dir) = target.enter(i == 0);
         super::warn_if_no_authored_ddl(&design, &dir, in_module);
-        code = code.max(apply_design(design, &dir, &run).await?);
+        code = code.max(apply_design(&design, &dir, &run).await?);
+        super::say_if_retired(&design);
     }
     // A module's failed policy fails the run, once every module has run.
     if code != 0 {
@@ -1057,7 +1058,7 @@ struct ApplyRun<'a> {
 }
 
 /// [`cmd_apply`] for one design: the project's, or one module's.
-async fn apply_design(design: Design, project_dir: &Path, run: &ApplyRun<'_>) -> Result<i32> {
+async fn apply_design(design: &Design, project_dir: &Path, run: &ApplyRun<'_>) -> Result<i32> {
     let &ApplyRun {
         config,
         database_url,
@@ -1098,7 +1099,7 @@ async fn apply_design(design: Design, project_dir: &Path, run: &ApplyRun<'_>) ->
             // The real run claims the design's entities; its preview refuses
             // what that claim would, and names what it would adopt (#7).
             design.check_ownership(&**adapter).await?;
-            super::announce_adoptions(&design, &**adapter, true).await?;
+            super::announce_adoptions(design, &**adapter, true).await?;
         }
 
         // Built before anything is printed: it refuses where the run does — a
@@ -1139,7 +1140,7 @@ async fn apply_design(design: Design, project_dir: &Path, run: &ApplyRun<'_>) ->
     // pinned to (unless the operator opted in to re-point it).
     let marks = design.database_marks(&*adapter).await?;
     Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
-    super::announce_adoptions(&design, &*adapter, false).await?;
+    super::announce_adoptions(design, &*adapter, false).await?;
 
     // Said before the run, not in its summary: a run that fails never prints
     // one, and a skipped hook is often why it failed. Always shown, whatever
@@ -1178,11 +1179,11 @@ async fn apply_design(design: Design, project_dir: &Path, run: &ApplyRun<'_>) ->
     // jobs through the shared path (no CLI-side sync call needed here).
 
     // Grants: shared with `Design::deploy`, so both commands grant alike.
-    super::apply_and_report_grants(&design, &*adapter, &resolved, verbosity).await?;
+    super::apply_and_report_grants(design, &*adapter, &resolved, verbosity).await?;
 
     // Apply RLS policies if requested
     if with_policies {
-        let policy_ws = policy_working_set(&design, &resolved)?;
+        let policy_ws = policy_working_set(design, &resolved)?;
         let report = dbd_core::design::apply_policies(
             &*adapter,
             project_dir,

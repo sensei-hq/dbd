@@ -624,6 +624,17 @@ pub struct Design {
     /// The module this design is in its workspace's manifest — see
     /// [`Design::module`].
     module: Option<String>,
+    /// A module's project's other owners, whose entities it takes over as it
+    /// claims what it declares: the project as it was before it had modules
+    /// — its predecessor, first — and the workspace's other modules (#7, the
+    /// workspace transfer rule). Empty for a project.
+    transfer_from: Vec<String>,
+    /// What the workspace's other modules declare: moving there, so never
+    /// this module's to prune, nor a sign of another project under its name.
+    declared_elsewhere: Vec<crate::adapter::OwnedObject>,
+    /// Whether a run of this design retired its predecessor — see
+    /// [`Design::retired_predecessor`].
+    retired: std::sync::atomic::AtomicBool,
 }
 
 /// A workspace manifest's hooks, and the folder their paths are relative to —
@@ -1035,6 +1046,9 @@ impl Design {
             import_emptied: std::sync::atomic::AtomicBool::new(false),
             reset_beside: std::collections::HashSet::new(),
             module: None,
+            transfer_from: Vec::new(),
+            declared_elsewhere: Vec::new(),
+            retired: std::sync::atomic::AtomicBool::new(false),
         })
     }
 

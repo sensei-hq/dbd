@@ -473,6 +473,9 @@ impl Design {
             restrict_snapshot_to_schemas(compared_snapshot(&live_entities, &extension_types), &managed_schemas);
         let owned = self.live_ownership(adapter, &live_full).await?;
         hidden.extend(owned.others.keys().cloned());
+        // What another module of the workspace declares is moving there: that
+        // module takes it over, so it is no orphan of this one's (#7, T22).
+        hidden.extend(self.relations_elsewhere());
         let live = hide_declared(live_full, &hidden);
 
         let mut plan = plan_reconcile(&live, &desired);
@@ -736,6 +739,7 @@ impl Design {
         crate::reconcile::qualify_extension_types(&mut live_full, &extension_types);
         let live_full = restrict_snapshot_to_schemas(live_full, &managed_schemas);
         hidden.extend(self.live_ownership(adapter, &live_full).await?.others.into_keys());
+        hidden.extend(self.relations_elsewhere());
         let live = hide_declared(live_full, &hidden);
 
         let mut diff = crate::SchemaDiff::compute(live, desired);
