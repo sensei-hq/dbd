@@ -26,7 +26,7 @@ This:
 
 - `design.yaml` version field tracks the latest snapshot version — `dbd snapshot`
   edits it in place, keeping the file's comments and layout; in a workspace,
-  each module's (see [below](#a-workspaces-history-each-modules-own))
+  each module's (see [below](#per-module-history))
 - The bookkeeping table tracks the applied version in the database — `dbd.meta` in a dedicated
   `dbd` schema on Postgres/Supabase, `_dbd_meta` on SQLite
 - `dbd apply` compares these and runs pending migrations
@@ -202,7 +202,7 @@ Auto-generated data.sql uses Postgres CAST for type conversions. Non-derivable c
 dbd snapshot --list
 ```
 
-## A workspace's history: each module's own
+## Per-module history
 
 In a workspace — a `design.yaml` with [`modules:`](03-design-yaml.md#modules) —
 each module has a history of its own: its own `snapshots/` and `migrations/` in
