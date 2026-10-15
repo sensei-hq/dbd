@@ -6,7 +6,8 @@ billing's in `billing`, both reading `app.orders`. dbd keeps them apart by
 declares it — and no run changes or drops an entity another project owns.
 
 This guide covers what each command does in a shared database, how to move an
-entity from one project to another, and how to see what shares a database.
+entity from one project to another, how a workspace's modules share one, and how
+to see what shares a database.
 
 ## Owners and the registry
 
@@ -202,6 +203,92 @@ holds still refuses the run, and nothing is adopted. Then remove it from the
 giver's design: the giver's next run no longer owns it, so neither declares it —
 declaring it still is refused — nor prunes it.
 
+## Modules of one workspace
+
+A workspace — a `design.yaml` declaring `modules:` (see
+[design.yaml](03-design-yaml.md)) — shares its database the same way, one owner
+per module. Each module is a design of its own, owned as `<project>/<module>`
+— `shop/shared`, `shop/core` — with its own `dbd.meta` record, its own claims
+and its own uses. What makes a workspace more than several projects is that
+its modules are one project's: they never contend for an entity, and they hand
+entities to each other.
+
+**Overlaps are refused before any database is.** Two modules declaring the same
+entity, or a module referencing what another module declares without that
+module in its `depends_on` (directly or through a dependency's own), is refused
+when the workspace loads — so by every command that loads it, `dbd inspect` included:
+
+```
+1 entity is declared by more than one module — an entity belongs to one module: keep it in one, and list that module in the depends_on of the others that use it:
+  relation app.currencies: modules "shared" and "core"
+```
+
+```
+✗ dependency gap: app.orders (core) requires app.currencies (shared) — add shared to modules.core.depends_on
+```
+
+### The workspace transfer rule
+
+A module takes over, as it claims, what it declares that the project's other
+owners hold:
+
+- **the project as it was before it had modules** — `shop`, when the modules
+  are `shop/shared` and `shop/core` — so a project [split into
+  modules](04-commands.md#dbd-split) needs no step of its own on the database:
+  each module's first run takes its share;
+- **the workspace's other modules** — `shop/core` holding `app.countries` after
+  its file moved to `shared/` — so an entity moves between modules by moving its
+  file.
+
+It is `--adopt-from` without the flag: in the claim's own transaction, a
+`[dry-run] would adopt …` in a dry run and `adopting … from "<owner>"` before
+the run, and what is taken over is the module's own to plan against —
+`reconcile` alters a moved table as the module's, rather than leaving it for
+another owner. Nothing else changes hands: an owner by any other name — `shopx`,
+`billing` — still refuses the run. `--adopt-from` still works alongside.
+
+```
+adopting relation app.currencies from "shop"
+adopting relation app.orders from "shop"
+```
+
+**Nothing moved is dropped.** A module does not prune what another module
+declares: a table moved out of `shared` is hidden from its `reconcile` and
+`diff`, as another owner's is, until the module it moved to takes it over — so
+a `reconcile --prune` over the workspace, whichever module runs first, keeps the
+table and its rows. Nor is a module whose entities all moved taken for another
+project reusing its name. A `reset --schemas` keeps a schema that holds what
+another module now declares:
+
+```
+schema ref kept: it holds table ref.countries (module core declares it).
+```
+
+**Uses go with an entity.** When a module takes an entity over, the uses its
+giver recorded through it — a function reading `billing.rates`, say — become the
+taker's, in the same transaction. Until then the giver's runs keep those uses,
+though its design no longer declares the entity: they are all that guards what
+the entity reads from another project's drop.
+
+### The project before it had modules is retired
+
+Once a module's run leaves the project as it was holding nothing that still
+exists, its record goes: its `dbd.meta` row, its `dbd.uses`, its claims of what
+is gone and its materialized-view stamps — on PostgreSQL in the claim's
+transaction, so with the run or not at all; on SQLite, which has no run-wide
+transaction, in one of its own right after the claim. Its `dbd.migrations` rows stay, as history. The run says
+so:
+
+```
+project "shop" is retired — its modules hold everything it held
+```
+
+Until then it is an owner like any other: with only `--module shared` run, `shop`
+still holds core's entities, and keeps its record. A retire is housekeeping:
+another session's open write to a row it would delete holds it up at most five
+seconds, after which the run finishes without it and a later run retires the
+project. `Design::retired_predecessor` says whether a run did.
+
 ## Seeing what shares a database
 
 ```sh
@@ -229,6 +316,12 @@ Conflicts for project 'taker':
 Error: 1 conflict for project 'taker' in this database
 ```
 
+In a workspace, every module is a project of the list — `shop/shared (prod, v0)
+— owns 2: …` — and the conflicts are each module's, under its heading
+(`module core (shop/core)`); `--module` narrows them to one module and those it
+depends on. What a module would take over from the project before it had
+modules, or from another module, is no conflict.
+
 From a library, the same report is `Design::shared_database`.
 
 ## Onboarding beside another project
@@ -254,7 +347,8 @@ records what it owns and uses: its entities cannot be told from nobody's.
 SQLite keeps the same registry, in `_dbd_objects` and `_dbd_uses`, and the same
 rules apply: a second project sharing a SQLite file is refused a table the first
 owns, a reset cannot drop another project's table, and name reuse,
-`--adopt-from`, `inspect --shared` and onboarding work as on Postgres. SQLite has
+`--adopt-from`, the workspace transfer rule, `inspect --shared` and onboarding
+work as on Postgres. SQLite has
 no schemas, so an entity is its name — `auth.users` is the table `users` —
 compared without regard to case. It has no catalog of what depends on what, so
 its uses guard has what projects record and the foreign keys that reference a

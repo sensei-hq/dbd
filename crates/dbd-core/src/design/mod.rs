@@ -21,14 +21,19 @@ mod import;
 mod marks;
 mod ownership;
 mod plan;
+mod reading;
 mod reconcile;
 mod reset;
 mod scope;
+mod workspace;
 
 pub use marks::DatabaseMarks;
 pub use ownership::{Prune, SharedDatabase, SharedProject, SharedUse, leave_out_other_owners};
 pub use plan::{ApplyStrategy, ExecutionPlan, ExecutionStep, build_execution_plan};
+pub use reading::Reading;
 pub use reset::{KeptRole, ResetComplete};
+pub(crate) use workspace::is_module_name;
+pub use workspace::{Module, Workspace, check_scope_gaps};
 
 /// Summary passed to the `on_complete` callback of `apply()`.
 #[derive(Debug, Clone, Default)]
@@ -276,26 +281,6 @@ fn ensure_no_pending_todos(pending: &[PendingMigration]) -> Result<()> {
     Err(DbdError::Config(format!(
         "Unresolved TODO(s) in data.sql — resolve before applying:\n{details}\n\
          Edit the file(s) above and replace each -- TODO comment with working SQL."
-    )))
-}
-
-/// Refuse a destructive reconcile (dropped columns, constraints, foreign keys,
-/// or indexes) unless the caller explicitly opted in with `allow_destructive`.
-fn ensure_reconcile_not_destructive(plan: &crate::reconcile::ReconcilePlan, allow_destructive: bool) -> Result<()> {
-    if !plan.destructive || allow_destructive {
-        return Ok(());
-    }
-    // What is destructive, and only that: listing every altered table named
-    // ones that merely gained a column.
-    let details: String = plan
-        .destructive_changes
-        .iter()
-        .map(|change| format!("  {change}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    Err(DbdError::Config(format!(
-        "reconcile would make destructive changes:\n{details}\n\
-         Re-run with --allow-destructive to proceed."
     )))
 }
 
@@ -625,6 +610,67 @@ pub struct Design {
     /// declares none of — `--allow-ownership-change` (#7). See
     /// [`Design::allowing_ownership_change`].
     allow_ownership_change: bool,
+    /// The workspace manifest's hooks a run attaches to the first and last
+    /// module it runs, read from the project folder (#7). See
+    /// [`Workspace::select`].
+    outer_hooks: Option<OuterHooks>,
+    /// What this design's import empties, when a workspace run decides it —
+    /// see [`Design::emptying_for_import`].
+    import_truncates: Option<Vec<String>>,
+    /// Whether its import has emptied tables — see
+    /// [`Design::emptied_for_import`].
+    import_emptied: std::sync::atomic::AtomicBool,
+    /// The owners a reset runs beside — see [`Design::resetting_beside`].
+    reset_beside: std::collections::HashSet<String>,
+    /// The module this design is in its workspace's manifest — see
+    /// [`Design::module`].
+    module: Option<String>,
+    /// A module's project's other owners, whose entities it takes over as it
+    /// claims what it declares: the project as it was before it had modules
+    /// — its predecessor, first — and the workspace's other modules (#7, the
+    /// workspace transfer rule). Empty for a project.
+    transfer_from: Vec<String>,
+    /// What the workspace's other modules declare, each with the module
+    /// declaring it: moving there, so never this module's to prune or drop,
+    /// nor a sign of another project under its name.
+    declared_elsewhere: Vec<(String, crate::adapter::OwnedObject)>,
+    /// Whether a run of this design retired its predecessor — see
+    /// [`Design::retired_predecessor`].
+    retired: std::sync::atomic::AtomicBool,
+}
+
+/// A workspace manifest's hooks, and the folder their paths are relative to —
+/// attached to a module's design for a run (#7): its `apply.before` to the
+/// first module, its `apply.after` and `import.after` to the last.
+pub(crate) struct OuterHooks {
+    pub(crate) dir: PathBuf,
+    pub(crate) apply: config::ApplyConfig,
+    pub(crate) import_after: Vec<config::ScriptEntry>,
+}
+
+/// Which list of hooks a run executes, for [`Design::plan_hook_phase`].
+#[derive(Clone, Copy)]
+pub(in crate::design) enum HookPhase {
+    ApplyBefore,
+    ApplyAfter,
+    ImportAfter,
+}
+
+/// The apply phase of a `kind` of hook.
+fn apply_phase(kind: hooks::HookKind) -> HookPhase {
+    match kind {
+        hooks::HookKind::Before => HookPhase::ApplyBefore,
+        hooks::HookKind::After => HookPhase::ApplyAfter,
+    }
+}
+
+impl HookPhase {
+    fn kind(self) -> hooks::HookKind {
+        match self {
+            Self::ApplyBefore => hooks::HookKind::Before,
+            Self::ApplyAfter | Self::ImportAfter => hooks::HookKind::After,
+        }
+    }
 }
 
 /// The phrase [`warn_if_no_search_path`] reports with, so
@@ -812,12 +858,42 @@ impl Design {
 
     /// Create a Design with an explicit project directory.
     /// If `project_dir` is None, uses the config file's parent directory.
+    ///
+    /// Refuses a `design.yaml` with a `modules:` block: that is a workspace,
+    /// a design per module — see [`Workspace::load`].
     pub fn from_config_with_dir(config_path: &Path, env: &str, project_dir: Option<&Path>) -> Result<Self> {
         let project_dir = project_dir
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| config_path.parent().unwrap_or(Path::new(".")).to_path_buf());
+        crate::split::refuse_a_half_split(&project_dir)?;
 
         let design_config = config::read(config_path)?;
+        if !design_config.modules.is_empty() {
+            return Err(DbdError::Config(format!(
+                "{} declares modules:, so it is a workspace — a design per module, each owned by \
+                 <project>/<module>; load it with Workspace::load",
+                config_path.display()
+            )));
+        }
+        Ok(Self::scan(design_config, env, project_dir)?.resolved(&[]))
+    }
+
+    /// Read the project `design_config` describes in `project_dir`: its DDL,
+    /// the entities its config declares, and its import files — not yet
+    /// resolved against each other (see [`Self::resolved`]).
+    pub(crate) fn scan(design_config: DesignConfig, env: &str, project_dir: PathBuf) -> Result<Self> {
+        // A scope's `modules:` selects the modules of a workspace; this design
+        // has none. (A module's own config carries only its projection of the
+        // manifest's scopes, which select nothing by module.)
+        for (name, entry) in &design_config.scopes {
+            if let config::ScopeEntry::Spec(spec) = entry
+                && !spec.modules.is_empty()
+            {
+                return Err(DbdError::Config(format!(
+                    "scope '{name}' selects modules (scopes.{name}.modules), but design.yaml declares no modules:"
+                )));
+            }
+        }
         // Taken before the config is moved into the Design, and kept as the
         // user wrote it — a refusal must name `sqlite`, not the `Verbatim`
         // reader that label selects.
@@ -936,39 +1012,6 @@ impl Design {
             });
         }
 
-        // Add external entities for reference resolution
-        let external_names: Vec<String> = design_config.external.iter().map(|e| e.name.clone()).collect();
-        for ext in &design_config.external {
-            entities.push(Entity::external(&ext.name));
-        }
-
-        // Resolve references
-        references::resolve_references(&mut entities, &external_names, &design_config.ignore);
-
-        // Order for apply in one pass over the whole graph. Dependencies decide,
-        // with the type sequence (schemas → extensions → roles → sequences →
-        // enums → tables → views → matviews → functions/procedures, via
-        // `EntityType::apply_rank`) acting as a floor rather than a partition —
-        // see `dependency::sort_by_dependencies` for why that distinction is the
-        // whole design.
-        //
-        // A single sort is required because two type pairs depend on each other
-        // in BOTH directions, so no fixed sequence can order them: a view can
-        // call a function and a function body can read a view (issue #9); a
-        // table's `DEFAULT`/`CHECK` can call a function and a function body can
-        // read that table (issue #10).
-        //
-        // External entities are held out of the graph and appended. They are
-        // never applied (`entities_in_scope` drops them), they exist only so
-        // `resolve_references` can resolve references to objects dbd does not
-        // manage — and being the highest rank, leaving them in would drag every
-        // entity that references one to the very end of the order.
-        let (externals, managed): (Vec<Entity>, Vec<Entity>) = entities
-            .into_iter()
-            .partition(|e| e.entity_type == EntityType::External);
-
-        let entities = [dependency::sort_by_dependencies(&managed), externals].concat();
-
         // Scan import tables (data files, not DDL)
         // Pass env so that import/{env}/ subdirectories are filtered appropriately.
         let mut import_scan = scanner::scan_import(&project_dir, Some(env))?;
@@ -1001,7 +1044,72 @@ impl Design {
             dialect: dialect_label,
             adopt_from: None,
             allow_ownership_change: false,
+            outer_hooks: None,
+            import_truncates: None,
+            import_emptied: std::sync::atomic::AtomicBool::new(false),
+            reset_beside: std::collections::HashSet::new(),
+            module: None,
+            transfer_from: Vec::new(),
+            declared_elsewhere: Vec::new(),
+            retired: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// The scanned design with its references resolved and its entities in
+    /// apply order. `known` names entities this design may reference without
+    /// declaring them, with their kinds: in a workspace, what the other
+    /// modules declare. Each is added as an external — never this design's to
+    /// build or own — as is each `external:` entry; a known sequence or enum
+    /// is reached folded as one of the design's own is.
+    pub(crate) fn resolved(mut self, known: &[(String, EntityType)]) -> Self {
+        let mut entities = std::mem::take(&mut self.entities);
+        let design_config = &self.config;
+
+        // Add external entities for reference resolution
+        let mut external_names: Vec<String> = design_config.external.iter().map(|e| e.name.clone()).collect();
+        for ext in &design_config.external {
+            entities.push(Entity::external(&ext.name));
+        }
+        let mut seen: std::collections::HashSet<String> = external_names.iter().cloned().collect();
+        for (name, _) in known {
+            if seen.insert(name.clone()) {
+                external_names.push(name.clone());
+                entities.push(Entity::external(name));
+            }
+        }
+        let foldable: Vec<String> = known
+            .iter()
+            .filter(|(_, kind)| matches!(kind, EntityType::Sequence | EntityType::Enum))
+            .map(|(name, _)| name.clone())
+            .collect();
+
+        // Resolve references
+        references::resolve_references_with(&mut entities, &external_names, &foldable, &design_config.ignore);
+
+        // Order for apply in one pass over the whole graph. Dependencies decide,
+        // with the type sequence (schemas → extensions → roles → sequences →
+        // enums → tables → views → matviews → functions/procedures, via
+        // `EntityType::apply_rank`) acting as a floor rather than a partition —
+        // see `dependency::sort_by_dependencies` for why that distinction is the
+        // whole design.
+        //
+        // A single sort is required because two type pairs depend on each other
+        // in BOTH directions, so no fixed sequence can order them: a view can
+        // call a function and a function body can read a view (issue #9); a
+        // table's `DEFAULT`/`CHECK` can call a function and a function body can
+        // read that table (issue #10).
+        //
+        // External entities are held out of the graph and appended. They are
+        // never applied (`entities_in_scope` drops them), they exist only so
+        // `resolve_references` can resolve references to objects dbd does not
+        // manage — and being the highest rank, leaving them in would drag every
+        // entity that references one to the very end of the order.
+        let (externals, managed): (Vec<Entity>, Vec<Entity>) = entities
+            .into_iter()
+            .partition(|e| e.entity_type == EntityType::External);
+
+        self.entities = [dependency::sort_by_dependencies(&managed), externals].concat();
+        self
     }
 
     /// `source.search_path`, resolved — `None` when the project sets none.
@@ -1017,6 +1125,161 @@ impl Design {
             search_path: self.script_search_path(),
             entities: &self.entities,
         }
+    }
+
+    /// Each list of `phase`'s hooks a run executes, in the order it runs
+    /// them, with where its paths are read: the workspace manifest's
+    /// `apply.before` a run attaches ahead of the design's own, its
+    /// `apply.after` and `import.after` behind (#7 — see
+    /// [`Workspace::select`]).
+    fn hook_lists(&self, phase: HookPhase) -> Vec<(hooks::HookSource<'_>, &[config::ScriptEntry])> {
+        let own = match phase {
+            HookPhase::ApplyBefore => &self.config.apply.before[..],
+            HookPhase::ApplyAfter => &self.config.apply.after[..],
+            HookPhase::ImportAfter => &self.config.import.after[..],
+        };
+        let own = (self.hook_source(), own);
+        let outer = self.outer_hooks.as_ref().map(|outer| {
+            let source = hooks::HookSource {
+                dir: &outer.dir,
+                search_path: self.script_search_path(),
+                entities: &self.entities,
+            };
+            match phase {
+                HookPhase::ApplyBefore => (source, &outer.apply.before[..]),
+                HookPhase::ApplyAfter => (source, &outer.apply.after[..]),
+                HookPhase::ImportAfter => (source, &outer.import_after[..]),
+            }
+        });
+        match phase {
+            HookPhase::ApplyBefore => outer.into_iter().chain([own]).collect(),
+            HookPhase::ApplyAfter | HookPhase::ImportAfter => [own].into_iter().chain(outer).collect(),
+        }
+    }
+
+    /// What a run's `phase` hooks would do — every list decided before any of
+    /// them runs, so a hook file missing from one aborts the phase before a
+    /// hook of another has run.
+    pub(in crate::design) fn plan_hook_phase(
+        &self,
+        phase: HookPhase,
+        scope: Option<(&str, &std::collections::HashSet<String>)>,
+    ) -> Result<hooks::HookPlan> {
+        let mut plan = hooks::HookPlan::default();
+        for (source, entries) in self.hook_lists(phase) {
+            let list = hooks::plan_hooks(source, entries, phase.kind(), scope)?;
+            plan.runnable.extend(list.runnable);
+            plan.warnings.extend(list.warnings);
+        }
+        Ok(plan)
+    }
+
+    /// Run a run's `phase` hooks, as [`Self::plan_hook_phase`] decides.
+    pub(in crate::design) async fn run_hook_phase<S, D, C>(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        phase: HookPhase,
+        scope: Option<(&str, &std::collections::HashSet<String>)>,
+        dry_run: bool,
+        progress: &mut Progress<S, D, C>,
+    ) -> Result<hooks::HookOutcome>
+    where
+        S: FnMut(&str),
+        D: FnMut(&str, Option<&str>),
+    {
+        let plan = self.plan_hook_phase(phase, scope)?;
+        hooks::run_planned(adapter, plan, self.script_search_path(), dry_run, progress).await
+    }
+
+    /// [`Self::plan_hook_phase`] for a `kind` of apply hook.
+    pub(in crate::design) fn plan_apply_hooks(
+        &self,
+        kind: hooks::HookKind,
+        scope: Option<(&str, &std::collections::HashSet<String>)>,
+    ) -> Result<hooks::HookPlan> {
+        self.plan_hook_phase(apply_phase(kind), scope)
+    }
+
+    /// [`Self::run_hook_phase`] for a `kind` of apply hook.
+    pub(in crate::design) async fn run_apply_hooks<S, D, C>(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        kind: hooks::HookKind,
+        scope: Option<(&str, &std::collections::HashSet<String>)>,
+        dry_run: bool,
+        progress: &mut Progress<S, D, C>,
+    ) -> Result<hooks::HookOutcome>
+    where
+        S: FnMut(&str),
+        D: FnMut(&str, Option<&str>),
+    {
+        self.run_hook_phase(adapter, apply_phase(kind), scope, dry_run, progress)
+            .await
+    }
+
+    /// Have this design's import empty `tables`, and only them, before it
+    /// loads (#7). A workspace's modules import one after another, and
+    /// Postgres empties a table another references only with it — so a run
+    /// has its first module's import empty, together, every table the run
+    /// reloads that exists, and the others empty none: `shared`'s reference
+    /// data reloads with the `core` tables that hold keys to it, as one
+    /// project's import empties its own.
+    pub fn emptying_for_import(mut self, tables: Vec<String>) -> Self {
+        self.import_truncates = Some(tables);
+        self
+    }
+
+    /// Where an entity's `file` is read from. A scanned file's path already
+    /// starts with the project directory — the scan is rooted there — so
+    /// joining it on again doubled a relative `-s proj` into `proj/proj/ddl/…`;
+    /// only a path not under it is resolved against it.
+    pub(crate) fn source_file(&self, file: &Path) -> PathBuf {
+        if file.starts_with(&self.project_dir) {
+            file.to_path_buf()
+        } else {
+            self.project_dir.join(file)
+        }
+    }
+
+    /// The module this design is in its workspace's manifest (#7) — what its
+    /// version and release state are written under, `modules.<module>` —
+    /// or `None` for a project's own design.
+    pub fn module(&self) -> Option<&str> {
+        self.module.as_deref()
+    }
+
+    /// Whether this design's import emptied tables before it loaded — false
+    /// until one has, and for one Postgres refused to empty, which empties
+    /// nothing. What a workspace run says of a failed import rests on it: an
+    /// emptying refused left nothing to reload.
+    pub fn emptied_for_import(&self) -> bool {
+        self.import_emptied.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The tables this design's import empties before it loads, under
+    /// `scope` and narrowed by `name`: each it reloads, unless its
+    /// `import.tables` entry says `truncate: false`.
+    pub fn import_truncations(&self, name: Option<&str>, scope: Option<&ResolvedScope>) -> Result<Vec<String>> {
+        let (plan, _) = self.scoped_import_plan(name, scope)?;
+        let mut tables: Vec<String> = Vec::new();
+        for entry in plan {
+            let table = entry.table.name;
+            if self.config.import.table_truncate(&table) && !tables.contains(&table) {
+                tables.push(table);
+            }
+        }
+        Ok(tables)
+    }
+
+    /// Reset beside `owners` (#7): a workspace resets its modules in one run,
+    /// each before the modules it depends on — so the modules reset before
+    /// this one, `owners`, are gone by the time it resets. Their uses do not
+    /// hold this reset back, and what they hold in a schema does not keep it
+    /// — though a prod mark of theirs still does. A preview names them so it
+    /// reads the database as the run will find it.
+    pub fn resetting_beside(mut self, owners: impl IntoIterator<Item = String>) -> Self {
+        self.reset_beside = owners.into_iter().filter(|o| o != self.owner()).collect();
+        self
     }
 
     /// Access the parsed config.
@@ -1244,6 +1507,13 @@ impl Design {
             Some(s) => self.scoped_entities(s)?,
             None => self.entities.clone(),
         };
+        std::fs::write(file, self.combined_ddl_of(&entities))?;
+        Ok(())
+    }
+
+    /// `entities`' DDL as one script, in their order — a file that did not
+    /// parse and an external left out.
+    pub(crate) fn combined_ddl_of(&self, entities: &[Entity]) -> String {
         // The script is for this project's own engine, so dbd's generated
         // statements are written in its dialect too (see `combined_ddl`).
         let dialect = crate::parser::Dialect::from_label(&self.dialect).unwrap_or_default();
@@ -1253,31 +1523,41 @@ impl Design {
             .filter(|e| e.entity_type != EntityType::External)
             .filter_map(|e| script::combined_ddl(e, dialect))
             .collect();
-
-        std::fs::write(file, combined.join("\n"))?;
-        Ok(())
+        combined.join("\n")
     }
 
     /// Get the dependency graph for visualization. `name` narrows to one entity's
     /// subgraph; `scope` filters to that scope's working set (`None` ⇒ full set).
     pub fn graph(&self, name: Option<&str>, scope: Option<&ResolvedScope>) -> Result<dependency::GraphResult> {
+        if let Some(n) = name {
+            self.check_graph_name(n, scope)?;
+        }
+        Ok(dependency::graph_from_entities(&self.graph_entities(scope)?, name))
+    }
+
+    /// Refuse a `-n` the graph cannot center on: one it does not know or the
+    /// scope leaves out, or an external.
+    pub(crate) fn check_graph_name(&self, name: &str, scope: Option<&ResolvedScope>) -> Result<()> {
         // An unknown or out-of-scope name produced an empty graph — a valid
         // document, indistinguishable from an entity with no dependencies. So
         // did an `external:` one: dbd has no DDL for it, so it is no node of
         // the graph, and `inspect -n` and `apply -n` refuse it alike.
-        if let Some(n) = name
-            && self.resolve_name(n, scope)?.entity_type == EntityType::External
-        {
+        if self.resolve_name(name, scope)?.entity_type == EntityType::External {
             return Err(DbdError::Config(format!(
-                "{n} is declared `external:` — dbd has no DDL for it, so it has no place in the dependency \
+                "{name} is declared `external:` — dbd has no DDL for it, so it has no place in the dependency \
                  graph; it only resolves references to it"
             )));
         }
+        Ok(())
+    }
+
+    /// The entities the graph is drawn over under `scope`.
+    pub(crate) fn graph_entities(&self, scope: Option<&ResolvedScope>) -> Result<Vec<Entity>> {
         // A file dbd could not parse is left out, as `dbd graph` tells the user
         // it is (`Design::unparsed`): kept as a node, it sat in a layer and at
         // the end of an edge although nothing about it was read.
         let graphable = |e: &Entity| crate::scope::is_scopable(e) && e.errors.is_empty();
-        let non_meta: Vec<Entity> = match scope {
+        Ok(match scope {
             Some(s) => {
                 let ws = self.working_set(s)?;
                 self.entities
@@ -1287,8 +1567,7 @@ impl Design {
                     .collect()
             }
             None => self.entities.iter().filter(|e| graphable(e)).cloned().collect(),
-        };
-        Ok(dependency::graph_from_entities(&non_meta, name))
+        })
     }
 
     /// Every materialized view's qualified name paired with its resolved
@@ -3808,7 +4087,7 @@ import:
         let desired = snap(vec![table("a", &["id"]), table("b", &["id", "added"])]);
 
         let plan = crate::reconcile::plan_reconcile(&live, &desired);
-        let err = ensure_reconcile_not_destructive(&plan, false).unwrap_err().to_string();
+        let err = plan.refuse_destructive(false).unwrap_err().to_string();
 
         assert!(err.contains("app.a") && err.contains("gone"), "{err}");
         assert!(

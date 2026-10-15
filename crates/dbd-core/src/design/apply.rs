@@ -351,44 +351,24 @@ impl Design {
         if !dry_run && outside_txn {
             // The before-hooks' own refusals — a file missing, a path outside
             // the project — come first: a refused run claims nothing.
-            hooks::plan_hooks(
-                self.hook_source(),
-                &self.config.apply.before,
-                hooks::HookKind::Before,
-                hook_scope,
-            )?;
+            self.plan_apply_hooks(hooks::HookKind::Before, hook_scope)?;
             self.claim(adapter).await?;
         }
 
         // `apply.before` runs here: after the scope and parse gates, so a bad
         // design still refuses before any hook fires, and before the first
         // entity, so a hook can prepare the ground the DDL lands on.
-        let before = hooks::run_hooks(
-            adapter,
-            self.hook_source(),
-            &self.config.apply.before,
-            hooks::HookKind::Before,
-            hook_scope,
-            dry_run,
-            &mut progress,
-        )
-        .await?;
+        let before = self
+            .run_apply_hooks(adapter, hooks::HookKind::Before, hook_scope, dry_run, &mut progress)
+            .await?;
 
         if dry_run {
             // A dry run executes nothing but must still name every script the
             // real run would — including the after-hooks, which the early
             // return below would otherwise hide, and including a missing file,
             // which is a misconfiguration whether or not we are about to write.
-            hooks::run_hooks(
-                adapter,
-                self.hook_source(),
-                &self.config.apply.after,
-                hooks::HookKind::After,
-                hook_scope,
-                dry_run,
-                &mut progress,
-            )
-            .await?;
+            self.run_apply_hooks(adapter, hooks::HookKind::After, hook_scope, dry_run, &mut progress)
+                .await?;
             return Ok(());
         }
 
@@ -406,16 +386,9 @@ impl Design {
             // Batch adapters take this shortcut past the execution plan, but a
             // hook is a hook: leaving `apply.after` out here would recreate, for
             // one backend, exactly the silent no-op this feature removes.
-            let after = hooks::run_hooks(
-                adapter,
-                self.hook_source(),
-                &self.config.apply.after,
-                hooks::HookKind::After,
-                hook_scope,
-                dry_run,
-                &mut progress,
-            )
-            .await?;
+            let after = self
+                .run_apply_hooks(adapter, hooks::HookKind::After, hook_scope, dry_run, &mut progress)
+                .await?;
             (progress.on_complete)(ApplyComplete {
                 strategy: ApplyStrategy::Current,
                 from_version: 0,
@@ -594,16 +567,9 @@ impl Design {
         // matview stamped, and — critically — `policies/` has not run yet.
         // Publications and grants attach to objects that must already exist;
         // RLS is independent of them, so it stays last (see `deploy_with_progress`).
-        let after = hooks::run_hooks(
-            adapter,
-            self.hook_source(),
-            &self.config.apply.after,
-            hooks::HookKind::After,
-            hook_scope,
-            dry_run,
-            &mut progress,
-        )
-        .await?;
+        let after = self
+            .run_apply_hooks(adapter, hooks::HookKind::After, hook_scope, dry_run, &mut progress)
+            .await?;
 
         (progress.on_complete)(ApplyComplete {
             strategy: plan.strategy,
@@ -871,7 +837,7 @@ impl Design {
 
     /// The `apply.before` and `apply.after` hooks a run under `scope` skips,
     /// one line each saying why — the run's own decision
-    /// (`hooks::plan_hooks`), made without running anything.
+    /// (`Design::plan_apply_hooks`), made without running anything.
     ///
     /// The run reports these in [`ApplyComplete::warnings`], which only a run
     /// that succeeds produces: a preview had no word of a skip, and neither
@@ -883,18 +849,15 @@ impl Design {
         let hook_scope = self.hook_scope(scope, working_set.as_ref());
         let hook_scope = hook_scope.as_ref().map(|(name, outside)| (*name, outside));
         let mut skips = Vec::new();
-        for (entries, kind) in [
-            (&self.config.apply.before, hooks::HookKind::Before),
-            (&self.config.apply.after, hooks::HookKind::After),
-        ] {
-            skips.extend(hooks::plan_hooks(self.hook_source(), entries, kind, hook_scope)?.warnings);
+        for kind in [hooks::HookKind::Before, hooks::HookKind::After] {
+            skips.extend(self.plan_apply_hooks(kind, hook_scope)?.warnings);
         }
         Ok(skips)
     }
 
     /// The `apply.before` and `apply.after` hooks a run under `scope` executes,
     /// as `"apply.before sql/x.sql"`, in the order it runs them — the run's own
-    /// decision (`hooks::plan_hooks`), made without running anything.
+    /// decision (`Design::plan_apply_hooks`), made without running anything.
     ///
     /// For a preview of a run that executes hooks: `reconcile --dry-run`
     /// listed the schema changes and never the hooks its run went on to.
@@ -903,17 +866,12 @@ impl Design {
         let hook_scope = self.hook_scope(scope, working_set.as_ref());
         let hook_scope = hook_scope.as_ref().map(|(name, outside)| (*name, outside));
         let mut run = Vec::new();
-        for (entries, phase) in [
-            (&self.config.apply.before, "apply.before"),
-            (&self.config.apply.after, "apply.after"),
+        for (kind, phase) in [
+            (hooks::HookKind::Before, "apply.before"),
+            (hooks::HookKind::After, "apply.after"),
         ] {
-            let kind = if phase == "apply.before" {
-                hooks::HookKind::Before
-            } else {
-                hooks::HookKind::After
-            };
             run.extend(
-                hooks::plan_hooks(self.hook_source(), entries, kind, hook_scope)?
+                self.plan_apply_hooks(kind, hook_scope)?
                     .runnable
                     .into_iter()
                     .map(|(script, _)| format!("{phase} {script}")),
@@ -1053,17 +1011,46 @@ impl Design {
         // applied, data not loaded.
         self.scoped_import_plan(None, scope)?;
 
-        let mut apply_summary: Option<ApplyComplete> = None;
-        let mut import_summary: Option<ImportComplete> = None;
+        let (apply, grants) = self
+            .deploy_schema(adapter, dry_run, scope, &mut progress.on_start, &mut progress.on_done)
+            .await?;
+        let (import, policies) = self
+            .deploy_data(adapter, dry_run, scope, &mut progress.on_start, &mut progress.on_done)
+            .await?;
+        (progress.on_complete)(DeployComplete {
+            apply,
+            grants,
+            import,
+            policies,
+        });
+        Ok(())
+    }
 
+    /// [`Design::deploy`]'s schema: the apply, then the grants. A workspace
+    /// deploys every module's schema before any module's data (#7), so that a
+    /// module's migrations read the tables they migrate by as they are, not as
+    /// an earlier module's import emptied them for the reload that follows.
+    pub async fn deploy_schema<S, D>(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        dry_run: bool,
+        scope: Option<&ResolvedScope>,
+        on_start: &mut S,
+        on_done: &mut D,
+    ) -> Result<(ApplyComplete, GrantsOutcome)>
+    where
+        S: FnMut(&str),
+        D: FnMut(&str, Option<&str>),
+    {
+        let mut apply_summary: Option<ApplyComplete> = None;
         self.apply(
             adapter,
             None,
             dry_run,
             scope,
             Progress {
-                on_start: &mut progress.on_start,
-                on_done: &mut progress.on_done,
+                on_start: &mut *on_start,
+                on_done: &mut *on_done,
                 on_complete: |s| {
                     apply_summary = Some(s);
                 },
@@ -1078,7 +1065,24 @@ impl Design {
         } else {
             self.apply_grants(adapter, scope).await?
         };
+        Ok((apply_summary.unwrap_or_default(), grants))
+    }
 
+    /// [`Design::deploy`]'s data: the import, then the policies — see
+    /// [`Design::deploy_schema`].
+    pub async fn deploy_data<S, D>(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        dry_run: bool,
+        scope: Option<&ResolvedScope>,
+        on_start: &mut S,
+        on_done: &mut D,
+    ) -> Result<(ImportComplete, PolicyReport)>
+    where
+        S: FnMut(&str),
+        D: FnMut(&str, Option<&str>),
+    {
+        let mut import_summary: Option<ImportComplete> = None;
         // Always run the import phase, even when the plan is empty: it still
         // executes the project's `import.after` scripts, and its summary is what
         // reports "0 table(s) loaded" plus the reason why.
@@ -1088,8 +1092,8 @@ impl Design {
             dry_run,
             scope,
             Progress {
-                on_start: &mut progress.on_start,
-                on_done: &mut progress.on_done,
+                on_start: &mut *on_start,
+                on_done: &mut *on_done,
                 on_complete: |s| {
                     import_summary = Some(s);
                 },
@@ -1110,14 +1114,7 @@ impl Design {
             policy_ws.as_ref().map(|(n, ws)| (n.as_str(), ws)),
         )
         .await?;
-
-        (progress.on_complete)(DeployComplete {
-            apply: apply_summary.unwrap_or_default(),
-            grants,
-            import: import_summary.unwrap_or_default(),
-            policies,
-        });
-        Ok(())
+        Ok((import_summary.unwrap_or_default(), policies))
     }
 }
 

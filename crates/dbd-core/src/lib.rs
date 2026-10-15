@@ -51,11 +51,14 @@ pub mod scope;
 pub mod script;
 pub mod snapshot;
 pub mod source_text;
+pub mod split;
 pub mod sql_expr;
 pub mod sql_quote;
 
 pub use adapter::DatabaseAdapter;
-pub use design::{ApplyComplete, ApplyStrategy, DeployComplete, Design, ImportComplete, Prune, ResetComplete};
+pub use design::{
+    ApplyComplete, ApplyStrategy, DeployComplete, Design, ImportComplete, Module, Prune, ResetComplete, Workspace,
+};
 pub use entity::{Entity, EntityType};
 pub use error::{DbdError, Result};
 pub use project::{ProjectSurvey, survey};

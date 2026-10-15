@@ -568,7 +568,7 @@ impl Bookkeeping {
         owner: &str,
         objects: &[crate::adapter::OwnedObject],
         write: bool,
-        adopt_from: Option<&str>,
+        adopt_from: &[String],
     ) -> Result<Vec<crate::adapter::HeldObject>> {
         if !write {
             let exists: Option<String> = sqlx::query_scalar("SELECT to_regclass('dbd.objects')::text")
@@ -629,7 +629,7 @@ impl Bookkeeping {
         tx: &mut Transaction<'static, Postgres>,
         owner: &str,
         objects: &[crate::adapter::OwnedObject],
-        adopt_from: Option<&str>,
+        adopt_from: &[String],
     ) -> Result<Vec<crate::adapter::HeldObject>> {
         let column = |f: fn(&crate::adapter::OwnedObject) -> &str| -> Vec<String> {
             objects.iter().map(|o| f(o).to_string()).collect()
@@ -637,20 +637,50 @@ impl Bookkeeping {
         bounded_wait(tx, "dbd.objects", true).await?;
         // What is adopted changes hands first, in the claim's transaction: a
         // claim refused for a third owner's entity rolls the adoption back.
-        if let Some(from) = adopt_from {
-            sqlx::query(
+        if !adopt_from.is_empty() {
+            let taken: Vec<(String, String, String)> = sqlx::query_as(
                 "UPDATE dbd.objects o SET owner = $4, claimed_at = now() \
                  FROM unnest($1::text[], $2::text[], $3::text[]) AS d(namespace, schema, name) \
-                 WHERE o.namespace = d.namespace AND o.schema = d.schema AND o.name = d.name AND o.owner = $5",
+                 WHERE o.namespace = d.namespace AND o.schema = d.schema AND o.name = d.name \
+                   AND o.owner = ANY($5) \
+                 RETURNING o.kind, o.schema, o.name",
             )
             .bind(column(|o| &o.namespace))
             .bind(column(|o| &o.schema))
             .bind(column(|o| &o.name))
             .bind(owner)
-            .bind(from)
-            .execute(&mut **tx)
+            .bind(adopt_from)
+            .fetch_all(&mut **tx)
             .await
             .map_err(|e| registry_error(&e, "dbd.objects", "adopt"))?;
+            // What an entity uses goes with it: recorded under its giver, the
+            // use guards what it reads until the taker records its own — and
+            // a giver retired, or a taker whose run fails before it records
+            // them, must not leave the use unguarded (#7).
+            let vias: Vec<String> = taken
+                .iter()
+                .map(|(kind, schema, name)| format!("{kind} {schema}.{name}"))
+                .collect();
+            if !vias.is_empty() {
+                sqlx::query(
+                    "INSERT INTO dbd.uses (owner, kind, target, via) \
+                       SELECT $1, u.kind, u.target, u.via FROM dbd.uses u \
+                       WHERE u.owner = ANY($2) AND u.via = ANY($3) \
+                     ON CONFLICT DO NOTHING",
+                )
+                .bind(owner)
+                .bind(adopt_from)
+                .bind(&vias)
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| registry_error(&e, "dbd.uses", "adopt"))?;
+                sqlx::query("DELETE FROM dbd.uses WHERE owner = ANY($1) AND via = ANY($2)")
+                    .bind(adopt_from)
+                    .bind(&vias)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|e| registry_error(&e, "dbd.uses", "adopt"))?;
+            }
         }
         sqlx::query(
             "INSERT INTO dbd.objects (namespace, schema, name, kind, owner) \
@@ -667,7 +697,7 @@ impl Bookkeeping {
         .execute(&mut **tx)
         .await
         .map_err(|e| registry_error(&e, "dbd.objects", "claim"))?;
-        let held = held_objects(tx, owner, objects, None).await?;
+        let held = held_objects(tx, owner, objects, &[]).await?;
         bounded_wait(tx, "dbd.objects", false).await?;
         Ok(held)
     }
@@ -1410,6 +1440,36 @@ impl Bookkeeping {
         Ok(())
     }
 
+    /// Retire `owner` if it holds nothing that still exists — its record, its
+    /// uses, its claims of what is gone and its materialized-view stamps; its
+    /// migrations stay, as history (#7: a project split into modules). In the
+    /// run's transaction when there is one, so the check sees what the run's
+    /// claim took over. Whether it was retired.
+    pub(super) async fn retire_owner(
+        &self,
+        tx: Option<&mut Transaction<'static, Postgres>>,
+        owner: &str,
+    ) -> Result<bool> {
+        let registry: Option<String> = sqlx::query_scalar("SELECT to_regclass('dbd.objects')::text")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| DbdError::Config(format!("retire: registry read failed: {e}")))?;
+        if registry.is_none() {
+            return Ok(false);
+        }
+        match tx {
+            Some(tx) => retire_in(tx, owner).await,
+            None => {
+                let mut own = self.registry_tx("retire").await?;
+                let retired = retire_in(&mut own, owner).await?;
+                own.commit()
+                    .await
+                    .map_err(|e| DbdError::Config(format!("retire: commit failed: {e}")))?;
+                Ok(retired)
+            }
+        }
+    }
+
     /// Read-only detection: `Some(version)` if this DB is dbd-managed — resolving
     /// `dbd.meta` OR a legacy `_dbd_meta` in ANY schema — reading the applied
     /// version for this project (`0` if the relation exists but has no matching
@@ -1474,7 +1534,7 @@ async fn held_objects(
     conn: &mut sqlx::PgConnection,
     owner: &str,
     objects: &[crate::adapter::OwnedObject],
-    adopting_from: Option<&str>,
+    adopting_from: &[String],
 ) -> Result<Vec<crate::adapter::HeldObject>> {
     let column = |f: fn(&crate::adapter::OwnedObject) -> &str| -> Vec<String> {
         objects.iter().map(|o| f(o).to_string()).collect()
@@ -1483,7 +1543,7 @@ async fn held_objects(
         "SELECT o.namespace, o.schema, o.name, o.kind, o.owner FROM dbd.objects o \
          JOIN unnest($1::text[], $2::text[], $3::text[]) AS d(namespace, schema, name) \
            ON o.namespace = d.namespace AND o.schema = d.schema AND o.name = d.name \
-         WHERE o.owner <> $4 AND o.owner IS DISTINCT FROM $5 ORDER BY o.namespace, o.schema, o.name",
+         WHERE o.owner <> $4 AND o.owner <> ALL($5) ORDER BY o.namespace, o.schema, o.name",
     )
     .bind(column(|o| &o.namespace))
     .bind(column(|o| &o.schema))
@@ -1505,6 +1565,75 @@ async fn held_objects(
             owner: r.get("owner"),
         })
         .collect())
+}
+
+/// [`Bookkeeping::retire_owner`]'s statements, in `tx`, in a savepoint of
+/// their own: nothing, if `owner` holds anything that still exists, or has no
+/// record — nor if another session's open write holds a row they delete past
+/// [`HEAL_LOCK_TIMEOUT`]. A retire is housekeeping: the run it ends does not
+/// wait on it or fail for it, and a later run retires the owner.
+async fn retire_in(tx: &mut Transaction<'static, Postgres>, owner: &str) -> Result<bool> {
+    use sqlx::Executor as _;
+    let failed = |e: sqlx::Error| registry_error(&e, "dbd.meta", &format!("retire {owner}"));
+    (&mut **tx).execute("SAVEPOINT dbd_retire").await.map_err(failed)?;
+    bounded_wait(tx, "dbd.meta", true).await?;
+    let outcome = retire_steps(tx, owner).await;
+    let retired = match outcome {
+        Ok(retired) => {
+            (&mut **tx)
+                .execute("RELEASE SAVEPOINT dbd_retire")
+                .await
+                .map_err(failed)?;
+            retired
+        }
+        Err(e) if sqlstate(&e).as_deref() == Some("55P03") => {
+            (&mut **tx)
+                .execute("ROLLBACK TO SAVEPOINT dbd_retire")
+                .await
+                .map_err(failed)?;
+            false
+        }
+        Err(e) => return Err(failed(e)),
+    };
+    bounded_wait(tx, "dbd.meta", false).await?;
+    Ok(retired)
+}
+
+/// What [`retire_in`] runs in its savepoint.
+async fn retire_steps(tx: &mut Transaction<'static, Postgres>, owner: &str) -> std::result::Result<bool, sqlx::Error> {
+    let holds: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM dbd.objects o WHERE o.owner = $1 \
+           AND CASE o.namespace \
+             WHEN 'routine' THEN EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+                                         WHERE n.nspname = o.schema AND p.proname = o.name) \
+             ELSE EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                          WHERE n.nspname = o.schema AND c.relname = o.name) \
+               OR EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
+                          WHERE n.nspname = o.schema AND t.typname = o.name) \
+           END)",
+    )
+    .bind(owner)
+    .fetch_one(&mut **tx)
+    .await?;
+    if holds {
+        return Ok(false);
+    }
+    let recorded: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM dbd.meta WHERE project = $1)")
+        .bind(owner)
+        .fetch_one(&mut **tx)
+        .await?;
+    if !recorded {
+        return Ok(false);
+    }
+    for statement in [
+        "DELETE FROM dbd.meta WHERE project = $1",
+        "DELETE FROM dbd.uses WHERE owner = $1",
+        "DELETE FROM dbd.objects WHERE owner = $1",
+        "DELETE FROM dbd.matview_stamps WHERE project = $1",
+    ] {
+        sqlx::query(statement).bind(owner).execute(&mut **tx).await?;
+    }
+    Ok(true)
 }
 
 /// The rows an entity use is looked up by: one per schema it may be in, `rank`

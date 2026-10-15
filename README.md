@@ -57,6 +57,7 @@ myproject/
 |---------|---------|
 | `dbd init` | Scaffold a new project (postgres or supabase), or reverse-engineer one from a live DB with `--from-db` (a Supabase database gets a `supabase` target) or a DBML file with `--from-dbml` |
 | `dbd merge` | Sync an existing database into the current project (reverse-engineer + reconcile) |
+| `dbd split` | Divide a project into a workspace of modules, one per region of its scopes (`--from-scopes`; `--write` to move the files; `--undo` to put back an interrupted `--write`) |
 | `dbd inspect` | Validate configuration, report errors and warnings |
 | `dbd apply` | Apply schemas, entities, and pending migrations |
 | `dbd import` | Load staging data from CSV, TSV, JSON and JSONL files, then call the procedures that read it |
@@ -272,6 +273,36 @@ scope 'hub': 7 of 12 entities
 Error: 1 dependency gap(s) in scope 'hub' — add them to the scope, or run with --deps include
 ```
 
+## Workspaces
+
+A project that has outgrown one design becomes a **workspace**: a `modules:`
+block divides it into modules, each a design of its own — its own folder,
+owner (`<project>/<module>`), version and history — deployed in `depends_on`
+order. A module references what its dependencies declare without `external:`
+entries; a reference past `depends_on`, or two modules declaring one entity, is
+refused before any database is touched.
+
+```yaml
+modules:
+  shared: {}                 # shared/ddl/…, shared/import/…
+  core:
+    depends_on: [shared]
+  dojo:
+    depends_on: [shared]
+
+scopes:
+  dojo:
+    modules: [dojo]          # dojo and what it depends on
+```
+
+Every command but `init`, `merge` and `split` runs the modules in order
+(`reset` in reverse); `--module core`
+runs one with its dependencies, and running inside a module's folder runs that
+module. A scoped project becomes a workspace with `dbd split --from-scopes`
+(`--write` to move the files, `--undo` to put an interrupted one back); on each database, the modules take over the
+project's entities on their first deploy. See [design.yaml](docs/guide/03-design-yaml.md)
+and [sharing a database](docs/guide/14-sharing-a-database.md).
+
 ## Materialized views
 
 Materialized views are a first-class entity type, discovered from
@@ -342,7 +373,7 @@ left to you (drop + recreate, or the snapshot/migrate workflow).
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.26.0
+  rev: v0.27.0
   hooks:
     - id: dbd-format
 ```

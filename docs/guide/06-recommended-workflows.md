@@ -154,6 +154,56 @@ warned about, for you to add — only a schema it wrote files into). A table the
 external. It **refuses** if the source database is behind your project version (see Version
 safety below).
 
+A project that keeps growing this way — several parts, each deploying to its own databases — is
+better as a **workspace** of modules, each with its own folder, version and history; see the next
+workflow.
+
+### Divide a scoped project into a workspace
+
+A project whose scopes already say which parts deploy where — `default` to the main database,
+`dojo` to another — becomes a **workspace** with `dbd split --from-scopes`. Each region of the
+scopes' Venn diagram, taken over each scope's entities with their dependencies, becomes a module:
+the region every scope holds is `shared`, a region one scope alone holds is named for it (`default`
+as `core`), one no scope holds is `unscoped`. Each module depends on the modules its entities
+reference, and each scope is rewritten as the modules it holds.
+
+```sh
+git status                                 # start clean: the split moves files with git mv
+dbd split --from-scopes                    # the plan — modules, their scopes, entity counts, depends_on, the new scopes
+dbd split --from-scopes -v                 # … with each module's entities and each file's move
+dbd split --from-scopes --rename shared=common   # name a module of the plan otherwise
+dbd split --from-scopes --write            # move the files, write modules: and scopes: into design.yaml
+dbd inspect                                # the workspace loads, module by module
+git diff --stat --cached                   # the renames, for review and commit
+```
+
+`--write` is whole or not at all. It first builds the workspace in a scratch folder and refuses
+unless it loads and deploys, under each scope and with none, exactly what the project deploys now.
+A move that fails puts back every move before it; a split interrupted part-way leaves a journal
+(`.dbd-split`), every command that loads the project refuses it until `dbd split --undo` puts it
+back, and the split can then run again. It refuses, before moving anything, a project with `snapshots/` or
+`migrations/` — a migration is SQL over several tables and does not divide by module, so **split
+before the first release** — and a project it cannot divide as it stands, naming each reason: a
+file that does not parse, a scope that leaves out what its entities need, a file that maps to no
+module or to two.
+
+Nothing changes on the databases until you deploy. Each module's first run on a database takes over
+what it declares from the project as it was — the transfer rule — and says so; once the modules hold
+everything the old project held there, its record is retired:
+
+```sh
+dbd deploy --dry-run                       # [dry-run] would adopt relation app.lookups from "sensei" …
+dbd deploy                                 # each module takes its entities over; project "sensei" is retired
+dbd deploy --scope dojo -d $DOJO_URL       # the same on each database a scope deploys to
+```
+
+The same entities deploy to each database as before the split, with their rows. From then on each
+module changes on its own: move a file between modules and the module it moves to takes it over
+(nothing is dropped); `--module core` runs one module with what it depends on; each module is
+released on its own (`dbd release --module core`). See [design.yaml](03-design-yaml.md) for the
+`modules:` block and [sharing a database](14-sharing-a-database.md) for how modules own what they
+declare.
+
 ### Start from a dbdiagram.io / dbdocs design
 
 Designed the schema visually first? Reverse-engineer the DBML export — no connection needed:

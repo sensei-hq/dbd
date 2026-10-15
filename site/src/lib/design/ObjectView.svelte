@@ -10,6 +10,7 @@
   import { vibe } from '@rokkit/states';
   import Tabs from './Tabs.svelte';
   import Markdown from './Markdown.svelte';
+  import ModuleBadge from './ModuleBadge.svelte';
   import EntityChangelog from './EntityChangelog.svelte';
   import { noteBlocks } from './md';
   import { entityAt, KIND_ICON } from './entities';
@@ -80,6 +81,7 @@
             <h1 class="font-display text-h3 font-semibold tracking-tight">{item.name}</h1>
           </div>
           <span data-kind-badge class="ds-badge">{item.kind.replace(/_/g, ' ')}</span>
+          <ModuleBadge module={item.module} />
           <span class="ds-badge">{uses.length} uses · {usedBy.length} used by</span>
         </div>
       </div>

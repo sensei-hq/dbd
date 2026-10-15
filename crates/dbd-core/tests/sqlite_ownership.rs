@@ -334,3 +334,191 @@ async fn sqlite_claims_are_refused_whole_and_released_when_gone() {
     assert!(!owned.contains(&"orders".to_string()), "{owned:?}");
     assert!(owned.contains(&"items".to_string()), "{owned:?}");
 }
+
+/// The workspace transfer rule on SQLite (#7 phase 3, slice 6): a project
+/// split into modules hands each its tables, a table moved from one module
+/// to another changes hands, and the project's record is retired once it
+/// holds nothing.
+#[tokio::test]
+async fn sqlite_modules_take_over_from_their_project_and_from_each_other() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("shop.db");
+    let root = tmp.path().join("shop");
+    let table = |name: &str| format!("CREATE TABLE IF NOT EXISTS {name} (id INTEGER PRIMARY KEY);\n");
+    let write = |rel: &str, text: &str| {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+    write(
+        "design.yaml",
+        "project:\n  name: shop\n\nsource:\n  dialect: sqlite\n\nschemas: []\n",
+    );
+    write("ddl/table/items.ddl", &table("items"));
+    write("ddl/table/orders.ddl", &table("orders"));
+    let project = Design::from_config_with_dir(&root.join("design.yaml"), "dev", Some(&root)).expect("load");
+    let shop = connect(&file, "shop").await;
+    project
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    shop.execute_script("INSERT INTO items (id) VALUES (7)").await.unwrap();
+
+    std::fs::remove_file(root.join("ddl/table/items.ddl")).unwrap();
+    std::fs::remove_file(root.join("ddl/table/orders.ddl")).unwrap();
+    write("shared/ddl/table/items.ddl", &table("items"));
+    write("core/ddl/table/orders.ddl", &table("orders"));
+    write(
+        "design.yaml",
+        "project:\n  name: shop\n\nsource:\n  dialect: sqlite\n\nschemas: []\n\n\
+         modules:\n  shared: {}\n  core:\n    depends_on: [shared]\n",
+    );
+    let apply_all = || async {
+        let modules = dbd_core::design::Workspace::load(&root.join("design.yaml"), "dev", Some(&root))
+            .expect("load")
+            .select(None)
+            .expect("select");
+        for module in &modules {
+            module
+                .design()
+                .apply(
+                    &*connect(&file, module.owner()).await,
+                    None,
+                    false,
+                    None,
+                    Progress::none(),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{}'s apply: {e}", module.owner()));
+        }
+        modules
+    };
+    let modules = apply_all().await;
+    let owners = |shared: dbd_core::design::SharedDatabase| -> Vec<(String, Vec<String>)> {
+        shared
+            .projects
+            .into_iter()
+            .map(|p| (p.name, p.owns.into_iter().map(|o| o.name).collect()))
+            .collect()
+    };
+    let registry = modules[0].design().shared_database(&*shop).await.unwrap();
+    assert_eq!(
+        owners(registry),
+        [
+            ("shop/core".to_string(), vec!["orders".to_string()]),
+            ("shop/shared".to_string(), vec!["items".to_string()]),
+        ],
+        "shop is retired once its tables are the modules'"
+    );
+
+    // items moves to core.
+    std::fs::rename(
+        root.join("shared/ddl/table/items.ddl"),
+        root.join("core/ddl/table/items.ddl"),
+    )
+    .unwrap();
+    write("shared/ddl/table/notes.ddl", &table("notes"));
+    let modules = apply_all().await;
+    let registry = modules[0].design().shared_database(&*shop).await.unwrap();
+    let core = owners(registry)
+        .into_iter()
+        .find(|(name, _)| name == "shop/core")
+        .expect("core");
+    assert!(core.1.contains(&"items".to_string()), "{core:?}");
+    assert!(
+        shop.list_entities().await.unwrap().contains(&"items".to_string()),
+        "items is kept"
+    );
+}
+
+/// On SQLite as on Postgres, the project keeps its record — and its claim —
+/// while it holds a table its modules have not taken over yet.
+#[tokio::test]
+async fn sqlite_keeps_the_project_until_its_last_table_is_taken_over() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("shop.db");
+    let root = tmp.path().join("shop");
+    let table = |name: &str| format!("CREATE TABLE IF NOT EXISTS {name} (id INTEGER PRIMARY KEY);\n");
+    let write = |rel: &str, text: &str| {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+    write(
+        "design.yaml",
+        "project:\n  name: shop\n\nsource:\n  dialect: sqlite\n\nschemas: []\n",
+    );
+    write("ddl/table/items.ddl", &table("items"));
+    write("ddl/table/orders.ddl", &table("orders"));
+    let shop = connect(&file, "shop").await;
+    Design::from_config_with_dir(&root.join("design.yaml"), "dev", Some(&root))
+        .unwrap()
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    std::fs::remove_file(root.join("ddl/table/items.ddl")).unwrap();
+    std::fs::remove_file(root.join("ddl/table/orders.ddl")).unwrap();
+    write("shared/ddl/table/items.ddl", &table("items"));
+    write("core/ddl/table/orders.ddl", &table("orders"));
+    write(
+        "design.yaml",
+        "project:\n  name: shop\n\nsource:\n  dialect: sqlite\n\nschemas: []\n\n\
+         modules:\n  shared: {}\n  core:\n    depends_on: [shared]\n",
+    );
+    let modules = dbd_core::design::Workspace::load(&root.join("design.yaml"), "dev", Some(&root))
+        .unwrap()
+        .select(None)
+        .unwrap();
+    modules[0]
+        .design()
+        .apply(
+            &*connect(&file, "shop/shared").await,
+            None,
+            false,
+            None,
+            Progress::none(),
+        )
+        .await
+        .expect("shared's apply");
+    assert!(!modules[0].design().retired_predecessor(), "shop still holds orders");
+    let owned: Vec<String> = shop
+        .owned_objects("shop")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|o| o.name)
+        .collect();
+    assert_eq!(owned, ["orders"]);
+}
+
+/// A project whose claims are all of what is gone is retired on SQLite as on
+/// Postgres: what it held that no longer exists is no hold.
+#[tokio::test]
+async fn sqlite_retires_a_project_holding_only_what_is_gone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("shop.db");
+    let root = tmp.path().join("shop");
+    std::fs::create_dir_all(&root).unwrap();
+    let shop = connect(&file, "shop").await;
+    lite_project(&root, "shop", &["items", "legacy"])
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    shop.execute_script("DROP TABLE legacy").await.unwrap();
+    // Its modules take items over; legacy is gone.
+    let module = connect(&file, "shop/shared").await;
+    let taken = module
+        .claim_objects_from(
+            "shop/shared",
+            &shop.owned_objects("shop").await.unwrap(),
+            true,
+            &["shop".to_string()],
+        )
+        .await
+        .unwrap();
+    assert!(taken.is_empty(), "{taken:?}");
+    assert!(
+        module.retire_owner("shop").await.unwrap(),
+        "shop holds nothing that still exists"
+    );
+}

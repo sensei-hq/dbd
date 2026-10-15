@@ -1,36 +1,31 @@
 # Checkpoint
 
-**Slice:** #7 Phases 1 and 2 merged into `develop` (Phase 2: PR #58, `1ec0e311`),
-unreleased. Phase 3 (workspaces) not started.
+**Slice:** release 0.27.0 (#7 phase 3, workspaces and modules), then the
+patch 0.27.1 for #65.
 
 ## Done
 
-- Entity ownership for projects sharing a database: registry and claim, uses,
-  prune by ownership (`--prune-unowned`), uses guard, reset rules, the dbd write
-  lock, name reuse (`--allow-ownership-change`), `--adopt-from`, `inspect
-  --shared`, onboarding beside other projects, SQLite parity; guide 14 and the
-  references (04, 06, 08, 12, llms, both SKILL.md, README, agent).
-- Embedded 299/299, `cli_live` 61/61, workspace 2017/0, clippy, fmt, doc, site.
+- #7 phase 3, slices 1–7, merged into `feat/workspaces` (PRs #61–#69) and
+  from there into `develop` (PR #70, 3bdb2e4f).
+- The 0.27.0 release notes: CHANGELOG `[0.27.0] — 2026-10-14`.
 
 ## Next
 
-    # waiting on the user: a release (Phases 1+2 → 0.26.0, minor), Phase 3
-    # (workspaces), or the nextval drift issue
+1. `make bump minor` on `develop` — tests, tag v0.27.0, push, publish
+   (`gh run list --workflow=release.yml`), install.
+2. PR `develop` → `main`, CI green, merge locally.
+3. Check the installed binary: a SQLite project → `dbd split --from-scopes
+   --write` → `dbd deploy`.
+4. #65: reconcile drops the foreign keys referencing a primary key it
+   changes, and re-adds them; a function whose return type changes is dropped
+   and created. Then 0.27.1.
 
 ## Open
 
-- Pre-existing, outside #7: reconcile re-emits a mixed-case or quoted
-  `nextval('App.Seq')` default every run (`canonical_default`) — needs an
-  issue and a pg_get_expr probe first.
-- Declined: best-effort batch rollback error; dropping the old `dbd.import_tmp`;
-  migrating a branch build's `dbd.uses` CHECK (no `owner`) — rebuild those.
-- A bare type of another project's is no use (dropped as a built-in).
-- An apply in one transaction runs `apply.before` hooks before its claim
-  (documented in the spec). `dbd.objects` still allows namespace `type`, unused.
-- Delete by hand: `/tmp/dbd-mut` (+ `git worktree prune`), `/tmp/dbd-mut-target`,
-  `/tmp/dbd-idx.*`, `/tmp/dbd-review2*`, `/tmp/dbd-lockreview*`.
-- Phases 1 and 2 are releasable together as 0.26.0 (minor: library API changes) when asked.
-
-## Known limits
-
-- A type in a schema that needs quoting (`"Ext"`) still reads as drift — backlog.
+- Issue #60: reconcile re-emits a mixed-case `nextval('App.Seq')` default.
+- `dbd init --dry-run` writes design.yaml and the scaffold (unfiled).
+- SQLite `deploy --module shared` with core's keys to it fails on a bare FK
+  error while emptying (Postgres names the keys) — unfiled.
+- Delete by hand: `/tmp/dbd-*` scratch and review dirs; `git worktree remove
+  /tmp/dbd-review-tests-wt` (and `git worktree prune`).
+- Known limit: a type in a schema that needs quoting (`"Ext"`) reads as drift.

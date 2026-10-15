@@ -55,7 +55,9 @@ println!(
 relative to the config's directory, so `Path::new("design.yaml")`
 means the current directory. `from_config_with_dir(config, env, Some(dir))`
 names the project directory explicitly. Loading is synchronous and needs no
-database.
+database. A `design.yaml` declaring `modules:` is a workspace, a design per
+module: `from_config` refuses it — load it with `Workspace::load` (see
+[Workspaces](#workspaces)).
 
 `report(name, scope)` is offline validation — what `dbd inspect` prints:
 
@@ -557,6 +559,10 @@ for doc in &docs {
 }
 ```
 
+A workspace's documentation is its modules read as one design — `dbd graph`,
+`combine`, `diagram` and `dbml` over a workspace — through a `Reading`; see
+[Reading a workspace as one](#reading-a-workspace-as-one).
+
 ## Translate to another engine
 
 ```rust
@@ -574,6 +580,8 @@ for d in &downgrades {
 `emit_schema(design, target, scope)` is `dbd emit`: the script — with a comment
 at every downgrade, and for SQL Server a `GO` after every statement — and the
 same downgrades as a list. See [Other dialects](13-other-dialects.md#dbd-emit).
+For a workspace, `emit_reading(&reading, target)` emits its modules as one
+schema (see [Reading a workspace as one](#reading-a-workspace-as-one)).
 
 ## Reverse-engineer a database
 
@@ -683,6 +691,150 @@ if let Some(survey) = dbd_core::survey(project_dir)? {
 }
 ```
 
+## Workspaces
+
+A `design.yaml` declaring `modules:` is a workspace (see
+[design.yaml](03-design-yaml.md)): a design per module, owned as
+`<project>/<module>` and rooted at the module's folder, each with its own
+version, snapshots and migrations. `dbd_core::design::Workspace` loads one, and
+selects the modules a run goes over:
+
+```rust
+use dbd_core::design::Workspace;
+
+let workspace = Workspace::load(path, "prod", None)?;
+for module in workspace.modules() {
+    println!("{} — {} — depends on {:?}", module.name().unwrap_or("-"), module.owner(), module.depends_on());
+}
+
+// `dbd deploy`'s modules: the `default` scope's, each with what it depends on,
+// in depends_on order — every module deployed as its own owner.
+for module in Workspace::load(path, "prod", None)?.under_scope_of(None, None)?.select(None)? {
+    let design = module.design();
+    let adapter = dbd_core::connect(database_url, design.owner()).await?;
+    let scope = design.resolve_scope(None, None)?;
+    design.deploy(&*adapter, false, Some(&scope), |_| {}).await?;
+    if design.retired_predecessor() {
+        println!("project {} is retired", design.predecessor().unwrap_or_default());
+    }
+}
+```
+
+`Workspace::load(config, env, project_dir)` validates the manifest before any
+database is involved — module names and folders, `depends_on` (an unknown
+module, a cycle), files left in a root `ddl/`, `import/`, `policies/`,
+`snapshots/` or `migrations/`, two modules declaring one entity (T19), and a
+reference into a module outside `depends_on` (T20) — and builds each module's
+design, its dependencies' entities added as externals. A `design.yaml` without
+`modules:` loads as a workspace of one module: `name()` is `None` and the owner
+is `project.name`, so code written for workspaces runs a project as it is.
+`has_modules()` tells them apart; `config()` is the manifest as written, its
+`scopes:` and its `apply:` hooks; `modules()` is every module in `depends_on`
+order.
+
+A run's modules are chosen by consuming the workspace, as the CLI does:
+
+| Call | Selects | For |
+|---|---|---|
+| `under_scope_of(scope, module)` | the modules a scope selects — with no `scope`, the `default` scope, or the module asked for when the default leaves it out | before any of the below |
+| `select(module)` | every module, or `module` and every module it depends on; the manifest's `apply:` hooks attached to the first and last | a run that builds or reads |
+| `select_declaring(module, name)` | the module declaring `name`, alone | `-n` |
+| `select_alone(module)` | every module, or `module` alone | `export` |
+| `selected_to_reset(module)` | every module in reverse, or `module` alone | `reset` |
+
+Each `Module` has a `name()`, an `owner()`, its `depends_on()` and its
+`design()` (`design_mut()`, `into_design()`). A module's design is a `Design`
+like any other, with `module()` its name, and runs as one: connect as its
+`owner()`. `check_scope_gaps(&modules, scope, deps)` is the gap check a run
+makes over them — what one module requires that the scope leaves out of
+another. The CLI also checks every module's run before the first one writes,
+deploys every module's schema (`Design::deploy_schema`) before any module's data
+(`deploy_data`), and resets each module beside those reset before it
+(`Design::resetting_beside`); the loop above does none of that.
+
+A module takes over what it declares from the project as it was before it had
+modules, and from the workspace's other modules, as it claims (see [the
+workspace transfer rule](14-sharing-a-database.md#the-workspace-transfer-rule)):
+`adoptions(adapter)` lists what it would, `predecessor()` names the project it
+would retire, and `retired_predecessor()` says whether a run did.
+
+Without loading any design, `Workspace::folders(config, project_dir)` lists each
+module's folder — what `format` and `doctor` go over — and
+`Workspace::locate(dir, Path::new("design.yaml"))` is how a run started in a
+module's folder finds its workspace: the folder holding the nearest
+`design.yaml` above `dir`, with the module whose folder holds `dir` — `None`
+when that `design.yaml` declares no modules.
+
+### Reading a workspace as one
+
+What writes a document of the design — `dbd dbml`, `diagram`, `graph`, `combine`
+and `emit` — reads a workspace's modules as one design, each entity once, from
+the module declaring it: `Workspace::reading(module, scope, deps)` returns that
+`Reading`, the modules `select` would choose, each through its scope, with no
+gap check — a table a scope leaves out of a dependency is a stub, as in one
+design.
+
+```rust
+use dbd_core::design::Workspace;
+use dbd_core::parser::Dialect;
+
+let reading = Workspace::load(path, "prod", None)?.reading(None, Some("hub"), None)?;
+
+let mut model = dbd_core::schema_model::build_reading(&reading)?;   // `dbd diagram --json`
+model.history = reading.history()?;
+std::fs::write("schema.json", serde_json::to_string_pretty(&model)?)?;
+
+std::fs::write("init.sql", reading.combined()?)?;                     // `dbd combine`
+for doc in dbd_core::dbml::generate_reading(&reading)? {              // `dbd dbml`
+    std::fs::write(&doc.file_name, &doc.content)?;
+}
+let (sql, downgrades) = dbd_core::emit_dialect::emit_reading(&reading, Dialect::Sqlite)?;
+```
+
+- `entities()` — what is in view, each once, in `depends_on` order; `declared()`
+  — every entity the modules declare, before their scopes; `counts()` — the
+  `(kept, total)` the `scope '…': N of M entities` line prints.
+- `module_of(name, kind)` — the module declaring an entity, by name and kind (a
+  function and a view may share a name, each in its own module).
+- `graph(name)` — the dependency graph across the modules, each node's `module`
+  set; `name` narrows it to that entity's subgraph.
+- `combined()` — one script, each module's statements after a comment naming it.
+- `history()` — each module's changelog in turn, each entry's `module` set.
+- `unparsed()`, `scope()`, `modules()`, `project_name()`, `project_note()` and
+  `dialect()` as their names say.
+
+`schema_model::build_reading` adds `modules` and each entity's `module` to the
+model (see [The schema viewer](11-schema-viewer.md)); `dbml::generate_reading`
+gives a document with no groups of its own a `TableGroup` per module;
+`emit_dialect::emit_reading` heads each module's statements with a comment. A
+project is a reading of one module, and each gives what `build`, `generate_all`
+and `emit_schema` give for it.
+
+### Splitting a project
+
+`dbd split --from-scopes` is `dbd_core::split`:
+
+```rust
+let design = dbd_core::Design::from_config(path, "dev")?;
+let plan = dbd_core::split::plan_from_scopes(&design, &[])?;
+for module in &plan.modules {
+    println!("{} — {} entities — depends on {:?}", module.name, module.entities.len(), module.depends_on);
+}
+if plan.cycle.is_none() {
+    dbd_core::split::write_split(&plan, path, project_dir)?;
+}
+```
+
+`plan_from_scopes(design, renames)` is the plan — `modules` (`PlannedModule`:
+`name`, `region`, `entities`, `depends_on`), `scopes` as they become
+(`PlannedScope`), each file's `FileMove`, and a `cycle` when the modules'
+dependencies would make one — and refuses what cannot divide; `renames` are
+`(module, name)` pairs, `--rename`. `write_split(plan, config, project_dir)`
+carries it out whole or not at all. While a split is interrupted, its journal
+is in the project folder — `split::interrupted(project_dir)` returns it —
+`Design::from_config` and `Workspace::load` refuse the project, and
+`split::undo(project_dir)` puts back what it moved, returning how many files.
+
 ## Share a database
 
 Several projects can deploy into one database, each entity owned by the one
@@ -735,7 +887,13 @@ none — `claim_objects`, `owned_objects`, `record_uses`, `release_objects`,
 `ownership`, `registry`, `dependents`, `users_of`, `not_owned_in_schema`,
 `lock_writes`/`unlock_writes`/`abandon_writes` — with `keeps_registry()` saying
 whether it does, and `same_object` how it compares two keys. The PostgreSQL and
-SQLite adapters keep one.
+SQLite adapters keep one. A module of a workspace takes over from several
+owners at once through `claim_objects_from(owner, objects, write, from)`: by
+default it calls `claim_objects` with the one of `from` that holds anything —
+so an adapter written before, or one keeping no registry, runs a workspace —
+and refuses only when several do. `retire_owner(owner)` retires the project a
+workspace was before it had modules, once it holds nothing that still exists;
+by default it retires nothing.
 
 ## What the CLI adds
 

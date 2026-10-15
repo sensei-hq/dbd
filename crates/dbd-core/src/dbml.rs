@@ -136,12 +136,52 @@ pub struct DbmlMultiParams<'a> {
     pub docs: &'a std::collections::HashMap<String, DbmlDocConfig>,
 }
 
+/// DBML over what a command reads (#7): a project's design, or a workspace's
+/// modules as one design — each table once, in the module declaring it, and a
+/// `TableGroup` per module in a document with no groups of its own.
+pub fn generate_reading(reading: &crate::design::Reading) -> crate::error::Result<Vec<DbmlDocument>> {
+    let sections = reading.sections_in_view()?;
+    let module_groups: Vec<DbmlGroup> = sections
+        .iter()
+        .filter_map(|(module, entities)| {
+            module.name().map(|name| DbmlGroup {
+                name: name.to_string(),
+                tables: entities
+                    .iter()
+                    .filter(|e| e.entity_type == EntityType::Table)
+                    .map(|e| e.name.clone())
+                    .collect(),
+            })
+        })
+        .collect();
+    let entities: Vec<Entity> = sections.into_iter().flat_map(|(_, e)| e).collect();
+    let declared = reading.declared();
+    let params = DbmlMultiParams {
+        entities: &entities,
+        // Every module's, not the scope's: a stub for an out-of-scope parent
+        // takes its column types from here.
+        design_entities: &declared,
+        project_name: reading.project_name(),
+        database_type: reading.dialect(),
+        project_note: reading.project_note(),
+        docs: &reading.config().dbml,
+    };
+    Ok(generate_grouped(&params, &module_groups))
+}
+
 /// Generate one `DbmlDocument` per entry in `docs`. The document
 /// `file_name` is the doc's configured `output`, or `<key>.dbml` when
 /// no `output` is set. When `docs` is empty, returns a single
 /// `design.dbml` document with no filters and no groups (the
 /// no-config default).
 pub fn generate_all(params: &DbmlMultiParams<'_>) -> Vec<DbmlDocument> {
+    generate_grouped(params, &[])
+}
+
+/// [`generate_all`], giving a document with no groups of its own — no
+/// `groups`, no `auto_group_by_schema` — `module_groups`, a workspace's
+/// modules each with its tables (#7): DBML puts a table in one group.
+fn generate_grouped(params: &DbmlMultiParams<'_>, module_groups: &[DbmlGroup]) -> Vec<DbmlDocument> {
     if params.docs.is_empty() {
         let doc = generate_dbml_in(
             &DbmlParams {
@@ -153,7 +193,7 @@ pub fn generate_all(params: &DbmlMultiParams<'_>) -> Vec<DbmlDocument> {
                 exclude_schemas: vec![],
                 include_tables: vec![],
                 exclude_tables: vec![],
-                groups: vec![],
+                groups: module_groups.to_vec(),
                 auto_group_by_schema: false,
             },
             params.design_entities,
@@ -174,7 +214,7 @@ pub fn generate_all(params: &DbmlMultiParams<'_>) -> Vec<DbmlDocument> {
             cfg.include.as_ref().map(|f| f.tables.clone()).unwrap_or_default(),
             cfg.exclude.as_ref().map(|f| f.tables.clone()).unwrap_or_default(),
         );
-        let groups: Vec<DbmlGroup> = cfg
+        let mut groups: Vec<DbmlGroup> = cfg
             .groups
             .iter()
             .map(|g| DbmlGroup {
@@ -182,6 +222,9 @@ pub fn generate_all(params: &DbmlMultiParams<'_>) -> Vec<DbmlDocument> {
                 tables: g.tables.clone(),
             })
             .collect();
+        if groups.is_empty() && !cfg.auto_group_by_schema {
+            groups = module_groups.to_vec();
+        }
         let mut doc = generate_dbml_in(
             &DbmlParams {
                 entities: params.entities,

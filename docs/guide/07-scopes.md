@@ -143,7 +143,7 @@ enum or sequence lives in a schema the scope leaves out has a gap, and
 |---|---|
 | **Filter, and refuse on a gap** under `deps: report` | `inspect`, `apply`, `deploy`, `import`, `reconcile`, `diff` |
 | **Filter only** — no gap check (`inspect --scope` is where gaps surface) | `combine`, `emit`, `dbml`, `graph`, `diagram`, `export`, `refresh`, `policies`, `reset` |
-| **Ignore, with a warning** | `snapshot`, `release`, `migrate`, `doctor`, `init`, `merge`, `format`, `install` |
+| **Ignore, with a warning** | `snapshot`, `release`, `migrate`, `doctor`, `init`, `merge`, `split`, `format`, `install` |
 
 The ignoring commands print
 `⚠ --scope hub ignored: this command operates on the whole design, not a scope`,
@@ -309,8 +309,10 @@ the pin, and the rest of the row, where it was. The
 environment is guarded the way the scope is: a `-e dev` run against a database
 marked prod is refused (see [global options](04-commands.md#global-options)).
 
-To host several modules in one database, define one scope that includes them
-all, rather than switching a database back and forth between scopes.
+To host several parts of the design in one database, define one scope that
+includes them all, rather than switching a database back and forth between
+scopes. In a workspace, each [module](#scopes-over-modules) keeps its own record,
+so each module of a database is pinned to the scope it was built under.
 
 ## Reconcile and prune under a scope
 
@@ -327,6 +329,187 @@ no `schema:`, does not make it managed.
 > the scope — but in a schema the scope touches — read as an orphan, and a
 > scoped prune dropped it with `DROP TABLE … CASCADE`
 > ([#40](https://github.com/sensei-hq/dbd/issues/40)).
+
+## Scopes over modules
+
+In a workspace — a `design.yaml` with [`modules:`](03-design-yaml.md#modules) —
+a scope selects **modules**, and entities within them. Sensei's 32-entry `dojo`
+include list becomes one line:
+
+```yaml
+modules:
+  shared: {}
+  core:
+    depends_on: [shared]
+  dojo:
+    depends_on: [shared]
+
+scopes:
+  default:
+    modules: [core]              # core, and shared, which it depends on
+  dojo:
+    modules: [dojo]              # dojo and shared
+  reporting:
+    modules: [core]
+    excludes: [app.audit_log]    # one of core's entities left out
+  rates:
+    includes: [app.currencies]   # one of shared's entities
+```
+
+- **`modules:`** selects each module it names with every module it depends on,
+  directly or through another — whole.
+- **`includes:`** selects entities of modules the scope does not select whole.
+  A module it takes entities from runs with the modules it depends on, whole,
+  as `--module` would run it. An include names entities: a bare schema alone
+  selects no module, since every module has the manifest's schemas.
+- **`excludes:`** leaves entities of the selected modules out, as in one
+  design.
+- A scope naming no module and including nothing selects **every** module —
+  `excludes:` alone narrows the whole workspace.
+- **`deps:`** and **`extensions:`** apply within each module, as in one design.
+
+Each scope is projected onto each module it selects, under the same name, when
+the workspace loads: every module resolves it as its own, so each command
+filters, guards and pins a module under the scope exactly as it does a project,
+and each module's record is pinned to the scope it was built under. Refused
+when the workspace loads: a scope naming a module `modules:` does not declare,
+an item no module declares, and `modules:` in a scope of a design that has no
+modules.
+
+**Which modules a run goes over.** With no `--scope`, the `default` scope if the
+manifest has one, else every module; `--scope all` is every module. A run goes
+over the modules the scope selects, in `depends_on` order. `--module` within a
+scope must be one of the scope's modules — `dbd deploy --scope default --module
+dojo` is refused:
+
+```
+Error: Config error: module "dojo" is not in scope default, which runs shared, core
+```
+
+A module you ask for — with `--module`, or by running in its folder — that the
+`default` scope leaves out runs on its own, with its dependencies, when no
+`--scope` is given, rather than being refused: `dbd deploy` in `dojo/` deploys
+dojo and shared.
+
+**Gaps between modules.** In one design a gap is caught by the design's own
+analysis; between modules it is not, since the module that requires an entity
+holds it as an external. So a run that builds or reads — `inspect`, `apply`,
+`deploy`, `reconcile`, `diff`, `import`, `refresh`, `policies`,
+`migrate --status` — checks, before it starts, that what each of its modules
+requires is in the run's scope in the module declaring it, each module resolving
+the scope and `--deps` as the run does. With a scope `lean` of
+`modules: [core]` and `excludes: [app.currencies]`, which core's orders
+reference:
+
+```
+Error: Config error: 1 dependency gap(s) between modules — stop excluding what is required, or exclude what requires it too:
+  app.orders (module "core") requires app.currencies, which scope 'lean' leaves out of module "shared"
+```
+
+It is checked when a run starts, not when the workspace loads, so other scopes,
+and runs that do not go over that module, still run. `dbml`, `diagram`,
+`graph`, `combine` and `emit` read a workspace as one design and do not refuse
+a gap: a table a scope leaves out of a dependency is drawn as a stub, as in one
+design.
+
+A reference into a module the requiring module does not depend on at all is a
+different mistake, refused whenever the workspace loads — see
+[`modules`](03-design-yaml.md#modules).
+
+### From scopes to modules: `dbd split`
+
+A project that already divides its work with scopes has, in its scopes, the
+partition a workspace makes explicit. `dbd split --from-scopes` turns one into
+the other: each **region** of the scopes' Venn diagram becomes a module.
+
+```sh
+dbd split --from-scopes                          # print the plan; change nothing
+dbd split --from-scopes --rename shared=common   # name a module of the plan otherwise
+dbd split --from-scopes --write                  # move the files, write modules: and scopes:
+dbd split --undo                                 # put back what an interrupted --write moved
+```
+
+Sensei in miniature — `app.lookups`, with its data file, deployed to both
+databases, `app.orders` to the main one, `dojo.sessions` (which references the
+lookups) to the Dōjō's:
+
+```yaml
+scopes:
+  default:
+    excludes: [dojo]
+  dojo:
+    includes: [dojo, app.lookups]
+```
+
+```
+$ dbd split --from-scopes
+sensei splits into 3 modules, by its scopes:
+  shared   in default and dojo   1 entity
+  core     only in default       1 entity   depends on shared
+  dojo     only in dojo          1 entity   depends on shared
+Its scopes become:
+  default: modules [core], excludes [dojo]
+  dojo: modules [dojo]
+4 files move into the modules' folders. Run again with --write to move them and write modules: and scopes: into design.yaml.
+```
+
+`-v` lists each module's entities and each file's move.
+
+**The regions.** Each scope's entities are taken with their dependencies —
+`deps: include`, whatever the scope says — and an entity's region is the set of
+scopes holding it. What every scope deploys — a role — is in every scope; the
+manifest's schemas and extensions stay in `design.yaml`, every module's. A region
+becomes a module named:
+
+| Region | Module |
+|---|---|
+| in every scope (of two or more) | `shared` |
+| in one scope only | that scope's name — `default` as `core` |
+| in several scopes, not all | their names joined with `-` (`core-hub`) |
+| in no scope | `unscoped` |
+
+Empty regions are dropped. `--rename <module>=<name>` names one otherwise.
+
+**What it infers.** Each module `depends_on` the modules its entities reference
+— a type created beside a table in its file included. A cycle is shown, and
+refuses `--write`. Each scope becomes `modules:` — the modules of the regions it
+holds, less those another of them depends on — keeping its `extensions:`, and
+`excludes:` the manifest's schemas it did not deploy, which every module would
+otherwise create; an `all` scope stays `all`.
+
+**What `--write` does.** It moves each DDL file to the folder of the module its
+entity is in, and each import data file and policy file to the folder of the
+module its table is in — with `git mv` in a git work tree — moves the manifest's
+`import.after` scripts under `import/` to `scripts/`, rewriting their paths, and
+writes `modules:` and the new `scopes:` into `design.yaml` in place: the rest of
+the file, comments and line endings, as it was. It is whole or not at all. It
+first builds the workspace in a scratch folder and refuses unless that loads and
+deploys, under each scope and with none, exactly what the project does. Until it
+is done it keeps a journal of its moves (`.dbd-split`) and the manifest as it
+was: a move that fails puts back every move before it, and while the journal is
+there every command that reads the project is refused, naming `dbd split --undo`, which puts the files
+and `design.yaml` back.
+
+**What it refuses** before anything moves, naming why:
+
+- a workspace, and a design without scopes;
+- a project with `snapshots/` or `migrations/` — a migration is SQL over several
+  tables and does not divide by module, so a project splits before its first
+  release;
+- a file that does not parse — what it references, and so its module, is
+  unknown;
+- a schema only a file's path names — add it to `schemas:` first;
+- a scope that leaves out what its entities need (`deps: report` with a gap) —
+  as modules it would deploy them;
+- a file of `ddl/`, `import/` or `policies/` that maps to no module or to two,
+  two files onto one path, and a file reached through a link from outside the
+  project;
+- a module name that cannot name an owner, or that differs from another only in
+  case; a module folder already holding files; and an earlier split's leftovers.
+
+On each database, each module's first deploy takes over what it declares from
+the project as it was, and the project's record is retired once its modules
+hold everything it held — see [sharing a database](14-sharing-a-database.md).
 
 ## Worked example: a schema as an optional add-on
 

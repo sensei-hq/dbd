@@ -50,6 +50,10 @@ pub struct HistoryEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline: Option<Baseline>,
     pub changes: Vec<EntityChange>,
+    /// The module whose version this is, in a workspace — each module has its
+    /// own (#7). Absent for a project's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -177,6 +181,7 @@ fn from_versions(versions: &[Versioned]) -> Vec<HistoryEntry> {
             timestamp: last.timestamp.clone(),
             baseline: None,
             changes: Vec::new(),
+            module: None,
         };
         match before {
             None => {
