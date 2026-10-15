@@ -684,6 +684,20 @@ pub fn canonical_exclusion(definition: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// An EXCLUDE reads a column through an element naming it, an element's
+    /// expression, or its predicate — and only those: re-adding one the
+    /// column's drop left alone fails on its name.
+    #[test]
+    fn an_exclusion_reads_the_columns_its_elements_and_predicate_read() {
+        let during = "USING gist (room WITH =, during WITH &&) WHERE (NOT cancelled)";
+        for column in ["room", "during", "cancelled"] {
+            assert!(exclusion_reads_column(during, column), "{column}");
+        }
+        assert!(!exclusion_reads_column(during, "id"));
+        assert!(exclusion_reads_column("USING gist (lower(code) WITH =)", "code"));
+        assert!(!exclusion_reads_column("USING gist (lower(code) WITH =)", "lower"));
+    }
+
     /// Both spellings of the same predicate must canonicalize to one string —
     /// the property reconcile's convergence rests on.
     fn assert_converges(authored: &str, introspected: &str) {
