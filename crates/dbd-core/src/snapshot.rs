@@ -663,7 +663,7 @@ impl MigrationDialect {
 fn order_key_changes(result: &mut MultiSnapshotResult, previous: &Snapshot, dialect: MigrationDialect) {
     use crate::diff::{ChangeAction, FieldDetail, FieldType, catalog_drop_sql, unnamed_drop_comment};
     use crate::entity::TableConstraint;
-    use crate::reconcile::{IndexDrops, fk_change_sql, fk_detail, key_holders, same_foreign_key};
+    use crate::reconcile::{KeyDrops, fk_change_sql, fk_detail, key_holders, same_foreign_key};
 
     let mut before = canonical_types(previous);
     for stage in &mut result.snapshots {
@@ -735,7 +735,7 @@ fn order_key_changes(result: &mut MultiSnapshotResult, previous: &Snapshot, dial
                 }
             }
         }
-        for (changed, holders) in key_holders(&old, &new, &before, &after, IndexDrops::Diff) {
+        for (changed, holders) in key_holders(&old, &new, &before, &after, KeyDrops::Migration) {
             let mut drops: Vec<String> = Vec::new();
             let mut adds: Vec<String> = Vec::new();
             for h in &holders {
@@ -924,6 +924,101 @@ fn prepare_stages(
     MultiSnapshotResult { snapshots, todos }
 }
 
+/// Append `more` to `sql` on a line of its own, when there is any.
+fn append_sql(sql: &mut String, more: &str) {
+    if !more.is_empty() {
+        sql.push('\n');
+        sql.push_str(more);
+    }
+}
+
+/// The constraints `col` declares itself — `primary key`, `unique` and
+/// `references` written on the column — which a snapshot keeps on the column
+/// rather than among the table's.
+fn inline_constraints(col: &ColumnDef) -> Vec<crate::entity::TableConstraint> {
+    use crate::entity::TableConstraint;
+    let mut found = Vec::new();
+    if col.is_pk {
+        found.push(TableConstraint::PrimaryKey {
+            name: None,
+            columns: vec![col.name.clone()],
+        });
+    }
+    if col.is_unique {
+        found.push(TableConstraint::Unique {
+            name: None,
+            columns: vec![col.name.clone()],
+            nulls_not_distinct: false,
+        });
+    }
+    found.extend(col.inline_fk.clone().map(TableConstraint::ForeignKey));
+    found
+}
+
+/// The rest of a column a migration's swap puts in place of another (#72).
+///
+/// Stage 1 adds it with its type alone — its rows are filled after — so
+/// stage 2, once it has its name, gives it what the design declares: NOT
+/// NULL, its default and identity, as the diff alters a column to them, the
+/// identity going on past the values the rows already hold; then
+/// `constraints`.
+fn restore_column_sql(table: &str, col: &ColumnDef, constraints: Vec<crate::entity::TableConstraint>) -> String {
+    use crate::sql_quote::{ident, literal, qualified};
+    let bare = ColumnDef {
+        nullable: true,
+        default_value: None,
+        identity: None,
+        ..col.clone()
+    };
+    // An identity column is NOT NULL, and must be before it can be one.
+    let whole = ColumnDef {
+        nullable: col.nullable && col.identity.is_none(),
+        ..col.clone()
+    };
+    let change = |action| diff::FieldChange {
+        field_name: col.name.clone(),
+        field_type: diff::FieldType::Column,
+        action,
+    };
+    let mut sql = diff::generate_migration_sql(&[MigrationDiff {
+        entity_name: table.to_string(),
+        entity_type: EntityType::Table,
+        action: DiffAction::Change(vec![change(diff::ChangeAction::Alter {
+            old: Box::new(diff::FieldDetail::Column(bare)),
+            new: Box::new(diff::FieldDetail::Column(whole)),
+        })]),
+    }]);
+    if col.identity.is_some() {
+        append_sql(
+            &mut sql,
+            &format!(
+                "SELECT setval(pg_get_serial_sequence({}, {}), max({column})) FROM {table} HAVING max({column}) IS NOT NULL;",
+                literal(&qualified(table)),
+                literal(&col.name),
+                column = ident(&col.name),
+            ),
+        );
+    }
+    append_sql(
+        &mut sql,
+        &diff::generate_migration_sql(&[MigrationDiff {
+            entity_name: table.to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(
+                constraints
+                    .into_iter()
+                    .map(|c| diff::FieldChange {
+                        field_name: String::new(),
+                        field_type: diff::FieldType::Constraint,
+                        action: diff::ChangeAction::Add(Box::new(diff::FieldDetail::Constraint(c))),
+                    })
+                    .collect(),
+            ),
+        }]),
+    );
+    sql
+}
+
 /// Shared inputs threaded through the multi-stage migration builders.
 struct MultiStageCtx<'a> {
     prev: &'a Snapshot,
@@ -1077,7 +1172,7 @@ impl StageBuilder {
                     let mut new_col_def = col_def.as_ref().clone();
                     if let ComplexChange::ColumnTypeChange { .. } = change {
                         // The new column gets a temp name: column_name_new
-                        new_col_def.name = format!("{new_name}_new");
+                        new_col_def.name = diff::swap_column(new_name);
                     }
                     snap_t.columns.push(new_col_def);
                 }
@@ -1096,8 +1191,15 @@ impl StageBuilder {
                         new_col, column_name, ..
                     } => {
                         format!(
-                            "ALTER TABLE {} ADD COLUMN {}_new {};",
-                            table_name, column_name, new_col.data_type
+                            "ALTER TABLE {} ADD COLUMN {} {}{};",
+                            table_name,
+                            diff::swap_column(column_name),
+                            new_col.data_type,
+                            new_col
+                                .collation
+                                .as_deref()
+                                .map(|c| format!(" COLLATE {c}"))
+                                .unwrap_or_default()
                         )
                     }
                     _ => unreachable!(),
@@ -1106,18 +1208,18 @@ impl StageBuilder {
                 // Append or create migration file for this table
                 push_or_append_sql(&mut self.files, entity_migration_path(table_name), add_col_sql);
 
-                // Generate data.sql
-                let data_sql = diff::generate_data_sql(change);
+                // The table's one data script, each change's part appended:
+                // a second change pushed a file of the same name, which
+                // replaced the first's when written — its column kept no value.
                 let data_path = entity_data_migration_path(table_name);
-                self.files.push(MigrationFile {
-                    relative_path: data_path.clone(),
-                    content: data_sql,
-                });
+                push_or_append_sql(&mut self.files, data_path.clone(), diff::generate_data_sql(change));
 
-                todos.push(TodoItem {
-                    file: data_path,
-                    message: format!("Review data migration SQL for {}", table_name),
-                });
+                if !todos.iter().any(|t| t.file == data_path) {
+                    todos.push(TodoItem {
+                        file: data_path,
+                        message: format!("Review data migration SQL for {}", table_name),
+                    });
+                }
             }
             ComplexChange::EnumValueRemoval {
                 enum_name,
@@ -1155,7 +1257,10 @@ impl StageBuilder {
     fn apply_complex_stage2(&mut self, change: &ComplexChange, ctx: &MultiStageCtx) {
         match change {
             ComplexChange::ColumnRename {
-                table_name, old_name, ..
+                table_name,
+                old_name,
+                col_def,
+                ..
             } => {
                 // Drop old column from snapshot
                 if let Some(snap_t) = self
@@ -1167,7 +1272,11 @@ impl StageBuilder {
                     snap_t.columns.retain(|c| c.name != *old_name);
                 }
 
-                let sql = format!("ALTER TABLE {} DROP COLUMN {};", table_name, old_name);
+                // The table's own constraints on the new name came with stage
+                // 1's diff; what the column declares itself did not (#72).
+                let mut sql = format!("ALTER TABLE {} DROP COLUMN {};", table_name, old_name);
+                let inline = inline_constraints(col_def);
+                append_sql(&mut sql, &restore_column_sql(table_name, col_def, inline));
                 push_or_append_sql(&mut self.files, entity_migration_path(table_name), sql);
 
                 self.mark_altered(table_name);
@@ -1188,16 +1297,33 @@ impl StageBuilder {
                 {
                     snap_t.columns.retain(|c| c.name != *column_name);
                     // Rename temp column to original name
-                    let temp_name = format!("{column_name}_new");
+                    let temp_name = diff::swap_column(column_name);
                     if let Some(col) = snap_t.columns.iter_mut().find(|c| c.name == temp_name) {
                         col.name = new_col.name.clone();
                     }
                 }
 
-                let sql = format!(
-                    "ALTER TABLE {} DROP COLUMN {};\nALTER TABLE {} RENAME COLUMN {}_new TO {};",
-                    table_name, old_col.name, table_name, column_name, column_name
+                let mut sql = format!(
+                    "ALTER TABLE {} DROP COLUMN {};\nALTER TABLE {} RENAME COLUMN {} TO {};",
+                    table_name,
+                    old_col.name,
+                    table_name,
+                    diff::swap_column(column_name),
+                    column_name
                 );
+                // The dropped column took every constraint on it with it, and
+                // the column in its place has its type alone: the rest of it,
+                // and the design's constraints on it, come back (#72). The
+                // foreign keys holding its keys come back after — see
+                // `order_key_changes`.
+                let constraints = ctx
+                    .final_snapshot
+                    .tables
+                    .iter()
+                    .find(|t| format!("{}.{}", t.schema, t.name) == *table_name)
+                    .map(|t| diff::constraints_on(t, &[column_name.as_str()]))
+                    .unwrap_or_default();
+                append_sql(&mut sql, &restore_column_sql(table_name, new_col, constraints));
                 push_or_append_sql(&mut self.files, entity_migration_path(table_name), sql);
 
                 self.mark_altered(table_name);

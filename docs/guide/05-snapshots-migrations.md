@@ -172,11 +172,28 @@ Complex changes are automatically split into multiple snapshots:
 
 ### Column rename (2 snapshots)
 v(N): ADD new column + data.sql (UPDATE SET new = old)
-v(N+1): DROP old column
+v(N+1): DROP old column; the new one gets the rest of its definition
 
 ### Column type change (2 snapshots)
-v(N): ADD new column with new type + data.sql (UPDATE SET new = old::type)
-v(N+1): DROP old column
+v(N): ADD `<column>_new` with the new type + data.sql (UPDATE SET `<column>_new` = old::type)
+v(N+1): DROP old column, RENAME `<column>_new` to it; it gets the rest of its definition
+
+The column v(N) adds has its type alone, so its rows can be filled first. Once
+v(N+1) has put it in place it gets the rest of what the design declares: NOT
+NULL, its default, an identity — which goes on past the values the rows
+already hold — and the constraints on it: a type change's primary key, unique
+keys, foreign keys, CHECKs and EXCLUDE constraints, all of which the old
+column's drop took with it, and a rename's own `primary key`, `unique` and
+`references`. A foreign key on another table holding one of its keys is dropped
+before the drop and added back after the key. A table with several columns
+changed keeps one `data.sql` with a line for each.
+
+Before 0.27.2 a type change's `data.sql` filled the old column, which v(N+1)
+then dropped: every value of the column was lost, NULL in its place, with
+nothing reported — and with several columns changed only the last one's script
+was written. The column in place had its type and nothing else, and a foreign
+key holding its key failed the drop. A database migrated through one has lost
+those values; `dbd diff` lists what else it is missing.
 
 ### Enum value removal (2 snapshots)
 v(N): data.sql (TODO: map removed values to remaining)

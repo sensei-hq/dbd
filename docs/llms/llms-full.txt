@@ -1510,8 +1510,14 @@ dbd snapshot --list
 
 Diffs the current DDL against the latest snapshot and writes a versioned
 migration. **Smart multi-snapshot**: complex changes auto-split into safe stages —
-a column rename → 2 snapshots (add+copy, drop old), a type change → 2 (add+CAST,
-drop old), an enum value removal → 2 (the data mapping, a TODO to fill in; then the type swap —
+a column rename → 2 snapshots (add+copy, drop old), a type change → 2 (add
+`<column>_new`+CAST into it, drop old and rename it into place) — the column put in place
+then gets the rest of its definition: NOT NULL, default, identity (going on past its rows)
+and its constraints (a type change's keys, foreign keys, CHECKs and EXCLUDEs; a rename's own
+`primary key`/`unique`/`references`), a foreign key holding one of its keys dropped first and
+re-added after; several columns of one table share one `data.sql` (before 0.27.2 a type
+change's `data.sql` filled the old column, so every value was lost, only the last changed
+column's script was written, and the column came back with its type alone) — an enum value removal → 2 (the data mapping, a TODO to fill in; then the type swap —
 the type renamed aside and recreated, each column moved across with its views, materialized views,
 indexes and default dropped and restored around it, the old type dropped once no column uses it,
 its `COMMENT ON TYPE` carried to the new one). Before 0.25 the removal took three stages through

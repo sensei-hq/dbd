@@ -4614,6 +4614,267 @@ async fn reconcile_changes_a_unique_index_a_foreign_key_rests_on() {
     .await;
 }
 
+// ── A column rebuilt keeps its keys (#72) ─────────────────────────────────────
+
+/// A unique key on a column turned generated survives reconcile — the column
+/// is dropped and added again — with the foreign key holding it, and a second
+/// run plans nothing.
+#[tokio::test]
+async fn reconcile_keeps_the_key_on_a_column_turned_generated() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let parent = |code: &str| {
+        format!(
+            "create table if not exists app.parent (\n  id integer primary key\n, name text not null\n\
+             , code text{code} unique\n);\n"
+        )
+    };
+    let child = "create table if not exists app.child (\n  id integer primary key\n\
+                 , code text references app.parent (code)\n);\n";
+    let (_v1, design) = rekey_design(&[("parent", &parent("")), ("child", child)]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("create");
+    adapter
+        .execute_script("INSERT INTO app.parent VALUES (1, 'a', 'A'); INSERT INTO app.child VALUES (1, 'A');")
+        .await
+        .unwrap();
+    let (_v2, design) = rekey_design(&[
+        ("parent", &parent(" generated always as (upper(name)) stored")),
+        ("child", child),
+    ]);
+    design
+        .reconcile(&*adapter, false, true, false, None, Progress::none())
+        .await
+        .expect("the column turns generated");
+    assert_catalog(
+        &*adapter,
+        true,
+        &constraint_predicate("parent", "UNIQUE (code)"),
+        "the unique key",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        &constraint_predicate("child", "FOREIGN KEY (code) REFERENCES app.parent(code)"),
+        "the foreign key, back",
+    )
+    .await;
+    let again = design
+        .reconcile(&*adapter, true, true, false, None, Progress::none())
+        .await
+        .expect("second dry run");
+    assert!(again.altered.is_empty(), "converged: {:?}", again.altered);
+}
+
+/// A released `id integer primary key` another table's foreign key holds, cut
+/// to `bigint`: the migration swaps the column in two stages, and the key and
+/// the foreign key both exist afterwards, every row with them.
+#[tokio::test]
+async fn a_released_key_column_cut_to_bigint_keeps_its_key_and_the_foreign_key() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let parent = |ty: &str| format!("create table if not exists app.parent (\n  id {ty} primary key\n);\n");
+    let child = "create table if not exists app.child (\n  id integer primary key\n\
+                 , parent_id integer references app.parent (id)\n);\n";
+    cut_rekey(dir, &[("parent", &parent("integer")), ("child", child)]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    adapter
+        .execute_script("INSERT INTO app.parent VALUES (1), (2); INSERT INTO app.child VALUES (1, 1), (2, 2);")
+        .await
+        .unwrap();
+    cut_rekey(dir, &[("parent", &parent("bigint")), ("child", child)]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("the type swap applies");
+    assert_catalog(
+        &*adapter,
+        true,
+        &constraint_predicate("parent", "PRIMARY KEY (id)"),
+        "the primary key",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_attribute WHERE attrelid = 'app.parent'::regclass AND attname = 'id' \
+         AND atttypid = 'bigint'::regtype",
+        "parent.id as bigint",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        &constraint_predicate("child", "FOREIGN KEY (parent_id) REFERENCES app.parent(id)"),
+        "the foreign key",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.child c JOIN app.parent p ON p.id = c.parent_id HAVING count(*) = 2",
+        "both rows, joined",
+    )
+    .await;
+}
+
+/// A released column's type change keeps its values: stage 1's data script
+/// fills the column it adds, which stage 2 renames into place. It filled the
+/// column itself, which stage 2 then dropped — every value went, NULL in its
+/// place, with nothing reported.
+#[tokio::test]
+async fn a_released_type_change_keeps_the_columns_values() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let line = |ty: &str| format!("create table if not exists app.line (\n  id integer primary key\n, qty {ty}\n);\n");
+    cut_rekey(dir, &[("line", &line("integer"))]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    adapter
+        .execute_script("INSERT INTO app.line VALUES (1, 10), (2, 20);")
+        .await
+        .unwrap();
+    cut_rekey(dir, &[("line", &line("bigint"))]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("the type change applies");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.line HAVING count(*) FILTER (WHERE id = 1 AND qty = 10) = 1 \
+         AND count(*) FILTER (WHERE id = 2 AND qty = 20) = 1",
+        "both rows' qty",
+    )
+    .await;
+}
+
+/// Every column of a released table cut to `bigint` at once — an identity
+/// primary key, a column with NOT NULL, a default and a CHECK, and one with a
+/// foreign key — keeps its values and its whole definition: once the
+/// migrations ran, the database is the design, as `diff` reads it, and the
+/// identity goes on past the rows already there. Each column's data script
+/// overwrote the one before it, and the swap left every column with its type
+/// and nothing else.
+#[tokio::test]
+async fn a_released_table_cut_to_bigint_keeps_every_columns_values_and_definition() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let reference = "create table if not exists app.ref (\n  id integer primary key\n);\n";
+    let line = |ty: &str| {
+        format!(
+            "create table if not exists app.line (\n  id {ty} generated always as identity primary key\n\
+             , qty {ty} not null default 0 check (qty >= 0)\n\
+             , ref_id {ty} references app.ref (id)\n);\n"
+        )
+    };
+    cut_rekey(dir, &[("ref", reference), ("line", &line("integer"))]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    adapter
+        .execute_script(
+            "INSERT INTO app.ref VALUES (1), (2); \
+             INSERT INTO app.line (qty, ref_id) VALUES (10, 1), (20, 2);",
+        )
+        .await
+        .unwrap();
+    cut_rekey(dir, &[("ref", reference), ("line", &line("bigint"))]);
+    let design = released(dir);
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("the type changes apply");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.line HAVING count(*) FILTER (WHERE id = 1 AND qty = 10 AND ref_id = 1) = 1 \
+         AND count(*) FILTER (WHERE id = 2 AND qty = 20 AND ref_id = 2) = 1",
+        "both rows, every value",
+    )
+    .await;
+    let diff = design.diff_live(&*adapter, None).await.expect("diff");
+    let touched: Vec<String> = diff
+        .changes
+        .iter()
+        .map(|c| format!("{:?} {}", c.action, c.entity_name))
+        .collect();
+    assert!(touched.is_empty(), "the database is the design: {touched:?}");
+    adapter
+        .execute_script("INSERT INTO app.line (qty) VALUES (30);")
+        .await
+        .expect("the identity goes on past the rows there");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.line WHERE qty = 30 AND id = 3",
+        "the next identity",
+    )
+    .await;
+}
+
+/// A released column renamed keeps its values and what it declares itself —
+/// NOT NULL, a default, `unique`: stage 1 adds the new name with its type
+/// alone, and stage 2 dropped the old one and left it at that.
+#[tokio::test]
+async fn a_released_rename_keeps_the_columns_values_and_definition() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let line = |name: &str| {
+        format!(
+            "create table if not exists app.line (\n  id integer primary key\n\
+             , {name} integer not null default 0 unique\n);\n"
+        )
+    };
+    cut_rekey(dir, &[("line", &line("qty"))]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    adapter
+        .execute_script("INSERT INTO app.line VALUES (1, 10), (2, 20);")
+        .await
+        .unwrap();
+    cut_rekey(dir, &[("line", &line("quantity"))]);
+    let design = released(dir);
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("the rename applies");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.line HAVING count(*) FILTER (WHERE id = 1 AND quantity = 10) = 1 \
+         AND count(*) FILTER (WHERE id = 2 AND quantity = 20) = 1",
+        "both rows' quantity",
+    )
+    .await;
+    let diff = design.diff_live(&*adapter, None).await.expect("diff");
+    let touched: Vec<String> = diff
+        .changes
+        .iter()
+        .map(|c| format!("{:?} {}", c.action, c.entity_name))
+        .collect();
+    assert!(touched.is_empty(), "the database is the design: {touched:?}");
+}
+
 // ── A routine whose return type changes (#65) ─────────────────────────────────
 
 /// A project `routines` in a temporary folder with `files` (`(path, text)`).

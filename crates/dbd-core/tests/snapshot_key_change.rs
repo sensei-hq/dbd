@@ -29,8 +29,12 @@ fn cut(dir: &Path, files: &[(&str, &str)], dialect: MigrationDialect) {
 }
 
 fn migration(dir: &Path, table: &str) -> String {
-    std::fs::read_to_string(dir.join(format!("migrations/002/app/{table}.sql")))
-        .unwrap_or_else(|e| panic!("migrations/002/app/{table}.sql: {e}"))
+    migration_at(dir, 2, table)
+}
+
+fn migration_at(dir: &Path, version: u32, table: &str) -> String {
+    let path = format!("migrations/{version:03}/app/{table}.sql");
+    std::fs::read_to_string(dir.join(&path)).unwrap_or_else(|e| panic!("{path}: {e}"))
 }
 
 fn at(sql: &str, part: &str) -> usize {
@@ -243,4 +247,79 @@ fn a_renamed_unique_index_a_foreign_key_rests_on_drops_it_first() {
     let drop_index = at(&sql, "DROP INDEX IF EXISTS \"app\".\"parent_code_uq\"");
     assert!(at(&sql, "contype = 'f'") < drop_index, "{sql}");
     assert!(drop_index < at(&sql, "ADD FOREIGN KEY (code)"), "{sql}");
+}
+
+// ── A column rebuilt keeps its keys (#72) ─────────────────────────────────────
+
+/// A column turned generated is dropped and added again, and its unique key
+/// with it: the migration re-adds the key after the column, and the foreign
+/// key holding it goes first and comes back after the key.
+#[test]
+fn a_column_turned_generated_gets_back_its_key_and_the_foreign_key_holding_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let parent = |code: &str| {
+        format!(
+            "create table if not exists app.parent (\n  id integer primary key\n, name text not null\n\
+             , code text{code} unique\n);\n"
+        )
+    };
+    let child = "create table if not exists app.child (\n  id integer primary key\n\
+                 , code text references app.parent (code)\n);\n";
+    cut(
+        dir,
+        &[("parent", &parent("")), ("child", child)],
+        MigrationDialect::Postgres,
+    );
+    cut(
+        dir,
+        &[
+            ("parent", &parent(" generated always as (upper(name)) stored")),
+            ("child", child),
+        ],
+        MigrationDialect::Postgres,
+    );
+    let sql = migration(dir, "parent");
+    let holder = at(&sql, "contype = 'f'");
+    let rebuilt = at(&sql, "ADD COLUMN code text GENERATED ALWAYS AS (upper(name)) STORED");
+    let key = at(&sql, "ALTER TABLE app.parent ADD UNIQUE (code)");
+    let back = at(
+        &sql,
+        "ALTER TABLE app.child ADD FOREIGN KEY (code) REFERENCES app.parent(code)",
+    );
+    assert!(holder < at(&sql, "DROP COLUMN code"), "{sql}");
+    assert!(rebuilt < key && key < back, "{sql}");
+}
+
+/// A key column's type change is a two-stage swap in a migration: stage 2
+/// drops the old column, which takes the primary key with it and which the
+/// foreign key holding it blocks. The foreign key goes first, and the key and
+/// then the foreign key come back once the new column has its name.
+#[test]
+fn a_key_columns_type_swap_gets_back_its_key_and_the_foreign_key_holding_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let parent = |ty: &str| format!("create table if not exists app.parent (\n  id {ty} primary key\n);\n");
+    let child = "create table if not exists app.child (\n  id integer primary key\n\
+                 , parent_id integer references app.parent (id)\n);\n";
+    cut(
+        dir,
+        &[("parent", &parent("integer")), ("child", child)],
+        MigrationDialect::Postgres,
+    );
+    cut(
+        dir,
+        &[("parent", &parent("bigint")), ("child", child)],
+        MigrationDialect::Postgres,
+    );
+    let sql = migration_at(dir, 3, "parent");
+    let holder = at(&sql, "contype = 'f'");
+    let drop = at(&sql, "DROP COLUMN id");
+    let rename = at(&sql, "RENAME COLUMN id_new TO id");
+    let key = at(&sql, "ALTER TABLE app.parent ADD PRIMARY KEY (id)");
+    let back = at(
+        &sql,
+        "ALTER TABLE app.child ADD FOREIGN KEY (parent_id) REFERENCES app.parent(id)",
+    );
+    assert!(holder < drop && drop < rename && rename < key && key < back, "{sql}");
 }

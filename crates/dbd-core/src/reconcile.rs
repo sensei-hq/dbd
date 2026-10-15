@@ -1212,14 +1212,18 @@ pub(crate) struct KeyHolder {
     pub replaced: bool,
 }
 
-/// How a change decides which indexes it drops — the rule its own SQL
-/// follows, so [`key_holders`] finds the keys that SQL takes away.
+/// How a change decides which keys it drops — the rules its own SQL follows,
+/// so [`key_holders`] finds the keys that SQL takes away.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum IndexDrops {
-    /// By shape, name aside — [`plan_index_convergence`]'s rule.
-    Shape,
-    /// As the diff of the raw snapshots drops them: by name — a migration's.
-    Diff,
+pub(crate) enum KeyDrops {
+    /// Reconcile's: an index by shape, name aside —
+    /// [`plan_index_convergence`]'s rule — and a column's type changed in
+    /// place.
+    Reconcile,
+    /// A migration's: an index as the diff of the raw snapshots drops it, by
+    /// name, and a column whose type changes rebuilt — the two-stage swap
+    /// drops it and renames another in its place (#72).
+    Migration,
 }
 
 /// Whether two foreign keys are the same key, their names aside.
@@ -1242,7 +1246,7 @@ pub(crate) fn key_holders(
     new: &Snapshot,
     old_all: &Snapshot,
     new_raw: &Snapshot,
-    indexes: IndexDrops,
+    rules: KeyDrops,
 ) -> Vec<(String, Vec<KeyHolder>)> {
     use crate::diff::{FieldDetail, FieldType};
 
@@ -1274,11 +1278,12 @@ pub(crate) fn key_holders(
                     }
                     _ => {}
                 },
-                // A column turned generated is dropped and added again.
+                // A column turned generated is dropped and added again; so,
+                // in a migration, is one whose type changes.
                 ChangeAction::Alter { old, new } => {
                     if let (FieldDetail::Column(was), FieldDetail::Column(is)) = (old.as_ref(), new.as_ref())
-                        && was.generated.is_none()
-                        && is.generated.is_some()
+                        && ((was.generated.is_none() && is.generated.is_some())
+                            || (rules == KeyDrops::Migration && was.data_type != is.data_type))
                     {
                         columns.insert(is.name.clone());
                     }
@@ -1289,7 +1294,7 @@ pub(crate) fn key_holders(
         lost.push((d.entity_name.clone(), keys, columns));
     }
     // A unique index a foreign key can rest on — on columns, whole — that
-    // goes, by the change's own rule (`indexes`): the canonical snapshots
+    // goes, by the change's own rules (`rules`): the canonical snapshots
     // carry no indexes.
     let raw_old: HashMap<String, &TableSnapshot> = old_all.tables.iter().map(|t| (qualified(t), t)).collect();
     let can_hold = |ix: &crate::entity::IndexDef| {
@@ -1303,8 +1308,8 @@ pub(crate) fn key_holders(
         let (Some(was), Some(is)) = (raw_old.get(name), new_tables.get(name)) else {
             continue;
         };
-        let dropped: Keys = match indexes {
-            IndexDrops::Shape => {
+        let dropped: Keys = match rules {
+            KeyDrops::Reconcile => {
                 let is_cols = coercible_columns(&is.columns);
                 let kept: HashSet<IndexShape> = secondary_indexes(is)
                     .iter()
@@ -1317,7 +1322,7 @@ pub(crate) fn key_holders(
                     .map(as_key)
                     .collect()
             }
-            IndexDrops::Diff => {
+            KeyDrops::Migration => {
                 let one = |t: &TableSnapshot| Snapshot {
                     version: 0,
                     description: String::new(),
@@ -1466,7 +1471,7 @@ pub(crate) fn plan_key_holders(
     let mut spans: Vec<(String, String)> = Vec::new();
     let mut refusals: Vec<String> = Vec::new();
     let mut outside_count = 0;
-    for (changed, holders) in key_holders(live, desired, live_all, desired_raw, IndexDrops::Shape) {
+    for (changed, holders) in key_holders(live, desired, live_all, desired_raw, KeyDrops::Reconcile) {
         let mut drops: Vec<String> = Vec::new();
         let mut adds: Vec<String> = Vec::new();
         let mut outside: Vec<String> = Vec::new();

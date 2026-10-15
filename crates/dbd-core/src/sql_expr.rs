@@ -142,6 +142,58 @@ pub fn reads_column(expr: &str, column: &str) -> bool {
     })
 }
 
+/// Whether an EXCLUDE constraint's `definition` — `USING gist (c WITH &&)
+/// WHERE …`, as a snapshot keeps it — reads the column `column`: an element
+/// naming it, or an expression or predicate reading it. One that does not
+/// parse reads as `true`, as [`reads_column`]'s does.
+pub fn exclusion_reads_column(definition: &str, column: &str) -> bool {
+    let Ok(parsed) = pg_query::parse(&format!("ALTER TABLE t ADD EXCLUDE {definition}")) else {
+        return true;
+    };
+    // `nodes()` stops at an `ALTER TABLE`'s relation, so the constraint is
+    // reached by hand, and only its elements' expressions and its predicate
+    // walked.
+    let constraint = parsed
+        .protobuf
+        .stmts
+        .first()
+        .and_then(|s| s.stmt.as_ref())
+        .and_then(|s| match s.node.as_ref()? {
+            NodeEnum::AlterTableStmt(alter) => alter.cmds.first(),
+            _ => None,
+        })
+        .and_then(|cmd| match cmd.node.as_ref()? {
+            NodeEnum::AlterTableCmd(cmd) => cmd.def.as_deref(),
+            _ => None,
+        })
+        .and_then(|def| match def.node.as_ref()? {
+            NodeEnum::Constraint(c) => Some(c),
+            _ => None,
+        });
+    let Some(constraint) = constraint else {
+        return true;
+    };
+    let reads = |node: &Node| {
+        node.node.as_ref().is_some_and(|n| {
+            n.nodes().iter().any(|(node, ..)| match node {
+                pg_query::NodeRef::ColumnRef(c) => matches!(
+                    c.fields.last().and_then(|f| f.node.as_ref()),
+                    Some(NodeEnum::String(s)) if s.sval == column
+                ),
+                _ => false,
+            })
+        })
+    };
+    let element_reads = |pair: &Node| match pair.node.as_ref() {
+        Some(NodeEnum::List(list)) => list.items.first().is_some_and(|e| match e.node.as_ref() {
+            Some(NodeEnum::IndexElem(e)) => e.name == column || e.expr.as_deref().is_some_and(reads),
+            _ => false,
+        }),
+        _ => false,
+    };
+    constraint.exclusions.iter().any(element_reads) || constraint.where_clause.as_deref().is_some_and(reads)
+}
+
 /// Parse `sql`, normalize its expression tree, re-deparse, and strip `prefix`.
 fn canonicalize_wrapped(sql: &str, prefix: &str, cols: &CoercibleColumns) -> Option<String> {
     let mut parsed = pg_query::parse(sql).ok()?;
@@ -683,6 +735,20 @@ pub fn canonical_exclusion(definition: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An EXCLUDE reads a column through an element naming it, an element's
+    /// expression, or its predicate — and only those: re-adding one the
+    /// column's drop left alone fails on its name.
+    #[test]
+    fn an_exclusion_reads_the_columns_its_elements_and_predicate_read() {
+        let during = "USING gist (room WITH =, during WITH &&) WHERE (NOT cancelled)";
+        for column in ["room", "during", "cancelled"] {
+            assert!(exclusion_reads_column(during, column), "{column}");
+        }
+        assert!(!exclusion_reads_column(during, "id"));
+        assert!(exclusion_reads_column("USING gist (lower(code) WITH =)", "code"));
+        assert!(!exclusion_reads_column("USING gist (lower(code) WITH =)", "lower"));
+    }
 
     /// Both spellings of the same predicate must canonicalize to one string —
     /// the property reconcile's convergence rests on.
