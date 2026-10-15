@@ -4325,6 +4325,96 @@ async fn a_key_held_from_outside_the_design_is_refused() {
     .await;
 }
 
+/// Two foreign keys from the same column to the same table: the version
+/// dropping the unnamed one drops that one, not the named one it keeps.
+#[tokio::test]
+async fn a_released_drop_of_an_unnamed_foreign_key_drops_that_one() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let parent = "create table if not exists app.parent (\n  code text unique\n, alt_code text unique\n);\n";
+    let child = |second: &str| {
+        format!(
+            "create table if not exists app.child (\n  code text\n\
+             , constraint child_code_fk foreign key (code) references app.parent(code){second}\n);\n"
+        )
+    };
+    cut_rekey(
+        dir,
+        &[
+            ("parent", parent),
+            (
+                "child",
+                &child("\n, foreign key (code) references app.parent(alt_code)"),
+            ),
+        ],
+    );
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    cut_rekey(dir, &[("parent", parent), ("child", &child(""))]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v2 applies");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_constraint WHERE conrelid = 'app.child'::regclass AND conname = 'child_code_fk'",
+        "the named foreign key",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        false,
+        &constraint_predicate("child", "FOREIGN KEY (code) REFERENCES app.parent(alt_code)"),
+        "the dropped foreign key",
+    )
+    .await;
+}
+
+/// A unique index a foreign key rests on, renamed in a release, applies.
+#[tokio::test]
+async fn a_released_rename_of_a_unique_index_a_foreign_key_rests_on_applies() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let parent = |index: &str| {
+        format!(
+            "set search_path to app;\ncreate table if not exists parent (\n  id integer primary key\n, code text not null\n);\n\
+             create unique index if not exists {index} on parent (code);\n"
+        )
+    };
+    let child = "set search_path to app;\ncreate table if not exists child (\n  id integer primary key\n, code text references parent (code)\n);\n";
+    cut_rekey(dir, &[("parent", &parent("parent_code_uq")), ("child", child)]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    cut_rekey(dir, &[("parent", &parent("parent_code_key")), ("child", child)]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v2 renames the index");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_indexes WHERE schemaname = 'app' AND indexname = 'parent_code_key'",
+        "the renamed index",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        &constraint_predicate("child", "FOREIGN KEY (code) REFERENCES app.parent(code)"),
+        "the foreign key",
+    )
+    .await;
+}
+
 /// The steps a key change runs as one hold the key's tables until they end:
 /// one of them waiting on a lock another session holds gives up after a
 /// bounded wait and rolls back, rather than holding them while it waits.

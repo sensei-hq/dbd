@@ -129,10 +129,118 @@ fn a_portable_migration_still_leaves_an_unnamed_key_to_drop_by_hand() {
     );
 }
 
-/// The migrations a target runs: PostgreSQL's on `postgres` and `supabase`.
+/// The migrations a database runs are its adapter's: PostgreSQL's for any URL
+/// dbd's PostgreSQL adapter connects to, whatever the target is called; with
+/// no URL to go by, the target's name decides.
 #[test]
-fn the_migration_dialect_follows_the_target() {
-    assert_eq!(MigrationDialect::of_target("postgres"), MigrationDialect::Postgres);
-    assert_eq!(MigrationDialect::of_target("supabase"), MigrationDialect::Postgres);
-    assert_eq!(MigrationDialect::of_target("sqlite"), MigrationDialect::Portable);
+fn the_migration_dialect_follows_the_url() {
+    use MigrationDialect::{Portable, Postgres};
+    assert_eq!(MigrationDialect::of(Some("postgres://localhost/app"), "prod"), Postgres);
+    assert_eq!(
+        MigrationDialect::of(Some("postgresql://localhost/app"), "dev"),
+        Postgres
+    );
+    assert_eq!(MigrationDialect::of(Some("sqlite://app.db"), "postgres"), Portable);
+    assert_eq!(MigrationDialect::of(Some("file:/tmp/app.db"), "prod"), Portable);
+    assert_eq!(MigrationDialect::of(Some("convex:./out"), "prod"), Portable);
+    assert_eq!(MigrationDialect::of(None, "supabase"), Postgres);
+    assert_eq!(MigrationDialect::of(None, "postgres"), Postgres);
+    assert_eq!(MigrationDialect::of(None, "sqlite"), Portable);
+}
+
+/// The kept foreign key renamed in the same version: the holder's own
+/// migration adds it under its new name, so the key's migration does not add
+/// it back as well.
+#[test]
+fn a_kept_foreign_key_renamed_is_added_once() {
+    let parent_v1 = "create table if not exists app.parent (\n  id uuid not null\n, owner_id uuid not null\n, path text not null\n, primary key (owner_id, path)\n);\n";
+    let parent_v2 = "create table if not exists app.parent (\n  id uuid not null\n, owner_id uuid not null\n, path text not null\n, primary key (id)\n, unique (owner_id, path)\n);\n";
+    let child = |constraint: &str| {
+        format!(
+            "create table if not exists app.child (\n  id uuid primary key\n, owner_id uuid not null\n, path text\n\
+             , {constraint}foreign key (owner_id, path) references app.parent(owner_id, path)\n);\n"
+        )
+    };
+    for (renamed, add) in [
+        (
+            "constraint child_parent_b ",
+            "ADD CONSTRAINT child_parent_b FOREIGN KEY",
+        ),
+        ("", "ADD FOREIGN KEY (owner_id, path)"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        cut(
+            dir,
+            &[("parent", parent_v1), ("child", &child("constraint child_parent_a "))],
+            MigrationDialect::Postgres,
+        );
+        cut(
+            dir,
+            &[("parent", parent_v2), ("child", &child(renamed))],
+            MigrationDialect::Postgres,
+        );
+        let parent = migration(dir, "parent");
+        let child_sql = migration(dir, "child");
+        let adds = parent.matches(add).count() + child_sql.matches(add).count();
+        assert_eq!(adds, 1, "{add}:\n{parent}\n--\n{child_sql}");
+    }
+}
+
+/// A foreign key naming no columns references the primary key; added back, it
+/// still names none — `REFERENCES app.parent`, not `app.parent()`.
+#[test]
+fn a_foreign_key_naming_no_columns_comes_back_as_it_was() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let parent = |name: &str| {
+        format!(
+            "create table if not exists app.parent (\n  id uuid not null\n, constraint {name} primary key (id)\n);\n"
+        )
+    };
+    let child = "create table if not exists app.child (\n  id uuid primary key\n, parent_id uuid\n, foreign key (parent_id) references app.parent\n);\n";
+    cut(
+        dir,
+        &[("parent", &parent("parent_id_pk")), ("child", child)],
+        MigrationDialect::Postgres,
+    );
+    cut(
+        dir,
+        &[("parent", &parent("parent_pkey")), ("child", child)],
+        MigrationDialect::Postgres,
+    );
+    let sql = migration(dir, "parent");
+    assert!(
+        sql.contains("REFERENCES app.parent;") && !sql.contains("app.parent()"),
+        "{sql}"
+    );
+}
+
+/// A unique index a foreign key rests on, renamed: the migration drops it by
+/// its old name, so the foreign key goes first and comes back after.
+#[test]
+fn a_renamed_unique_index_a_foreign_key_rests_on_drops_it_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let parent = |index: &str| {
+        format!(
+            "set search_path to app;\ncreate table if not exists parent (\n  id integer primary key\n, code text not null\n);\n\
+             create unique index if not exists {index} on parent (code);\n"
+        )
+    };
+    let child = "set search_path to app;\ncreate table if not exists child (\n  id integer primary key\n, code text references parent (code)\n);\n";
+    cut(
+        dir,
+        &[("parent", &parent("parent_code_uq")), ("child", child)],
+        MigrationDialect::Postgres,
+    );
+    cut(
+        dir,
+        &[("parent", &parent("parent_code_key")), ("child", child)],
+        MigrationDialect::Postgres,
+    );
+    let sql = migration(dir, "parent");
+    let drop_index = at(&sql, "DROP INDEX IF EXISTS \"parent_code_uq\"");
+    assert!(at(&sql, "contype = 'f'") < drop_index, "{sql}");
+    assert!(drop_index < at(&sql, "ADD FOREIGN KEY (code)"), "{sql}");
 }
