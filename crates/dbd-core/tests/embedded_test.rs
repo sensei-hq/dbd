@@ -4573,6 +4573,118 @@ async fn reconcile_changes_a_unique_index_a_foreign_key_rests_on() {
     .await;
 }
 
+// ── A column rebuilt keeps its keys (#72) ─────────────────────────────────────
+
+/// A unique key on a column turned generated survives reconcile — the column
+/// is dropped and added again — with the foreign key holding it, and a second
+/// run plans nothing.
+#[tokio::test]
+async fn reconcile_keeps_the_key_on_a_column_turned_generated() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let parent = |code: &str| {
+        format!(
+            "create table if not exists app.parent (\n  id integer primary key\n, name text not null\n\
+             , code text{code} unique\n);\n"
+        )
+    };
+    let child = "create table if not exists app.child (\n  id integer primary key\n\
+                 , code text references app.parent (code)\n);\n";
+    let (_v1, design) = rekey_design(&[("parent", &parent("")), ("child", child)]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("create");
+    adapter
+        .execute_script("INSERT INTO app.parent VALUES (1, 'a', 'A'); INSERT INTO app.child VALUES (1, 'A');")
+        .await
+        .unwrap();
+    let (_v2, design) = rekey_design(&[
+        ("parent", &parent(" generated always as (upper(name)) stored")),
+        ("child", child),
+    ]);
+    design
+        .reconcile(&*adapter, false, true, false, None, Progress::none())
+        .await
+        .expect("the column turns generated");
+    assert_catalog(
+        &*adapter,
+        true,
+        &constraint_predicate("parent", "UNIQUE (code)"),
+        "the unique key",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        &constraint_predicate("child", "FOREIGN KEY (code) REFERENCES app.parent(code)"),
+        "the foreign key, back",
+    )
+    .await;
+    let again = design
+        .reconcile(&*adapter, true, true, false, None, Progress::none())
+        .await
+        .expect("second dry run");
+    assert!(again.altered.is_empty(), "converged: {:?}", again.altered);
+}
+
+/// A released `id integer primary key` another table's foreign key holds, cut
+/// to `bigint`: the migration swaps the column in two stages, and the key and
+/// the foreign key both exist afterwards, every row with them.
+#[tokio::test]
+async fn a_released_key_column_cut_to_bigint_keeps_its_key_and_the_foreign_key() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let parent = |ty: &str| format!("create table if not exists app.parent (\n  id {ty} primary key\n);\n");
+    let child = "create table if not exists app.child (\n  id integer primary key\n\
+                 , parent_id integer references app.parent (id)\n);\n";
+    cut_rekey(dir, &[("parent", &parent("integer")), ("child", child)]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    adapter
+        .execute_script("INSERT INTO app.parent VALUES (1), (2); INSERT INTO app.child VALUES (1, 1), (2, 2);")
+        .await
+        .unwrap();
+    cut_rekey(dir, &[("parent", &parent("bigint")), ("child", child)]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("the type swap applies");
+    assert_catalog(
+        &*adapter,
+        true,
+        &constraint_predicate("parent", "PRIMARY KEY (id)"),
+        "the primary key",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_attribute WHERE attrelid = 'app.parent'::regclass AND attname = 'id' \
+         AND atttypid = 'bigint'::regtype",
+        "parent.id as bigint",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        &constraint_predicate("child", "FOREIGN KEY (parent_id) REFERENCES app.parent(id)"),
+        "the foreign key",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.child c JOIN app.parent p ON p.id = c.parent_id HAVING count(*) = 2",
+        "both rows, joined",
+    )
+    .await;
+}
+
 // ── A routine whose return type changes (#65) ─────────────────────────────────
 
 /// A project `routines` in a temporary folder with `files` (`(path, text)`).

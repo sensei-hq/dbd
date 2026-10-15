@@ -935,6 +935,46 @@
         );
     }
 
+    /// The rebuild takes the keys on the column with it, and both sides still
+    /// declare them, so the diff re-adds each one the column is part of after
+    /// the column is back (#72) — and leaves a key it is no part of alone.
+    #[test]
+    fn a_column_turned_generated_gets_back_the_keys_it_is_part_of() {
+        let table = |code: ColumnDef| TableSnapshot {
+            table_constraints: vec![
+                TableConstraint::PrimaryKey {
+                    name: None,
+                    columns: vec!["id".to_string()],
+                },
+                TableConstraint::Unique {
+                    name: None,
+                    columns: vec!["code".to_string()],
+                    nulls_not_distinct: false,
+                },
+                TableConstraint::Unique {
+                    name: Some("docs_body_code_uq".to_string()),
+                    columns: vec!["body".to_string(), "code".to_string()],
+                    nulls_not_distinct: true,
+                },
+            ],
+            ..table(
+                "public",
+                "docs",
+                vec![col_not_null("id", "integer"), col("body", "text"), code],
+            )
+        };
+        let old = snap(vec![table(col("code", "text"))], vec![]);
+        let new = snap(vec![table(col_generated("code", "text", "upper(body)"))], vec![]);
+        let sql = generate_migration_sql(&diff(&old, &new));
+        assert_eq!(
+            sql,
+            "ALTER TABLE public.docs DROP COLUMN code;\n\
+             ALTER TABLE public.docs ADD COLUMN code text GENERATED ALWAYS AS (upper(body)) STORED;\n\
+             ALTER TABLE public.docs ADD UNIQUE (code);\n\
+             ALTER TABLE public.docs ADD CONSTRAINT docs_body_code_uq UNIQUE NULLS NOT DISTINCT (body, code);"
+        );
+    }
+
     // ── S7c: a changed default settles after the new type ────
 
     #[test]
