@@ -4685,6 +4685,41 @@ async fn a_released_key_column_cut_to_bigint_keeps_its_key_and_the_foreign_key()
     .await;
 }
 
+/// A released column's type change keeps its values: stage 1's data script
+/// fills the column it adds, which stage 2 renames into place. It filled the
+/// column itself, which stage 2 then dropped — every value went, NULL in its
+/// place, with nothing reported.
+#[tokio::test]
+async fn a_released_type_change_keeps_the_columns_values() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let line = |ty: &str| format!("create table if not exists app.line (\n  id integer primary key\n, qty {ty}\n);\n");
+    cut_rekey(dir, &[("line", &line("integer"))]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    adapter
+        .execute_script("INSERT INTO app.line VALUES (1, 10), (2, 20);")
+        .await
+        .unwrap();
+    cut_rekey(dir, &[("line", &line("bigint"))]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("the type change applies");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.line HAVING count(*) FILTER (WHERE id = 1 AND qty = 10) = 1 \
+         AND count(*) FILTER (WHERE id = 2 AND qty = 20) = 1",
+        "both rows' qty",
+    )
+    .await;
+}
+
 // ── A routine whose return type changes (#65) ─────────────────────────────────
 
 /// A project `routines` in a temporary folder with `files` (`(path, text)`).

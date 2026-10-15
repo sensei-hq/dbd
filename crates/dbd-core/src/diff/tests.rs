@@ -2213,6 +2213,10 @@
         assert_eq!(sql, "UPDATE \"config\".\"users\" SET \"display_name\" = \"name\";\n");
     }
 
+    /// The values go into the column stage 1 adds, `<column>_new`, which stage
+    /// 2 renames into place — never into the column itself, which stage 2
+    /// drops. Both sides of a type change carry the column's own name, as
+    /// `classify_changes` builds them.
     #[test]
     fn d_data_castable_type_change() {
         let change = ComplexChange::ColumnTypeChange {
@@ -2221,10 +2225,10 @@
             old_type: "INTEGER".to_string(),
             new_type: "TEXT".to_string(),
             old_col: Box::new(col("total", "INTEGER")),
-            new_col: Box::new(col("total_text", "TEXT")),
+            new_col: Box::new(col("total", "TEXT")),
         };
         let sql = generate_data_sql(&change);
-        assert!(sql.contains("UPDATE \"config\".\"orders\" SET \"total_text\" = \"total\"::TEXT;"));
+        assert_eq!(sql, "UPDATE \"config\".\"orders\" SET \"total_new\" = \"total\"::TEXT;\n");
     }
 
     #[test]
