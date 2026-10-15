@@ -1,0 +1,43 @@
+{
+    "nix.enableLanguageServer": true,
+    "nix.formatterPath": "nixfmt",
+    "nix.serverPath": "nixd",
+    "nix.serverSettings": {
+        "nixd": {
+            "formatting": {
+                "command": [
+                    "nixfmt"
+                ]
+            }
+        }
+    },
+    "[rust]": {
+        "editor.defaultFormatter": "rust-lang.rust-analyzer",
+        "editor.formatOnSave": true,
+        "editor.rulers": [
+            120
+        ]
+    },
+    "rust-analyzer.check.command": "clippy",
+    "rust-analyzer.check.extraArgs": [
+        "--all-targets"
+    ],
+    "rust-analyzer.check.workspace": true,
+    "rust-analyzer.cargo.targetDir": true,
+    "rust-analyzer.cargo.features": [],
+    "rust-analyzer.imports.granularity.group": "module",
+    "rust-analyzer.imports.prefix": "crate",
+    "rust-analyzer.inlayHints.chainingHints.enable": true,
+    "rust-analyzer.inlayHints.closingBraceHints.minLines": 25,
+    "rust-analyzer.lens.references.adt.enable": true,
+    "rust-analyzer.lens.references.method.enable": true,
+    "files.watcherExclude": {
+        "**/target/**": true,
+        "**/result/**": true,
+        "site/node_modules/**": true
+    },
+    "search.exclude": {
+        "**/target": true,
+        "Cargo.lock": true
+    }
+}
