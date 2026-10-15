@@ -187,7 +187,11 @@ pub fn raw_snapshot_from_entities(entities: &[Entity]) -> Snapshot {
         .filter(|e| e.entity_type == EntityType::Table && e.table_def.is_some())
         .filter_map(|e| {
             let mut t = snapshot::entity_to_table_snapshot(e)?;
-            qualify_bare_sequences(&mut t, &e.schema_path, &sequences);
+            // A design's table, read from its file: introspection reads a live
+            // one's sequence by its schema already.
+            if e.file.is_some() {
+                qualify_bare_sequences(&mut t, &e.schema_path, &sequences);
+            }
             Some(t)
         })
         .map(|mut t| {
@@ -219,19 +223,21 @@ pub fn raw_snapshot_from_entities(entities: &[Entity]) -> Snapshot {
 
 /// Name the schema of the sequence a bare `nextval('seq')` default draws on,
 /// as Postgres found it when the table's file ran (#60): the first schema on
-/// the file's path that `sequences` declares `seq` in. `pg_get_expr` prints a
-/// sequence the session's path does not reach with its schema —
-/// `nextval('app.seq'::regclass)` — so the bare spelling read as a changed
-/// default on every run. One declared on none of them is left as written:
-/// where it resolved, the design cannot say. A table read from a database
-/// has no path of its own, so is left as it is.
+/// the file's path that `sequences` declares `seq` in — dbd runs every file
+/// with `public` on its path — else the path's first, where a sequence the
+/// file makes itself lands. Introspection reads the live default the same
+/// way, by the schema the sequence is in, so the two compare whatever path
+/// the session has.
 fn qualify_bare_sequences(
     t: &mut snapshot::TableSnapshot,
     path: &crate::entity::SchemaPath,
     sequences: &HashSet<&str>,
 ) {
     use crate::parser::pg::common::{nextval_sequence_of, regclass_parts};
-    use crate::sql_quote::ident_if_needed;
+    let mut walk: Vec<&str> = path.schemas().collect();
+    if !walk.contains(&DEFAULT_SCHEMA) {
+        walk.push(DEFAULT_SCHEMA);
+    }
     for c in &mut t.columns {
         let Some(sequence) = c.default_value.as_deref().and_then(|d| nextval_sequence_of(d.trim())) else {
             continue;
@@ -240,13 +246,12 @@ fn qualify_bare_sequences(
         let Some([name]) = parts.as_deref() else {
             continue;
         };
-        if let Some(schema) = path
-            .schemas()
+        let schema = walk
+            .iter()
             .find(|schema| sequences.contains(format!("{schema}.{name}").as_str()))
-        {
-            let qualified = format!("{}.{}", ident_if_needed(schema), ident_if_needed(name));
-            c.default_value = Some(format!("nextval('{}'::regclass)", qualified.replace('\'', "''")));
-        }
+            .unwrap_or(&walk[0]);
+        let qualified = qualified_spelling(&[schema.to_string(), name.clone()]);
+        c.default_value = Some(format!("nextval('{}'::regclass)", qualified.replace('\'', "''")));
     }
 }
 
@@ -699,18 +704,21 @@ pub(crate) fn canonical_default(raw: &str, data_type: &str) -> String {
     canonical_default_for_type(&base, data_type).unwrap_or(base)
 }
 
-/// The relation a `regclass` string names, spelled as `pg_get_expr` prints
-/// it (#60): each part as `quote_identifier` writes it — `'App.Seq'` is
-/// `app.seq`, `'"app"."seq"'` too — and no `public.`, the implicit search
-/// path, as [`canonical_type`] takes it. A string naming no relation by name
-/// (an OID) is kept as written.
+/// The relation a `regclass` string names, spelled as Postgres reads it and
+/// `quote_identifier` writes each part (#60): `'App.Seq'` is `app.seq`,
+/// `'"app"."seq"'` too. Its schema is kept as written — `public` too: this is
+/// emitted, and a bare name is read on whatever path runs it, where another
+/// schema's relation of the name can answer (0.27.2 review). A string naming
+/// no relation by name (an OID) is kept as written.
 fn regclass_spelling(text: &str) -> String {
-    let Some(mut parts) = crate::parser::pg::common::regclass_parts(text) else {
-        return text.to_string();
-    };
-    if parts.len() == 2 && parts[0] == DEFAULT_SCHEMA {
-        parts.remove(0);
+    match crate::parser::pg::common::regclass_parts(text) {
+        Some(parts) => qualified_spelling(&parts),
+        None => text.to_string(),
     }
+}
+
+/// `parts` joined as `quote_identifier` writes each.
+fn qualified_spelling(parts: &[String]) -> String {
     parts
         .iter()
         .map(|part| crate::sql_quote::ident_if_needed(part))
