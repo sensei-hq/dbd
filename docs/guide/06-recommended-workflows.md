@@ -71,9 +71,12 @@ A function or procedure is re-applied with its file's `CREATE OR REPLACE`, which
 refuses when the routine changes what it returns, renames a parameter, loses a parameter's default
 or turns from a function into a procedure. `reconcile` and `apply` then drop it and create it
 again, in one transaction — when it is the only routine of its name and nothing depends on it.
+Its grants, owner and comment are put back on the new one, as `CREATE OR REPLACE` would have kept
+them, and the file runs once more over them, so its own grants and comment have the last word.
 Otherwise the run fails naming the routines of that name, or what depends on the routine (a view,
 a trigger, a column default): drop that, and the run creates again what the design declares. A
-grant or comment the file does not make goes with the dropped routine.
+file that runs its own transaction (`BEGIN` … `COMMIT`) is run as it always was, and not
+replaced.
 
 **Cut v1 with `dbd release`.** When the schema stabilizes, `dbd release` (alias `dbd baseline`)
 writes a baseline snapshot at the current version and flips `project.released: true`:

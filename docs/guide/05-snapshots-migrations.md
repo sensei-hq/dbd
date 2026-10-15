@@ -135,11 +135,12 @@ holding that key first, and adds back, after its new key, the ones the design ke
 design replaces, its own table's migration adds. A version runs in one transaction (above), so
 nothing is left half-changed. Before 0.27.1 the key's drop failed while the foreign key held it.
 
-A key the design leaves unnamed has the name PostgreSQL gave it, which no snapshot records. On a
-`postgres` or `supabase` target the migration drops it by the name the catalog has for it — a
-`DO` block looking up the table's primary key, or the unique key or foreign key over exactly those
-columns. On any other target it is left, as it was everywhere before 0.27.1, as a comment saying
-to drop it by hand. An unnamed CHECK or EXCLUDE is always left to you: only its expression
+A key the design leaves unnamed has the name PostgreSQL gave it, which no snapshot records. When
+the migrations will run on PostgreSQL — the database `-d`/`DATABASE_URL` or the target's `url:`
+names is one, or, with neither to go by, the target is called `postgres` or `supabase` — the
+migration drops it by the name the catalog has for it: a `DO` block looking up the table's
+primary key, or the unique key or foreign key over exactly those columns. Otherwise it is left,
+as it was everywhere before 0.27.1, as a comment saying to drop it by hand. An unnamed CHECK or EXCLUDE is always left to you: only its expression
 identifies it. A primary key declared on its column (`id uuid primary key`) is not migrated when
 it changes — the migration says so; declare a key that will change as `primary key (…)`.
 

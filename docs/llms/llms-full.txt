@@ -1334,7 +1334,10 @@ parameter, loses a parameter's default or turns from a function into a procedure
 and `apply` then drop it and create it again, in one transaction (a savepoint inside `apply`'s)
 — when it is the only routine of its name and nothing depends on it. Otherwise the run fails
 naming the routines of that name, or what depends on the routine (a view, a trigger, a column
-default). A grant or comment the file does not make goes with the dropped routine.
+default). Its grants, owner and comment are put back on the new one, as `CREATE OR REPLACE`
+would have kept them, and the file runs once more over them, so its own grants and comment have
+the last word. A file running its own transaction (`BEGIN` … `COMMIT`) runs as it always did,
+and is not replaced.
 
 The diff is scoped to the schemas the design declares — reconcile never touches
 tables in other schemas. Two kinds of destruction each need an explicit opt-in:
@@ -1520,13 +1523,15 @@ comments and layout.
 column of one) goes drops the foreign keys holding that key first — its file runs before
 theirs — and adds back, after its new key, the ones the design keeps; one the design replaces,
 its own table's migration adds. A key the design leaves unnamed has the name PostgreSQL gave
-it, which no snapshot records: on a `postgres` or `supabase` target the migration drops it by
-the name the catalog has for it (a `DO` block looking up the primary key, or the unique key or
-foreign key over exactly those columns); on any other target — and everywhere before 0.27.1 —
-it is left as a comment saying to drop it by hand. An unnamed CHECK or EXCLUDE is always left
+it, which no snapshot records: when the migrations will run on PostgreSQL — the URL
+`-d`/`DATABASE_URL` or the target's `url:` names, or with neither a target called `postgres` or
+`supabase` — the migration drops it by the name the catalog has for it (a `DO` block looking up
+the primary key, or the unique key or foreign key over exactly those columns); otherwise — and
+everywhere before 0.27.1 — it is left as a comment saying to drop it by hand. An unnamed CHECK or EXCLUDE is always left
 to you. A primary key declared on its column (`id uuid primary key`) is not migrated when it
 changes — declare a key that will change as `primary key (…)`. Library: `snapshot::{MigrationDialect,
-create_snapshot_in, prepare_multi_snapshot_in}`; the existing functions write `Portable`.
+create_snapshot_in, prepare_multi_snapshot_in}` (`MigrationDialect::of(url, target)`); the
+existing functions write `Portable`.
 
 A table removed from the design is written as `DROP TABLE … CASCADE` in
 `migrations/<NNN>/<schema>/<table>.sql`, where every per-table migration goes, and the
