@@ -74,15 +74,6 @@ fn jsonb_import_tmp(project: &str) -> String {
     format!("{JSONB_IMPORT_SCHEMA}.\"{}\"", name.replace('"', "\"\""))
 }
 
-/// Whether `sql` spells `search_path` anywhere, in any case — the only way a
-/// script can set one, so one that does not leaves its connection's path as
-/// it found it. The same test as [`script::keep_public_on_search_path`]'s
-/// fast path, without lower-casing a large data script to make it.
-fn mentions_search_path(sql: &str) -> bool {
-    const NAME: &[u8] = b"search_path";
-    sql.as_bytes().windows(NAME.len()).any(|w| w.eq_ignore_ascii_case(NAME))
-}
-
 /// One column of a table or view, as [`PostgresAdapter::column_kinds`] reads it.
 struct ColumnKind {
     name: String,
@@ -410,7 +401,7 @@ impl PostgresAdapter {
             let result = (&mut *tx).execute(sql).await;
             *guard = Some(tx);
             result.map(|_| ())
-        } else if mentions_search_path(sql) {
+        } else if script::may_set_search_path(sql) {
             // A script's own `SET search_path` outlives it on the pooled
             // connection it ran on, and what runs there next reads names
             // through it: introspection printed `app.seq` as `seq`, and a
