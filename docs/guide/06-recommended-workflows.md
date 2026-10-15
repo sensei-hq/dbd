@@ -55,6 +55,26 @@ Reconcile is not one transaction: it writes in the dependency order `apply` uses
 committing as it runs, so a step that fails stops the run with the earlier steps applied. Fix the
 cause and run it again — what is already in place is no longer drift.
 
+The exception is a key a foreign key holds. PostgreSQL will not drop a primary key, a unique key
+or index, or a column of one, while a foreign key references it, so reconcile drops those
+foreign keys first, in the step of the table whose key changes. One the design keeps comes back
+in that same step, once the new key is there; one the design replaces comes back in its own
+table's step, and the steps from the key change to that one run in one transaction — a failure in
+any of them leaves the key as it was. A step in that transaction waits at most 10 seconds for a
+lock another session holds; then the run fails and rolls it back. A foreign key on a table the run
+does not reconcile — another project's or module's, one the scope leaves out, one no design
+declares, one the role has no privilege on — is never dropped: the key change is refused before
+anything is written, `--dry-run` included, naming it. Before 0.27.1 the key's drop failed with
+`cannot drop constraint … because other objects depend on it`.
+
+A function or procedure is re-applied with its file's `CREATE OR REPLACE`, which PostgreSQL
+refuses when the routine changes what it returns, renames a parameter, loses a parameter's default
+or turns from a function into a procedure. `reconcile` and `apply` then drop it and create it
+again, in one transaction — when it is the only routine of its name and nothing depends on it.
+Otherwise the run fails naming the routines of that name, or what depends on the routine (a view,
+a trigger, a column default): drop that, and the run creates again what the design declares. A
+grant or comment the file does not make goes with the dropped routine.
+
 **Cut v1 with `dbd release`.** When the schema stabilizes, `dbd release` (alias `dbd baseline`)
 writes a baseline snapshot at the current version and flips `project.released: true`:
 

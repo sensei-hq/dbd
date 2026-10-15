@@ -126,6 +126,26 @@ generated `ALTER TABLE … ADD COLUMN` for it fails with `already exists`. Upgra
 one release at a time there, or edit that migration to `ADD COLUMN IF NOT
 EXISTS`.
 
+## A key a foreign key holds
+
+PostgreSQL will not drop a primary key, a unique key, or a column of one, while a foreign key
+references it, and a version's migrations run table by table in dependency order — the
+referenced table's first. So the migration of a table whose key changes drops the foreign keys
+holding that key first, and adds back, after its new key, the ones the design keeps; one the
+design replaces, its own table's migration adds. A version runs in one transaction (above), so
+nothing is left half-changed. Before 0.27.1 the key's drop failed while the foreign key held it.
+
+A key the design leaves unnamed has the name PostgreSQL gave it, which no snapshot records. On a
+`postgres` or `supabase` target the migration drops it by the name the catalog has for it — a
+`DO` block looking up the table's primary key, or the unique key or foreign key over exactly those
+columns. On any other target it is left, as it was everywhere before 0.27.1, as a comment saying
+to drop it by hand. An unnamed CHECK or EXCLUDE is always left to you: only its expression
+identifies it. A primary key declared on its column (`id uuid primary key`) is not migrated when
+it changes — the migration says so; declare a key that will change as `primary key (…)`.
+
+A function whose return type changes is dropped and created again when `apply` re-applies it, as
+`reconcile` does — see [recommended workflows](06-recommended-workflows.md).
+
 ## Dropping a table
 
 Delete a table's DDL file and `dbd snapshot` writes its drop where it writes

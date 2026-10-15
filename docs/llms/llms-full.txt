@@ -1315,6 +1315,27 @@ recreation — each a single statement batch) rolls back. A batch transaction is
 possible: an enum value added by `ALTER TYPE … ADD VALUE` cannot be used until its
 transaction commits, so a later default or CHECK naming it would fail.
 
+The exception is a **key a foreign key holds**. PostgreSQL will not drop a primary key, a
+unique key or index, or a column of one, while a foreign key references it, so reconcile
+drops those foreign keys first, in the step of the table whose key changes. One the design
+keeps comes back in that same step, once the new key is there; one the design replaces comes
+back in its own table's step, and the steps from the key change to that one run in one
+transaction (an enum gaining a value between them is altered before it opens) — a failure in
+any of them leaves the key as it was. A step in it waits at most 10 seconds for a lock another
+session holds, then fails and rolls back. A foreign key on a table the run does not reconcile —
+another project's or module's, one the scope leaves out, one no design declares, one the role
+has no privilege on (read from `pg_constraint`, which lists it) — is never dropped: the key
+change is refused before anything is written, `--dry-run` included, naming it. Before 0.27.1
+the key's drop failed with `cannot drop constraint … because other objects depend on it`.
+
+A function or procedure is re-applied with its file's `CREATE OR REPLACE`, which PostgreSQL
+refuses (SQLSTATE `42P13`, `42809`) when the routine changes what it returns, renames a
+parameter, loses a parameter's default or turns from a function into a procedure. `reconcile`
+and `apply` then drop it and create it again, in one transaction (a savepoint inside `apply`'s)
+— when it is the only routine of its name and nothing depends on it. Otherwise the run fails
+naming the routines of that name, or what depends on the routine (a view, a trigger, a column
+default). A grant or comment the file does not make goes with the dropped routine.
+
 The diff is scoped to the schemas the design declares — reconcile never touches
 tables in other schemas. Two kinds of destruction each need an explicit opt-in:
 `--allow-destructive` drops a **column**/constraint from a managed table, or
@@ -1494,6 +1515,18 @@ its `COMMENT ON TYPE` carried to the new one). Before 0.25 the removal took thre
 
 `dbd snapshot` writes `project.version` by editing `design.yaml` in place, keeping its
 comments and layout.
+
+**A key a foreign key holds.** The migration of a table whose primary or unique key (or a
+column of one) goes drops the foreign keys holding that key first — its file runs before
+theirs — and adds back, after its new key, the ones the design keeps; one the design replaces,
+its own table's migration adds. A key the design leaves unnamed has the name PostgreSQL gave
+it, which no snapshot records: on a `postgres` or `supabase` target the migration drops it by
+the name the catalog has for it (a `DO` block looking up the primary key, or the unique key or
+foreign key over exactly those columns); on any other target — and everywhere before 0.27.1 —
+it is left as a comment saying to drop it by hand. An unnamed CHECK or EXCLUDE is always left
+to you. A primary key declared on its column (`id uuid primary key`) is not migrated when it
+changes — declare a key that will change as `primary key (…)`. Library: `snapshot::{MigrationDialect,
+create_snapshot_in, prepare_multi_snapshot_in}`; the existing functions write `Portable`.
 
 A table removed from the design is written as `DROP TABLE … CASCADE` in
 `migrations/<NNN>/<schema>/<table>.sql`, where every per-table migration goes, and the
