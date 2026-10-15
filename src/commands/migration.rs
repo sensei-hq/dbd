@@ -540,8 +540,10 @@ fn snapshot_design(
     verbosity: Verbosity,
 ) -> Result<()> {
     let desc = description.unwrap_or("snapshot");
-    let result = dbd_core::snapshot::create_snapshot_of(design.entities(), project_dir, config, design.module(), desc)
-        .context("Failed to create snapshot")?;
+    let dialect = dbd_core::snapshot::MigrationDialect::of_target(design.target_name());
+    let result =
+        dbd_core::snapshot::create_snapshot_in(design.entities(), project_dir, config, design.module(), desc, dialect)
+            .context("Failed to create snapshot")?;
 
     // Single snapshot, no changes
     if result.snapshots.len() == 1 && result.snapshots[0].no_changes {

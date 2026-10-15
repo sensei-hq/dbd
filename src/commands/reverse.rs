@@ -714,10 +714,18 @@ fn merge_snapshot(
     let design = dbd_core::Design::from_config_with_dir(config_path, env, Some(project_dir)).context(
         "failed to reload project after writing DDL — recover via version control if files were partially written",
     )?;
-    let snap = dbd_core::snapshot::create_snapshot(design.entities(), project_dir, config_path, "merge from database")
-        .context(
-            "failed to create snapshot after writing DDL — recover via version control if files were partially written",
-        )?;
+    let dialect = dbd_core::snapshot::MigrationDialect::of_target(design.target_name());
+    let snap = dbd_core::snapshot::create_snapshot_in(
+        design.entities(),
+        project_dir,
+        config_path,
+        None,
+        "merge from database",
+        dialect,
+    )
+    .context(
+        "failed to create snapshot after writing DDL — recover via version control if files were partially written",
+    )?;
 
     // `create_snapshot` handles the no-previous-snapshot (baseline) case, so a
     // project without prior snapshots still snapshots cleanly. A single result

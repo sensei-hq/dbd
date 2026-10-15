@@ -167,6 +167,70 @@ fn constraint_name(con: &TableConstraint) -> Option<&str> {
     }
 }
 
+/// The comment a migration carries for a constraint it must drop but cannot
+/// name: neither side of the diff knows the name Postgres gave it.
+pub(crate) fn unnamed_drop_comment(entity_name: &str, con: &TableConstraint) -> String {
+    format!(
+        "-- {}: cannot drop {} — the constraint has no name; drop it manually",
+        entity_name,
+        constraint_description(con)
+    )
+}
+
+/// On PostgreSQL, a `DO` block dropping a primary key, unique key or foreign
+/// key the design left unnamed (#65), by the name the catalog has for it: the
+/// one primary key of `entity_name`; the unique key or foreign key on exactly
+/// those columns, in that order — a foreign key to that table. Gone already,
+/// it drops nothing, as `DROP CONSTRAINT IF EXISTS` would. `None` for a CHECK
+/// or EXCLUDE, which only their expression identifies.
+pub(crate) fn catalog_drop_sql(entity_name: &str, con: &TableConstraint) -> Option<String> {
+    use crate::sql_quote::literal;
+    let columns_are = |columns: &[String]| {
+        let list = columns.iter().map(|c| literal(c)).collect::<Vec<_>>().join(", ");
+        format!(
+            " AND ARRAY(SELECT a.attname::text FROM unnest(k.conkey) WITH ORDINALITY AS u(attnum, i) \
+             JOIN pg_attribute a ON a.attrelid = k.conrelid AND a.attnum = u.attnum ORDER BY u.i) \
+             = ARRAY[{list}]::text[]"
+        )
+    };
+    let (contype, condition) = match con {
+        TableConstraint::PrimaryKey { .. } => ("p", String::new()),
+        TableConstraint::Unique { columns, .. } => ("u", columns_are(columns)),
+        TableConstraint::ForeignKey(fk) => {
+            let (schema, _) = crate::entity::split_qualified_name(entity_name);
+            let target = match fk.ref_schema.as_deref().or(schema.as_deref()) {
+                Some(schema) => format!("{schema}.{}", fk.ref_table),
+                None => fk.ref_table.clone(),
+            };
+            (
+                "f",
+                format!(
+                    "{} AND k.confrelid = to_regclass({})",
+                    columns_are(&fk.columns),
+                    literal(&target)
+                ),
+            )
+        }
+        TableConstraint::Check { .. } | TableConstraint::Exclude { .. } => return None,
+    };
+    let table = literal(entity_name);
+    Some(format!(
+        "-- {}: drop {} by the name the catalog has for it\n\
+         DO $dbd$\n\
+         DECLARE c name;\n\
+         BEGIN\n\
+         \x20 SELECT k.conname INTO c FROM pg_constraint k\n\
+         \x20 WHERE k.conrelid = to_regclass({table}) AND k.contype = '{contype}'{condition}\n\
+         \x20 LIMIT 1;\n\
+         \x20 IF c IS NOT NULL THEN\n\
+         \x20   EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I', {table}, c);\n\
+         \x20 END IF;\n\
+         END $dbd$;",
+        entity_name,
+        constraint_description(con)
+    ))
+}
+
 /// The `CONSTRAINT <name> ` prefix for an `ALTER TABLE … ADD …`, or an empty
 /// string when the constraint is unnamed so Postgres auto-names it.
 fn constraint_clause(name: Option<&str>) -> String {
@@ -175,7 +239,7 @@ fn constraint_clause(name: Option<&str>) -> String {
 
 /// A human-readable description of an unnamed constraint, for the comment and
 /// warning that stand in for DDL that cannot be written.
-fn constraint_description(con: &TableConstraint) -> String {
+pub(crate) fn constraint_description(con: &TableConstraint) -> String {
     match con {
         TableConstraint::PrimaryKey { columns, .. } => format!("PRIMARY KEY ({})", columns.join(", ")),
         TableConstraint::Unique {
@@ -236,11 +300,7 @@ fn generate_field_sql(entity_name: &str, _entity_type: &EntityType, change: &Fie
                     "ALTER TABLE {} DROP CONSTRAINT IF EXISTS \"{}\";",
                     entity_name, name
                 )),
-                None => lines.push(format!(
-                    "-- {}: cannot drop {} — the constraint has no name; drop it manually",
-                    entity_name,
-                    constraint_description(con)
-                )),
+                None => lines.push(unnamed_drop_comment(entity_name, con)),
             }
         }
 
