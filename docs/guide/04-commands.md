@@ -1503,7 +1503,9 @@ The desired schema is parsed from your DDL; the live schema is introspected. dbd
 representation noise so only real drift is reported: type aliases and array/date-time
 spellings (`int4` → `integer`, `text[3]` → `text[]`, `time` → `time without time zone`),
 default casts (so a `nextval('s')` default matches the `nextval('s'::regclass)` Postgres
-reports), enum and extension-type qualification (`citext` → `extensions.citext`), PK/UNIQUE-backing indexes (matched by the constraint's name, so a
+reports), a `nextval` default's sequence as Postgres prints it (`nextval('App.Seq')` and
+`nextval('"app"."seq"')` are `app.seq`, `public.` is left off, and a bare name is in the
+schema its file's path finds it in), enum and extension-type qualification (`citext` → `extensions.citext`), PK/UNIQUE-backing indexes (matched by the constraint's name, so a
 dropped index over a key's columns is still drift), FK `NO ACTION` defaults and
 auto-generated FK names, and CHECK-expression *spelling* via the Postgres parser — parens
 and case, `IN` ↔ `= ANY (ARRAY[…])`, casts on literals, `BETWEEN` ↔ the `>=`/`<=` pair
@@ -1529,10 +1531,7 @@ compared.
 **Best-effort edges** (reported, but may need a human glance): a foreign key that references a
 table in the *same non-public schema* without qualifying it can read as drift; a standalone
 index whose columns exactly match a PK/UNIQUE constraint is treated as that constraint's
-backing index and suppressed; an unparseable CHECK is shown with an `advisory`. How Postgres
-renders a name inside a live default depends on the reading session's `search_path`, which a
-pooled connection can inherit from an earlier DDL file, so a bare `nextval('s')` in a file can
-still read as drift now and then. A negative default (`-1`, which Postgres reports as
+backing index and suppressed; an unparseable CHECK is shown with an `advisory`. A negative default (`-1`, which Postgres reports as
 `'-1'::integer`) and a `varbit` column read as drift on every run.
 
 **In a workspace** `diff` answers for every module the run selects, under its

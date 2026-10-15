@@ -1467,14 +1467,15 @@ a declared index over a key's columns that the database lost is drift), FK `NO
 ACTION`/auto-generated names, EXCLUDE spelling, and CHECK-expression spelling via libpg_query — parens/case, `IN` ↔
 `= ANY (ARRAY[…])`, literal casts, `BETWEEN` ↔ its `>=`/`<=` expansion, casts on
 `ARRAY[…]` constructors, and `AND`/`OR` nesting; a `nextval('s')` default matches
-the `nextval('s'::regclass)` Postgres reports) so only real drift shows. An
+the `nextval('s'::regclass)` Postgres reports, its sequence spelled as Postgres
+prints it — `nextval('App.Seq')` is `app.seq`, `public.` left off, a bare name in
+the schema its file's path finds it in) so only real drift shows. An
 unparseable CHECK is shown flagged `advisory`. Covers tables + enums
 structurally, plus **materialized-view drift** (each matview reported
 `missing`/`drifted`/`unstamped`/`orphan` via the `dbd:hash` drift stamp in
 `dbd.matview_stamps`; in `--json` as `matview_drift`, and counts toward
 `--exit-code`). Views/functions/roles/sequences are not structurally diffed, and
-table, view and enum comments are not compared. A pooled connection's inherited
-`search_path` can still make a bare `nextval('s')` read as drift now and then.
+table, view and enum comments are not compared.
 
 ### dbd release (alias: dbd baseline)
 
