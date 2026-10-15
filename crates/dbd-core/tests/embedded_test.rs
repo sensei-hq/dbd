@@ -7884,6 +7884,75 @@ async fn a_scripts_search_path_does_not_outlive_it_on_the_pool() {
     }
 }
 
+/// The pool goes back on the session's path however a script set another:
+/// `SET SCHEMA` is `SET search_path` by another name, the setting's name may be
+/// any case, and a connection whose path cannot be reset — its transaction
+/// left aborted by the script — is not handed out again (0.27.2 review).
+#[tokio::test]
+async fn a_scripts_path_ends_with_it_however_it_was_set() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "paths").await.unwrap();
+    adapter.execute_script("CREATE SCHEMA IF NOT EXISTS app;").await.unwrap();
+    for script in [
+        "SET SCHEMA 'app';\nCREATE TABLE s1 (id integer);",
+        "SET SEARCH_PATH TO app;\nCREATE TABLE s2 (id integer);",
+        "set local schema 'app';\nCREATE TABLE s3 (id integer);",
+    ] {
+        adapter.execute_script(script).await.unwrap();
+        for _ in 0..5 {
+            adapter
+                .execute_script(ON_THE_SESSION_PATH)
+                .await
+                .unwrap_or_else(|e| panic!("after {script:?}: {e}"));
+        }
+    }
+    let _ = adapter
+        .execute_script("BEGIN; SET search_path TO app; SELECT 1/0;")
+        .await;
+    for _ in 0..6 {
+        adapter
+            .execute_script(ON_THE_SESSION_PATH)
+            .await
+            .expect("after a script whose path could not be reset");
+    }
+}
+
+/// In one `apply`, a file that sets no path runs on the session's — not on
+/// the one the file before it set, which built its table in that file's
+/// schema (0.27.2 review).
+#[tokio::test]
+async fn a_file_that_sets_no_path_runs_on_the_sessions_in_a_batch() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "batch_path").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    for d in ["ddl/table/app", "ddl/table/public"] {
+        std::fs::create_dir_all(dir.join(d)).unwrap();
+    }
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: batch_path\nsource:\n  dialect: postgresql\nschemas:\n  - public\n  - app\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/a.ddl"),
+        "set search_path to app;\ncreate table if not exists a (id integer primary key);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/table/public/b.ddl"),
+        "create table if not exists b (id integer primary key);\n",
+    )
+    .unwrap();
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load");
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply");
+    assert_table_exists(&*adapter, "public", "b").await;
+    assert_table_absent(&*adapter, "app", "b").await;
+}
+
 /// A `nextval` default naming its sequence in a spelling Postgres does not
 /// print — mixed case unquoted, quoted where it need not be, qualified by a
 /// schema on the search path, or bare in a schema the file's own path reaches
