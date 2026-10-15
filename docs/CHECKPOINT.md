@@ -19,11 +19,12 @@
   over a workspace; the viewer groups by module.
 - Slice 6 merged (PRs #67, #68): the workspace transfer rule (T22, T24) and
   `dbd split --from-scopes` (T23), whole or not at all, with `--undo`.
+- Slice 7 merged (PR #69): docs on every surface; CHANGELOG Unreleased.
 
 ## Next
 
-Slice 7 on `feat/workspaces-docs`: guide 03/04/05/07/11/12/14, llms, both
-SKILL.md, the site. Then the release checklist for 0.27.0.
+Phase 3 complete on `feat/workspaces`. Next: PR `feat/workspaces` → main, CI,
+then — with the user's OK — merge and the 0.27.0 release checklist.
 
 ## Open
 
