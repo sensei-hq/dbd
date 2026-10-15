@@ -79,7 +79,8 @@ pub struct Cli {
     pub deps: Option<DepsArg>,
 
     /// In a workspace (a design.yaml with modules:), run this module and the
-    /// modules it depends on — `reset`, this module alone
+    /// modules it depends on — `reset`, `export`, `snapshot` and `release`,
+    /// this module alone
     #[arg(long, global = true)]
     pub module: Option<String>,
 }

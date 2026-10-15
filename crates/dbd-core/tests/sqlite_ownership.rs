@@ -490,3 +490,35 @@ async fn sqlite_keeps_the_project_until_its_last_table_is_taken_over() {
         .collect();
     assert_eq!(owned, ["orders"]);
 }
+
+/// A project whose claims are all of what is gone is retired on SQLite as on
+/// Postgres: what it held that no longer exists is no hold.
+#[tokio::test]
+async fn sqlite_retires_a_project_holding_only_what_is_gone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("shop.db");
+    let root = tmp.path().join("shop");
+    std::fs::create_dir_all(&root).unwrap();
+    let shop = connect(&file, "shop").await;
+    lite_project(&root, "shop", &["items", "legacy"])
+        .apply(&*shop, None, false, None, Progress::none())
+        .await
+        .expect("shop's apply");
+    shop.execute_script("DROP TABLE legacy").await.unwrap();
+    // Its modules take items over; legacy is gone.
+    let module = connect(&file, "shop/shared").await;
+    let taken = module
+        .claim_objects_from(
+            "shop/shared",
+            &shop.owned_objects("shop").await.unwrap(),
+            true,
+            &["shop".to_string()],
+        )
+        .await
+        .unwrap();
+    assert!(taken.is_empty(), "{taken:?}");
+    assert!(
+        module.retire_owner("shop").await.unwrap(),
+        "shop holds nothing that still exists"
+    );
+}

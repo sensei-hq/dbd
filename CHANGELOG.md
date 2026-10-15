@@ -9,6 +9,79 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+**A project can be a workspace of modules.** A `design.yaml` with a
+`modules:` block is a workspace: each module is a design of its own, in a
+folder of its own, recorded in the database as its own owner
+(`<project>/<module>`) with its own version, snapshots and migrations. Every
+command but `init`, `merge` and `split` runs a workspace module by module in
+`depends_on` order — `reset` in
+reverse — checking every module before the first writes; `--module` selects a
+module (with what it depends on); scopes select modules
+(`scopes.<name>.modules`); running inside a module's folder runs that module.
+The viewer groups by module, and `dbml`, `diagram`, `graph`, `combine` and
+`emit` read a workspace as one design. `dbd split --from-scopes` divides a
+scoped project into a workspace — each region of its scopes a module — and
+each module's first deploy takes over what it declares from the project as it
+was. The third phase of [#7]; the guides [design.yaml](https://dbd.sensei-hq.com/guide/design-yaml),
+[scopes](https://dbd.sensei-hq.com/guide/scopes) and [sharing a database](https://dbd.sensei-hq.com/guide/sharing-a-database)
+cover it.
+
+**Upgrading.** A `design.yaml` without `modules:` runs as before. The library
+API grows: the schema model's `modules` and each node's `module`, a history
+entry's `module`, a graph node's `module`, `ScopeSpec::modules` and
+`DesignConfig::modules` are new public fields, so code building these structs
+by hand adds them; `Design::from_config` refuses a workspace — load one with
+`Workspace::load`.
+
+### Added
+
+- **Workspaces** (#7, phase 3). The `modules:` block — `note`, `depends_on`,
+  `path`, `version`, `released`, `apply` — validated at load: a name that
+  cannot name an owner or a folder, an unknown dependency or a cycle, a folder
+  outside the project, the project's own or another module's, files left at
+  the root, two modules declaring one entity (T19) and a reference into a
+  module outside `depends_on`, a type created beside a table included (T20).
+- **Running a workspace.** Each module as its own owner (T21), headed
+  `module <name> (<owner>)`; the manifest's `apply:` and `import.after` once
+  around the run; a deploy's schema pass over every module before any data;
+  an import emptying what the run reloads together; `diff --json` as
+  `{"modules": [...]}`; `inspect --shared` listing each module; a reset in
+  reverse, whole or not at all; `export` and `reset` with `--module` take the
+  module alone.
+- **`--module <name>`**, a global flag; **scopes over modules**
+  (`scopes.<name>.modules`, with `includes:` and `excludes:` across modules);
+  running inside a module's folder finds the workspace by walking up.
+- **Per-module history.** `snapshot` and `release` write a module's version and
+  release state into its `modules.<name>` block in place; `reconcile` leaves a
+  released module out; `format`, `doctor` and `snapshot --list` go over each
+  module's folder.
+- **The viewer by module.** The schema model names a workspace's modules and
+  each entity's; the sidebar groups by module, the diagram is tinted by module
+  or schema, and entity pages and changelog entries name their module.
+  `dbml` groups each module's tables; `combine` and `emit` head each module's
+  statements.
+- **`dbd split --from-scopes`** (T23) — the plan, `--rename`, and `--write`,
+  which moves the files (with `git mv` in a git work tree) and writes
+  `modules:` and `scopes:`, whole or not at all: it checks first that the
+  workspace deploys under each scope what the project did, keeps a journal
+  while it moves, and `dbd split --undo` puts an interrupted split back.
+- **The workspace transfer rule** (T22, T24). A module takes over, as it
+  claims, what it declares from the project as it was and from the other
+  modules — what it uses going with it — prunes none of what another module
+  declares, and the project's record is retired once its modules hold
+  everything it held.
+- **Library API**: `design::{Workspace, Module, Reading}`, `schema_model::build_reading`,
+  `dbml::generate_reading`, `emit_dialect::emit_reading`, the `split` module,
+  `Design::{module, predecessor, retired_predecessor}`, and the
+  `DatabaseAdapter` methods `claim_objects_from` and `retire_owner`, each with
+  a default an adapter written before keeps working with.
+
+### Fixed
+
+- What a file creates beside its entity, and a routine's body, are read
+  wherever the project folder is named from — a relative `-s` read neither.
+- `rustls` 0.23.46, for RUSTSEC-2026-0346, -0347, -0348 and -0349.
+
 ## [0.26.0] — 2026-10-13
 
 **Several projects can share one database.** dbd now records which project

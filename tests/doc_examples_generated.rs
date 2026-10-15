@@ -6,7 +6,7 @@
 //
 // Regenerate: DBD_REGEN_DOC_EXAMPLES=1 cargo test --test doc_examples
 //
-// docs-digest: 0x2ec357c7da47a4a8
+// docs-digest: 0x1e34f06fb5c77219
 #![allow(dead_code, unused_imports, non_snake_case)]
 
 // README.md — block 0
@@ -1226,6 +1226,120 @@ async fn doc_docs_guide_12_embedding_md_16() -> dbd_core::Result<()> {
     let project_dir = std::path::Path::new(".");
     #[allow(unused_variables)]
     let path = std::path::Path::new("design.yaml");
+    use dbd_core::design::Workspace;
+
+    let workspace = Workspace::load(path, "prod", None)?;
+    for module in workspace.modules() {
+        println!(
+            "{} — {} — depends on {:?}",
+            module.name().unwrap_or("-"),
+            module.owner(),
+            module.depends_on()
+        );
+    }
+
+    // `dbd deploy`'s modules: the `default` scope's, each with what it depends on,
+    // in depends_on order — every module deployed as its own owner.
+    for module in Workspace::load(path, "prod", None)?
+        .under_scope_of(None, None)?
+        .select(None)?
+    {
+        let design = module.design();
+        let adapter = dbd_core::connect(database_url, design.owner()).await?;
+        let scope = design.resolve_scope(None, None)?;
+        design.deploy(&*adapter, false, Some(&scope), |_| {}).await?;
+        if design.retired_predecessor() {
+            println!("project {} is retired", design.predecessor().unwrap_or_default());
+        }
+    }
+    Ok(())
+}
+
+// docs/guide/12-embedding.md — block 17
+#[allow(unused, clippy::all)]
+async fn doc_docs_guide_12_embedding_md_17() -> dbd_core::Result<()> {
+    #[allow(unused_variables)]
+    let sql: &str = "";
+    #[allow(unused_variables)]
+    let database_url: &str = "";
+    #[allow(unused_variables)]
+    let db_url: &str = "";
+    #[allow(unused_variables)]
+    let db_version: u32 = 0;
+    #[allow(unused_variables)]
+    let entities: Vec<dbd_core::Entity> = Vec::new();
+    #[allow(unused_variables)]
+    let project_dir = std::path::Path::new(".");
+    #[allow(unused_variables)]
+    let path = std::path::Path::new("design.yaml");
+    use dbd_core::design::Workspace;
+    use dbd_core::parser::Dialect;
+
+    let reading = Workspace::load(path, "prod", None)?.reading(None, Some("hub"), None)?;
+
+    let mut model = dbd_core::schema_model::build_reading(&reading)?; // `dbd diagram --json`
+    model.history = reading.history()?;
+    std::fs::write("schema.json", serde_json::to_string_pretty(&model)?)?;
+
+    std::fs::write("init.sql", reading.combined()?)?; // `dbd combine`
+    for doc in dbd_core::dbml::generate_reading(&reading)? {
+        // `dbd dbml`
+        std::fs::write(&doc.file_name, &doc.content)?;
+    }
+    let (sql, downgrades) = dbd_core::emit_dialect::emit_reading(&reading, Dialect::Sqlite)?;
+    Ok(())
+}
+
+// docs/guide/12-embedding.md — block 18
+#[allow(unused, clippy::all)]
+async fn doc_docs_guide_12_embedding_md_18() -> dbd_core::Result<()> {
+    #[allow(unused_variables)]
+    let sql: &str = "";
+    #[allow(unused_variables)]
+    let database_url: &str = "";
+    #[allow(unused_variables)]
+    let db_url: &str = "";
+    #[allow(unused_variables)]
+    let db_version: u32 = 0;
+    #[allow(unused_variables)]
+    let entities: Vec<dbd_core::Entity> = Vec::new();
+    #[allow(unused_variables)]
+    let project_dir = std::path::Path::new(".");
+    #[allow(unused_variables)]
+    let path = std::path::Path::new("design.yaml");
+    let design = dbd_core::Design::from_config(path, "dev")?;
+    let plan = dbd_core::split::plan_from_scopes(&design, &[])?;
+    for module in &plan.modules {
+        println!(
+            "{} — {} entities — depends on {:?}",
+            module.name,
+            module.entities.len(),
+            module.depends_on
+        );
+    }
+    if plan.cycle.is_none() {
+        dbd_core::split::write_split(&plan, path, project_dir)?;
+    }
+    Ok(())
+}
+
+// docs/guide/12-embedding.md — block 19
+#[allow(unused, clippy::all)]
+async fn doc_docs_guide_12_embedding_md_19() -> dbd_core::Result<()> {
+    #[allow(unused_variables)]
+    let sql: &str = "";
+    #[allow(unused_variables)]
+    let database_url: &str = "";
+    #[allow(unused_variables)]
+    let db_url: &str = "";
+    #[allow(unused_variables)]
+    let db_version: u32 = 0;
+    #[allow(unused_variables)]
+    let entities: Vec<dbd_core::Entity> = Vec::new();
+    #[allow(unused_variables)]
+    let project_dir = std::path::Path::new(".");
+    #[allow(unused_variables)]
+    let path = std::path::Path::new("design.yaml");
     use dbd_core::design::Progress;
 
     let design = dbd_core::Design::from_config(path, "prod")?
@@ -1253,9 +1367,9 @@ async fn doc_docs_guide_12_embedding_md_16() -> dbd_core::Result<()> {
     Ok(())
 }
 
-// docs/guide/12-embedding.md — block 17
+// docs/guide/12-embedding.md — block 20
 #[allow(unused, clippy::all)]
-async fn doc_docs_guide_12_embedding_md_17() -> dbd_core::Result<()> {
+async fn doc_docs_guide_12_embedding_md_20() -> dbd_core::Result<()> {
     #[allow(unused_variables)]
     let sql: &str = "";
     #[allow(unused_variables)]
@@ -1288,9 +1402,9 @@ async fn doc_docs_guide_12_embedding_md_17() -> dbd_core::Result<()> {
     Ok(())
 }
 
-// docs/guide/12-embedding.md — block 18
+// docs/guide/12-embedding.md — block 21
 #[allow(unused, clippy::all)]
-async fn doc_docs_guide_12_embedding_md_18() -> dbd_core::Result<()> {
+async fn doc_docs_guide_12_embedding_md_21() -> dbd_core::Result<()> {
     #[allow(unused_variables)]
     let sql: &str = "";
     #[allow(unused_variables)]

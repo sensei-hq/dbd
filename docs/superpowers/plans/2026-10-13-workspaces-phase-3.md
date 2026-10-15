@@ -136,7 +136,8 @@ Taken in slice 3:
   dependencies (`Workspace::under_scope_of`), each module resolving its own
   `default`, else `all`; the scope guard still holds each to its pin.
 - Run inside a module's folder — no design.yaml of its own — dbd walks up to
-  the nearest design.yaml declaring `modules:` (`Workspace::locate`), along
+  the nearest design.yaml above it, when it declares `modules:`
+  (`Workspace::locate`), along
   the path the run was started in (a module folder may be a link), and runs
   that module, unless `--module` says otherwise. Run in a folder of the
   workspace no module holds, it runs the workspace; `-s <module folder>`
@@ -342,9 +343,10 @@ PR into the integration branch `feat/workspaces`.
 6. **Converting a project: `dbd split --from-scopes`.** The plan (regions of the
    scopes' Venn diagram after `deps: include`, entity counts, inferred
    `depends_on`, rewritten `scopes:`), and `--write` (moves files with `git mv`,
-   splits `import/`, `policies/`, `snapshots/` and `migrations/` by owning
-   module — a root folder left holding files refuses the workspace — writes
-   `modules:` and `scopes:`). The
+   splits `import/` and `policies/` by owning module — a root folder left
+   holding files refuses the workspace — writes `modules:` and `scopes:`; a
+   project with `snapshots/` or `migrations/` is refused, see "Taken in slice
+   6"). The
    **workspace transfer rule**: a module's first run, where the predecessor
    owner is the same project (`sensei` before `sensei/core`), takes over what
    it declares from the predecessor and retires the predecessor's record once

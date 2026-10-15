@@ -291,9 +291,18 @@ fn an_interrupted_split_is_undone() {
     fs::create_dir_all(dir.join(&first.to).parent().unwrap()).unwrap();
     fs::rename(dir.join(&first.from), dir.join(&first.to)).unwrap();
 
-    let out = dbd(dir, &["inspect"]);
-    assert!(!out.status.success(), "{}", text(&out));
-    assert!(text(&out).contains("dbd split --undo"), "{}", text(&out));
+    // Every command that reads the project, the ones reading only its folders
+    // included: format rewrote files of the half-moved tree.
+    for args in [
+        &["inspect"][..],
+        &["format", "--check"],
+        &["doctor"],
+        &["snapshot", "--list"],
+    ] {
+        let out = dbd(dir, args);
+        assert!(!out.status.success(), "{args:?}: {}", text(&out));
+        assert!(text(&out).contains("dbd split --undo"), "{args:?}: {}", text(&out));
+    }
 
     let out = dbd(dir, &["split", "--undo"]);
     assert!(out.status.success(), "{}", text(&out));

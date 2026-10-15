@@ -17,11 +17,13 @@
   `format`, `doctor`; reconcile leaves released modules out.
 - Slice 5 merged (PR #66): `Reading` — dbml, diagram, graph, combine, emit
   over a workspace; the viewer groups by module.
+- Slice 6 merged (PRs #67, #68): the workspace transfer rule (T22, T24) and
+  `dbd split --from-scopes` (T23), whole or not at all, with `--undo`.
 
 ## Next
 
-Slice 6a merged (PR #67). Slice 6b PR #68: `dbd split --from-scopes`; review
-fixed (1c5a02ed: whole or not at all, scratch check). Next: CI, merge; slice 7.
+Slice 7 on `feat/workspaces-docs`: guide 03/04/05/07/11/12/14, llms, both
+SKILL.md, the site. Then the release checklist for 0.27.0.
 
 ## Open
 
