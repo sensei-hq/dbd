@@ -35,7 +35,4 @@ user's OK the merge and the 0.27.0 release checklist.
   error while emptying (Postgres names the keys) — slice 2, unfiled.
 - Delete by hand: `/tmp/dbd-*` scratch and review dirs; `git worktree remove
   /tmp/dbd-review-tests-wt` (and `git worktree prune`).
-
-## Known limits
-
-- A type in a schema that needs quoting (`"Ext"`) still reads as drift — backlog.
+- Known limit: a type in a schema that needs quoting (`"Ext"`) reads as drift.
