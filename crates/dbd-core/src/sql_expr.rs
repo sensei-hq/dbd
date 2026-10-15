@@ -836,6 +836,15 @@ mod tests {
         assert_eq!(rename_column("(((", "qty", "quantity"), None);
     }
 
+    /// A column an EXCLUDE carries in its `INCLUDE` is one its drop takes too;
+    /// a definition that cannot be read is taken to read every column.
+    #[test]
+    fn an_exclusion_reads_the_columns_it_includes() {
+        assert!(exclusion_reads_column("USING gist (r WITH =) INCLUDE (note)", "note"));
+        assert!(!exclusion_reads_column("USING gist (r WITH =) INCLUDE (note)", "other"));
+        assert!(exclusion_reads_column("USING (((", "any"));
+    }
+
     /// An EXCLUDE reads a column through an element naming it, an element's
     /// expression, or its predicate — and only those: re-adding one the
     /// column's drop left alone fails on its name.

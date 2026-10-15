@@ -570,3 +570,27 @@ fn an_unmarked_stage_run_that_drops_before_it_adds_is_not_dbds_and_is_not_groupe
     );
     assert_eq!(history_json(dir.path()).as_array().unwrap().len(), 3);
 }
+
+/// A column turned generated is one modification: its unique key, declared
+/// on both sides, did not change — the re-add a migration makes around the
+/// rebuild is not something the version did.
+#[test]
+fn a_column_turned_generated_changes_no_constraint() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut code = col("code", "text");
+    code["is_unique"] = json!(true);
+    let base = table("app", "t", vec![pk("id", "integer"), col("name", "text"), code.clone()]);
+    write(dir.path(), 1, "baseline", vec![base.clone()], vec![]);
+    let mut generated = code;
+    generated["generated"] = json!("upper(name)");
+    let next = table("app", "t", vec![pk("id", "integer"), col("name", "text"), generated]);
+    write(dir.path(), 2, "generated", vec![next], vec![]);
+    let fields = &history_json(dir.path())[1]["changes"][0]["fields"];
+    let kinds: Vec<&str> = fields
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["column"], "{fields}");
+}

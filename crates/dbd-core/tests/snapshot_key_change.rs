@@ -399,3 +399,70 @@ fn a_column_named_like_a_swap_column_is_left_alone() {
     assert!(sql.contains("ALTER COLUMN price TYPE bigint"), "{sql}");
     assert!(!sql.contains("price_new"), "{sql}");
 }
+
+// ── A column turned generated gets back what its rebuild takes (0.27.2 review) ─
+
+/// A member of a composite primary key turned generated: the key comes back
+/// once, as the table declares it — never a second key on the column alone.
+#[test]
+fn a_composite_keys_column_turned_generated_gets_the_one_key_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let p = |b: &str| {
+        format!(
+            "create table if not exists app.p (\n  a integer not null\n, b integer not null{b}\n, primary key (a, b)\n);\n"
+        )
+    };
+    cut(dir, &[("p", &p(""))], MigrationDialect::Postgres);
+    cut(
+        dir,
+        &[("p", &p(" generated always as (a * 2) stored"))],
+        MigrationDialect::Postgres,
+    );
+    let sql = migration(dir, "p");
+    assert_eq!(sql.matches("PRIMARY KEY").count(), 1, "{sql}");
+    assert!(sql.contains("ADD PRIMARY KEY (a, b)"), "{sql}");
+}
+
+/// The rebuild drops every constraint and index on the column, so each one
+/// the design keeps comes back after it: a CHECK, a table-level foreign key,
+/// an EXCLUDE including it, an index — and a key the release adds anyway is
+/// added once.
+#[test]
+fn a_column_turned_generated_gets_back_every_constraint_and_index_on_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let r = "create table if not exists app.r (\n  code text primary key\n);\n";
+    let t = |code: &str, extra: &str| {
+        format!(
+            "create table if not exists app.t (\n  id integer primary key\n, name text not null\n, during tsrange\n\
+             , code text{code}\n, check (code <> '')\n, foreign key (code) references app.r (code)\n\
+             , exclude using gist (during with &&) include (code){extra}\n);\n\
+             create index if not exists t_code_lower on app.t (lower(code));\n"
+        )
+    };
+    cut(dir, &[("r", r), ("t", &t("", ""))], MigrationDialect::Postgres);
+    cut(
+        dir,
+        &[
+            ("r", r),
+            (
+                "t",
+                &t(" generated always as (upper(name)) stored", "\n, unique (code)"),
+            ),
+        ],
+        MigrationDialect::Postgres,
+    );
+    let sql = migration(dir, "t");
+    let rebuilt = at(&sql, "ADD COLUMN code text GENERATED ALWAYS AS (upper(name)) STORED");
+    for part in [
+        "ADD CHECK (code <> '')",
+        "ADD FOREIGN KEY (code) REFERENCES app.r(code)",
+        "INCLUDE (code)",
+        "t_code_lower",
+        "ADD UNIQUE (code)",
+    ] {
+        assert!(rebuilt < at(&sql, part), "{part}:\n{sql}");
+    }
+    assert_eq!(sql.matches("ADD UNIQUE (code)").count(), 1, "{sql}");
+}

@@ -5240,6 +5240,77 @@ async fn a_pending_swap_cut_before_0_27_2_is_refused() {
     assert_catalog(&*adapter, true, "SELECT 1 FROM app.line WHERE qty = 10", "the value").await;
 }
 
+/// The column a table turns generated, with a CHECK, a foreign key to
+/// another table and an expression index on it.
+fn turned_generated(code: &str) -> [(&'static str, String); 2] {
+    [
+        (
+            "r",
+            "create table if not exists app.r (\n  code text primary key\n);\n".to_string(),
+        ),
+        (
+            "t",
+            format!(
+                "create table if not exists app.t (\n  id integer primary key\n, name text not null\n\
+                 , code text{code} references app.r (code)\n, check (code <> '')\n);\n\
+                 create index if not exists t_code_lower on app.t (lower(code));\n"
+            ),
+        ),
+    ]
+}
+
+/// Reconcile turns a column generated in one run: the CHECK, the foreign key
+/// and the index its rebuild drops come back in the same run, and the second
+/// plans nothing.
+#[tokio::test]
+async fn reconcile_turns_a_column_generated_with_everything_on_it_in_one_run() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let files = |code: &str| turned_generated(code);
+    let v1 = files("");
+    let (_v1, design) = rekey_design(&[("r", &v1[0].1), ("t", &v1[1].1)]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("create");
+    adapter
+        .execute_script("INSERT INTO app.r VALUES ('A'); INSERT INTO app.t VALUES (1, 'a', 'A');")
+        .await
+        .unwrap();
+    let v2 = files(" generated always as (upper(name)) stored");
+    let (_v2, design) = rekey_design(&[("r", &v2[0].1), ("t", &v2[1].1)]);
+    design
+        .reconcile(&*adapter, false, true, false, None, Progress::none())
+        .await
+        .expect("the column turns generated");
+    let again = design
+        .reconcile(&*adapter, true, true, false, None, Progress::none())
+        .await
+        .expect("second dry run");
+    assert!(again.altered.is_empty(), "converged: {:?}", again.altered);
+    assert_in_sync(&design, &*adapter).await;
+}
+
+/// A release turning a column generated leaves the database the design.
+#[tokio::test]
+async fn a_released_column_turned_generated_keeps_everything_on_it() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let v1 = turned_generated("");
+    let v2 = turned_generated(" generated always as (upper(name)) stored");
+    let (design, outcome) = release_then_change(
+        &*adapter,
+        tmp.path(),
+        &[("r", &v1[0].1), ("t", &v1[1].1)],
+        "INSERT INTO app.r VALUES ('A'); INSERT INTO app.t VALUES (1, 'a', 'A');",
+        &[("r", &v2[0].1), ("t", &v2[1].1)],
+    )
+    .await;
+    outcome.expect("the column turns generated");
+    assert_in_sync(&design, &*adapter).await;
+}
+
 // ── A routine whose return type changes (#65) ─────────────────────────────────
 
 /// A project `routines` in a temporary folder with `files` (`(path, text)`).
