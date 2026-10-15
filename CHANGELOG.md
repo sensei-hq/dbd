@@ -9,6 +9,8 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.27.0] — 2026-10-14
+
 **A project can be a workspace of modules.** A `design.yaml` with a
 `modules:` block is a workspace: each module is a design of its own, in a
 folder of its own, recorded in the database as its own owner
