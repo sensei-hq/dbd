@@ -4132,10 +4132,20 @@ async fn reconcile_changes_a_key_a_foreign_key_holds() {
         .reconcile(&*adapter, true, true, false, None, Progress::none())
         .await
         .expect("dry run");
-    let parent = &preview.altered.iter().find(|s| s.entity_name == "app.parent").unwrap().sql;
-    let drop_fk = parent.find("child_owner_id_path_fkey").unwrap_or_else(|| panic!("{parent}"));
+    let parent = &preview
+        .altered
+        .iter()
+        .find(|s| s.entity_name == "app.parent")
+        .unwrap()
+        .sql;
+    let drop_fk = parent
+        .find("child_owner_id_path_fkey")
+        .unwrap_or_else(|| panic!("{parent}"));
     let drop_pk = parent.find("parent_pkey").unwrap_or_else(|| panic!("{parent}"));
-    assert!(drop_fk < drop_pk, "the foreign key goes before the key it holds:\n{parent}");
+    assert!(
+        drop_fk < drop_pk,
+        "the foreign key goes before the key it holds:\n{parent}"
+    );
 
     design
         .reconcile(&*adapter, false, true, false, None, Progress::none())
@@ -4193,7 +4203,13 @@ async fn reconcile_keeps_a_foreign_key_across_a_key_change() {
         .reconcile(&*adapter, false, true, false, None, Progress::none())
         .await
         .expect("the key change reconciles");
-    assert_catalog(&*adapter, true, &constraint_predicate("parent", "PRIMARY KEY (id)"), "the new key").await;
+    assert_catalog(
+        &*adapter,
+        true,
+        &constraint_predicate("parent", "PRIMARY KEY (id)"),
+        "the new key",
+    )
+    .await;
     assert_catalog(
         &*adapter,
         true,
@@ -4246,7 +4262,13 @@ async fn a_key_change_that_fails_later_leaves_the_key_as_it_was() {
         "the old primary key",
     )
     .await;
-    assert_catalog(&*adapter, false, &column_predicate("app", "parent", "branch"), "parent.branch").await;
+    assert_catalog(
+        &*adapter,
+        false,
+        &column_predicate("app", "parent", "branch"),
+        "parent.branch",
+    )
+    .await;
     assert_catalog(
         &*adapter,
         true,
@@ -4294,7 +4316,13 @@ async fn a_key_held_from_outside_the_design_is_refused() {
         "the old primary key",
     )
     .await;
-    assert_catalog(&*adapter, false, &column_predicate("app", "child", "branch"), "child.branch").await;
+    assert_catalog(
+        &*adapter,
+        false,
+        &column_predicate("app", "child", "branch"),
+        "child.branch",
+    )
+    .await;
 }
 
 // ── Reconcile convergence: comments and keyword defaults ──────────────────────

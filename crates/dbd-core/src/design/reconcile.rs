@@ -167,11 +167,21 @@ impl Design {
     /// transaction is not a drop-in here — an enum value added by `ALTER TYPE …
     /// ADD VALUE` cannot be used until its transaction commits, and a later
     /// default or CHECK naming that value in the same batch would fail.
+    ///
+    /// The exception is a key change a foreign key holds (#65; see
+    /// [`crate::reconcile::plan_key_holders`]): `key_spans` pairs the table whose
+    /// key changes with one whose own step adds back the foreign key the design
+    /// replaced. Those steps, and every step between, run in one transaction where
+    /// the adapter has them — a failure in the second leaves the first's key as
+    /// it was, not a key without the foreign keys that held it. An enum gaining a
+    /// value between them is altered before the transaction opens: it depends on
+    /// nothing in it, and a value added inside could not be used there.
     #[allow(clippy::too_many_arguments)]
     async fn execute_reconcile_writes<S, D>(
         &self,
         adapter: &dyn DatabaseAdapter,
         plan: &crate::reconcile::ReconcilePlan,
+        key_spans: &[(String, String)],
         desired_entities: &[&Entity],
         managed_schemas: &std::collections::HashSet<String>,
         mv_to_create: &[(&Entity, String)],
@@ -183,7 +193,7 @@ impl Design {
         S: FnMut(&str),
         D: FnMut(&str, Option<&str>),
     {
-        use crate::reconcile::{ReconcileComplete, matview_create_sql, matview_stamp, qualified_entity_name};
+        use crate::reconcile::{ReconcileComplete, matview_stamp, qualified_entity_name};
         use std::collections::{HashMap, HashSet};
 
         let added: HashSet<&str> = plan.added.iter().map(|s| s.as_str()).collect();
@@ -205,70 +215,90 @@ impl Design {
         // resolve the same way they do when the DDL file runs.
         let search_path = search_path_prelude(managed_schemas);
 
-        for e in desired_entities {
-            let n = qualified_entity_name(e);
-            match e.entity_type {
-                // Prerequisites and code objects: idempotent DDL (`IF NOT
-                // EXISTS` / `CREATE OR REPLACE`), re-applied on every run.
-                EntityType::Schema
-                | EntityType::Extension
-                | EntityType::Role
-                | EntityType::Sequence
-                | EntityType::View
-                | EntityType::Function
-                | EntityType::Procedure => {
-                    let desc = format!("{}:{}", e.entity_type.tag(), e.name);
-                    on_start(&desc);
-                    let result = adapter.apply_entity(e).await;
-                    report_step_result(&desc, on_done, result)?;
-                    summary.reapplied += 1;
+        // The runs of steps a key change spans, by position, overlapping ones
+        // merged — only where the adapter can hold them in one transaction.
+        let position: HashMap<String, usize> = desired_entities
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (qualified_entity_name(e), i))
+            .collect();
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        if adapter.supports_transactional_apply() {
+            let mut spans: Vec<(usize, usize)> = key_spans
+                .iter()
+                .filter_map(|(a, b)| {
+                    let (i, j) = (*position.get(a)?, *position.get(b)?);
+                    Some((i.min(j), i.max(j)))
+                })
+                .collect();
+            spans.sort_unstable();
+            for (start, end) in spans {
+                match runs.last_mut() {
+                    Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                    _ => runs.push((start, end)),
                 }
-                // Tables and enums are diffed: a full create when new, the
-                // generated ALTERs when changed, nothing when in sync.
-                EntityType::Enum | EntityType::Table => {
-                    if added.contains(n.as_str()) {
-                        let desc = format!("{}:{}", e.entity_type.tag(), e.name);
+            }
+        }
+        // An enum's ALTER adding a value, run ahead of the transaction it falls in.
+        let adds_a_value = |e: &Entity| {
+            e.entity_type == EntityType::Enum
+                && alter_sql
+                    .get(qualified_entity_name(e).as_str())
+                    .is_some_and(|sql| sql.contains("ADD VALUE"))
+        };
+        let mut ran_ahead: HashSet<usize> = HashSet::new();
+        // The open transaction: where it ends, and the step it began with.
+        let mut open: Option<(usize, String)> = None;
+
+        for (i, e) in desired_entities.iter().enumerate() {
+            if let Some(&(start, end)) = runs.iter().find(|(start, _)| *start == i) {
+                for (k, ahead) in desired_entities.iter().enumerate().take(end + 1).skip(start) {
+                    if adds_a_value(ahead) {
+                        let n = qualified_entity_name(ahead);
+                        let desc = format!("alter {}:{n}", ahead.entity_type.tag());
                         on_start(&desc);
-                        let result = adapter.apply_entity(e).await;
-                        report_step_result(&desc, on_done, result)?;
-                        summary.created += 1;
-                    }
-                    if let Some(sql) = alter_sql.get(n.as_str()) {
-                        let desc = format!("alter {}:{n}", e.entity_type.tag());
-                        on_start(&desc);
-                        let script = format!("{search_path}{sql}");
+                        let script = format!("{search_path}{}", alter_sql[n.as_str()]);
                         let result = adapter.execute_script(&script).await;
                         report_step_result(&desc, on_done, result)?;
                         summary.altered += 1;
+                        ran_ahead.insert(k);
                     }
                 }
-                // A matview detection found absent. Postgres has no `CREATE OR
-                // REPLACE MATERIALIZED VIEW`, so one that exists is left alone
-                // (see `detect_reconcile_matviews`). The CREATE carries the same
-                // `search_path` prelude the ALTERs use.
-                EntityType::MaterializedView => {
-                    let Some(want) = mv_create.get(e.name.as_str()) else {
-                        continue;
-                    };
-                    let desc = format!("{}:{}", e.entity_type.tag(), e.name);
-                    on_start(&desc);
-                    // A file that states no path was read against
-                    // `source.search_path`, so its body is created on that path
-                    // — as `apply` runs the file — not on the managed-schema one.
-                    let prelude = crate::script::project_search_path(e)
-                        .map(|set| format!("{set}\n"))
-                        .unwrap_or_else(|| search_path.clone());
-                    let result = match adapter
-                        .execute_script(&format!("{prelude}{}", matview_create_sql(e)))
-                        .await
-                    {
-                        Ok(()) => adapter.stamp_matview(&n, &matview_stamp(want)).await,
-                        err => err,
-                    };
-                    report_step_result(&desc, on_done, result)?;
-                    summary.reapplied += 1;
-                }
-                _ => {}
+                adapter.begin_batch().await?;
+                open = Some((end, format!("{}:{}", e.entity_type.tag(), e.name)));
+            }
+            if ran_ahead.contains(&i) {
+                continue;
+            }
+            let step: Result<()> = async {
+                self.reconcile_step(
+                    adapter,
+                    e,
+                    &added,
+                    &alter_sql,
+                    &mv_create,
+                    &search_path,
+                    &mut summary,
+                    on_start,
+                    on_done,
+                )
+                .await
+            }
+            .await;
+            if let Err(err) = step {
+                let Some((_, first)) = open else {
+                    return Err(err);
+                };
+                // Best-effort: the original failure is the one to report.
+                let _ = adapter.rollback_batch().await;
+                return Err(DbdError::Config(format!(
+                    "{err} — rolled back with the steps from {first} on, which a key change runs as one: \
+                     the key is as it was"
+                )));
+            }
+            if open.as_ref().is_some_and(|(end, _)| *end == i) {
+                adapter.commit_batch().await?;
+                open = None;
             }
         }
 
@@ -289,6 +319,94 @@ impl Design {
         }
 
         Ok(summary)
+    }
+
+    /// One entity's step of [`Self::execute_reconcile_writes`]: re-apply a
+    /// prerequisite or code object; create, then alter, a table or enum; create
+    /// an absent materialized view and stamp it.
+    #[allow(clippy::too_many_arguments)]
+    async fn reconcile_step<S, D>(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        e: &Entity,
+        added: &std::collections::HashSet<&str>,
+        alter_sql: &std::collections::HashMap<&str, &str>,
+        mv_create: &std::collections::HashMap<&str, &str>,
+        search_path: &str,
+        summary: &mut crate::reconcile::ReconcileComplete,
+        on_start: &mut S,
+        on_done: &mut D,
+    ) -> Result<()>
+    where
+        S: FnMut(&str),
+        D: FnMut(&str, Option<&str>),
+    {
+        use crate::reconcile::{matview_create_sql, matview_stamp, qualified_entity_name};
+        let n = qualified_entity_name(e);
+        match e.entity_type {
+            // Prerequisites and code objects: idempotent DDL (`IF NOT
+            // EXISTS` / `CREATE OR REPLACE`), re-applied on every run.
+            EntityType::Schema
+            | EntityType::Extension
+            | EntityType::Role
+            | EntityType::Sequence
+            | EntityType::View
+            | EntityType::Function
+            | EntityType::Procedure => {
+                let desc = format!("{}:{}", e.entity_type.tag(), e.name);
+                on_start(&desc);
+                let result = adapter.apply_entity(e).await;
+                report_step_result(&desc, &mut *on_done, result)?;
+                summary.reapplied += 1;
+            }
+            // Tables and enums are diffed: a full create when new, the
+            // generated ALTERs when changed, nothing when in sync.
+            EntityType::Enum | EntityType::Table => {
+                if added.contains(n.as_str()) {
+                    let desc = format!("{}:{}", e.entity_type.tag(), e.name);
+                    on_start(&desc);
+                    let result = adapter.apply_entity(e).await;
+                    report_step_result(&desc, &mut *on_done, result)?;
+                    summary.created += 1;
+                }
+                if let Some(sql) = alter_sql.get(n.as_str()) {
+                    let desc = format!("alter {}:{n}", e.entity_type.tag());
+                    on_start(&desc);
+                    let script = format!("{search_path}{sql}");
+                    let result = adapter.execute_script(&script).await;
+                    report_step_result(&desc, &mut *on_done, result)?;
+                    summary.altered += 1;
+                }
+            }
+            // A matview detection found absent. Postgres has no `CREATE OR
+            // REPLACE MATERIALIZED VIEW`, so one that exists is left alone
+            // (see `detect_reconcile_matviews`). The CREATE carries the same
+            // `search_path` prelude the ALTERs use.
+            EntityType::MaterializedView => {
+                let Some(want) = mv_create.get(e.name.as_str()) else {
+                    return Ok(());
+                };
+                let desc = format!("{}:{}", e.entity_type.tag(), e.name);
+                on_start(&desc);
+                // A file that states no path was read against
+                // `source.search_path`, so its body is created on that path
+                // — as `apply` runs the file — not on the managed-schema one.
+                let prelude = crate::script::project_search_path(e)
+                    .map(|set| format!("{set}\n"))
+                    .unwrap_or_else(|| search_path.to_string());
+                let result = match adapter
+                    .execute_script(&format!("{prelude}{}", matview_create_sql(e)))
+                    .await
+                {
+                    Ok(()) => adapter.stamp_matview(&n, &matview_stamp(want)).await,
+                    err => err,
+                };
+                report_step_result(&desc, &mut *on_done, result)?;
+                summary.reapplied += 1;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// Prune the orphans `plan` drops — claimed and dropped in one
@@ -553,6 +671,22 @@ impl Design {
         // What another owner depends on: a prune keeps it, a dropped part is
         // refused — before any write, dry run included (#7).
         self.guard_uses(adapter, &mut plan).await?;
+        // A key a foreign key holds: the foreign keys go first, and one on a
+        // table this design does not declare refuses the change — after the
+        // guard above, which names another project's use of it (#65).
+        let pruned: std::collections::HashSet<String> = if prune == ownership::Prune::Off {
+            Default::default()
+        } else {
+            plan.dropped.iter().map(|s| s.entity_name.clone()).collect()
+        };
+        let key_spans = crate::reconcile::plan_key_holders(
+            &mut plan,
+            &live,
+            &desired,
+            &raw_snapshot_from_entities(&live_entities),
+            &desired_raw,
+            &pruned,
+        )?;
 
         if dry_run {
             // Checked as the run checks them, executing none: a hook file that
@@ -585,6 +719,7 @@ impl Design {
             .execute_reconcile_writes(
                 adapter,
                 &plan,
+                &key_spans,
                 &desired_entities,
                 &managed_schemas,
                 &mv_to_create,

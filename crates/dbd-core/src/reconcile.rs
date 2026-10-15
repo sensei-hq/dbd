@@ -1126,6 +1126,231 @@ pub fn plan_fk_convergence(plan: &mut ReconcilePlan, live: &Snapshot, desired: &
     }
 }
 
+// ── Keys foreign keys hold (#65) ────────────────────────────
+
+/// Drop, before a key changes, the foreign keys that hold it (#65).
+///
+/// Postgres refuses to drop a primary key or a unique constraint while a
+/// foreign key references it, and a column of one while a foreign key reads
+/// it — `cannot drop constraint parent_pkey … because other objects depend on
+/// it` — so a design changing a table's key failed at the key's own step. For
+/// each table whose key or key column the diff of `live` and `desired` (the
+/// canonical snapshots [`plan_reconcile`] compared) drops, every foreign key in
+/// `live_all` (the raw live snapshot, every schema, hidden tables included)
+/// that references it is dropped at the start of that table's step:
+///
+/// - one the design keeps — the same shape on the same table in `desired_raw`
+///   — is added back at the end of the step, once the key it references is
+///   there again, so the change is one statement Postgres runs whole;
+/// - one the design replaces is added back by its own table's step (see
+///   [`plan_fk_convergence`]), after the columns it needs. The pair is
+///   returned — the changed table, then the one re-adding — for the caller to
+///   run those steps, and what lies between, in one transaction;
+/// - one on a table the run prunes (in `pruned`) is simply dropped;
+/// - one on a table this design does not declare — another project's, one a
+///   scope leaves out, one nobody declares — is never dropped by dbd: the
+///   change is refused, naming the key and every foreign key holding it.
+pub(crate) fn plan_key_holders(
+    plan: &mut ReconcilePlan,
+    live: &Snapshot,
+    desired: &Snapshot,
+    live_all: &Snapshot,
+    desired_raw: &Snapshot,
+    pruned: &HashSet<String>,
+) -> crate::error::Result<Vec<(String, String)>> {
+    use crate::diff::{FieldChange, FieldDetail, FieldType};
+
+    let qualified = |t: &TableSnapshot| format!("{}.{}", t.schema, t.name);
+    let desired_tables: HashMap<String, &TableSnapshot> =
+        desired_raw.tables.iter().map(|t| (qualified(t), t)).collect();
+    let live_tables: HashMap<String, &TableSnapshot> = live.tables.iter().map(|t| (qualified(t), t)).collect();
+    let fk_sql = |table: &str, change: ChangeAction| {
+        diff::generate_migration_sql(&[MigrationDiff {
+            entity_name: table.to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(vec![FieldChange {
+                field_name: String::new(),
+                field_type: FieldType::Constraint,
+                action: change,
+            }]),
+        }])
+    };
+
+    let mut spans: Vec<(String, String)> = Vec::new();
+    let mut refusals: Vec<String> = Vec::new();
+    let mut outside_count = 0;
+    for d in diff::diff(live, desired) {
+        let DiffAction::Change(changes) = &d.action else {
+            continue;
+        };
+        let changed = d.entity_name.as_str();
+        // What the diff drops: the keys, by their columns, and the columns.
+        let mut keys: Vec<(String, Vec<String>)> = Vec::new();
+        let mut columns: HashSet<&str> = HashSet::new();
+        for c in changes {
+            let ChangeAction::Drop(detail) = &c.action else {
+                continue;
+            };
+            match detail.as_ref() {
+                FieldDetail::Constraint(TableConstraint::PrimaryKey { name, columns }) => {
+                    keys.push((key_label("primary key", name, columns), columns.clone()))
+                }
+                FieldDetail::Constraint(TableConstraint::Unique { name, columns, .. }) => {
+                    keys.push((key_label("unique key", name, columns), columns.clone()))
+                }
+                _ if c.field_type == FieldType::Column => {
+                    columns.insert(c.field_name.as_str());
+                }
+                _ => {}
+            }
+        }
+        if keys.is_empty() && columns.is_empty() {
+            continue;
+        }
+        // A foreign key naming no columns references the primary key.
+        let primary_key: Vec<String> = live_tables
+            .get(changed)
+            .and_then(|t| {
+                t.table_constraints.iter().find_map(|c| match c {
+                    TableConstraint::PrimaryKey { columns, .. } => Some(columns.clone()),
+                    _ => None,
+                })
+            })
+            .unwrap_or_default();
+
+        let mut drops: Vec<String> = Vec::new();
+        let mut adds: Vec<String> = Vec::new();
+        let mut outside: Vec<String> = Vec::new();
+        let mut what_held: Vec<String> = Vec::new();
+        for holder in &live_all.tables {
+            let holder_name = qualified(holder);
+            for fk in table_fks(holder) {
+                let ref_schema = fk.ref_schema.clone().unwrap_or_else(|| holder.schema.clone());
+                if format!("{ref_schema}.{}", fk.ref_table) != changed {
+                    continue;
+                }
+                let refs: Vec<String> = if fk.ref_columns.is_empty() {
+                    primary_key.clone()
+                } else {
+                    fk.ref_columns.clone()
+                };
+                let same_set = |key: &[String]| key.len() == refs.len() && key.iter().all(|k| refs.contains(k));
+                let held = keys
+                    .iter()
+                    .filter(|(_, key)| same_set(key))
+                    .map(|(label, _)| label.clone())
+                    .chain(
+                        refs.iter()
+                            .filter(|c| columns.contains(c.as_str()))
+                            .map(|c| format!("column {c}")),
+                    )
+                    .collect::<Vec<_>>();
+                if held.is_empty() {
+                    continue;
+                }
+                let Some(declared) = desired_tables.get(&holder_name) else {
+                    if pruned.contains(&holder_name) {
+                        drops.push(fk_sql(
+                            &holder_name,
+                            ChangeAction::Drop(Box::new(FieldDetail::Constraint(TableConstraint::ForeignKey(
+                                fk.clone(),
+                            )))),
+                        ));
+                    } else {
+                        for h in held {
+                            if !what_held.contains(&h) {
+                                what_held.push(h);
+                            }
+                        }
+                        outside.push(format!(
+                            "{holder_name} ({})",
+                            fk.name.as_deref().unwrap_or("an unnamed foreign key")
+                        ));
+                    }
+                    continue;
+                };
+                drops.push(fk_sql(
+                    &holder_name,
+                    ChangeAction::Drop(Box::new(FieldDetail::Constraint(TableConstraint::ForeignKey(
+                        fk.clone(),
+                    )))),
+                ));
+                let shape = fk_shape(&fk);
+                if let Some(kept) = table_fks(declared).into_iter().find(|f| fk_shape(f) == shape) {
+                    adds.push(fk_sql(
+                        &holder_name,
+                        ChangeAction::Add(Box::new(FieldDetail::Constraint(TableConstraint::ForeignKey(kept)))),
+                    ));
+                } else if holder_name != changed && replaces_a_key_to(declared, holder, changed) {
+                    // Replaced: the holder's own step adds what the design
+                    // declares now, and must run with this one.
+                    let span = (changed.to_string(), holder_name.clone());
+                    if !spans.contains(&span) {
+                        spans.push(span);
+                    }
+                }
+            }
+        }
+        if !outside.is_empty() {
+            outside_count += outside.len();
+            refusals.push(format!(
+                "{changed}'s {} — held by {}",
+                what_held.join(", "),
+                outside.join(", ")
+            ));
+            continue;
+        }
+        if drops.is_empty() {
+            continue;
+        }
+        let drops = drops.join("\n");
+        match plan.altered.iter_mut().find(|s| s.entity_name == changed) {
+            Some(stmt) => stmt.sql = format!("{drops}\n{}", stmt.sql),
+            None => plan.altered.push(ReconcileStatement {
+                entity_name: changed.to_string(),
+                sql: drops,
+            }),
+        }
+        if !adds.is_empty() {
+            merge_altered_sql(plan, changed, adds.join("\n"));
+        }
+    }
+
+    if !refusals.is_empty() {
+        return Err(crate::error::DbdError::Config(format!(
+            "reconcile cannot change a key that a foreign key on a table outside this run holds: {}. \
+             dbd drops no foreign key on a table it does not reconcile — another project's, another \
+             module's, one the scope leaves out, one no design declares — so nothing was changed. Drop \
+             {} by hand and re-run; reconcile adds back a foreign key its design declares.",
+            refusals.join("; "),
+            if outside_count == 1 {
+                "that foreign key"
+            } else {
+                "those foreign keys"
+            }
+        )));
+    }
+    Ok(spans)
+}
+
+/// Whether `declared` — a table as the design declares it — adds a foreign key
+/// to `target` that `live`, the same table as it is, does not have.
+fn replaces_a_key_to(declared: &TableSnapshot, live: &TableSnapshot, target: &str) -> bool {
+    let live_shapes: HashSet<FkShape> = table_fks(live).iter().map(fk_shape).collect();
+    table_fks(declared).iter().any(|fk| {
+        let schema = fk.ref_schema.as_deref().unwrap_or(&declared.schema);
+        format!("{schema}.{}", fk.ref_table) == target && !live_shapes.contains(&fk_shape(fk))
+    })
+}
+
+/// `primary key parent_pkey (owner_id, path)` — a key as a refusal names it.
+fn key_label(kind: &str, name: &Option<String>, columns: &[String]) -> String {
+    match name {
+        Some(name) => format!("{kind} {name} ({})", columns.join(", ")),
+        None => format!("{kind} ({})", columns.join(", ")),
+    }
+}
+
 // ── CHECK convergence ───────────────────────────────────────
 
 /// A table's CHECK constraints, keyed by canonical expression.
@@ -4978,7 +5203,11 @@ mod key_holder_tests {
 
     /// What `Design::reconcile` plans for these raw snapshots, key holders
     /// included: the canonical diff, then the foreign keys, then the holders.
-    fn plan(live: &Snapshot, desired: &Snapshot, pruned: &[&str]) -> (ReconcilePlan, crate::error::Result<Vec<(String, String)>>) {
+    fn plan(
+        live: &Snapshot,
+        desired: &Snapshot,
+        pruned: &[&str],
+    ) -> (ReconcilePlan, crate::error::Result<Vec<(String, String)>>) {
         let (mut live_c, mut desired_c) = (live.clone(), desired.clone());
         canonicalize(&mut live_c);
         canonicalize(&mut desired_c);
@@ -5006,24 +5235,42 @@ mod key_holder_tests {
     /// foreign key follows it.
     fn rekeyed_pair() -> (Snapshot, Snapshot) {
         let live = snap(vec![
-            table("app.parent", &["owner_id", "path"], vec![pk(Some("parent_pkey"), &["owner_id", "path"])]),
+            table(
+                "app.parent",
+                &["owner_id", "path"],
+                vec![pk(Some("parent_pkey"), &["owner_id", "path"])],
+            ),
             table(
                 "app.child",
                 &["id", "owner_id", "path"],
                 vec![
                     pk(Some("child_pkey"), &["id"]),
-                    fk(Some("child_owner_id_path_fkey"), &["owner_id", "path"], "app.parent", &["owner_id", "path"]),
+                    fk(
+                        Some("child_owner_id_path_fkey"),
+                        &["owner_id", "path"],
+                        "app.parent",
+                        &["owner_id", "path"],
+                    ),
                 ],
             ),
         ]);
         let desired = snap(vec![
-            table("app.parent", &["owner_id", "branch", "path"], vec![pk(None, &["owner_id", "branch", "path"])]),
+            table(
+                "app.parent",
+                &["owner_id", "branch", "path"],
+                vec![pk(None, &["owner_id", "branch", "path"])],
+            ),
             table(
                 "app.child",
                 &["id", "owner_id", "branch", "path"],
                 vec![
                     pk(None, &["id"]),
-                    fk(None, &["owner_id", "branch", "path"], "app.parent", &["owner_id", "branch", "path"]),
+                    fk(
+                        None,
+                        &["owner_id", "branch", "path"],
+                        "app.parent",
+                        &["owner_id", "branch", "path"],
+                    ),
                 ],
             ),
         ]);
@@ -5036,8 +5283,10 @@ mod key_holder_tests {
         let (plan, spans) = plan(&live, &desired, &[]);
         let sql = sql_of(&plan, "app.parent");
         assert!(
-            at(sql, "ALTER TABLE app.child DROP CONSTRAINT IF EXISTS \"child_owner_id_path_fkey\"")
-                < at(sql, "DROP CONSTRAINT IF EXISTS \"parent_pkey\""),
+            at(
+                sql,
+                "ALTER TABLE app.child DROP CONSTRAINT IF EXISTS \"child_owner_id_path_fkey\""
+            ) < at(sql, "DROP CONSTRAINT IF EXISTS \"parent_pkey\""),
             "{sql}"
         );
         // The design replaced that key: the child's own step adds the new
@@ -5062,7 +5311,11 @@ mod key_holder_tests {
             )
         };
         let live = snap(vec![
-            table("app.parent", &["id", "owner_id", "path"], vec![pk(Some("parent_pkey"), &["owner_id", "path"])]),
+            table(
+                "app.parent",
+                &["id", "owner_id", "path"],
+                vec![pk(Some("parent_pkey"), &["owner_id", "path"])],
+            ),
             child(Some("child_owner_id_path_fkey")),
         ]);
         let desired = snap(vec![
@@ -5075,9 +5328,15 @@ mod key_holder_tests {
         ]);
         let (plan, spans) = plan(&live, &desired, &[]);
         let sql = sql_of(&plan, "app.parent");
-        let drop = at(sql, "ALTER TABLE app.child DROP CONSTRAINT IF EXISTS \"child_owner_id_path_fkey\"");
+        let drop = at(
+            sql,
+            "ALTER TABLE app.child DROP CONSTRAINT IF EXISTS \"child_owner_id_path_fkey\"",
+        );
         assert!(drop < at(sql, "DROP CONSTRAINT IF EXISTS \"parent_pkey\""), "{sql}");
-        let add = at(sql, "ALTER TABLE app.child ADD FOREIGN KEY (owner_id, path) REFERENCES app.parent(owner_id, path)");
+        let add = at(
+            sql,
+            "ALTER TABLE app.child ADD FOREIGN KEY (owner_id, path) REFERENCES app.parent(owner_id, path)",
+        );
         assert!(at(sql, "UNIQUE (owner_id, path)") < add, "{sql}");
         assert!(at(sql, "PRIMARY KEY (id)") < add, "{sql}");
         assert!(!plan.altered.iter().any(|s| s.entity_name == "app.child"), "{plan:?}");
@@ -5090,8 +5349,19 @@ mod key_holder_tests {
     #[test]
     fn a_key_column_dropped_drops_the_foreign_keys_on_it_first() {
         let live = snap(vec![
-            table("app.parent", &["id", "code"], vec![pk(Some("parent_pkey"), &["id"]), unique(Some("parent_code_key"), &["code"])]),
-            table("app.child", &["id", "code"], vec![fk(Some("child_code_fkey"), &["code"], "app.parent", &["code"])]),
+            table(
+                "app.parent",
+                &["id", "code"],
+                vec![
+                    pk(Some("parent_pkey"), &["id"]),
+                    unique(Some("parent_code_key"), &["code"]),
+                ],
+            ),
+            table(
+                "app.child",
+                &["id", "code"],
+                vec![fk(Some("child_code_fkey"), &["code"], "app.parent", &["code"])],
+            ),
         ]);
         let desired = snap(vec![
             table("app.parent", &["id"], vec![pk(None, &["id"])]),
@@ -5100,7 +5370,10 @@ mod key_holder_tests {
         let (plan, spans) = plan(&live, &desired, &[]);
         let sql = sql_of(&plan, "app.parent");
         assert!(
-            at(sql, "ALTER TABLE app.child DROP CONSTRAINT IF EXISTS \"child_code_fkey\"") < at(sql, "DROP COLUMN"),
+            at(
+                sql,
+                "ALTER TABLE app.child DROP CONSTRAINT IF EXISTS \"child_code_fkey\""
+            ) < at(sql, "DROP COLUMN"),
             "{sql}"
         );
         assert!(!sql.contains("ADD FOREIGN KEY"), "{sql}");
@@ -5130,7 +5403,10 @@ mod key_holder_tests {
         let sql = sql_of(&plan, "app.node");
         let drop_fk = at(sql, "DROP CONSTRAINT IF EXISTS \"node_parent_id_fkey\"");
         assert!(drop_fk < at(sql, "DROP CONSTRAINT IF EXISTS \"node_pkey\""), "{sql}");
-        assert!(at(sql, "PRIMARY KEY (tenant, id)") < at(sql, "ADD FOREIGN KEY (tenant, parent_id)"), "{sql}");
+        assert!(
+            at(sql, "PRIMARY KEY (tenant, id)") < at(sql, "ADD FOREIGN KEY (tenant, parent_id)"),
+            "{sql}"
+        );
         assert!(spans.unwrap().is_empty());
     }
 
@@ -5144,7 +5420,12 @@ mod key_holder_tests {
         live.tables.push(table(
             "ext.audit",
             &["owner_id", "path"],
-            vec![fk(Some("audit_owner_id_path_fkey"), &["owner_id", "path"], "app.parent", &["owner_id", "path"])],
+            vec![fk(
+                Some("audit_owner_id_path_fkey"),
+                &["owner_id", "path"],
+                "app.parent",
+                &["owner_id", "path"],
+            )],
         ));
         let (_, spans) = plan(&live, &desired, &[]);
         let message = spans.unwrap_err().to_string();
@@ -5161,13 +5442,20 @@ mod key_holder_tests {
         live.tables.push(table(
             "app.orphan",
             &["owner_id", "path"],
-            vec![fk(Some("orphan_owner_id_path_fkey"), &["owner_id", "path"], "app.parent", &["owner_id", "path"])],
+            vec![fk(
+                Some("orphan_owner_id_path_fkey"),
+                &["owner_id", "path"],
+                "app.parent",
+                &["owner_id", "path"],
+            )],
         ));
         let (plan, spans) = plan(&live, &desired, &["app.orphan"]);
         let sql = sql_of(&plan, "app.parent");
         assert!(
-            at(sql, "ALTER TABLE app.orphan DROP CONSTRAINT IF EXISTS \"orphan_owner_id_path_fkey\"")
-                < at(sql, "DROP CONSTRAINT IF EXISTS \"parent_pkey\""),
+            at(
+                sql,
+                "ALTER TABLE app.orphan DROP CONSTRAINT IF EXISTS \"orphan_owner_id_path_fkey\""
+            ) < at(sql, "DROP CONSTRAINT IF EXISTS \"parent_pkey\""),
             "{sql}"
         );
         assert!(!sql.contains("app.orphan ADD"), "{sql}");
