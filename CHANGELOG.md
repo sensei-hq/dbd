@@ -30,22 +30,27 @@ since `CREATE OR REPLACE` cannot change one.
   refused before any write, `--dry-run` included, naming it.
 - **A migration changes a key a foreign key holds.** A version's migration of
   the table whose key changes drops the foreign keys holding it first and adds
-  back the ones the design keeps. On a `postgres` or `supabase` target, a
-  primary key, unique key or foreign key the design left unnamed is dropped by
-  the name the catalog has for it; it was a comment saying to drop it by hand,
-  and the `ADD PRIMARY KEY` after it failed with `multiple primary keys`.
+  back the ones the design keeps. When the migrations will run on PostgreSQL —
+  as the URL `-d`/`DATABASE_URL` or the target's `url:` names, or a target
+  called `postgres` or `supabase` — a primary key, unique key or foreign key
+  the design left unnamed is dropped by the name the catalog has for it; it was
+  a comment saying to drop it by hand, and the `ADD PRIMARY KEY` after it
+  failed with `multiple primary keys`. A foreign key naming no columns is added
+  as it was written, not as `REFERENCES t()`.
 - **A function or procedure `CREATE OR REPLACE` cannot change** — a new return
   type, a renamed parameter, a parameter's default removed, a function turned
   procedure — is dropped and created again in one transaction by `reconcile`
   and `apply`, when it is the only routine of its name and nothing depends on
-  it; otherwise the run fails naming the routines of that name or what depends
-  on it. A grant or comment its file does not make goes with it.
+  it — its grants, owner and comment put back, as a replace would have kept
+  them; otherwise the run fails naming the routines of that name or what
+  depends on it. A file running its own `BEGIN` … `COMMIT` runs as before.
 
 ### Added
 
 - **Library API**: `snapshot::{MigrationDialect, create_snapshot_in,
-  prepare_multi_snapshot_in}` — the existing snapshot functions write
-  `MigrationDialect::Portable` — and the `DatabaseAdapter` methods
+  prepare_multi_snapshot_in}` — `MigrationDialect::of(url, target)`; the
+  existing snapshot functions write `MigrationDialect::Portable` — and the
+  `DatabaseAdapter` methods
   `bound_lock_waits` and `foreign_keys_to`, each with a default an adapter
   written before keeps working with.
 
