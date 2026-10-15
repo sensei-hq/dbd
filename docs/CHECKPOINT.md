@@ -12,15 +12,16 @@ return type changes; then the patch 0.27.1. Branch `fix/65-key-change`
   the plan drops before it, adds back the ones the design keeps, refuses one
   on a table outside the run; `execute_reconcile_writes` runs the key change
   and the step re-adding a replaced foreign key in one transaction.
+- Slice 2 (functions): Postgres `apply_routine` drops and re-creates a routine
+  `CREATE OR REPLACE` refuses (42P13/42809) when it is the only one of its
+  name and nothing depends on it — reconcile and apply (savepoint in a batch).
 
 ## Next
 
-1. Review slice 1 (failure modes, data correctness).
-2. Slice 2: Postgres `apply_entity` drops and re-creates a routine
-   `CREATE OR REPLACE` refuses (42P13/42809, one overload), naming dependents.
-3. Slice 3: snapshot migrations — an unnamed key dropped by catalog lookup;
+1. Review slices 1 and 2 (failure modes, data correctness).
+2. Slice 3: snapshot migrations — an unnamed key dropped by catalog lookup;
    the foreign keys holding a dropped key dropped first, kept ones re-added.
-4. Docs (guide reconcile/migrations, CHANGELOG), `make bump` patch 0.27.1.
+3. Docs (guide reconcile/migrations, CHANGELOG), `make bump` patch 0.27.1.
 
 ## Open
 
