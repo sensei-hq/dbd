@@ -67,6 +67,14 @@ Read `project.released` in `design.yaml` and look for `snapshots/`:
   `dbd snapshot` has captured any change no snapshot records and with `project.version` matching
   the latest snapshot — it refuses otherwise.
 
+**In a workspace** (`design.yaml` declares `modules:`), the release state is each module's:
+`modules.<name>.released` and that module's own `snapshots/` (in its folder) — `project.version`
+and `project.released` are refused there. Judge each module on its own: `reconcile` leaves a
+released module out of a run that takes it in and refuses one `--module` names, so advising
+`reconcile` for a released module is the same violation as for a released project. A project
+being divided with `dbd split --from-scopes` must have no `snapshots/` or `migrations/` yet — the
+split refuses one that has.
+
 Establish this before judging the workflow, and state which one you concluded and why (the
 file evidence).
 
