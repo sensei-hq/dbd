@@ -4720,6 +4720,73 @@ async fn a_released_type_change_keeps_the_columns_values() {
     .await;
 }
 
+/// Every column of a released table cut to `bigint` at once — an identity
+/// primary key, a column with NOT NULL, a default and a CHECK, and one with a
+/// foreign key — keeps its values and its whole definition: once the
+/// migrations ran, the database is the design, as `diff` reads it, and the
+/// identity goes on past the rows already there. Each column's data script
+/// overwrote the one before it, and the swap left every column with its type
+/// and nothing else.
+#[tokio::test]
+async fn a_released_table_cut_to_bigint_keeps_every_columns_values_and_definition() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let reference = "create table if not exists app.ref (\n  id integer primary key\n);\n";
+    let line = |ty: &str| {
+        format!(
+            "create table if not exists app.line (\n  id {ty} generated always as identity primary key\n\
+             , qty {ty} not null default 0 check (qty >= 0)\n\
+             , ref_id {ty} references app.ref (id)\n);\n"
+        )
+    };
+    cut_rekey(dir, &[("ref", reference), ("line", &line("integer"))]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    adapter
+        .execute_script(
+            "INSERT INTO app.ref VALUES (1), (2); \
+             INSERT INTO app.line (qty, ref_id) VALUES (10, 1), (20, 2);",
+        )
+        .await
+        .unwrap();
+    cut_rekey(dir, &[("ref", reference), ("line", &line("bigint"))]);
+    let design = released(dir);
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("the type changes apply");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.line HAVING count(*) FILTER (WHERE id = 1 AND qty = 10 AND ref_id = 1) = 1 \
+         AND count(*) FILTER (WHERE id = 2 AND qty = 20 AND ref_id = 2) = 1",
+        "both rows, every value",
+    )
+    .await;
+    let diff = design.diff_live(&*adapter, None).await.expect("diff");
+    let touched: Vec<String> = diff
+        .changes
+        .iter()
+        .map(|c| format!("{:?} {}", c.action, c.entity_name))
+        .collect();
+    assert!(touched.is_empty(), "the database is the design: {touched:?}");
+    adapter
+        .execute_script("INSERT INTO app.line (qty) VALUES (30);")
+        .await
+        .expect("the identity goes on past the rows there");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.line WHERE qty = 30 AND id = 3",
+        "the next identity",
+    )
+    .await;
+}
+
 // ── A routine whose return type changes (#65) ─────────────────────────────────
 
 /// A project `routines` in a temporary folder with `files` (`(path, text)`).
