@@ -81,7 +81,7 @@ fn a_foreign_key_the_design_keeps_comes_back_after_the_new_key() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     let parent_v1 = "create table if not exists app.parent (\n  id uuid not null\n, owner_id uuid not null\n, path text not null\n, primary key (owner_id, path)\n);\n";
-    let parent_v2 = "create table if not exists app.parent (\n  id uuid primary key\n, owner_id uuid not null\n, path text not null\n, unique (owner_id, path)\n);\n";
+    let parent_v2 = "create table if not exists app.parent (\n  id uuid not null\n, owner_id uuid not null\n, path text not null\n, primary key (id)\n, unique (owner_id, path)\n);\n";
     cut(
         dir,
         &[("parent", parent_v1), ("child", CHILD_V1)],
@@ -100,6 +100,7 @@ fn a_foreign_key_the_design_keeps_comes_back_after_the_new_key() {
         "ALTER TABLE app.child ADD FOREIGN KEY (owner_id, path) REFERENCES app.parent(owner_id, path)",
     );
     assert!(at(&parent, "UNIQUE (owner_id, path)") < add, "{parent}");
+    assert!(at(&parent, "PRIMARY KEY (id)") < add, "{parent}");
     assert!(!dir.join("migrations/002/app/child.sql").exists());
 }
 

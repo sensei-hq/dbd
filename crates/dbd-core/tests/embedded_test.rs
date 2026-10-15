@@ -4580,7 +4580,9 @@ async fn a_released_key_change_a_foreign_key_holds_applies() {
 }
 
 /// A released surrogate-key switch keeping `(owner_id, path)` unique: the
-/// child's unchanged foreign key comes back over the rows already there.
+/// child's unchanged foreign key comes back over the rows already there. The
+/// new key is a table `PRIMARY KEY`, as a migration manages one: an inline
+/// flag's change is left to the author, the migration saying so.
 #[tokio::test]
 async fn a_released_key_change_keeps_the_foreign_key_the_design_keeps() {
     let (_pg, url) = start_pg().await;
@@ -4588,7 +4590,7 @@ async fn a_released_key_change_keeps_the_foreign_key_the_design_keeps() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     let parent_v1 = "create table if not exists app.parent (\n  id uuid not null default gen_random_uuid()\n, owner_id uuid not null\n, path text not null\n, primary key (owner_id, path)\n);\n";
-    let parent_v2 = "create table if not exists app.parent (\n  id uuid primary key default gen_random_uuid()\n, owner_id uuid not null\n, path text not null\n, unique (owner_id, path)\n);\n";
+    let parent_v2 = "create table if not exists app.parent (\n  id uuid not null default gen_random_uuid()\n, owner_id uuid not null\n, path text not null\n, primary key (id)\n, unique (owner_id, path)\n);\n";
     cut_rekey(dir, &[("parent", parent_v1), ("child", REKEY_CHILD_V1)]);
     released(dir)
         .apply(&*adapter, None, false, None, Progress::none())
