@@ -4463,6 +4463,123 @@ async fn a_function_with_overloads_is_not_dropped_to_change_its_return_type() {
     assert_catalog(&*adapter, true, &stats_returns("jsonb"), "the old return type").await;
 }
 
+// ── A released key change a foreign key holds (#65) ───────────────────────────
+
+/// Cut the next version of the `rekey` project in `dir` from `files` — tables
+/// under `ddl/table/app/` — with PostgreSQL's migrations.
+fn cut_rekey(dir: &std::path::Path, files: &[(&str, &str)]) {
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: rekey\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    for (table, ddl) in files {
+        std::fs::write(dir.join(format!("ddl/table/app/{table}.ddl")), ddl).unwrap();
+    }
+    let design = released(dir);
+    dbd_core::snapshot::create_snapshot_in(
+        design.entities(),
+        dir,
+        &dir.join("design.yaml"),
+        None,
+        "next",
+        dbd_core::snapshot::MigrationDialect::Postgres,
+    )
+    .unwrap();
+}
+
+/// The issue's repro on a released project: v2's migrations change the key
+/// and the foreign key holding it, and apply.
+#[tokio::test]
+async fn a_released_key_change_a_foreign_key_holds_applies() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    cut_rekey(dir, &[("parent", REKEY_PARENT_V1), ("child", REKEY_CHILD_V1)]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    cut_rekey(dir, &[("parent", REKEY_PARENT_V2), ("child", REKEY_CHILD_V2)]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v2's key change applies");
+    assert_catalog(
+        &*adapter,
+        true,
+        &constraint_predicate("parent", "PRIMARY KEY (owner_id, branch, path)"),
+        "the new primary key",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        &constraint_predicate(
+            "child",
+            "FOREIGN KEY (owner_id, branch, path) REFERENCES app.parent(owner_id, branch, path) ON DELETE CASCADE",
+        ),
+        "the new foreign key",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        false,
+        &constraint_predicate("parent", "PRIMARY KEY (owner_id, path)"),
+        "the old primary key",
+    )
+    .await;
+}
+
+/// A released surrogate-key switch keeping `(owner_id, path)` unique: the
+/// child's unchanged foreign key comes back over the rows already there.
+#[tokio::test]
+async fn a_released_key_change_keeps_the_foreign_key_the_design_keeps() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let parent_v1 = "create table if not exists app.parent (\n  id uuid not null default gen_random_uuid()\n, owner_id uuid not null\n, path text not null\n, primary key (owner_id, path)\n);\n";
+    let parent_v2 = "create table if not exists app.parent (\n  id uuid primary key default gen_random_uuid()\n, owner_id uuid not null\n, path text not null\n, unique (owner_id, path)\n);\n";
+    cut_rekey(dir, &[("parent", parent_v1), ("child", REKEY_CHILD_V1)]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    adapter
+        .execute_script(
+            "INSERT INTO app.parent (owner_id, path) VALUES ('00000000-0000-0000-0000-000000000001', 'a');\
+             INSERT INTO app.child (owner_id, path) VALUES ('00000000-0000-0000-0000-000000000001', 'a');",
+        )
+        .await
+        .unwrap();
+    cut_rekey(dir, &[("parent", parent_v2), ("child", REKEY_CHILD_V1)]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v2's key change applies");
+    assert_catalog(
+        &*adapter,
+        true,
+        &constraint_predicate("parent", "PRIMARY KEY (id)"),
+        "the new key",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        &constraint_predicate(
+            "child",
+            "FOREIGN KEY (owner_id, path) REFERENCES app.parent(owner_id, path) ON DELETE CASCADE",
+        ),
+        "the foreign key, back",
+    )
+    .await;
+    assert_catalog(&*adapter, true, "SELECT 1 FROM app.child", "the child's row").await;
+}
+
 // ── Reconcile convergence: comments and keyword defaults ──────────────────────
 
 /// Apply a design, then require reconcile to report NOTHING — the property both
