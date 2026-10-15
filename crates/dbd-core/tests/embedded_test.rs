@@ -4079,6 +4079,930 @@ async fn reconcile_converges_foreign_keys() {
     assert_catalog(&*adapter, false, fk_pred, "FK on app.children").await;
 }
 
+// ── Reconcile: a key a foreign key holds (#65) ────────────────────────────────
+
+/// A project `rekey` in a temporary folder, its tables written from `files`
+/// (`(table, ddl)` under `ddl/table/app/`). Returned with the folder, which
+/// must outlive the design.
+fn rekey_design(files: &[(&str, &str)]) -> (tempfile::TempDir, Design) {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: rekey\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    for (table, ddl) in files {
+        std::fs::write(dir.join(format!("ddl/table/app/{table}.ddl")), ddl).unwrap();
+    }
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design");
+    (tmp, design)
+}
+
+const REKEY_PARENT_V1: &str = "create table if not exists app.parent (\n  owner_id uuid not null\n, path text not null\n, primary key (owner_id, path)\n);\n";
+const REKEY_CHILD_V1: &str = "create table if not exists app.child (\n  id uuid primary key default gen_random_uuid()\n, owner_id uuid not null\n, path text\n, foreign key (owner_id, path) references app.parent(owner_id, path) on delete cascade\n);\n";
+const REKEY_PARENT_V2: &str = "create table if not exists app.parent (\n  owner_id uuid not null\n, branch text not null\n, path text not null\n, primary key (owner_id, branch, path)\n);\n";
+const REKEY_CHILD_V2: &str = "create table if not exists app.child (\n  id uuid primary key default gen_random_uuid()\n, owner_id uuid not null\n, branch text not null\n, path text\n, foreign key (owner_id, branch, path) references app.parent(owner_id, branch, path) on delete cascade\n);\n";
+
+/// A constraint of `app.<table>` whose definition `pg_get_constraintdef` reports as `def`.
+fn constraint_predicate(table: &str, def: &str) -> String {
+    format!(
+        "SELECT 1 FROM pg_constraint WHERE conrelid = 'app.{table}'::regclass \
+         AND pg_get_constraintdef(oid) = '{}'",
+        def.replace('\'', "''")
+    )
+}
+
+/// The issue's repro: `app.parent`'s primary key gains a column, and the
+/// foreign key `app.child` holds it by follows. Reconcile drops the foreign
+/// key before the key, and a second run plans nothing.
+#[tokio::test]
+async fn reconcile_changes_a_key_a_foreign_key_holds() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let (_v1, design) = rekey_design(&[("parent", REKEY_PARENT_V1), ("child", REKEY_CHILD_V1)]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("create");
+
+    let (_v2, design) = rekey_design(&[("parent", REKEY_PARENT_V2), ("child", REKEY_CHILD_V2)]);
+    let preview = design
+        .reconcile(&*adapter, true, true, false, None, Progress::none())
+        .await
+        .expect("dry run");
+    let parent = &preview
+        .altered
+        .iter()
+        .find(|s| s.entity_name == "app.parent")
+        .unwrap()
+        .sql;
+    let drop_fk = parent
+        .find("child_owner_id_path_fkey")
+        .unwrap_or_else(|| panic!("{parent}"));
+    let drop_pk = parent.find("parent_pkey").unwrap_or_else(|| panic!("{parent}"));
+    assert!(
+        drop_fk < drop_pk,
+        "the foreign key goes before the key it holds:\n{parent}"
+    );
+
+    design
+        .reconcile(&*adapter, false, true, false, None, Progress::none())
+        .await
+        .expect("the key change reconciles");
+    assert_catalog(
+        &*adapter,
+        true,
+        &constraint_predicate("parent", "PRIMARY KEY (owner_id, branch, path)"),
+        "the new primary key",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        &constraint_predicate(
+            "child",
+            "FOREIGN KEY (owner_id, branch, path) REFERENCES app.parent(owner_id, branch, path) ON DELETE CASCADE",
+        ),
+        "the new foreign key",
+    )
+    .await;
+
+    let again = design
+        .reconcile(&*adapter, true, true, false, None, Progress::none())
+        .await
+        .expect("second dry run");
+    assert!(again.altered.is_empty(), "converged: {:?}", again.altered);
+}
+
+/// `app.parent` takes a surrogate key and keeps `(owner_id, path)` unique, so
+/// `app.child`'s foreign key is unchanged: it is dropped for the key change
+/// and comes back, over the rows already there.
+#[tokio::test]
+async fn reconcile_keeps_a_foreign_key_across_a_key_change() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let parent_v1 = "create table if not exists app.parent (\n  id uuid not null default gen_random_uuid()\n, owner_id uuid not null\n, path text not null\n, primary key (owner_id, path)\n);\n";
+    let parent_v2 = "create table if not exists app.parent (\n  id uuid primary key default gen_random_uuid()\n, owner_id uuid not null\n, path text not null\n, unique (owner_id, path)\n);\n";
+    let (_v1, design) = rekey_design(&[("parent", parent_v1), ("child", REKEY_CHILD_V1)]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("create");
+    adapter
+        .execute_script(
+            "INSERT INTO app.parent (owner_id, path) VALUES ('00000000-0000-0000-0000-000000000001', 'a');\
+             INSERT INTO app.child (owner_id, path) VALUES ('00000000-0000-0000-0000-000000000001', 'a');",
+        )
+        .await
+        .unwrap();
+
+    let (_v2, design) = rekey_design(&[("parent", parent_v2), ("child", REKEY_CHILD_V1)]);
+    design
+        .reconcile(&*adapter, false, true, false, None, Progress::none())
+        .await
+        .expect("the key change reconciles");
+    assert_catalog(
+        &*adapter,
+        true,
+        &constraint_predicate("parent", "PRIMARY KEY (id)"),
+        "the new key",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        &constraint_predicate(
+            "child",
+            "FOREIGN KEY (owner_id, path) REFERENCES app.parent(owner_id, path) ON DELETE CASCADE",
+        ),
+        "the foreign key, back",
+    )
+    .await;
+    assert_catalog(&*adapter, true, "SELECT 1 FROM app.child", "the child's row").await;
+
+    let again = design
+        .reconcile(&*adapter, true, true, false, None, Progress::none())
+        .await
+        .expect("second dry run");
+    assert!(again.altered.is_empty(), "converged: {:?}", again.altered);
+}
+
+/// The key change and the step that adds the replacing foreign key run as
+/// one: `app.child` cannot take a `NOT NULL` column over its row, so the run
+/// fails there — and `app.parent` keeps its key, `app.child` its foreign key.
+#[tokio::test]
+async fn a_key_change_that_fails_later_leaves_the_key_as_it_was() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let (_v1, design) = rekey_design(&[("parent", REKEY_PARENT_V1), ("child", REKEY_CHILD_V1)]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("create");
+    adapter
+        .execute_script(
+            "INSERT INTO app.parent VALUES ('00000000-0000-0000-0000-000000000001', 'a');\
+             INSERT INTO app.child (owner_id, path) VALUES ('00000000-0000-0000-0000-000000000001', 'a');",
+        )
+        .await
+        .unwrap();
+
+    let parent_v2 = REKEY_PARENT_V2.replace("branch text not null", "branch text not null default 'main'");
+    let (_v2, design) = rekey_design(&[("parent", &parent_v2), ("child", REKEY_CHILD_V2)]);
+    let failed = design
+        .reconcile(&*adapter, false, true, false, None, Progress::none())
+        .await;
+    assert!(failed.is_err(), "the child's NOT NULL column fails over its row");
+    assert_catalog(
+        &*adapter,
+        true,
+        &constraint_predicate("parent", "PRIMARY KEY (owner_id, path)"),
+        "the old primary key",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        false,
+        &column_predicate("app", "parent", "branch"),
+        "parent.branch",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        &constraint_predicate(
+            "child",
+            "FOREIGN KEY (owner_id, path) REFERENCES app.parent(owner_id, path) ON DELETE CASCADE",
+        ),
+        "the old foreign key",
+    )
+    .await;
+}
+
+/// A table the design does not declare holds the key: dbd does not drop its
+/// foreign key, so the key change is refused before anything is written,
+/// dry run included.
+#[tokio::test]
+async fn a_key_held_from_outside_the_design_is_refused() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let (_v1, design) = rekey_design(&[("parent", REKEY_PARENT_V1), ("child", REKEY_CHILD_V1)]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("create");
+    adapter
+        .execute_script(
+            "CREATE SCHEMA ext; CREATE TABLE ext.audit (owner_id uuid, path text, \
+             FOREIGN KEY (owner_id, path) REFERENCES app.parent (owner_id, path));",
+        )
+        .await
+        .unwrap();
+
+    let (_v2, design) = rekey_design(&[("parent", REKEY_PARENT_V2), ("child", REKEY_CHILD_V2)]);
+    for dry_run in [true, false] {
+        let refused = design
+            .reconcile(&*adapter, dry_run, true, false, None, Progress::none())
+            .await
+            .expect_err("refused");
+        assert!(refused.to_string().contains("ext.audit"), "{refused}");
+    }
+    assert_catalog(
+        &*adapter,
+        true,
+        &constraint_predicate("parent", "PRIMARY KEY (owner_id, path)"),
+        "the old primary key",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        false,
+        &column_predicate("app", "child", "branch"),
+        "child.branch",
+    )
+    .await;
+}
+
+/// Two foreign keys from the same column to the same table: the version
+/// dropping the unnamed one drops that one, not the named one it keeps.
+#[tokio::test]
+async fn a_released_drop_of_an_unnamed_foreign_key_drops_that_one() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let parent = "create table if not exists app.parent (\n  code text unique\n, alt_code text unique\n);\n";
+    let child = |second: &str| {
+        format!(
+            "create table if not exists app.child (\n  code text\n\
+             , constraint child_code_fk foreign key (code) references app.parent(code){second}\n);\n"
+        )
+    };
+    cut_rekey(
+        dir,
+        &[
+            ("parent", parent),
+            (
+                "child",
+                &child("\n, foreign key (code) references app.parent(alt_code)"),
+            ),
+        ],
+    );
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    cut_rekey(dir, &[("parent", parent), ("child", &child(""))]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v2 applies");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_constraint WHERE conrelid = 'app.child'::regclass AND conname = 'child_code_fk'",
+        "the named foreign key",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        false,
+        &constraint_predicate("child", "FOREIGN KEY (code) REFERENCES app.parent(alt_code)"),
+        "the dropped foreign key",
+    )
+    .await;
+}
+
+/// A unique index a foreign key rests on, renamed in a release, applies.
+#[tokio::test]
+async fn a_released_rename_of_a_unique_index_a_foreign_key_rests_on_applies() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let parent = |index: &str| {
+        format!(
+            "set search_path to app;\ncreate table if not exists parent (\n  id integer primary key\n, code text not null\n);\n\
+             create unique index if not exists {index} on parent (code);\n"
+        )
+    };
+    let child = "set search_path to app;\ncreate table if not exists child (\n  id integer primary key\n, code text references parent (code)\n);\n";
+    cut_rekey(dir, &[("parent", &parent("parent_code_uq")), ("child", child)]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    cut_rekey(dir, &[("parent", &parent("parent_code_key")), ("child", child)]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v2 renames the index");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_indexes WHERE schemaname = 'app' AND indexname = 'parent_code_key'",
+        "the renamed index",
+    )
+    .await;
+    // By the catalog's relations: the migration ran on `app`'s search path,
+    // and `pg_get_constraintdef` leaves a table on the path unqualified.
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_constraint WHERE conrelid = 'app.child'::regclass AND contype = 'f' \
+         AND confrelid = 'app.parent'::regclass",
+        "the foreign key",
+    )
+    .await;
+}
+
+/// The steps a key change runs as one hold the key's tables until they end:
+/// one of them waiting on a lock another session holds gives up after a
+/// bounded wait and rolls back, rather than holding them while it waits.
+#[tokio::test]
+async fn a_key_change_waiting_on_a_lock_gives_up_and_rolls_back() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let zebra = |extra: &str| format!("create table if not exists app.zebra (\n  id integer primary key{extra}\n);\n");
+    let with_zebra = |child: &str| {
+        child.replace(
+            "\n, foreign key",
+            "\n, zebra_id integer references app.zebra (id)\n, foreign key",
+        )
+    };
+    let (_v1, design) = rekey_design(&[
+        ("parent", REKEY_PARENT_V1),
+        ("zebra", &zebra("")),
+        ("child", &with_zebra(REKEY_CHILD_V1)),
+    ]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("create");
+    let (_v2, design) = rekey_design(&[
+        ("parent", REKEY_PARENT_V2),
+        ("zebra", &zebra("\n, extra text")),
+        ("child", &with_zebra(REKEY_CHILD_V2)),
+    ]);
+    let order: Vec<&str> = design.entities().iter().map(|e| e.name.as_str()).collect();
+    let at = |name: &str| order.iter().position(|e| *e == name).unwrap();
+    assert!(
+        at("app.parent") < at("app.zebra") && at("app.zebra") < at("app.child"),
+        "zebra's step falls between the key change and the child's: {order:?}"
+    );
+
+    // Another session has read app.zebra, its transaction still open.
+    let other = connect(&url, "other").await.unwrap();
+    other.begin_batch().await.unwrap();
+    other.execute_script("SELECT 1 FROM app.zebra").await.unwrap();
+    let run = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        design.reconcile(&*adapter, false, true, false, None, Progress::none()),
+    )
+    .await;
+    other.rollback_batch().await.unwrap();
+    let err = run
+        .expect("the run gives up waiting for the other session")
+        .expect_err("the wait fails the run");
+    assert!(err.to_string().contains("lock"), "{err}");
+    assert_catalog(
+        &*adapter,
+        true,
+        &constraint_predicate("parent", "PRIMARY KEY (owner_id, path)"),
+        "the old primary key",
+    )
+    .await;
+}
+
+/// A table dbd's role has no privilege on is one `information_schema` does
+/// not list — its foreign key on the key is read from the catalog, and the
+/// key change refused naming it, before anything is written.
+#[tokio::test]
+async fn a_key_held_by_a_table_the_role_cannot_see_is_refused() {
+    let (pg, url) = start_pg().await;
+    let admin = connect(&url, "admin").await.unwrap();
+    admin
+        .execute_script("CREATE ROLE role_app LOGIN PASSWORD 'secret'; GRANT CREATE ON DATABASE testdb TO role_app;")
+        .await
+        .unwrap();
+    let settings = pg.settings();
+    let app = connect(
+        &format!(
+            "postgresql://role_app:secret@{}:{}/testdb",
+            settings.host, settings.port
+        ),
+        "rekey",
+    )
+    .await
+    .unwrap();
+    let (_v1, design) = rekey_design(&[("parent", REKEY_PARENT_V1), ("child", REKEY_CHILD_V1)]);
+    design
+        .reconcile(&*app, false, false, false, None, Progress::none())
+        .await
+        .expect("create");
+    admin
+        .execute_script(
+            "CREATE SCHEMA ext; CREATE TABLE ext.audit (owner_id uuid, path text, \
+             FOREIGN KEY (owner_id, path) REFERENCES app.parent (owner_id, path));",
+        )
+        .await
+        .unwrap();
+
+    let (_v2, design) = rekey_design(&[("parent", REKEY_PARENT_V2), ("child", REKEY_CHILD_V2)]);
+    for dry_run in [true, false] {
+        let refused = design
+            .reconcile(&*app, dry_run, true, false, None, Progress::none())
+            .await
+            .expect_err("refused");
+        assert!(refused.to_string().contains("ext.audit"), "{refused}");
+    }
+    assert_catalog(
+        &*admin,
+        false,
+        &column_predicate("app", "child", "branch"),
+        "child.branch",
+    )
+    .await;
+}
+
+/// A foreign key resting on a unique index: the design turns the index into
+/// a unique constraint, and reconcile moves the foreign key across.
+#[tokio::test]
+async fn reconcile_changes_a_unique_index_a_foreign_key_rests_on() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let child = "create table if not exists app.child (\n  id integer primary key\n, code text references app.parent (code)\n);\n";
+    let (_v1, design) = rekey_design(&[
+        (
+            "parent",
+            "create table if not exists app.parent (\n  id integer primary key\n, code text not null\n);\n\
+             create unique index if not exists parent_code_uidx on app.parent (code);\n",
+        ),
+        ("child", child),
+    ]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("create");
+    let (_v2, design) = rekey_design(&[
+        (
+            "parent",
+            "create table if not exists app.parent (\n  id integer primary key\n, code text not null unique\n);\n",
+        ),
+        ("child", child),
+    ]);
+    design
+        .reconcile(&*adapter, false, true, false, None, Progress::none())
+        .await
+        .expect("the index becomes a constraint");
+    assert_catalog(
+        &*adapter,
+        true,
+        &constraint_predicate("parent", "UNIQUE (code)"),
+        "the unique key",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        &constraint_predicate("child", "FOREIGN KEY (code) REFERENCES app.parent(code)"),
+        "the foreign key, back",
+    )
+    .await;
+}
+
+// ── A routine whose return type changes (#65) ─────────────────────────────────
+
+/// A project `routines` in a temporary folder with `files` (`(path, text)`).
+fn routine_design(files: &[(&str, &str)]) -> (tempfile::TempDir, Design) {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: routines\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    for (path, text) in files {
+        let path = dir.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design");
+    (tmp, design)
+}
+
+const STATS_FILE: &str = "ddl/function/app/stats.ddl";
+const STATS_JSONB: &str =
+    "create or replace function app.stats()\nreturns jsonb\nlanguage sql\nas $$ select '{}'::jsonb $$;\n";
+const STATS_TABLE: &str = "create or replace function app.stats()\n\
+     returns table (files integer, refused_older integer, pruned integer)\n\
+     language sql\nas $$ select 0, 0, 0 $$;\n";
+
+/// `app.stats()` returns what `result` says (`pg_get_function_result`).
+fn stats_returns(result: &str) -> String {
+    format!(
+        "SELECT 1 FROM pg_proc WHERE oid = 'app.stats()'::regprocedure \
+         AND pg_get_function_result(oid) = '{}'",
+        result.replace('\'', "''")
+    )
+}
+
+/// `CREATE OR REPLACE` cannot change what a function returns: reconcile drops
+/// it and creates it again.
+#[tokio::test]
+async fn reconcile_replaces_a_function_whose_return_type_changes() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "routines").await.unwrap();
+    let (_v1, design) = routine_design(&[(STATS_FILE, STATS_JSONB)]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("create");
+    let (_v2, design) = routine_design(&[(STATS_FILE, STATS_TABLE)]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("the new return type reconciles");
+    assert_catalog(
+        &*adapter,
+        true,
+        &stats_returns("TABLE(files integer, refused_older integer, pruned integer)"),
+        "the new return type",
+    )
+    .await;
+}
+
+/// `apply` runs in one transaction: the replacement happens inside it.
+#[tokio::test]
+async fn apply_replaces_a_function_whose_return_type_changes() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "routines").await.unwrap();
+    let (_v1, design) = routine_design(&[(STATS_FILE, STATS_JSONB)]);
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply v1");
+    let (_v2, design) = routine_design(&[(STATS_FILE, STATS_TABLE)]);
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("the new return type applies");
+    assert_catalog(
+        &*adapter,
+        true,
+        &stats_returns("TABLE(files integer, refused_older integer, pruned integer)"),
+        "the new return type",
+    )
+    .await;
+}
+
+/// A view over the function: dropping it would take the view, so dbd does
+/// not — the run fails naming the view, and the function is as it was.
+#[tokio::test]
+async fn a_function_a_view_reads_is_not_dropped_to_change_its_return_type() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "routines").await.unwrap();
+    let view = (
+        "ddl/view/app/v_stats.ddl",
+        "create or replace view app.v_stats as select app.stats() as stats;\n",
+    );
+    let (_v1, design) = routine_design(&[(STATS_FILE, STATS_JSONB), view]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("create");
+    let (_v2, design) = routine_design(&[(STATS_FILE, STATS_TABLE), view]);
+    let err = design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect_err("the view depends on it")
+        .to_string();
+    assert!(err.contains("app.v_stats"), "{err}");
+    assert_catalog(&*adapter, true, &stats_returns("jsonb"), "the old return type").await;
+}
+
+/// Two functions of that name: which one the file replaces is not dbd's to
+/// guess, so it drops neither and names both.
+#[tokio::test]
+async fn a_function_with_overloads_is_not_dropped_to_change_its_return_type() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "routines").await.unwrap();
+    let (_v1, design) = routine_design(&[(STATS_FILE, STATS_JSONB)]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("create");
+    adapter
+        .execute_script("CREATE FUNCTION app.stats(n integer) RETURNS integer LANGUAGE sql AS $$ SELECT n $$;")
+        .await
+        .unwrap();
+    let (_v2, design) = routine_design(&[(STATS_FILE, STATS_TABLE)]);
+    let err = design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect_err("two functions of that name")
+        .to_string();
+    assert!(
+        err.contains("app.stats()") && err.contains("app.stats(integer)"),
+        "{err}"
+    );
+    assert_catalog(&*adapter, true, &stats_returns("jsonb"), "the old return type").await;
+}
+
+/// What `CREATE OR REPLACE` keeps, dropping and creating again keeps too: the
+/// grants made outside the file, the owner, the comment. `EXECUTE` revoked
+/// from `PUBLIC` stays revoked.
+#[tokio::test]
+async fn a_replaced_function_keeps_its_grants_owner_and_comment() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "routines").await.unwrap();
+    let (_v1, design) = routine_design(&[(STATS_FILE, STATS_JSONB)]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("create");
+    adapter
+        .execute_script(
+            "CREATE ROLE reader; CREATE ROLE app_owner; \
+             REVOKE EXECUTE ON FUNCTION app.stats() FROM PUBLIC; \
+             GRANT EXECUTE ON FUNCTION app.stats() TO reader; \
+             COMMENT ON FUNCTION app.stats() IS 'hand comment'; \
+             ALTER FUNCTION app.stats() OWNER TO app_owner;",
+        )
+        .await
+        .unwrap();
+    let (_v2, design) = routine_design(&[(STATS_FILE, STATS_TABLE)]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("the new return type reconciles");
+    assert_catalog(
+        &*adapter,
+        true,
+        &stats_returns("TABLE(files integer, refused_older integer, pruned integer)"),
+        "the new return type",
+    )
+    .await;
+    for (holds, predicate, what) in [
+        (
+            false,
+            "SELECT 1 WHERE has_function_privilege('public', 'app.stats()', 'EXECUTE')",
+            "PUBLIC's EXECUTE",
+        ),
+        (
+            true,
+            "SELECT 1 WHERE has_function_privilege('reader', 'app.stats()', 'EXECUTE')",
+            "reader's EXECUTE",
+        ),
+        (
+            true,
+            "SELECT 1 FROM pg_proc WHERE oid = 'app.stats()'::regprocedure AND proowner = 'app_owner'::regrole",
+            "the owner",
+        ),
+        (
+            true,
+            "SELECT 1 WHERE obj_description('app.stats()'::regprocedure, 'pg_proc') = 'hand comment'",
+            "the comment",
+        ),
+    ] {
+        assert_catalog(&*adapter, holds, predicate, what).await;
+    }
+}
+
+/// A function file that wraps itself in `BEGIN`/`COMMIT` applies as it did:
+/// its own transaction is left alone.
+#[tokio::test]
+async fn a_function_file_with_its_own_transaction_applies_as_before() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "routines").await.unwrap();
+    let (_v1, design) = routine_design(&[(STATS_FILE, &format!("BEGIN;\n{STATS_JSONB}COMMIT;\n"))]);
+    for run in ["first apply", "second apply"] {
+        design
+            .apply(&*adapter, None, false, None, Progress::none())
+            .await
+            .unwrap_or_else(|e| panic!("{run}: {e}"));
+    }
+    assert_catalog(&*adapter, true, &stats_returns("jsonb"), "the function").await;
+}
+
+/// The function a file replaces is the one its `CREATE` names, as Postgres
+/// reads it — `app.getStats` is `app.getstats` — whatever the file is called.
+#[tokio::test]
+async fn a_function_named_in_mixed_case_is_replaced() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "routines").await.unwrap();
+    let file = "ddl/function/app/getStats.ddl";
+    let (_v1, design) = routine_design(&[(file, &STATS_JSONB.replace("app.stats()", "app.getStats()"))]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("create");
+    let (_v2, design) = routine_design(&[(file, &STATS_TABLE.replace("app.stats()", "app.getStats()"))]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("the new return type reconciles");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 WHERE pg_get_function_result('app.getstats()'::regprocedure) = \
+         'TABLE(files integer, refused_older integer, pruned integer)'",
+        "the new return type",
+    )
+    .await;
+}
+
+/// A definition Postgres refuses for itself is reported as it is — not as one
+/// to drop by hand, with no function of that name, or with two.
+#[tokio::test]
+async fn a_function_definition_error_is_reported_as_it_is() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "routines").await.unwrap();
+    let broken = "create or replace function app.stats()\nreturns integer\nlanguage sql\nas $$ select 'x'::text $$;\n";
+    let (_v1, design) = routine_design(&[(STATS_FILE, broken)]);
+    let err = design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect_err("a body returning text")
+        .to_string();
+    assert!(
+        err.contains("return type mismatch") && !err.contains("by hand"),
+        "{err}"
+    );
+
+    adapter
+        .execute_script(
+            "CREATE SCHEMA IF NOT EXISTS app; \
+             CREATE FUNCTION app.stats(n integer) RETURNS integer LANGUAGE sql AS $$ SELECT n $$; \
+             CREATE FUNCTION app.stats(t text) RETURNS text LANGUAGE sql AS $$ SELECT t $$;",
+        )
+        .await
+        .unwrap();
+    let err = design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect_err("a body returning text, beside two of that name")
+        .to_string();
+    assert!(
+        err.contains("return type mismatch") && !err.contains("by hand"),
+        "{err}"
+    );
+}
+
+/// A database in LATIN1 takes the drop and create like any other: what dbd
+/// sends it is ASCII.
+#[tokio::test]
+async fn a_function_on_a_latin1_database_is_replaced() {
+    let (pg, url) = start_pg().await;
+    connect(&url, "admin")
+        .await
+        .unwrap()
+        .execute_script("CREATE DATABASE l1 ENCODING 'LATIN1' LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0")
+        .await
+        .unwrap();
+    let settings = pg.settings();
+    let adapter = connect(
+        &format!(
+            "postgresql://{}:{}@{}:{}/l1",
+            settings.username, settings.password, settings.host, settings.port
+        ),
+        "routines",
+    )
+    .await
+    .unwrap();
+    let (_v1, design) = routine_design(&[(STATS_FILE, STATS_JSONB)]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("create");
+    let (_v2, design) = routine_design(&[(STATS_FILE, STATS_TABLE)]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("the new return type reconciles on LATIN1");
+}
+
+// ── A released key change a foreign key holds (#65) ───────────────────────────
+
+/// Cut the next version of the `rekey` project in `dir` from `files` — tables
+/// under `ddl/table/app/` — with PostgreSQL's migrations.
+fn cut_rekey(dir: &std::path::Path, files: &[(&str, &str)]) {
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: rekey\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    for (table, ddl) in files {
+        std::fs::write(dir.join(format!("ddl/table/app/{table}.ddl")), ddl).unwrap();
+    }
+    let design = released(dir);
+    dbd_core::snapshot::create_snapshot_in(
+        design.entities(),
+        dir,
+        &dir.join("design.yaml"),
+        None,
+        "next",
+        dbd_core::snapshot::MigrationDialect::Postgres,
+    )
+    .unwrap();
+}
+
+/// The issue's repro on a released project: v2's migrations change the key
+/// and the foreign key holding it, and apply.
+#[tokio::test]
+async fn a_released_key_change_a_foreign_key_holds_applies() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    cut_rekey(dir, &[("parent", REKEY_PARENT_V1), ("child", REKEY_CHILD_V1)]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    cut_rekey(dir, &[("parent", REKEY_PARENT_V2), ("child", REKEY_CHILD_V2)]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v2's key change applies");
+    assert_catalog(
+        &*adapter,
+        true,
+        &constraint_predicate("parent", "PRIMARY KEY (owner_id, branch, path)"),
+        "the new primary key",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        &constraint_predicate(
+            "child",
+            "FOREIGN KEY (owner_id, branch, path) REFERENCES app.parent(owner_id, branch, path) ON DELETE CASCADE",
+        ),
+        "the new foreign key",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        false,
+        &constraint_predicate("parent", "PRIMARY KEY (owner_id, path)"),
+        "the old primary key",
+    )
+    .await;
+}
+
+/// A released surrogate-key switch keeping `(owner_id, path)` unique: the
+/// child's unchanged foreign key comes back over the rows already there. The
+/// new key is a table `PRIMARY KEY`, as a migration manages one: an inline
+/// flag's change is left to the author, the migration saying so.
+#[tokio::test]
+async fn a_released_key_change_keeps_the_foreign_key_the_design_keeps() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let parent_v1 = "create table if not exists app.parent (\n  id uuid not null default gen_random_uuid()\n, owner_id uuid not null\n, path text not null\n, primary key (owner_id, path)\n);\n";
+    let parent_v2 = "create table if not exists app.parent (\n  id uuid not null default gen_random_uuid()\n, owner_id uuid not null\n, path text not null\n, primary key (id)\n, unique (owner_id, path)\n);\n";
+    cut_rekey(dir, &[("parent", parent_v1), ("child", REKEY_CHILD_V1)]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    adapter
+        .execute_script(
+            "INSERT INTO app.parent (owner_id, path) VALUES ('00000000-0000-0000-0000-000000000001', 'a');\
+             INSERT INTO app.child (owner_id, path) VALUES ('00000000-0000-0000-0000-000000000001', 'a');",
+        )
+        .await
+        .unwrap();
+    cut_rekey(dir, &[("parent", parent_v2), ("child", REKEY_CHILD_V1)]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v2's key change applies");
+    assert_catalog(
+        &*adapter,
+        true,
+        &constraint_predicate("parent", "PRIMARY KEY (id)"),
+        "the new key",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        &constraint_predicate(
+            "child",
+            "FOREIGN KEY (owner_id, path) REFERENCES app.parent(owner_id, path) ON DELETE CASCADE",
+        ),
+        "the foreign key, back",
+    )
+    .await;
+    assert_catalog(&*adapter, true, "SELECT 1 FROM app.child", "the child's row").await;
+}
+
 // ── Reconcile convergence: comments and keyword defaults ──────────────────────
 
 /// Apply a design, then require reconcile to report NOTHING — the property both

@@ -607,6 +607,167 @@ fn push_or_append_sql(files: &mut Vec<MigrationFile>, path: PathBuf, sql: String
     }
 }
 
+// ── Keys foreign keys hold, in migrations (#65) ───────────
+
+/// The SQL a snapshot's migrations are written in, where it makes a difference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MigrationDialect {
+    /// SQL that names what it changes: a constraint the design left unnamed is
+    /// left to be dropped by hand, the migration saying so.
+    #[default]
+    Portable,
+    /// PostgreSQL's: a primary key, unique key or foreign key the design left
+    /// unnamed is dropped by the name the catalog has for it (#65).
+    Postgres,
+}
+
+impl MigrationDialect {
+    /// The dialect of the migrations the database at `url` runs: its
+    /// adapter's — PostgreSQL's for any URL dbd's PostgreSQL adapter connects
+    /// to, which is every one not `sqlite:`, `file:` or `convex:` (nor one dbd
+    /// has no adapter for). With no URL to go by — none configured, or a
+    /// `$VAR` not set — the target's name decides: PostgreSQL's on `postgres`
+    /// and `supabase`.
+    pub fn of(url: Option<&str>, target: &str) -> Self {
+        const NOT_POSTGRES: [&str; 8] = [
+            "sqlite:",
+            "file:",
+            "convex:",
+            "mysql:",
+            "mariadb:",
+            "sqlserver:",
+            "mssql:",
+            "jdbc:",
+        ];
+        match url {
+            Some(url) if NOT_POSTGRES.iter().any(|scheme| url.starts_with(scheme)) => Self::Portable,
+            Some(_) => Self::Postgres,
+            None if matches!(target, "postgres" | "supabase") => Self::Postgres,
+            None => Self::Portable,
+        }
+    }
+}
+
+/// Write each stage's migrations around the keys foreign keys hold (#65).
+///
+/// Postgres refuses to drop a key, or a column of one, while a foreign key
+/// references it, and a migration file is one table's: `parent.sql` dropped
+/// the key `child`'s foreign key still held, and `child.sql` — which drops
+/// that foreign key — runs after it. So the migration of the table whose key
+/// goes drops the foreign keys holding it first, and adds back after it the
+/// ones the design keeps; one the design replaces, the holder's own migration
+/// adds. A whole version runs in one transaction, so the pair runs whole.
+///
+/// On [`MigrationDialect::Postgres`] a key the design left unnamed is dropped
+/// by the name the catalog has for it, instead of a comment saying to.
+fn order_key_changes(result: &mut MultiSnapshotResult, previous: &Snapshot, dialect: MigrationDialect) {
+    use crate::diff::{ChangeAction, FieldDetail, FieldType, catalog_drop_sql, unnamed_drop_comment};
+    use crate::entity::TableConstraint;
+    use crate::reconcile::{IndexDrops, fk_change_sql, fk_detail, key_holders, same_foreign_key};
+
+    let mut before = canonical_types(previous);
+    for stage in &mut result.snapshots {
+        if stage.is_baseline || stage.no_changes {
+            continue;
+        }
+        let after = canonical_types(&stage.snapshot);
+        let in_file = |files: &mut Vec<MigrationFile>, table: &str| -> usize {
+            let path = entity_migration_path(table);
+            match files.iter().position(|f| f.relative_path == path) {
+                Some(i) => i,
+                None => {
+                    files.push(MigrationFile {
+                        relative_path: path,
+                        content: String::new(),
+                    });
+                    files.len() - 1
+                }
+            }
+        };
+
+        if dialect == MigrationDialect::Postgres {
+            for d in diff::diff(&before, &after) {
+                let DiffAction::Change(changes) = &d.action else {
+                    continue;
+                };
+                for c in changes {
+                    let (FieldType::Constraint, ChangeAction::Drop(detail)) = (&c.field_type, &c.action) else {
+                        continue;
+                    };
+                    let FieldDetail::Constraint(con) = detail.as_ref() else {
+                        continue;
+                    };
+                    let named = match con {
+                        TableConstraint::PrimaryKey { name, .. } | TableConstraint::Unique { name, .. } => {
+                            name.is_some()
+                        }
+                        TableConstraint::ForeignKey(fk) => fk.name.is_some(),
+                        _ => true,
+                    };
+                    let Some(drop) = catalog_drop_sql(&d.entity_name, con).filter(|_| !named) else {
+                        continue;
+                    };
+                    let comment = unnamed_drop_comment(&d.entity_name, con);
+                    let path = entity_migration_path(&d.entity_name);
+                    if let Some(file) = stage.migration_files.iter_mut().find(|f| f.relative_path == path) {
+                        file.content = file.content.replacen(&comment, &drop, 1);
+                    }
+                    let warned = format!("{}: {}", d.entity_name, crate::diff::constraint_description(con));
+                    stage.warnings.retain(|w| !w.starts_with(&warned));
+                }
+            }
+        }
+
+        let (mut old, mut new) = (before.clone(), after.clone());
+        crate::reconcile::canonicalize(&mut old);
+        crate::reconcile::canonicalize(&mut new);
+        // The foreign keys each table's own migration adds: one kept under
+        // another name is added there, and not added back again.
+        let mut added: Vec<(String, crate::entity::ForeignKey)> = Vec::new();
+        for d in diff::diff(&before, &after) {
+            if let DiffAction::Change(changes) = d.action {
+                for c in changes {
+                    if let ChangeAction::Add(detail) = c.action
+                        && let FieldDetail::Constraint(TableConstraint::ForeignKey(fk)) = *detail
+                    {
+                        added.push((d.entity_name.clone(), fk));
+                    }
+                }
+            }
+        }
+        for (changed, holders) in key_holders(&old, &new, &before, &after, IndexDrops::Diff) {
+            let mut drops: Vec<String> = Vec::new();
+            let mut adds: Vec<String> = Vec::new();
+            for h in &holders {
+                let catalog = (h.fk.name.is_none() && dialect == MigrationDialect::Postgres)
+                    .then(|| catalog_drop_sql(&h.table, &TableConstraint::ForeignKey(h.fk.clone())))
+                    .flatten();
+                drops.push(catalog.unwrap_or_else(|| fk_change_sql(&h.table, ChangeAction::Drop(fk_detail(&h.fk)))));
+                if let Some(kept) = &h.kept
+                    && !added
+                        .iter()
+                        .any(|(table, fk)| table == &h.table && same_foreign_key(fk, kept))
+                {
+                    adds.push(fk_change_sql(&h.table, ChangeAction::Add(fk_detail(kept))));
+                }
+            }
+            let i = in_file(&mut stage.migration_files, &changed);
+            let file = &mut stage.migration_files[i];
+            let mut content = drops.join("\n");
+            if !file.content.is_empty() {
+                content.push('\n');
+                content.push_str(&file.content);
+            }
+            for add in adds {
+                content.push('\n');
+                content.push_str(&add);
+            }
+            file.content = content;
+        }
+        before = after;
+    }
+}
+
 // ── Multi-snapshot preparation ─────────────────────────
 
 /// Prepare a multi-snapshot result from entities, potentially splitting complex
@@ -614,6 +775,39 @@ fn push_or_append_sql(files: &mut Vec<MigrationFile>, path: PathBuf, sql: String
 ///
 /// This is pure logic — no I/O. The caller is responsible for writing files.
 pub fn prepare_multi_snapshot(
+    entities: &[Entity],
+    previous: Option<&Snapshot>,
+    next_version: u32,
+    description: &str,
+) -> MultiSnapshotResult {
+    prepare_multi_snapshot_in(
+        entities,
+        previous,
+        next_version,
+        description,
+        MigrationDialect::Portable,
+    )
+}
+
+/// [`prepare_multi_snapshot`], its migrations written in `dialect` — and,
+/// whatever the dialect, around the keys foreign keys hold (#65).
+pub fn prepare_multi_snapshot_in(
+    entities: &[Entity],
+    previous: Option<&Snapshot>,
+    next_version: u32,
+    description: &str,
+    dialect: MigrationDialect,
+) -> MultiSnapshotResult {
+    let mut result = prepare_stages(entities, previous, next_version, description);
+    if let Some(previous) = previous {
+        order_key_changes(&mut result, previous, dialect);
+    }
+    result
+}
+
+/// The stages of [`prepare_multi_snapshot_in`], each table's migration as the
+/// diff writes it.
+fn prepare_stages(
     entities: &[Entity],
     previous: Option<&Snapshot>,
     next_version: u32,
@@ -1302,9 +1496,29 @@ pub fn create_snapshot_of(
     module: Option<&str>,
     description: &str,
 ) -> Result<MultiSnapshotResult> {
+    create_snapshot_in(
+        entities,
+        project_dir,
+        config_path,
+        module,
+        description,
+        MigrationDialect::Portable,
+    )
+}
+
+/// [`create_snapshot_of`], its migrations written in `dialect` (#65) — see
+/// [`MigrationDialect::of`].
+pub fn create_snapshot_in(
+    entities: &[Entity],
+    project_dir: &Path,
+    config_path: &Path,
+    module: Option<&str>,
+    description: &str,
+    dialect: MigrationDialect,
+) -> Result<MultiSnapshotResult> {
     let previous = latest_snapshot(project_dir)?;
     let base_version = next_version(project_dir);
-    let result = prepare_multi_snapshot(entities, previous.as_ref(), base_version, description);
+    let result = prepare_multi_snapshot_in(entities, previous.as_ref(), base_version, description, dialect);
 
     // Check for no-changes
     if result.snapshots.len() == 1 && result.snapshots[0].no_changes {

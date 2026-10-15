@@ -1921,3 +1921,63 @@ fn a_sqlite_merge_beside_another_project_leaves_out_its_tables() {
     assert!(o.status.success(), "merge: {said}");
     assert!(said.contains("left out") && said.contains("b (\"lite_b\")"), "{said}");
 }
+
+/// `dbd snapshot` writes a PostgreSQL project's migrations for PostgreSQL: a
+/// key the design left unnamed is dropped by the name the catalog has, not
+/// left to be dropped by hand (#65).
+#[test]
+fn a_postgres_snapshot_drops_an_unnamed_key_by_its_catalog_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write(
+        dir,
+        "design.yaml",
+        "project:\n  name: rekey\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+    );
+    let table = |key: &str| {
+        format!(
+            "create table if not exists app.t (\n  a integer not null\n, b integer not null\n, primary key ({key})\n);\n"
+        )
+    };
+    write(dir, "ddl/table/app/t.ddl", &table("a"));
+    let o = dbd(dir, &["snapshot"]);
+    assert!(o.status.success(), "v1: {}{}", stdout(&o), stderr(&o));
+    write(dir, "ddl/table/app/t.ddl", &table("a, b"));
+    let o = dbd(dir, &["snapshot"]);
+    assert!(o.status.success(), "v2: {}{}", stdout(&o), stderr(&o));
+    let sql = fs::read_to_string(dir.join("migrations/002/app/t.sql")).unwrap();
+    assert!(
+        sql.contains("contype = 'p'") && !sql.contains("drop it manually"),
+        "{sql}"
+    );
+}
+
+/// A target named anything else is PostgreSQL's when its URL is: the snapshot
+/// follows the adapter the URL picks, not the target's name (#65).
+#[test]
+fn a_snapshot_follows_the_url_not_the_target_name() {
+    for (url, catalog) in [("postgres://localhost/nothing", true), ("sqlite://app.db", false)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        write(
+            dir,
+            "design.yaml",
+            &format!(
+                "project:\n  name: rekey\nsource:\n  dialect: postgresql\ntarget:\n  prod:\n    url: {url}\nschemas:\n  - app\n"
+            ),
+        );
+        let table = |key: &str| {
+            format!(
+                "create table if not exists app.t (\n  a integer not null\n, b integer not null\n, primary key ({key})\n);\n"
+            )
+        };
+        write(dir, "ddl/table/app/t.ddl", &table("a"));
+        let o = dbd(dir, &["snapshot"]);
+        assert!(o.status.success(), "{url} v1: {}{}", stdout(&o), stderr(&o));
+        write(dir, "ddl/table/app/t.ddl", &table("a, b"));
+        let o = dbd(dir, &["snapshot"]);
+        assert!(o.status.success(), "{url} v2: {}{}", stdout(&o), stderr(&o));
+        let sql = fs::read_to_string(dir.join("migrations/002/app/t.sql")).unwrap();
+        assert_eq!(sql.contains("contype = 'p'"), catalog, "{url}: {sql}");
+    }
+}

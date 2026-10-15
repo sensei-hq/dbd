@@ -1525,7 +1525,7 @@ fn quoted_table(schema: &str, relname: &str) -> String {
 }
 
 /// The SQLSTATE of a database error, if `e` is one.
-fn sqlstate(e: &sqlx::Error) -> Option<String> {
+pub(super) fn sqlstate(e: &sqlx::Error) -> Option<String> {
     e.as_database_error().and_then(|db| db.code()).map(|c| c.into_owned())
 }
 

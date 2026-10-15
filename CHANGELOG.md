@@ -9,6 +9,55 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.27.1] — 2026-10-14
+
+**A key a foreign key holds can change, and so can what a function returns**
+([#65]). Changing a table's primary key while another table's foreign key
+referenced it failed — `cannot drop constraint parent_pkey … because other
+objects depend on it` — on `reconcile` and in the migration `dbd snapshot`
+writes alike; and a function whose return type changed failed on every run,
+since `CREATE OR REPLACE` cannot change one.
+
+### Fixed
+
+- **`reconcile` changes a key a foreign key holds.** The foreign keys holding a
+  primary key, a unique key or index, or a column of one that the plan drops
+  are dropped first, in the step of the table whose key changes; one the design
+  keeps is added back in that step, after the new key, and one it replaces in
+  its own table's step — the steps from the one to the other in one
+  transaction, so a failure leaves the key as it was, and a lock wait in it
+  gives up after 10 seconds. A foreign key on a table the run does not
+  reconcile — another project's or module's, one the scope leaves out, one no
+  design declares, one the role cannot read — is never dropped: the change is
+  refused before any write, `--dry-run` included, naming it.
+- **A migration changes a key a foreign key holds.** A version's migration of
+  the table whose key changes drops the foreign keys holding it first and adds
+  back the ones the design keeps. When the migrations will run on PostgreSQL —
+  as the URL `-d`/`DATABASE_URL` or the target's `url:` names, or a target
+  called `postgres` or `supabase` — a primary key, unique key or foreign key
+  the design left unnamed is dropped by the name the catalog has for it; it was
+  a comment saying to drop it by hand, and the `ADD PRIMARY KEY` after it
+  failed with `multiple primary keys`. A foreign key naming no columns is added
+  as it was written, not as `REFERENCES t()`.
+- **A function or procedure `CREATE OR REPLACE` cannot change** — a new return
+  type, a renamed parameter, a parameter's default removed, a function turned
+  procedure — is dropped and created again in one transaction by `reconcile`
+  and `apply`, when it is the only routine of its name and nothing depends on
+  it — its grants, owner and comment put back, as a replace would have kept
+  them; otherwise the run fails naming the routines of that name or what
+  depends on it. A file running its own `BEGIN` … `COMMIT` runs as before.
+
+### Added
+
+- **Library API**: `snapshot::{MigrationDialect, create_snapshot_in,
+  prepare_multi_snapshot_in}` — `MigrationDialect::of(url, target)`; the
+  existing snapshot functions write `MigrationDialect::Portable` — and the
+  `DatabaseAdapter` methods
+  `bound_lock_waits` and `foreign_keys_to`, each with a default an adapter
+  written before keeps working with.
+
+[#65]: https://github.com/sensei-hq/dbd/issues/65
+
 ## [0.27.0] — 2026-10-14
 
 **A project can be a workspace of modules.** A `design.yaml` with a

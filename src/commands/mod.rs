@@ -600,7 +600,15 @@ pub async fn run(
             if *list {
                 return migration::cmd_snapshot_list(config, project_dir, module, verbosity);
             }
-            migration::cmd_snapshot_create(config, env, project_dir, module, name.as_deref(), verbosity)
+            migration::cmd_snapshot_create(
+                config,
+                env,
+                project_dir,
+                module,
+                name.as_deref(),
+                database_url,
+                verbosity,
+            )
         }
 
         Commands::Migrate { status } => {
