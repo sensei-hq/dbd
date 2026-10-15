@@ -9,6 +9,17 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+### Fixed
+
+- **A migration drops an index in its table's schema** ([#73]). It wrote
+  `DROP INDEX IF EXISTS "<name>"`, which looks the index up on the search path
+  the migration runs on — the session's, for a DDL file that qualifies its
+  names and sets none. An index in another schema was not found, `IF EXISTS`
+  made the miss a no-op, and the version was recorded as applied with the old
+  index still there. It now names the schema, as `reconcile` does.
+
+[#73]: https://github.com/sensei-hq/dbd/issues/73
+
 ## [0.27.1] — 2026-10-14
 
 **A key a foreign key holds can change, and so can what a function returns**
