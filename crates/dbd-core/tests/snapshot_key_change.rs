@@ -458,7 +458,7 @@ fn a_column_turned_generated_gets_back_every_constraint_and_index_on_it() {
     for part in [
         "ADD CHECK (code <> '')",
         "ADD FOREIGN KEY (code) REFERENCES app.r(code)",
-        "INCLUDE (code)",
+        "INCLUDE (\"code\")",
         "t_code_lower",
         "ADD UNIQUE (code)",
     ] {

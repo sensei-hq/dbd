@@ -998,7 +998,12 @@
         };
         let old = snap(vec![table(col("code", "text"))], vec![]);
         let new = snap(vec![table(col_generated("code", "text", "upper(body)"))], vec![]);
-        let sql = generate_migration_sql(&diff(&old, &new));
+        // The diff itself says nothing of them — history reads it as what
+        // the version changed; what is run from it adds them back.
+        let mut diffs = diff(&old, &new);
+        assert_eq!(generate_migration_sql(&diffs).matches("UNIQUE").count(), 0);
+        with_rebuilds(&mut diffs, &new);
+        let sql = generate_migration_sql(&diffs);
         assert_eq!(
             sql,
             "ALTER TABLE public.docs DROP COLUMN code;\n\
