@@ -132,8 +132,10 @@ pub fn generate_migration_sql(diffs: &[MigrationDiff]) -> String {
                 // New entities use regular apply — no SQL emitted
             }
             DiffAction::Drop => match d.entity_type {
+                // The name may be one a live catalog holds and the design does
+                // not: written as a name, never pasted in as SQL.
                 EntityType::Table => {
-                    lines.push(format!("DROP TABLE {} CASCADE;", d.entity_name));
+                    lines.push(format!("DROP TABLE {} CASCADE;", name_if_needed(&d.entity_name)));
                 }
                 EntityType::Enum => {
                     lines.push(format!(
@@ -243,6 +245,16 @@ pub(crate) fn catalog_drop_sql(entity_name: &str, con: &TableConstraint) -> Opti
     ))
 }
 
+/// A `schema.name` entity name as SQL: each part bare when it reads back as
+/// itself, quoted — its quotes doubled — when it does not.
+fn name_if_needed(entity_name: &str) -> String {
+    use crate::sql_quote::ident_if_needed;
+    match crate::entity::split_qualified_name(entity_name) {
+        (Some(schema), name) => format!("{}.{}", ident_if_needed(&schema), ident_if_needed(&name)),
+        (None, name) => ident_if_needed(&name),
+    }
+}
+
 /// The `CONSTRAINT <name> ` prefix for an `ALTER TABLE … ADD …`, or an empty
 /// string when the constraint is unnamed so Postgres auto-names it.
 fn constraint_clause(name: Option<&str>) -> String {
@@ -281,7 +293,8 @@ fn generate_field_sql(entity_name: &str, _entity_type: &EntityType, change: &Fie
         (FieldType::Column, ChangeAction::Drop(_)) => {
             lines.push(format!(
                 "ALTER TABLE {} DROP COLUMN {};",
-                entity_name, change.field_name
+                entity_name,
+                crate::sql_quote::ident_if_needed(&change.field_name)
             ));
         }
         (FieldType::Column, ChangeAction::Alter { old, new }) => {
@@ -309,8 +322,9 @@ fn generate_field_sql(entity_name: &str, _entity_type: &EntityType, change: &Fie
                 // this runs: dropping a column earlier in the same batch takes the
                 // PRIMARY KEY covering it along with it.
                 Some(name) => lines.push(format!(
-                    "ALTER TABLE {} DROP CONSTRAINT IF EXISTS \"{}\";",
-                    entity_name, name
+                    "ALTER TABLE {} DROP CONSTRAINT IF EXISTS {};",
+                    entity_name,
+                    crate::sql_quote::ident(name)
                 )),
                 None => lines.push(unnamed_drop_comment(entity_name, con)),
             }
