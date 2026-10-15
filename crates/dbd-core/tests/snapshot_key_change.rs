@@ -323,3 +323,112 @@ fn a_key_columns_type_swap_gets_back_its_key_and_the_foreign_key_holding_it() {
     );
     assert!(holder < drop && drop < rename && rename < key && key < back, "{sql}");
 }
+
+// ── A released column's type change and rename, in place (0.27.2 review) ─────
+
+/// A type change dbd can cast is one version that alters the column in
+/// place — the values, keys, identity and every foreign key on either side of
+/// it are Postgres's to keep — and adds no `<column>_new`.
+#[test]
+fn a_castable_type_change_is_one_version_altering_the_column_in_place() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let parent = |ty: &str| format!("create table if not exists app.parent (\n  id {ty} primary key\n);\n");
+    let child = "create table if not exists app.child (\n  id integer primary key\n\
+                 , parent_id integer references app.parent (id)\n);\n";
+    cut(
+        dir,
+        &[("parent", &parent("integer")), ("child", child)],
+        MigrationDialect::Postgres,
+    );
+    cut(
+        dir,
+        &[("parent", &parent("bigint")), ("child", child)],
+        MigrationDialect::Postgres,
+    );
+    let sql = migration(dir, "parent");
+    assert!(
+        sql.contains("ALTER TABLE app.parent ALTER COLUMN id TYPE bigint USING id::bigint;"),
+        "{sql}"
+    );
+    assert!(!sql.contains("_new") && !sql.contains("contype"), "{sql}");
+    assert!(!dir.join("migrations/003").exists());
+    assert!(!dir.join("migrations/002/app/parent.data.sql").exists());
+}
+
+/// A rename is one version leading with `RENAME COLUMN`: the column keeps its
+/// values and everything on it, and what the design declares over the new
+/// name is what the rename already made of the old — no constraint churns.
+#[test]
+fn a_rename_is_one_version_leading_with_rename_column() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let line = |name: &str| {
+        format!(
+            "create table if not exists app.line (\n  id integer primary key\n\
+             , {name} integer not null default 0 check ({name} >= 0)\n, unique ({name})\n);\n"
+        )
+    };
+    let child = |name: &str| {
+        format!(
+            "create table if not exists app.child (\n  id integer primary key\n\
+             , line_qty integer references app.line ({name})\n);\n"
+        )
+    };
+    cut(
+        dir,
+        &[("line", &line("qty")), ("child", &child("qty"))],
+        MigrationDialect::Postgres,
+    );
+    cut(
+        dir,
+        &[("line", &line("quantity")), ("child", &child("quantity"))],
+        MigrationDialect::Postgres,
+    );
+    let sql = migration(dir, "line");
+    assert_eq!(
+        sql.trim(),
+        "ALTER TABLE app.line RENAME COLUMN qty TO quantity;",
+        "{sql}"
+    );
+    assert!(!dir.join("migrations/002/app/child.sql").exists());
+    assert!(!dir.join("migrations/003").exists());
+}
+
+/// A type change dbd cannot cast takes two versions, both on the column
+/// itself: the first's data script is where its values are made castable,
+/// the second alters it in place with a `USING` that can be edited.
+#[test]
+fn a_type_change_dbd_cannot_cast_prepares_the_column_then_alters_it_in_place() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let orders =
+        |ty: &str| format!("create table if not exists app.orders (\n  id integer primary key\n, total {ty}\n);\n");
+    cut(dir, &[("orders", &orders("text"))], MigrationDialect::Postgres);
+    cut(dir, &[("orders", &orders("integer"))], MigrationDialect::Postgres);
+    let data = std::fs::read_to_string(dir.join("migrations/002/app/orders.data.sql")).unwrap();
+    assert!(data.contains("-- TODO:") && data.contains("total"), "{data}");
+    assert!(!data.contains("total_new"), "{data}");
+    assert!(!dir.join("migrations/002/app/orders.sql").exists() || !migration(dir, "orders").contains("_new"));
+    let stage2 = migration_at(dir, 3, "orders");
+    assert!(
+        stage2.contains("ALTER TABLE app.orders ALTER COLUMN total TYPE integer USING total::integer;"),
+        "{stage2}"
+    );
+    assert!(!stage2.contains("DROP COLUMN"), "{stage2}");
+}
+
+/// A `<column>_new` the design really has is never taken for a swap column.
+#[test]
+fn a_column_named_like_a_swap_column_is_left_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let t = |ty: &str| {
+        format!("create table if not exists app.t (\n  id integer primary key\n, price {ty}\n, price_new integer\n);\n")
+    };
+    cut(dir, &[("t", &t("integer"))], MigrationDialect::Postgres);
+    cut(dir, &[("t", &t("bigint"))], MigrationDialect::Postgres);
+    let sql = migration(dir, "t");
+    assert!(sql.contains("ALTER COLUMN price TYPE bigint"), "{sql}");
+    assert!(!sql.contains("price_new"), "{sql}");
+}

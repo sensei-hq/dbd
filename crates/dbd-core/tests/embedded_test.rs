@@ -4875,6 +4875,302 @@ async fn a_released_rename_keeps_the_columns_values_and_definition() {
     assert!(touched.is_empty(), "the database is the design: {touched:?}");
 }
 
+// ── A released column changed in place (0.27.2 review) ────────────────────────
+
+/// A released project at v1 with `v1`'s tables, `rows` run over it, then cut
+/// to `v2` and applied: the design as it ends, and the outcome of the apply.
+async fn release_then_change(
+    adapter: &dyn dbd_core::DatabaseAdapter,
+    dir: &std::path::Path,
+    v1: &[(&str, &str)],
+    rows: &str,
+    v2: &[(&str, &str)],
+) -> (Design, dbd_core::Result<()>) {
+    cut_rekey(dir, v1);
+    released(dir)
+        .apply(adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    if !rows.is_empty() {
+        adapter.execute_script(rows).await.unwrap();
+    }
+    cut_rekey(dir, v2);
+    let design = released(dir);
+    let outcome = design
+        .apply(adapter, None, false, None, Progress::none())
+        .await
+        .map(|_| ());
+    (design, outcome)
+}
+
+/// Whether the live database is the design, as `diff` reads it.
+async fn assert_in_sync(design: &Design, adapter: &dyn dbd_core::DatabaseAdapter) {
+    let diff = design.diff_live(adapter, None).await.expect("diff");
+    let touched: Vec<String> = diff
+        .changes
+        .iter()
+        .map(|c| format!("{:?} {}", c.action, c.entity_name))
+        .collect();
+    assert!(touched.is_empty(), "the database is the design: {touched:?}");
+}
+
+/// A generated column's type change keeps it generated: the swap put a plain
+/// column in its place, every new row's value NULL.
+#[tokio::test]
+async fn a_released_generated_columns_type_change_keeps_it_generated() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let g = |ty: &str| {
+        format!(
+            "create table if not exists app.g (\n  id integer primary key\n, a integer not null\n\
+             , twice {ty} not null generated always as (a * 2) stored\n);\n"
+        )
+    };
+    let (design, outcome) = release_then_change(
+        &*adapter,
+        tmp.path(),
+        &[("g", &g("integer"))],
+        "INSERT INTO app.g (id, a) VALUES (1, 10);",
+        &[("g", &g("bigint"))],
+    )
+    .await;
+    outcome.expect("the type change applies");
+    assert_in_sync(&design, &*adapter).await;
+    adapter
+        .execute_script("INSERT INTO app.g (id, a) VALUES (3, 30);")
+        .await
+        .unwrap();
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.g HAVING count(*) FILTER (WHERE id = 1 AND twice = 20) = 1 \
+         AND count(*) FILTER (WHERE id = 3 AND twice = 60) = 1",
+        "twice computed",
+    )
+    .await;
+}
+
+/// A table whose foreign key is to itself, both columns cut to `bigint`:
+/// one foreign key at the end, and the same migration on every cut.
+#[tokio::test]
+async fn a_released_tree_table_cut_to_bigint_keeps_its_one_foreign_key() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let node = |ty: &str| {
+        format!(
+            "create table if not exists app.node (\n  id {ty} primary key\n\
+             , parent_id {ty} references app.node (id)\n);\n"
+        )
+    };
+    let (design, outcome) = release_then_change(
+        &*adapter,
+        tmp.path(),
+        &[("node", &node("integer"))],
+        "INSERT INTO app.node VALUES (1, NULL), (2, 1);",
+        &[("node", &node("bigint"))],
+    )
+    .await;
+    outcome.expect("the type changes apply");
+    assert_in_sync(&design, &*adapter).await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_constraint WHERE conrelid = 'app.node'::regclass AND contype = 'f' HAVING count(*) = 1",
+        "one foreign key",
+    )
+    .await;
+}
+
+/// A referenced key widened in a release that also changes something else on
+/// its table applies: the foreign key's drop landed in the wrong stage.
+#[tokio::test]
+async fn a_referenced_key_widened_beside_another_change_applies() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let child = "create table if not exists app.child (\n  id integer primary key\n\
+                 , parent_id integer references app.parent (id)\n);\n";
+    let (design, outcome) = release_then_change(
+        &*adapter,
+        tmp.path(),
+        &[
+            (
+                "parent",
+                "create table if not exists app.parent (\n  id integer primary key\n);\n",
+            ),
+            ("child", child),
+        ],
+        "INSERT INTO app.parent VALUES (1); INSERT INTO app.child VALUES (1, 1);",
+        &[
+            (
+                "parent",
+                "create table if not exists app.parent (\n  id bigint primary key\n, note text\n);\n",
+            ),
+            ("child", child),
+        ],
+    )
+    .await;
+    outcome.expect("the change applies");
+    assert_in_sync(&design, &*adapter).await;
+}
+
+/// An identity widened goes on past the last value it handed out — not past
+/// the largest still in the table, which reissues a deleted row's id.
+#[tokio::test]
+async fn a_released_identity_widened_goes_on_past_its_last_value() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let line = |ty: &str| {
+        format!(
+            "create table if not exists app.line (\n  id {ty} generated always as identity primary key\n, qty integer\n);\n"
+        )
+    };
+    let (design, outcome) = release_then_change(
+        &*adapter,
+        tmp.path(),
+        &[("line", &line("integer"))],
+        "INSERT INTO app.line (qty) VALUES (1), (2), (3); DELETE FROM app.line WHERE id = 3;",
+        &[("line", &line("bigint"))],
+    )
+    .await;
+    outcome.expect("the type change applies");
+    assert_in_sync(&design, &*adapter).await;
+    adapter
+        .execute_script("INSERT INTO app.line (qty) VALUES (4);")
+        .await
+        .unwrap();
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.line WHERE qty = 4 AND id = 4",
+        "id 4",
+    )
+    .await;
+}
+
+/// Narrowing text to `varchar(3)` over a longer value fails the version, as
+/// Postgres refuses `value too long` — it never truncates the value.
+#[tokio::test]
+async fn a_released_narrowing_refuses_a_value_too_long_rather_than_truncate() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let t = |ty: &str| format!("create table if not exists app.t (\n  id integer primary key\n, name {ty}\n);\n");
+    let (_design, outcome) = release_then_change(
+        &*adapter,
+        tmp.path(),
+        &[("t", &t("text"))],
+        "INSERT INTO app.t VALUES (1, 'abcdef');",
+        &[("t", &t("varchar(3)"))],
+    )
+    .await;
+    let err = outcome.expect_err("a value too long refuses the version").to_string();
+    assert!(err.contains("too long"), "{err}");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.t WHERE name = 'abcdef'",
+        "the value",
+    )
+    .await;
+}
+
+/// The same on reconcile: its in-place type change never truncates either.
+#[tokio::test]
+async fn reconcile_narrowing_refuses_a_value_too_long_rather_than_truncate() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let t = |ty: &str| format!("create table if not exists app.t (\n  id integer primary key\n, name {ty}\n);\n");
+    let (_v1, design) = rekey_design(&[("t", &t("text"))]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("create");
+    adapter
+        .execute_script("INSERT INTO app.t VALUES (1, 'abcdef');")
+        .await
+        .unwrap();
+    let (_v2, design) = rekey_design(&[("t", &t("varchar(3)"))]);
+    let err = design
+        .reconcile(&*adapter, false, true, false, None, Progress::none())
+        .await
+        .expect_err("a value too long refuses the change")
+        .to_string();
+    assert!(err.contains("too long"), "{err}");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.t WHERE name = 'abcdef'",
+        "the value",
+    )
+    .await;
+}
+
+/// Renaming a key another table's foreign key holds: the foreign key follows
+/// the rename, as Postgres's `RENAME COLUMN` takes it along.
+#[tokio::test]
+async fn a_released_rename_of_a_held_key_applies() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = |key: &str| format!("create table if not exists app.parent (\n  {key} integer primary key\n);\n");
+    let child = |key: &str| {
+        format!(
+            "create table if not exists app.child (\n  id integer primary key\n\
+             , parent_id integer references app.parent ({key})\n);\n"
+        )
+    };
+    let (design, outcome) = release_then_change(
+        &*adapter,
+        tmp.path(),
+        &[("parent", &parent("id")), ("child", &child("id"))],
+        "INSERT INTO app.parent VALUES (1); INSERT INTO app.child VALUES (1, 1);",
+        &[("parent", &parent("pid")), ("child", &child("pid"))],
+    )
+    .await;
+    outcome.expect("the rename applies");
+    assert_in_sync(&design, &*adapter).await;
+}
+
+/// A rename keeps the table's own constraints over the column and its
+/// collation: the constraints were added before the column existed, and the
+/// collation was dropped.
+#[tokio::test]
+async fn a_released_rename_keeps_table_constraints_and_collation() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let line = |name: &str| {
+        format!(
+            "create table if not exists app.line (\n  id integer primary key\n\
+             , {name} integer not null default 0\n, unique ({name})\n, check ({name} >= 0)\n);\n"
+        )
+    };
+    let tag = |name: &str| {
+        format!("create table if not exists app.tag (\n  id integer primary key\n, {name} text collate \"C\"\n);\n")
+    };
+    let (design, outcome) = release_then_change(
+        &*adapter,
+        tmp.path(),
+        &[("line", &line("qty")), ("tag", &tag("code"))],
+        "INSERT INTO app.line VALUES (1, 10); INSERT INTO app.tag VALUES (1, 'x');",
+        &[("line", &line("quantity")), ("tag", &tag("label"))],
+    )
+    .await;
+    outcome.expect("the renames apply");
+    assert_in_sync(&design, &*adapter).await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.line l JOIN app.tag t ON t.id = l.id WHERE l.quantity = 10 AND t.label = 'x'",
+        "the values",
+    )
+    .await;
+}
+
 // ── A routine whose return type changes (#65) ─────────────────────────────────
 
 /// A project `routines` in a temporary folder with `files` (`(path, text)`).
