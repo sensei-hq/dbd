@@ -2637,8 +2637,10 @@ mod tests {
         assert!(result.todos.is_empty());
     }
 
+    /// A rename is one version that renames the column in place: Postgres
+    /// keeps its values and everything on it, so nothing is copied or dropped.
     #[test]
-    fn b2_column_rename_two_snapshots() {
+    fn b2_a_column_rename_is_one_snapshot_renaming_in_place() {
         let prev = Snapshot {
             version: 1,
             description: "v1".to_string(),
@@ -2657,27 +2659,76 @@ mod tests {
             vec![col("id", "INT"), col("display_name", "TEXT")],
         )];
         let result = prepare_multi_snapshot(&entities, Some(&prev), 2, "rename");
-        assert_eq!(result.snapshots.len(), 2, "column rename should produce 2 snapshots");
-        let stages: Vec<_> = result
-            .snapshots
-            .iter()
-            .map(|r| r.graph.as_ref().unwrap().stage)
-            .collect();
+        assert_eq!(result.snapshots.len(), 1, "a rename is one version");
         assert_eq!(
-            stages,
-            vec![
-                Some(MigrationStage { index: 1, of: 2 }),
-                Some(MigrationStage { index: 2, of: 2 })
-            ],
-            "each stage's graph names its place in the run"
+            result.snapshots[0].graph.as_ref().unwrap().stage,
+            Some(MigrationStage { index: 1, of: 1 })
         );
-        // Stage 1 should have data.sql file
+        let files = &result.snapshots[0].migration_files;
+        assert_eq!(files.len(), 1, "{}", files.len());
+        assert_eq!(
+            files[0].content.trim(),
+            "ALTER TABLE config.users RENAME COLUMN name TO display_name;"
+        );
+        assert!(result.todos.is_empty());
+    }
+
+    /// A type change dbd can cast is one version altering the column in place;
+    /// one it cannot takes two, the column at its old type in the first.
+    #[test]
+    fn b4_a_type_change_is_in_place_one_version_or_two_when_it_cannot_cast() {
+        let prev = |ty: &str| Snapshot {
+            version: 1,
+            description: "v1".to_string(),
+            timestamp: "t".to_string(),
+            tables: vec![TableSnapshot {
+                name: "users".to_string(),
+                schema: "config".to_string(),
+                columns: vec![col("id", "INT"), col("n", ty)],
+                indexes: vec![],
+                table_constraints: vec![],
+            }],
+            enums: vec![],
+        };
+        let castable = prepare_multi_snapshot(
+            &[make_table_entity(
+                "config.users",
+                vec![col("id", "INT"), col("n", "BIGINT")],
+            )],
+            Some(&prev("INT")),
+            2,
+            "widen",
+        );
+        assert_eq!(castable.snapshots.len(), 1);
         assert!(
-            result.snapshots[0]
-                .migration_files
+            castable.snapshots[0].migration_files[0]
+                .content
+                .contains("ALTER TABLE config.users ALTER COLUMN n TYPE bigint USING n::bigint;")
+        );
+
+        let staged = prepare_multi_snapshot(
+            &[make_table_entity(
+                "config.users",
+                vec![col("id", "INT"), col("n", "INT")],
+            )],
+            Some(&prev("JSONB")),
+            2,
+            "to int",
+        );
+        assert_eq!(staged.snapshots.len(), 2);
+        let n_type = |i: usize| {
+            staged.snapshots[i].snapshot.tables[0]
+                .columns
                 .iter()
-                .any(|f| f.relative_path.to_string_lossy().contains("data.sql")),
-            "stage 1 should have data.sql for copy"
+                .find(|c| c.name == "n")
+                .map(|c| c.data_type.clone())
+                .unwrap()
+        };
+        assert_eq!((n_type(0), n_type(1)), ("jsonb".to_string(), "integer".to_string()));
+        assert!(
+            staged.snapshots[1].migration_files[0]
+                .content
+                .contains("ALTER TABLE config.users ALTER COLUMN n TYPE integer USING n::integer;")
         );
     }
 
@@ -2751,8 +2802,9 @@ mod tests {
         );
     }
 
+    /// The renamed column's snapshot holds the new name only.
     #[test]
-    fn s1_stage1_adds_new_column_for_rename() {
+    fn s1_a_renames_snapshot_holds_the_new_name_only() {
         let prev = Snapshot {
             version: 1,
             description: "v1".to_string(),
@@ -2771,52 +2823,14 @@ mod tests {
             vec![col("id", "INT"), col("display_name", "TEXT")],
         )];
         let result = prepare_multi_snapshot(&entities, Some(&prev), 2, "rename");
-        assert!(result.snapshots.len() >= 2);
-        // Stage 1 should have 3 columns: id, name, display_name
-        let stage1_table = result.snapshots[0]
+        let table = result.snapshots[0]
             .snapshot
             .tables
             .iter()
             .find(|t| t.name == "users")
             .expect("should have users table");
-        let col_names: Vec<&str> = stage1_table.columns.iter().map(|c| c.name.as_str()).collect();
-        assert!(col_names.contains(&"id"), "should have id");
-        assert!(col_names.contains(&"name"), "should still have old name");
-        assert!(col_names.contains(&"display_name"), "should have new display_name");
-    }
-
-    #[test]
-    fn s2_stage2_drops_old_column_for_rename() {
-        let prev = Snapshot {
-            version: 1,
-            description: "v1".to_string(),
-            timestamp: "t".to_string(),
-            tables: vec![TableSnapshot {
-                name: "users".to_string(),
-                schema: "config".to_string(),
-                columns: vec![col("id", "INT"), col("name", "TEXT")],
-                indexes: vec![],
-                table_constraints: vec![],
-            }],
-            enums: vec![],
-        };
-        let entities = vec![make_table_entity(
-            "config.users",
-            vec![col("id", "INT"), col("display_name", "TEXT")],
-        )];
-        let result = prepare_multi_snapshot(&entities, Some(&prev), 2, "rename");
-        assert!(result.snapshots.len() >= 2);
-        // Stage 2 should have 2 columns: id, display_name (no "name")
-        let stage2_table = result.snapshots[1]
-            .snapshot
-            .tables
-            .iter()
-            .find(|t| t.name == "users")
-            .expect("should have users table");
-        let col_names: Vec<&str> = stage2_table.columns.iter().map(|c| c.name.as_str()).collect();
-        assert!(col_names.contains(&"id"));
-        assert!(col_names.contains(&"display_name"));
-        assert!(!col_names.contains(&"name"), "old name should be dropped in stage 2");
+        let col_names: Vec<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(col_names, ["id", "display_name"]);
     }
 
     #[test]

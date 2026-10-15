@@ -2215,10 +2215,8 @@
         assert_eq!(sql, "UPDATE \"config\".\"users\" SET \"display_name\" = \"name\";\n");
     }
 
-    /// The values go into the column stage 1 adds, `<column>_new`, which stage
-    /// 2 renames into place — never into the column itself, which stage 2
-    /// drops. Both sides of a type change carry the column's own name, as
-    /// `classify_changes` builds them.
+    /// A type change dbd can cast is altered in place, its values Postgres's
+    /// to convert: there is nothing to move.
     #[test]
     fn d_data_castable_type_change() {
         let change = ComplexChange::ColumnTypeChange {
@@ -2229,8 +2227,7 @@
             old_col: Box::new(col("total", "INTEGER")),
             new_col: Box::new(col("total", "TEXT")),
         };
-        let sql = generate_data_sql(&change);
-        assert_eq!(sql, "UPDATE \"config\".\"orders\" SET \"total_new\" = \"total\"::TEXT;\n");
+        assert_eq!(generate_data_sql(&change), "");
     }
 
     #[test]
@@ -2245,6 +2242,11 @@
         };
         let sql = generate_data_sql(&change);
         assert!(sql.contains("-- TODO:"), "should contain TODO comment: {sql}");
+        // On the column itself, before the next version alters it in place.
+        assert!(
+            sql.contains("payload") && sql.contains("USING") && !sql.contains("payload_new"),
+            "{sql}"
+        );
     }
 
     #[test]
@@ -2303,7 +2305,9 @@
     }
 
     #[test]
-    fn d_data_text_to_varchar_has_truncation_warning() {
+    /// Narrowing text to `varchar(n)` moves nothing: the column is altered in
+    /// place, where Postgres refuses a value too long rather than cut it.
+    fn d_data_text_to_varchar_moves_nothing() {
         let change = ComplexChange::ColumnTypeChange {
             table_name: "config.users".to_string(),
             column_name: "name".to_string(),
@@ -2312,7 +2316,5 @@
             old_col: Box::new(col("name", "TEXT")),
             new_col: Box::new(col("name", "VARCHAR(50)")),
         };
-        let sql = generate_data_sql(&change);
-        assert!(sql.contains("WARNING"), "should contain WARNING: {sql}");
-        assert!(sql.contains("truncate"), "should mention truncate: {sql}");
+        assert_eq!(generate_data_sql(&change), "");
     }
