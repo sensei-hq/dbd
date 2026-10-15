@@ -177,10 +177,19 @@ pub const DEFAULT_SCHEMA: &str = "public";
 /// Empty schemas are normalized to [`DEFAULT_SCHEMA`] so an unqualified project
 /// table (`""`) matches its introspected counterpart (`"public"`).
 pub fn raw_snapshot_from_entities(entities: &[Entity]) -> Snapshot {
+    let sequences: HashSet<&str> = entities
+        .iter()
+        .filter(|e| e.entity_type == EntityType::Sequence)
+        .map(|e| e.name.as_str())
+        .collect();
     let tables = entities
         .iter()
         .filter(|e| e.entity_type == EntityType::Table && e.table_def.is_some())
-        .filter_map(snapshot::entity_to_table_snapshot)
+        .filter_map(|e| {
+            let mut t = snapshot::entity_to_table_snapshot(e)?;
+            qualify_bare_sequences(&mut t, &e.schema_path, &sequences);
+            Some(t)
+        })
         .map(|mut t| {
             if t.schema.is_empty() {
                 t.schema = DEFAULT_SCHEMA.to_string();
@@ -205,6 +214,39 @@ pub fn raw_snapshot_from_entities(entities: &[Entity]) -> Snapshot {
         timestamp: String::new(),
         tables,
         enums,
+    }
+}
+
+/// Name the schema of the sequence a bare `nextval('seq')` default draws on,
+/// as Postgres found it when the table's file ran (#60): the first schema on
+/// the file's path that `sequences` declares `seq` in. `pg_get_expr` prints a
+/// sequence the session's path does not reach with its schema —
+/// `nextval('app.seq'::regclass)` — so the bare spelling read as a changed
+/// default on every run. One declared on none of them is left as written:
+/// where it resolved, the design cannot say. A table read from a database
+/// has no path of its own, so is left as it is.
+fn qualify_bare_sequences(
+    t: &mut snapshot::TableSnapshot,
+    path: &crate::entity::SchemaPath,
+    sequences: &HashSet<&str>,
+) {
+    use crate::parser::pg::common::{nextval_sequence_of, regclass_parts};
+    use crate::sql_quote::ident_if_needed;
+    for c in &mut t.columns {
+        let Some(sequence) = c.default_value.as_deref().and_then(|d| nextval_sequence_of(d.trim())) else {
+            continue;
+        };
+        let parts = regclass_parts(&sequence);
+        let Some([name]) = parts.as_deref() else {
+            continue;
+        };
+        if let Some(schema) = path
+            .schemas()
+            .find(|schema| sequences.contains(format!("{schema}.{name}").as_str()))
+        {
+            let qualified = format!("{}.{}", ident_if_needed(schema), ident_if_needed(name));
+            c.default_value = Some(format!("nextval('{}'::regclass)", qualified.replace('\'', "''")));
+        }
     }
 }
 
@@ -648,10 +690,32 @@ pub(crate) fn canonical_default(raw: &str, data_type: &str) -> String {
     // default on every run. Both sides take the reported form — valid SQL with
     // the same meaning, as everything this returns must be (it is emitted).
     if let Some(sequence) = crate::parser::pg::common::nextval_sequence_of(raw.trim()) {
-        return format!("nextval('{}'::regclass)", sequence.replace('\'', "''"));
+        return format!(
+            "nextval('{}'::regclass)",
+            regclass_spelling(&sequence).replace('\'', "''")
+        );
     }
     let base = fold_unquoted_case(strip_trailing_cast(raw.trim()).trim());
     canonical_default_for_type(&base, data_type).unwrap_or(base)
+}
+
+/// The relation a `regclass` string names, spelled as `pg_get_expr` prints
+/// it (#60): each part as `quote_identifier` writes it — `'App.Seq'` is
+/// `app.seq`, `'"app"."seq"'` too — and no `public.`, the implicit search
+/// path, as [`canonical_type`] takes it. A string naming no relation by name
+/// (an OID) is kept as written.
+fn regclass_spelling(text: &str) -> String {
+    let Some(mut parts) = crate::parser::pg::common::regclass_parts(text) else {
+        return text.to_string();
+    };
+    if parts.len() == 2 && parts[0] == DEFAULT_SCHEMA {
+        parts.remove(0);
+    }
+    parts
+        .iter()
+        .map(|part| crate::sql_quote::ident_if_needed(part))
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 /// Settle a literal the server rewrites when it stores it (#18).

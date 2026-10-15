@@ -224,6 +224,12 @@ pub(crate) fn nextval_sequence(expr: &pg_query::protobuf::Node) -> Option<String
 /// double-quoted as written (`""` a quote) or folded to lower case. `None`
 /// for a string that is not a name — a number is an OID.
 pub(crate) fn regclass_name(text: &str) -> Option<String> {
+    regclass_parts(text).map(|parts| parts.join("."))
+}
+
+/// [`regclass_name`]'s parts, each as Postgres reads it — apart, so a quoted
+/// part holding a `.` stays one part.
+pub(crate) fn regclass_parts(text: &str) -> Option<Vec<String>> {
     let trimmed = text.trim();
     if !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit()) {
         return None;
@@ -253,7 +259,7 @@ pub(crate) fn regclass_name(text: &str) -> Option<String> {
         parts.push(part);
         while chars.next_if(space).is_some() {}
         match chars.next() {
-            None => return Some(parts.join(".")),
+            None => return Some(parts),
             Some('.') => {}
             Some(_) => return None,
         }
