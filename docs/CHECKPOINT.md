@@ -1,31 +1,34 @@
 # Checkpoint
 
-**Slice:** release 0.27.0 (#7 phase 3, workspaces and modules), then the
-patch 0.27.1 for #65.
+**Slice:** #65 — a key change a foreign key holds, and a function whose
+return type changes; then the patch 0.27.1. Branch `fix/65-key-change`
+(from `develop`).
 
 ## Done
 
-- #7 phase 3, slices 1–7, merged into `feat/workspaces` (PRs #61–#69) and
-  from there into `develop` (PR #70, 3bdb2e4f).
-- The 0.27.0 release notes: CHANGELOG `[0.27.0] — 2026-10-14`.
+- 0.27.0 released (crates.io), `develop` merged to `main` (PR #71), CI green;
+  the installed binary split and deployed a scratch Postgres project.
+- Slice 1 (reconcile): `plan_key_holders` drops the foreign keys holding a key
+  the plan drops before it, adds back the ones the design keeps, refuses one
+  on a table outside the run; `execute_reconcile_writes` runs the key change
+  and the step re-adding a replaced foreign key in one transaction.
 
 ## Next
 
-1. `make bump minor` on `develop` — tests, tag v0.27.0, push, publish
-   (`gh run list --workflow=release.yml`), install.
-2. PR `develop` → `main`, CI green, merge locally.
-3. Check the installed binary: a SQLite project → `dbd split --from-scopes
-   --write` → `dbd deploy`.
-4. #65: reconcile drops the foreign keys referencing a primary key it
-   changes, and re-adds them; a function whose return type changes is dropped
-   and created. Then 0.27.1.
+1. Review slice 1 (failure modes, data correctness).
+2. Slice 2: Postgres `apply_entity` drops and re-creates a routine
+   `CREATE OR REPLACE` refuses (42P13/42809, one overload), naming dependents.
+3. Slice 3: snapshot migrations — an unnamed key dropped by catalog lookup;
+   the foreign keys holding a dropped key dropped first, kept ones re-added.
+4. Docs (guide reconcile/migrations, CHANGELOG), `make bump` patch 0.27.1.
 
 ## Open
 
 - Issue #60: reconcile re-emits a mixed-case `nextval('App.Seq')` default.
-- `dbd init --dry-run` writes design.yaml and the scaffold (unfiled).
-- SQLite `deploy --module shared` with core's keys to it fails on a bare FK
-  error while emptying (Postgres names the keys) — unfiled.
-- Delete by hand: `/tmp/dbd-*` scratch and review dirs; `git worktree remove
-  /tmp/dbd-review-tests-wt` (and `git worktree prune`).
-- Known limit: a type in a schema that needs quoting (`"Ext"`) reads as drift.
+- `dbd init --dry-run` writes files (unfiled). SQLite scopes cannot name a
+  table (bare names read as schemas; `main.` is dropped) — unfiled.
+- A dry run with `--allow-destructive` still says "re-run with
+  --allow-destructive" (unfiled).
+- SQLite `deploy --module shared` with core's keys fails on a bare FK error.
+- Scratch Postgres at /tmp/dbd-verify-pg (port 55432, socket) — stop with
+  `pg_ctl -D /tmp/dbd-verify-pg/data stop` when done.
