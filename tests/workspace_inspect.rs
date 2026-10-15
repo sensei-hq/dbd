@@ -569,3 +569,19 @@ fn a_deps_override_reaches_the_workspace_gap_check() {
         "{text}"
     );
 }
+
+/// `--module`'s help names every command that takes the module alone.
+#[test]
+fn modules_help_names_what_takes_the_module_alone() {
+    let out = Command::cargo_bin("dbd").unwrap().arg("--help").output().unwrap();
+    let help = String::from_utf8_lossy(&out.stdout).to_string();
+    let module = help
+        .lines()
+        .skip_while(|l| !l.contains("--module"))
+        .take_while(|l| !l.trim_start().starts_with("--") || l.contains("--module"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    for command in ["reset", "export", "snapshot", "release"] {
+        assert!(module.contains(command), "{command}: {module}");
+    }
+}
