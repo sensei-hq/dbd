@@ -9,6 +9,8 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.27.1] — 2026-10-14
+
 **A key a foreign key holds can change, and so can what a function returns**
 ([#65]). Changing a table's primary key while another table's foreign key
 referenced it failed — `cannot drop constraint parent_pkey … because other
