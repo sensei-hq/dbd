@@ -205,6 +205,68 @@ pub fn pending_data_sql_todos(pending: &[PendingMigration]) -> Result<Vec<DataSq
     Ok(result)
 }
 
+/// A pending version a dbd before 0.27.2 cut for a column's type change, whose
+/// data script fills the column the next version drops: run as written, the
+/// column loses every value. 0.27.1 and earlier staged a type change as
+/// `ADD COLUMN <column>_new` with a `data.sql` meant to fill it, but wrote
+/// `SET "<column>" = "<column>"::<type>`.
+#[derive(Debug, Clone)]
+pub struct LossySwap {
+    /// Version number of the migration the data script belongs to.
+    pub version: u32,
+    /// The data script.
+    pub file: PathBuf,
+    /// The column whose values it loses.
+    pub column: String,
+}
+
+/// The pending versions' [`LossySwap`]s, found by that shape: a table file
+/// adding `<column>_new`, beside a data script setting `<column>` from itself.
+/// Fails closed, as [`pending_data_sql_todos`] does.
+pub fn pending_lossy_swaps(pending: &[PendingMigration]) -> Result<Vec<LossySwap>> {
+    let mut found = Vec::new();
+    for migration in pending {
+        let dir = &migration.migration_dir;
+        if !dir.exists() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(dir) {
+            let entry = entry.map_err(|e| DbdError::Config(format!("scan {}: {e}", dir.display())))?;
+            let path = entry.path();
+            let Some(table_file) = path
+                .to_str()
+                .and_then(|p| p.strip_suffix(".data.sql"))
+                .map(|stem| PathBuf::from(format!("{stem}.sql")))
+            else {
+                continue;
+            };
+            if !entry.file_type().is_file() || !table_file.exists() {
+                continue;
+            }
+            let data = crate::source_text::read_to_string(path)?;
+            let table = crate::source_text::read_to_string(&table_file)?;
+            for line in data.lines() {
+                // `UPDATE "s"."t" SET "<column>" = "<column>"::<type>;`
+                let Some((_, rest)) = line.trim().split_once(" SET \"") else {
+                    continue;
+                };
+                let Some((column, rest)) = rest.split_once("\" = \"") else {
+                    continue;
+                };
+                if rest.starts_with(&format!("{column}\"::")) && table.contains(&format!("ADD COLUMN {column}_new ")) {
+                    found.push(LossySwap {
+                        version: migration.to_version,
+                        file: path.to_path_buf(),
+                        column: column.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    found.sort_by(|a, b| (a.version, &a.file).cmp(&(b.version, &b.file)));
+    Ok(found)
+}
+
 // ── Snapshot I/O ────────────────────────────────────────
 
 /// The migration graph written alongside snapshot `version`, if there is one.
