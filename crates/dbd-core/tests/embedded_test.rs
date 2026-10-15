@@ -4406,10 +4406,13 @@ async fn a_released_rename_of_a_unique_index_a_foreign_key_rests_on_applies() {
         "the renamed index",
     )
     .await;
+    // By the catalog's relations: the migration ran on `app`'s search path,
+    // and `pg_get_constraintdef` leaves a table on the path unqualified.
     assert_catalog(
         &*adapter,
         true,
-        &constraint_predicate("child", "FOREIGN KEY (code) REFERENCES app.parent(code)"),
+        "SELECT 1 FROM pg_constraint WHERE conrelid = 'app.child'::regclass AND contype = 'f' \
+         AND confrelid = 'app.parent'::regclass",
         "the foreign key",
     )
     .await;
