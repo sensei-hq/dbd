@@ -1506,6 +1506,29 @@
         assert_eq!(generate_migration_sql(&ordinary), "DROP TABLE app.t CASCADE;");
     }
 
+    /// A table with no schema of its own drops its index bare, never in a
+    /// schema named `""`; and an index name keeps its quotes doubled.
+    #[test]
+    fn s13b_index_drop_names_a_schema_only_when_the_table_has_one() {
+        let drop = |entity: &str, index: &str| {
+            generate_migration_sql(&[MigrationDiff {
+                entity_name: entity.to_string(),
+                entity_type: EntityType::Table,
+                action: DiffAction::Change(vec![FieldChange {
+                    field_name: index.to_string(),
+                    field_type: FieldType::Index,
+                    action: ChangeAction::Drop(Box::new(FieldDetail::Index(IndexDef {
+                        name: Some(index.to_string()),
+                        ..Default::default()
+                    }))),
+                }]),
+            }])
+        };
+        assert_eq!(drop(".t", "t_c"), "DROP INDEX IF EXISTS \"t_c\";");
+        assert_eq!(drop("t", "t_c"), "DROP INDEX IF EXISTS \"t_c\";");
+        assert_eq!(drop("app.t", "a\"b"), "DROP INDEX IF EXISTS \"app\".\"a\"\"b\";");
+    }
+
     // ── S14: Enum value add / drop SQL ──────────────────────
 
     #[test]
