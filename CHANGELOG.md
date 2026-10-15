@@ -13,7 +13,8 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 `modules:` block is a workspace: each module is a design of its own, in a
 folder of its own, recorded in the database as its own owner
 (`<project>/<module>`) with its own version, snapshots and migrations. Every
-command runs a workspace module by module in `depends_on` order — `reset` in
+command but `init`, `merge` and `split` runs a workspace module by module in
+`depends_on` order — `reset` in
 reverse — checking every module before the first writes; `--module` selects a
 module (with what it depends on); scopes select modules
 (`scopes.<name>.modules`); running inside a module's folder runs that module.

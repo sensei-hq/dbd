@@ -143,7 +143,7 @@ enum or sequence lives in a schema the scope leaves out has a gap, and
 |---|---|
 | **Filter, and refuse on a gap** under `deps: report` | `inspect`, `apply`, `deploy`, `import`, `reconcile`, `diff` |
 | **Filter only** — no gap check (`inspect --scope` is where gaps surface) | `combine`, `emit`, `dbml`, `graph`, `diagram`, `export`, `refresh`, `policies`, `reset` |
-| **Ignore, with a warning** | `snapshot`, `release`, `migrate`, `doctor`, `init`, `merge`, `format`, `install` |
+| **Ignore, with a warning** | `snapshot`, `release`, `migrate`, `doctor`, `init`, `merge`, `split`, `format`, `install` |
 
 The ignoring commands print
 `⚠ --scope hub ignored: this command operates on the whole design, not a scope`,
@@ -487,7 +487,7 @@ first builds the workspace in a scratch folder and refuses unless that loads and
 deploys, under each scope and with none, exactly what the project does. Until it
 is done it keeps a journal of its moves (`.dbd-split`) and the manifest as it
 was: a move that fails puts back every move before it, and while the journal is
-there every command is refused, naming `dbd split --undo`, which puts the files
+there every command that reads the project is refused, naming `dbd split --undo`, which puts the files
 and `design.yaml` back.
 
 **What it refuses** before anything moves, naming why:

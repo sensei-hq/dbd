@@ -216,7 +216,7 @@ entities to each other.
 **Overlaps are refused before any database is.** Two modules declaring the same
 entity, or a module referencing what another module declares without that
 module in its `depends_on` (directly or through a dependency's own), is refused
-when the workspace loads — so by every command, `dbd inspect` included:
+when the workspace loads — so by every command that loads it, `dbd inspect` included:
 
 ```
 1 entity is declared by more than one module — an entity belongs to one module: keep it in one, and list that module in the depends_on of the others that use it:
@@ -274,8 +274,9 @@ the entity reads from another project's drop.
 
 Once a module's run leaves the project as it was holding nothing that still
 exists, its record goes: its `dbd.meta` row, its `dbd.uses`, its claims of what
-is gone and its materialized-view stamps — in the claim's transaction, so with
-the run or not at all. Its `dbd.migrations` rows stay, as history. The run says
+is gone and its materialized-view stamps — on PostgreSQL in the claim's
+transaction, so with the run or not at all; on SQLite, which has no run-wide
+transaction, in one of its own right after the claim. Its `dbd.migrations` rows stay, as history. The run says
 so:
 
 ```

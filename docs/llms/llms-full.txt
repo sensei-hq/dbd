@@ -454,7 +454,8 @@ scopes:
   `[A-Za-z0-9_][A-Za-z0-9_-]*` that YAML reads as a string (`2024`, `true`, `no`, `on`, `null` are
   refused): it is half the module's owner, `<project>/<module>`, and its default folder.
 - **Folders.** Each module's folder holds its own `ddl/`, `import/`, `policies/`, `snapshots/`,
-  `migrations/` and hook scripts. Refused, before any database work and by every command: a folder
+  `migrations/` and hook scripts. Refused, before any database work and by every command that loads the
+  workspace (`format`, `doctor` and `snapshot --list` read only the module folders): a folder
   outside the project, the project's own (`path: .`), inside another module's, shared by two, or
   missing; files in a root `ddl/`, `import/`, `policies/`, `snapshots/` or `migrations/` (dotfiles
   aside) — they belong to no module; `project.version` or `project.released` — each module has its
@@ -480,13 +481,13 @@ scopes:
   declares, `modules:` in a design without modules. No `--scope` runs the `default` scope when the
   manifest has one, else every module; `all` is every module. What one module of a run requires and
   the run's scope leaves out of another is a gap, checked when the run starts.
-- **`--module <name>`** (global) runs that module and the modules it depends on; `reset` and `export`
-  that module alone. Within a scope it must be one of the scope's modules; with no `--scope`, a module
+- **`--module <name>`** (global) runs that module and the modules it depends on; `reset`, `export`,
+  `snapshot` and `release` that module alone. Within a scope it must be one of the scope's modules; with no `--scope`, a module
   the `default` scope leaves out runs on its own, with its dependencies. On a design without modules
   it is refused.
 - **Running inside a module folder.** Run in a module's folder — no design.yaml of its own — dbd
-  walks up to the nearest design.yaml declaring `modules:`, as Cargo finds its workspace, and runs
-  that module unless `--module` says otherwise; `-s <module folder>` does the same. Run in a folder of
+  walks up to the nearest design.yaml above it, as Cargo finds its workspace, and — if that one
+  declares `modules:` — runs that module unless `--module` says otherwise; `-s <module folder>` does the same. Run in a folder of
   the workspace no module holds, it runs the workspace. `init` and `install` do not walk up, and a
   design without modules is not looked for above where dbd runs.
 - **Owners.** Each module runs, claims and records as its own owner, `<project>/<module>` — its own
@@ -504,7 +505,8 @@ scopes:
 - **Converting a project**: `dbd split --from-scopes` makes a module of each region of its scopes —
   see [dbd split](#dbd-split). `init` and `merge` refuse a workspace, pointing there.
 
-**Commands in a workspace.** Every command but `init` and `merge` runs a workspace, module by module:
+**Commands in a workspace.** Every command but `init`, `merge` and `split` runs a workspace, module by
+module:
 
 - Each module's run is headed `module <name> (<owner>)`, in `depends_on` order; `reset` in reverse,
   and `reset --module` resets that module alone — never its dependencies, which are other owners.

@@ -12,7 +12,7 @@ All commands accept these options:
 | `--source` | `-s` | `.` | Project directory (`dbd deploy` also takes a GitHub repo) |
 | `--scope` | | (all) | Named scope from `scopes:` in design.yaml |
 | `--deps` | | (scope default) | Override scope's `deps` setting: `report` or `include` |
-| `--module` | | (every module) | In a [workspace](#workspaces), run this module and the modules it depends on — `reset` and `export`, this module alone |
+| `--module` | | (every module) | In a [workspace](#workspaces), run this module and the modules it depends on — `reset`, `export`, `snapshot` and `release`, this module alone |
 | `--verbose` | `-v` | | Show all details (entity list, full JSON) |
 | `--help` | `-h` | | Print help |
 | `--version` | `-V` | | Print version |
@@ -169,7 +169,7 @@ A design.yaml that declares `modules:` is a **workspace**: each module is a desi
 of its own, in its own folder, recorded in the database as its own owner,
 `<project>/<module>` (see [design.yaml](03-design-yaml.md) for the `modules:`
 block, and [scopes](07-scopes.md) for scopes that select modules). Every command
-runs one but `init` and `merge` (`install` reads no project).
+runs one but `init`, `merge` and `split` (`install` reads no project).
 
 **Module by module.** A run goes over the modules in `depends_on` order — of
 those whose dependencies are in place, the one `modules:` lists first — each
@@ -199,7 +199,7 @@ own `apply.before` runs once, before the first module's own hooks; its
 `apply.after` and `import.after` run once, after the last module's.
 
 **`--module <name>`** narrows the run to one module and the modules it depends
-on — `reset` and `export` take the module alone: a reset never drops a
+on — `reset`, `export`, `snapshot` and `release` take the module alone: a reset never drops a
 dependency's entities, which are another owner's, and an export only reads. An
 unknown name is refused naming the modules, and on a design without `modules:`
 the flag is refused:
@@ -220,7 +220,8 @@ module: `app.orders is module "core"'s, and --module shared does not select it`.
 
 **Inside a module's folder.** Run in a module's folder — one with no
 design.yaml of its own — dbd walks up, along the path the run was started in,
-to the nearest design.yaml that declares `modules:` and runs that module, as
+to the nearest design.yaml above it and, if that one declares `modules:`, runs
+that module, as
 `--module` would, unless `--module` says otherwise; `-s <module folder>` does
 the same. Run in a folder of the workspace that no module holds, it runs the
 workspace. `init` and `install` do not walk up, and a design without modules is
@@ -2084,7 +2085,7 @@ journal of its moves, `.dbd-split`, in the project folder, with the manifest as
 it was; a move that fails — or a file git tracks that `git mv` will not move —
 puts back every move before it, and a move git will not put back is made by
 hand, saying to run `git add -A`. The journal goes when the split is done; while
-it is there, every command is refused:
+it is there, every command that reads the project — `format`, `doctor` and `snapshot --list` among them — is refused:
 
 ```
 Error: Failed to load design: Config error: a dbd split was interrupted here — its journal ./.dbd-split lists the files it moved, and design.yaml may not declare the modules yet: run `dbd split --undo` to put them back, then split again

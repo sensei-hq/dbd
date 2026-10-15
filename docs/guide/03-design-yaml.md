@@ -428,7 +428,7 @@ resolve its references, and are never its own to build, claim or drop.
 modules whose dependencies are in place, the one `modules:` lists first — each
 as its owner, under a heading `module core (shop/core)`; `reset` goes in
 reverse. `--module <name>` runs one module with every module it depends on
-(`reset` and `export` take the module alone). The manifest's own `apply:` hooks
+(`reset`, `export`, `snapshot` and `release` take the module alone). The manifest's own `apply:` hooks
 run once around the whole run — `apply.before` ahead of the first module's,
 `apply.after` behind the last's — read from the project folder; so does
 `import.after`, once, after the last module's import. A module's own `apply:`
@@ -436,13 +436,13 @@ runs with that module. Each `export:` entry is exported by the module declaring
 its entity.
 
 **Running inside a module's folder.** Run from a folder that holds no
-`design.yaml` of its own, dbd walks up to the nearest `design.yaml` that declares
-`modules:` — as Cargo finds its workspace — and runs the module whose folder you
-are in (`--module` says otherwise). `-s <module folder>` does the same. Run in a
+`design.yaml` of its own, dbd walks up to the nearest `design.yaml` above it —
+as Cargo finds its workspace — and, if that one declares `modules:`, runs the
+module whose folder you are in (`--module` says otherwise). `-s <module folder>` does the same. Run in a
 folder of the workspace no module holds, it runs the whole workspace. `init` and
 `install` never walk up, and a design without modules is not looked for above.
 
-**What is refused when the workspace loads** — by every command, before any
+**What is refused when the workspace loads** — by every command that loads it (all but `format`, `doctor` and `snapshot --list`, which read only the module folders), before any
 database is involved:
 
 - a module name outside `[A-Za-z0-9_][A-Za-z0-9_-]*`, or one YAML reads as

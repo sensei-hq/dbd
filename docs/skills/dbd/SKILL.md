@@ -134,7 +134,7 @@ A PostgreSQL URL that cannot be reached fails within 5 seconds, naming its
 
 **Global scope flags**: `--scope <name>` selects a `scopes:` subset; `--deps
 report|include` overrides its gap policy. In a workspace, `--module <name>` runs
-that module and the modules it depends on (`reset`/`export`: that module alone). **Gap-gated** (refuse on a dependency
+that module and the modules it depends on (`reset`/`export`/`snapshot`/`release`: that module alone). **Gap-gated** (refuse on a dependency
 gap under `report`): `inspect`/`apply`/`import`/`deploy`/`reconcile`/`diff`.
 **Filter-only**: `dbml`/`combine`/`emit`/`graph`/`diagram`/`export`/`reset`/
 `refresh`/`policies`. **Ignored with a warning** (`--scope` or `--deps` alike):
@@ -428,7 +428,7 @@ scopes:
   module to add (`✗ dependency gap: … — add dojo to modules.core.depends_on`); two
   modules declaring one entity are refused too. Fix by adding the dependency or
   moving the file — never with `external:`.
-- **Running**: every command but `init`/`merge` runs the modules in order, each
+- **Running**: every command but `init`/`merge`/`split` runs the modules in order, each
   headed `module <name> (<owner>)` (`reset` in reverse). `--module <name>` narrows
   to it and its dependencies; run inside a module's folder, dbd walks up to the
   workspace and runs that module. The manifest's `apply:` hooks run once around

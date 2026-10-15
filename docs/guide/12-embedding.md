@@ -762,8 +762,8 @@ Without loading any design, `Workspace::folders(config, project_dir)` lists each
 module's folder — what `format` and `doctor` go over — and
 `Workspace::locate(dir, Path::new("design.yaml"))` is how a run started in a
 module's folder finds its workspace: the folder holding the nearest
-`design.yaml` above `dir` that declares `modules:`, with the module whose folder
-holds `dir`.
+`design.yaml` above `dir`, with the module whose folder holds `dir` — `None`
+when that `design.yaml` declares no modules.
 
 ### Reading a workspace as one
 
