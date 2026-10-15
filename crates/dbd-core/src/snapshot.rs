@@ -1077,7 +1077,7 @@ impl StageBuilder {
                     let mut new_col_def = col_def.as_ref().clone();
                     if let ComplexChange::ColumnTypeChange { .. } = change {
                         // The new column gets a temp name: column_name_new
-                        new_col_def.name = format!("{new_name}_new");
+                        new_col_def.name = diff::swap_column(new_name);
                     }
                     snap_t.columns.push(new_col_def);
                 }
@@ -1096,8 +1096,10 @@ impl StageBuilder {
                         new_col, column_name, ..
                     } => {
                         format!(
-                            "ALTER TABLE {} ADD COLUMN {}_new {};",
-                            table_name, column_name, new_col.data_type
+                            "ALTER TABLE {} ADD COLUMN {} {};",
+                            table_name,
+                            diff::swap_column(column_name),
+                            new_col.data_type
                         )
                     }
                     _ => unreachable!(),
@@ -1188,15 +1190,19 @@ impl StageBuilder {
                 {
                     snap_t.columns.retain(|c| c.name != *column_name);
                     // Rename temp column to original name
-                    let temp_name = format!("{column_name}_new");
+                    let temp_name = diff::swap_column(column_name);
                     if let Some(col) = snap_t.columns.iter_mut().find(|c| c.name == temp_name) {
                         col.name = new_col.name.clone();
                     }
                 }
 
                 let mut sql = format!(
-                    "ALTER TABLE {} DROP COLUMN {};\nALTER TABLE {} RENAME COLUMN {}_new TO {};",
-                    table_name, old_col.name, table_name, column_name, column_name
+                    "ALTER TABLE {} DROP COLUMN {};\nALTER TABLE {} RENAME COLUMN {} TO {};",
+                    table_name,
+                    old_col.name,
+                    table_name,
+                    diff::swap_column(column_name),
+                    column_name
                 );
                 // The dropped column took the keys it was part of with it, and
                 // nothing else adds them back: the design's, on the column now

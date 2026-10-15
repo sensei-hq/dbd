@@ -3,6 +3,7 @@ mod compare;
 mod generate;
 mod types;
 
+pub(crate) use classify::swap_column;
 pub use classify::{classify_changes, generate_data_sql, is_castable};
 pub use compare::diff;
 pub(crate) use compare::keys_on;

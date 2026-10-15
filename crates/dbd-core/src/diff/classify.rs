@@ -339,6 +339,13 @@ fn classify_enum_changes(
 
 // ── Data SQL generation ────────────────────────────────
 
+/// The column a type change's first stage adds in place of `column`, filled
+/// by its data script and renamed to `column` by its second — one name for
+/// every stage to agree on.
+pub(crate) fn swap_column(column: &str) -> String {
+    format!("{column}_new")
+}
+
 /// Generate a data correction SQL script for a complex change.
 ///
 /// Every name and value here comes from a database catalog, and the script this
@@ -370,11 +377,11 @@ pub fn generate_data_sql(change: &ComplexChange) -> String {
         }
         ComplexChange::ColumnTypeChange {
             table_name,
+            column_name,
             old_type,
             new_type,
             old_col,
             new_col,
-            ..
         } => {
             if is_castable(old_type, new_type) {
                 let mut sql = String::new();
@@ -388,10 +395,12 @@ pub fn generate_data_sql(change: &ComplexChange) -> String {
                         old_type, new_type
                     ));
                 }
+                // Into the column stage 1 adds, which stage 2 renames into
+                // place — the column itself is the one stage 2 drops.
                 sql.push_str(&format!(
                     "UPDATE {} SET {} = {}::{new_type};\n",
                     qualified(table_name),
-                    ident(&new_col.name),
+                    ident(&swap_column(column_name)),
                     ident(&old_col.name)
                 ));
                 sql
