@@ -326,8 +326,18 @@ fn generate_field_sql(entity_name: &str, _entity_type: &EntityType, change: &Fie
             let FieldDetail::Index(idx) = detail.as_ref() else {
                 return;
             };
+            // In the schema of the table it is on, as reconcile drops it: a
+            // migration runs on its file's search path, which that schema may
+            // not be on, and `IF EXISTS` would make the miss a no-op (#73).
+            let schema = match crate::entity::split_qualified_name(entity_name) {
+                (Some(schema), _) => format!("{}.", crate::sql_quote::ident(&schema)),
+                (None, _) => String::new(),
+            };
             match &idx.name {
-                Some(name) => lines.push(format!("DROP INDEX IF EXISTS \"{name}\";")),
+                Some(name) => lines.push(format!(
+                    "DROP INDEX IF EXISTS {schema}{};",
+                    crate::sql_quote::ident(name)
+                )),
                 None => lines.push(format!(
                     "-- {}: cannot drop the index on ({}) — it has no name; drop it manually",
                     entity_name,

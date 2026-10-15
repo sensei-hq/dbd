@@ -1373,8 +1373,10 @@
                 }))),
             }]),
         }];
+        // In the table's schema: a migration runs on its file's search path,
+        // which the schema may not be on (#73).
         let sql = generate_migration_sql(&diffs);
-        assert_eq!(sql, "DROP INDEX IF EXISTS \"idx_email\";");
+        assert_eq!(sql, "DROP INDEX IF EXISTS \"public\".\"idx_email\";");
     }
 
     // ── S14: Enum value add / drop SQL ──────────────────────
