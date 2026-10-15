@@ -294,6 +294,15 @@ pub(super) fn file_folders(
     project_dir: &Path,
     module: Option<&str>,
 ) -> Result<Vec<(Option<String>, PathBuf)>> {
+    // A project a split was interrupted in is half-moved: read as it is, it
+    // is missing what moved — and `format` would rewrite its files.
+    if let Some(journal) = dbd_core::split::interrupted(project_dir) {
+        anyhow::bail!(
+            "a dbd split was interrupted here — its journal {} lists the files it moved: run `dbd split --undo` to \
+             put them back first",
+            journal.display()
+        );
+    }
     let folders = if config.exists() {
         Workspace::folders(config, project_dir)?
     } else {
