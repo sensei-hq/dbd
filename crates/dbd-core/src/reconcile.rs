@@ -1217,12 +1217,10 @@ pub(crate) struct KeyHolder {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KeyDrops {
     /// Reconcile's: an index by shape, name aside —
-    /// [`plan_index_convergence`]'s rule — and a column's type changed in
-    /// place.
+    /// [`plan_index_convergence`]'s rule.
     Reconcile,
     /// A migration's: an index as the diff of the raw snapshots drops it, by
-    /// name, and a column whose type changes rebuilt — the two-stage swap
-    /// drops it and renames another in its place (#72).
+    /// name.
     Migration,
 }
 
@@ -1278,12 +1276,12 @@ pub(crate) fn key_holders(
                     }
                     _ => {}
                 },
-                // A column turned generated is dropped and added again; so,
-                // in a migration, is one whose type changes.
+                // A column turned generated is dropped and added again. One
+                // whose type changes is altered in place, its keys kept.
                 ChangeAction::Alter { old, new } => {
                     if let (FieldDetail::Column(was), FieldDetail::Column(is)) = (old.as_ref(), new.as_ref())
-                        && ((was.generated.is_none() && is.generated.is_some())
-                            || (rules == KeyDrops::Migration && was.data_type != is.data_type))
+                        && was.generated.is_none()
+                        && is.generated.is_some()
                     {
                         columns.insert(is.name.clone());
                     }

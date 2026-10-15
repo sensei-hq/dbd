@@ -164,39 +164,6 @@ fn keys_on(table: &TableSnapshot, columns: &[&str]) -> Vec<TableConstraint> {
     keys
 }
 
-/// Every constraint of `table` that dropping any of `columns` drops with it:
-/// [`keys_on`] them, then each foreign key from them — the table's own, and
-/// one a column declares inline (`ref_id integer references …`) — and each
-/// CHECK and EXCLUDE reading them.
-pub(crate) fn constraints_on(table: &TableSnapshot, columns: &[&str]) -> Vec<TableConstraint> {
-    use crate::sql_expr::{exclusion_reads_column, reads_column};
-    let mut found = keys_on(table, columns);
-    found.extend(
-        table
-            .table_constraints
-            .iter()
-            .filter(|c| match c {
-                TableConstraint::ForeignKey(fk) => fk.columns.iter().any(|on| columns.contains(&on.as_str())),
-                TableConstraint::Check { expression, .. } => {
-                    columns.iter().any(|column| reads_column(expression, column))
-                }
-                TableConstraint::Exclude { definition, .. } => {
-                    columns.iter().any(|column| exclusion_reads_column(definition, column))
-                }
-                TableConstraint::PrimaryKey { .. } | TableConstraint::Unique { .. } => false,
-            })
-            .cloned(),
-    );
-    found.extend(
-        table
-            .columns
-            .iter()
-            .filter(|c| columns.contains(&c.name.as_str()))
-            .filter_map(|c| c.inline_fk.clone().map(TableConstraint::ForeignKey)),
-    );
-    found
-}
-
 /// Diff columns by name: Add / Drop / Alter (via PartialEq).
 fn diff_columns(old: &[ColumnDef], new: &[ColumnDef]) -> Vec<FieldChange> {
     let old_map: HashMap<&str, &ColumnDef> = old.iter().map(|c| (c.name.as_str(), c)).collect();

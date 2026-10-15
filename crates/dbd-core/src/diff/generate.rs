@@ -61,7 +61,7 @@ fn unnamed_constraint_drop_warnings(entity_name: &str, changes: &[FieldChange]) 
     warnings
 }
 
-/// Warn about column type changes (suggest a two-snapshot split).
+/// Say what a column type change does: it is made in place.
 fn type_change_warnings(entity_name: &str, changes: &[FieldChange]) -> Vec<String> {
     let mut warnings = Vec::new();
     for change in changes {
@@ -71,8 +71,8 @@ fn type_change_warnings(entity_name: &str, changes: &[FieldChange]) -> Vec<Strin
             && old_col.data_type != new_col.data_type
         {
             warnings.push(format!(
-                "{}.{}: type change {} -> {} — consider splitting across two snapshots \
-                 (v(N): add new column + data correction, v(N+1): drop old column)",
+                "{}.{}: type change {} -> {} — the column is altered in place: Postgres converts every \
+                 value, and refuses one the new type cannot hold",
                 entity_name, change.field_name, old_col.data_type, new_col.data_type
             ));
         }
@@ -98,9 +98,9 @@ fn rename_warnings(entity_name: &str, changes: &[FieldChange]) -> Vec<String> {
                 && matches!(**detail, FieldDetail::Column(_))
             {
                 warnings.push(format!(
-                    "{}: column '{}' dropped and '{}' added — if this is a rename, \
-                     consider splitting: v(N): add '{}' + UPDATE, v(N+1): drop '{}'",
-                    entity_name, drop_col.field_name, add_col.field_name, add_col.field_name, drop_col.field_name,
+                    "{}: column '{}' dropped and '{}' added — the drop loses '{}'s values; \
+                     if this is a rename, rename it in place (ALTER TABLE … RENAME COLUMN) instead",
+                    entity_name, drop_col.field_name, add_col.field_name, drop_col.field_name,
                 ));
             }
         }
@@ -388,8 +388,8 @@ fn column_add_sql(entity_name: &str, col: &crate::entity::ColumnDef) -> String {
 ///
 /// | old → new | statement |
 /// |---|---|
-/// | generated → generated (same expr) | nothing |
-/// | generated → generated (changed) | `ALTER COLUMN … SET EXPRESSION AS (…)` |
+/// | generated → generated (same expr) | nothing — or its type, in place |
+/// | generated → generated (changed) | `ALTER COLUMN … SET EXPRESSION AS (…)`, after any type |
 /// | generated → plain | `ALTER COLUMN … DROP EXPRESSION` |
 /// | plain → generated | `DROP COLUMN` + `ADD COLUMN … GENERATED …` |
 ///
@@ -408,6 +408,13 @@ fn push_generated_alter_sql(
 ) {
     match (&old_col.generated, &new_col.generated) {
         (Some(old_expr), Some(new_expr)) => {
+            // The type first, in place: Postgres recomputes the column at it.
+            if old_col.data_type != new_col.data_type {
+                lines.push(format!(
+                    "ALTER TABLE {} ALTER COLUMN {} TYPE {};",
+                    entity_name, new_col.name, new_col.data_type
+                ));
+            }
             if old_expr != new_expr {
                 lines.push(format!(
                     "ALTER TABLE {} ALTER COLUMN {} SET EXPRESSION AS ({new_expr});",
@@ -430,6 +437,23 @@ fn push_generated_alter_sql(
     }
 }
 
+/// Whether a type change is character data into a bounded character type —
+/// `text` → `varchar(3)` — which an explicit cast would cut to fit, and an
+/// assignment refuses as `value too long`.
+fn narrows_by_assignment(old_type: &str, new_type: &str) -> bool {
+    let base = |t: &str| t.trim().to_lowercase();
+    let characters = |t: &str| {
+        let t = base(t);
+        let name = t.split('(').next().unwrap_or(&t).trim().to_string();
+        matches!(
+            name.as_str(),
+            "text" | "varchar" | "character varying" | "char" | "character" | "bpchar" | "name" | "citext"
+        )
+    };
+    let bounded = base(new_type).contains('(') && !base(new_type).ends_with("[]");
+    characters(old_type) && characters(new_type) && bounded
+}
+
 /// Push the `ALTER TABLE … ALTER COLUMN …` statements for a column whose type,
 /// nullability, or default value changed.
 fn push_column_alter_sql(
@@ -445,7 +469,10 @@ fn push_column_alter_sql(
     // DEFAULT uses — which is how it came to be read as one (issue #16).
     if old_col.generated.is_some() || new_col.generated.is_some() {
         push_generated_alter_sql(entity_name, old_col, new_col, lines);
-        return;
+        if new_col.generated.is_some() || old_col.generated.is_none() {
+            return;
+        }
+        // Turned plain: the rest of it settles as any column's does.
     }
 
     let type_changed = old_col.data_type != new_col.data_type;
@@ -472,7 +499,15 @@ fn push_column_alter_sql(
         ));
     }
 
-    if type_changed {
+    if type_changed && narrows_by_assignment(&old_col.data_type, &new_col.data_type) {
+        // Character data into a bounded character type: by assignment, where
+        // Postgres refuses a value too long. An explicit cast (`USING c::t`)
+        // cuts it to fit without a word.
+        lines.push(format!(
+            "ALTER TABLE {} ALTER COLUMN {} TYPE {}{collate};",
+            entity_name, new_col.name, new_col.data_type
+        ));
+    } else if type_changed {
         // Always spell the cast out. Postgres accepts the bare
         // `ALTER COLUMN … TYPE t` only where an assignment cast exists, so
         // `text → integer`, `text → <enum>`, `text → uuid`, `text → jsonb` and

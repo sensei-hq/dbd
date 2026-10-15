@@ -194,6 +194,78 @@ pub fn exclusion_reads_column(definition: &str, column: &str) -> bool {
     constraint.exclusions.iter().any(element_reads) || constraint.where_clause.as_deref().is_some_and(reads)
 }
 
+/// `expr` — a CHECK, an index key expression or predicate — with every
+/// reference to the column `old` naming `new` instead, as Postgres makes of
+/// it when the column is renamed, rendered as the parser renders an
+/// expression. `None` when it cannot be read, or the result is not `expr`'s
+/// column references with that one renamed.
+///
+/// By the scanner's tokens, not text: a string or a function of the same name
+/// is not the column. The tree then checks the outcome, so a reading the
+/// tokens got wrong gives `None`, never a different expression.
+pub fn rename_column(expr: &str, old: &str, new: &str) -> Option<String> {
+    use pg_query::protobuf::Token;
+    let scanned = pg_query::scan(expr).ok()?;
+    let mut out = String::with_capacity(expr.len());
+    let mut copied = 0;
+    for (i, token) in scanned.tokens.iter().enumerate() {
+        if token.token != Token::Ident as i32 {
+            continue;
+        }
+        let (start, end) = (usize::try_from(token.start).ok()?, usize::try_from(token.end).ok()?);
+        let text = &expr[start..end];
+        let name = match text.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
+            Some(quoted) => quoted.replace("\"\"", "\""),
+            None => text.to_lowercase(),
+        };
+        let called = scanned
+            .tokens
+            .get(i + 1)
+            .is_some_and(|next| next.token == Token::Ascii40 as i32);
+        if name != old || called {
+            continue;
+        }
+        out.push_str(&expr[copied..start]);
+        out.push_str(&crate::sql_quote::ident_if_needed(new));
+        copied = end;
+    }
+    out.push_str(&expr[copied..]);
+    let rendered = render_expression(&out)?;
+    let before: Vec<String> = column_references(expr)?
+        .into_iter()
+        .map(|c| if c == old { new.to_string() } else { c })
+        .collect();
+    (column_references(&rendered)? == before).then_some(rendered)
+}
+
+/// `expr` as the parser renders an expression: `SELECT <expr>`, deparsed.
+fn render_expression(expr: &str) -> Option<String> {
+    let parsed = pg_query::parse(&format!("SELECT {expr}")).ok()?;
+    pg_query::deparse(&parsed.protobuf)
+        .ok()?
+        .strip_prefix("SELECT ")
+        .map(str::to_string)
+}
+
+/// The columns `expr` reads, in order, each by its last name part.
+fn column_references(expr: &str) -> Option<Vec<String>> {
+    let parsed = pg_query::parse(&format!("SELECT {expr}")).ok()?;
+    let mut found: Vec<(i32, String)> = parsed
+        .protobuf
+        .nodes()
+        .iter()
+        .filter_map(|(node, ..)| match node {
+            pg_query::NodeRef::ColumnRef(c) => match c.fields.last().and_then(|f| f.node.as_ref()) {
+                Some(NodeEnum::String(s)) => Some((c.location, s.sval.clone())),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    found.sort();
+    Some(found.into_iter().map(|(_, name)| name).collect())
+}
+
 /// Parse `sql`, normalize its expression tree, re-deparse, and strip `prefix`.
 fn canonicalize_wrapped(sql: &str, prefix: &str, cols: &CoercibleColumns) -> Option<String> {
     let mut parsed = pg_query::parse(sql).ok()?;
