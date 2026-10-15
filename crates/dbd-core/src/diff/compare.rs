@@ -83,8 +83,85 @@ fn diff_table_fields(old: &TableSnapshot, new: &TableSnapshot) -> Vec<FieldChang
     let mut changes = Vec::new();
     changes.extend(diff_columns(&old.columns, &new.columns));
     changes.extend(diff_constraints(&old.table_constraints, &new.table_constraints));
+    let rebuilt = rebuilt_keys(&changes, new);
+    changes.extend(rebuilt);
     changes.extend(diff_indexes(&old.indexes, &new.indexes));
     changes
+}
+
+/// The keys a rebuilt column takes with it, added back after it (#72).
+///
+/// A column turned generated is dropped and added again — Postgres has no
+/// verb to make a plain column generated — and `DROP COLUMN` drops every key
+/// the column is part of. Both sides still declare those keys, so nothing
+/// else adds them back: each of [`keys_on`] the column, unless `changes` adds
+/// it already.
+fn rebuilt_keys(changes: &[FieldChange], new: &TableSnapshot) -> Vec<FieldChange> {
+    let rebuilt: Vec<&str> = changes
+        .iter()
+        .filter_map(|c| match &c.action {
+            ChangeAction::Alter { old, new } => match (old.as_ref(), new.as_ref()) {
+                (FieldDetail::Column(was), FieldDetail::Column(is))
+                    if was.generated.is_none() && is.generated.is_some() =>
+                {
+                    Some(is.name.as_str())
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    let added = |key: &str| {
+        changes.iter().any(|c| {
+            c.field_type == FieldType::Constraint && c.field_name == key && matches!(c.action, ChangeAction::Add(_))
+        })
+    };
+    keys_on(new, &rebuilt)
+        .into_iter()
+        .filter(|c| !added(&constraint_key(c)))
+        .map(|c| FieldChange {
+            field_name: constraint_key(&c),
+            field_type: FieldType::Constraint,
+            action: ChangeAction::Add(Box::new(FieldDetail::Constraint(c))),
+        })
+        .collect()
+}
+
+/// The primary key and unique keys of `table` that any of `columns` is part
+/// of — `DROP COLUMN` drops each — in declaration order: the table's own, and
+/// those a column declares inline (`code text unique`), which a snapshot
+/// keeps as the column's flag until reconcile lifts it into a constraint.
+pub(crate) fn keys_on(table: &TableSnapshot, columns: &[&str]) -> Vec<TableConstraint> {
+    let mut keys: Vec<TableConstraint> = table
+        .table_constraints
+        .iter()
+        .filter(|c| match c {
+            TableConstraint::PrimaryKey { columns: on, .. } | TableConstraint::Unique { columns: on, .. } => {
+                on.iter().any(|column| columns.contains(&column.as_str()))
+            }
+            _ => false,
+        })
+        .cloned()
+        .collect();
+    for column in table.columns.iter().filter(|c| columns.contains(&c.name.as_str())) {
+        let inline = [
+            column.is_pk.then(|| TableConstraint::PrimaryKey {
+                name: None,
+                columns: vec![column.name.clone()],
+            }),
+            column.is_unique.then(|| TableConstraint::Unique {
+                name: None,
+                columns: vec![column.name.clone()],
+                nulls_not_distinct: false,
+            }),
+        ];
+        for key in inline.into_iter().flatten() {
+            if !keys.iter().any(|k| constraint_key(k) == constraint_key(&key)) {
+                keys.push(key);
+            }
+        }
+    }
+    keys
 }
 
 /// Diff columns by name: Add / Drop / Alter (via PartialEq).

@@ -663,7 +663,7 @@ impl MigrationDialect {
 fn order_key_changes(result: &mut MultiSnapshotResult, previous: &Snapshot, dialect: MigrationDialect) {
     use crate::diff::{ChangeAction, FieldDetail, FieldType, catalog_drop_sql, unnamed_drop_comment};
     use crate::entity::TableConstraint;
-    use crate::reconcile::{IndexDrops, fk_change_sql, fk_detail, key_holders, same_foreign_key};
+    use crate::reconcile::{KeyDrops, fk_change_sql, fk_detail, key_holders, same_foreign_key};
 
     let mut before = canonical_types(previous);
     for stage in &mut result.snapshots {
@@ -735,7 +735,7 @@ fn order_key_changes(result: &mut MultiSnapshotResult, previous: &Snapshot, dial
                 }
             }
         }
-        for (changed, holders) in key_holders(&old, &new, &before, &after, IndexDrops::Diff) {
+        for (changed, holders) in key_holders(&old, &new, &before, &after, KeyDrops::Migration) {
             let mut drops: Vec<String> = Vec::new();
             let mut adds: Vec<String> = Vec::new();
             for h in &holders {
@@ -1194,10 +1194,38 @@ impl StageBuilder {
                     }
                 }
 
-                let sql = format!(
+                let mut sql = format!(
                     "ALTER TABLE {} DROP COLUMN {};\nALTER TABLE {} RENAME COLUMN {}_new TO {};",
                     table_name, old_col.name, table_name, column_name, column_name
                 );
+                // The dropped column took the keys it was part of with it, and
+                // nothing else adds them back: the design's, on the column now
+                // in its place (#72). The foreign keys holding them come back
+                // after — see `order_key_changes`.
+                let keys = ctx
+                    .final_snapshot
+                    .tables
+                    .iter()
+                    .find(|t| format!("{}.{}", t.schema, t.name) == *table_name)
+                    .map(|t| diff::keys_on(t, &[column_name.as_str()]))
+                    .unwrap_or_default();
+                let readd = diff::generate_migration_sql(&[MigrationDiff {
+                    entity_name: table_name.clone(),
+                    entity_type: EntityType::Table,
+                    action: DiffAction::Change(
+                        keys.into_iter()
+                            .map(|key| diff::FieldChange {
+                                field_name: String::new(),
+                                field_type: diff::FieldType::Constraint,
+                                action: diff::ChangeAction::Add(Box::new(diff::FieldDetail::Constraint(key))),
+                            })
+                            .collect(),
+                    ),
+                }]);
+                if !readd.is_empty() {
+                    sql.push('\n');
+                    sql.push_str(&readd);
+                }
                 push_or_append_sql(&mut self.files, entity_migration_path(table_name), sql);
 
                 self.mark_altered(table_name);
