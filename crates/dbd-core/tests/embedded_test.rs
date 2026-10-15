@@ -4325,6 +4325,144 @@ async fn a_key_held_from_outside_the_design_is_refused() {
     .await;
 }
 
+// ── A routine whose return type changes (#65) ─────────────────────────────────
+
+/// A project `routines` in a temporary folder with `files` (`(path, text)`).
+fn routine_design(files: &[(&str, &str)]) -> (tempfile::TempDir, Design) {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: routines\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    for (path, text) in files {
+        let path = dir.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load design");
+    (tmp, design)
+}
+
+const STATS_FILE: &str = "ddl/function/app/stats.ddl";
+const STATS_JSONB: &str =
+    "create or replace function app.stats()\nreturns jsonb\nlanguage sql\nas $$ select '{}'::jsonb $$;\n";
+const STATS_TABLE: &str = "create or replace function app.stats()\n\
+     returns table (files integer, refused_older integer, pruned integer)\n\
+     language sql\nas $$ select 0, 0, 0 $$;\n";
+
+/// `app.stats()` returns what `result` says (`pg_get_function_result`).
+fn stats_returns(result: &str) -> String {
+    format!(
+        "SELECT 1 FROM pg_proc WHERE oid = 'app.stats()'::regprocedure \
+         AND pg_get_function_result(oid) = '{}'",
+        result.replace('\'', "''")
+    )
+}
+
+/// `CREATE OR REPLACE` cannot change what a function returns: reconcile drops
+/// it and creates it again.
+#[tokio::test]
+async fn reconcile_replaces_a_function_whose_return_type_changes() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "routines").await.unwrap();
+    let (_v1, design) = routine_design(&[(STATS_FILE, STATS_JSONB)]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("create");
+    let (_v2, design) = routine_design(&[(STATS_FILE, STATS_TABLE)]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("the new return type reconciles");
+    assert_catalog(
+        &*adapter,
+        true,
+        &stats_returns("TABLE(files integer, refused_older integer, pruned integer)"),
+        "the new return type",
+    )
+    .await;
+}
+
+/// `apply` runs in one transaction: the replacement happens inside it.
+#[tokio::test]
+async fn apply_replaces_a_function_whose_return_type_changes() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "routines").await.unwrap();
+    let (_v1, design) = routine_design(&[(STATS_FILE, STATS_JSONB)]);
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply v1");
+    let (_v2, design) = routine_design(&[(STATS_FILE, STATS_TABLE)]);
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("the new return type applies");
+    assert_catalog(
+        &*adapter,
+        true,
+        &stats_returns("TABLE(files integer, refused_older integer, pruned integer)"),
+        "the new return type",
+    )
+    .await;
+}
+
+/// A view over the function: dropping it would take the view, so dbd does
+/// not — the run fails naming the view, and the function is as it was.
+#[tokio::test]
+async fn a_function_a_view_reads_is_not_dropped_to_change_its_return_type() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "routines").await.unwrap();
+    let view = (
+        "ddl/view/app/v_stats.ddl",
+        "create or replace view app.v_stats as select app.stats() as stats;\n",
+    );
+    let (_v1, design) = routine_design(&[(STATS_FILE, STATS_JSONB), view]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("create");
+    let (_v2, design) = routine_design(&[(STATS_FILE, STATS_TABLE), view]);
+    let err = design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect_err("the view depends on it")
+        .to_string();
+    assert!(err.contains("app.v_stats"), "{err}");
+    assert_catalog(&*adapter, true, &stats_returns("jsonb"), "the old return type").await;
+}
+
+/// Two functions of that name: which one the file replaces is not dbd's to
+/// guess, so it drops neither and names both.
+#[tokio::test]
+async fn a_function_with_overloads_is_not_dropped_to_change_its_return_type() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "routines").await.unwrap();
+    let (_v1, design) = routine_design(&[(STATS_FILE, STATS_JSONB)]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("create");
+    adapter
+        .execute_script("CREATE FUNCTION app.stats(n integer) RETURNS integer LANGUAGE sql AS $$ SELECT n $$;")
+        .await
+        .unwrap();
+    let (_v2, design) = routine_design(&[(STATS_FILE, STATS_TABLE)]);
+    let err = design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect_err("two functions of that name")
+        .to_string();
+    assert!(
+        err.contains("app.stats()") && err.contains("app.stats(integer)"),
+        "{err}"
+    );
+    assert_catalog(&*adapter, true, &stats_returns("jsonb"), "the old return type").await;
+}
+
 // ── Reconcile convergence: comments and keyword defaults ──────────────────────
 
 /// Apply a design, then require reconcile to report NOTHING — the property both
