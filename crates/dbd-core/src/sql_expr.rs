@@ -144,7 +144,7 @@ pub fn reads_column(expr: &str, column: &str) -> bool {
 
 /// Whether an EXCLUDE constraint's `definition` — `USING gist (c WITH &&)
 /// WHERE …`, as a snapshot keeps it — reads the column `column`: an element
-/// naming it, or an expression or predicate reading it. One that does not
+/// naming it, an expression or predicate reading it, or its `INCLUDE`. One that does not
 /// parse reads as `true`, as [`reads_column`]'s does.
 pub fn exclusion_reads_column(definition: &str, column: &str) -> bool {
     let Ok(parsed) = pg_query::parse(&format!("ALTER TABLE t ADD EXCLUDE {definition}")) else {
@@ -191,7 +191,10 @@ pub fn exclusion_reads_column(definition: &str, column: &str) -> bool {
         }),
         _ => false,
     };
-    constraint.exclusions.iter().any(element_reads) || constraint.where_clause.as_deref().is_some_and(reads)
+    let included = |name: &Node| matches!(name.node.as_ref(), Some(NodeEnum::String(s)) if s.sval == column);
+    constraint.exclusions.iter().any(element_reads)
+        || constraint.including.iter().any(included)
+        || constraint.where_clause.as_deref().is_some_and(reads)
 }
 
 /// `expr` — a CHECK, an index key expression or predicate — with every

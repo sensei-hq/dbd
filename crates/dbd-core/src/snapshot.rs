@@ -559,7 +559,9 @@ pub fn prepare_snapshot(
         Some(prev) => {
             // Compared in canonical spelling, stored as authored — see
             // [`canonical_types`] for why the two must not be the same thing.
-            let diffs = diff::diff(&canonical_types(prev), &canonical_types(&snapshot));
+            let canonical = canonical_types(&snapshot);
+            let mut diffs = diff::diff(&canonical_types(prev), &canonical);
+            diff::with_rebuilds(&mut diffs, &canonical);
 
             if diffs.is_empty() {
                 return SnapshotResult {
@@ -941,7 +943,8 @@ fn prepare_stages(
     // what the rename made of the old (0.27.2 review).
     let renames = detected_renames(&prev, &final_snapshot);
     let prev = &with_renames(&prev, &renames);
-    let diffs = diff::diff(prev, &final_snapshot);
+    let mut diffs = diff::diff(prev, &final_snapshot);
+    diff::with_rebuilds(&mut diffs, &final_snapshot);
 
     if diffs.is_empty() && renames.is_empty() {
         return MultiSnapshotResult {

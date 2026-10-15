@@ -405,7 +405,7 @@ pub fn canonicalize(snap: &mut Snapshot) {
 /// (`DROP CONSTRAINT pk:tenant_id,metric_id`), which blocked every PK replacement.
 /// Matching stays name-agnostic regardless: `diff::constraint_key` keys PK/UNIQUE
 /// on their columns and never on their name.
-fn lift_pk_unique_keep_others(t: &mut snapshot::TableSnapshot) {
+pub(crate) fn lift_pk_unique_keep_others(t: &mut snapshot::TableSnapshot) {
     let mut kept: Vec<TableConstraint> = Vec::new();
     let mut seen: HashSet<(char, String)> = HashSet::new();
     let push = |kept: &mut Vec<TableConstraint>, seen: &mut HashSet<(char, String)>, c: TableConstraint| {
@@ -950,7 +950,8 @@ pub fn qualified_entity_name(entity: &Entity) -> String {
 
 /// Compute a reconcile plan from a live→desired snapshot diff.
 pub fn plan_reconcile(live: &Snapshot, desired: &Snapshot) -> ReconcilePlan {
-    let diffs = diff::diff(live, desired);
+    let mut diffs = diff::diff(live, desired);
+    diff::with_rebuilds(&mut diffs, desired);
     let warnings = diff::migration_warnings(&diffs);
     let mut plan = ReconcilePlan {
         warnings,
@@ -1416,6 +1417,44 @@ pub(crate) fn key_holders(
         }
         if !holders.is_empty() {
             out.push((changed.to_string(), holders));
+        }
+    }
+    out
+}
+
+/// `live` without what reconcile's plan drops by rebuilding a column — one
+/// `desired` turns generated, which is dropped and added again (#72): its
+/// keys, constraints, indexes, foreign key and comment. The convergence passes
+/// compare against this, so they add each back after the rebuild, in the same
+/// run, rather than finding it there and leaving it to the next.
+pub(crate) fn without_what_rebuilds_drop(live: &Snapshot, desired: &Snapshot) -> Snapshot {
+    let qualified = |t: &TableSnapshot| format!("{}.{}", t.schema, t.name);
+    let mut out = live.clone();
+    for t in &mut out.tables {
+        let Some(want) = desired.tables.iter().find(|d| qualified(d) == qualified(t)) else {
+            continue;
+        };
+        let rebuilt: Vec<String> = t
+            .columns
+            .iter()
+            .filter(|c| c.generated.is_none())
+            .filter(|c| want.columns.iter().any(|w| w.name == c.name && w.generated.is_some()))
+            .map(|c| c.name.clone())
+            .collect();
+        if rebuilt.is_empty() {
+            continue;
+        }
+        let columns: Vec<&str> = rebuilt.iter().map(String::as_str).collect();
+        let dropped = diff::constraints_on(t, &columns);
+        let dropped_indexes: Vec<crate::entity::IndexDef> =
+            indexes_reading_columns(t, &columns).into_iter().cloned().collect();
+        t.table_constraints.retain(|c| !dropped.contains(c));
+        t.indexes.retain(|ix| !dropped_indexes.contains(ix));
+        for c in t.columns.iter_mut().filter(|c| rebuilt.contains(&c.name)) {
+            c.inline_fk = None;
+            c.comment = None;
+            c.is_pk = false;
+            c.is_unique = false;
         }
     }
     out
