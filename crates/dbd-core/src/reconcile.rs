@@ -4570,8 +4570,8 @@ mod tests {
         let entities = vec![
             Entity::new(EntityType::Sequence, "app.seq"),
             Entity::new(EntityType::Sequence, "public.pseq"),
-            Entity::new(EntityType::Sequence, "public.both"),
-            Entity::new(EntityType::Sequence, "app.both"),
+            Entity::new(EntityType::Sequence, "public.twin"),
+            Entity::new(EntityType::Sequence, "app.twin"),
             Entity::new(EntityType::Sequence, "App.Seq"),
             table(
                 "app.u",
@@ -4584,7 +4584,7 @@ mod tests {
                 ],
             ),
             table("app.v", SchemaPath::default(), &["nextval('seq')", "nextval('pseq')"]),
-            table("app.x", path(&["app", "public"]), &["nextval('both')"]),
+            table("app.x", path(&["app", "public"]), &["nextval('twin')"]),
             table("app.y", path(&["App"]), &["nextval('\"Seq\"')"]),
             live,
         ];
@@ -4612,7 +4612,7 @@ mod tests {
             defaults("v"),
             ["nextval('public.seq'::regclass)", "nextval('public.pseq'::regclass)"]
         );
-        assert_eq!(defaults("x"), ["nextval('app.both'::regclass)"]);
+        assert_eq!(defaults("x"), ["nextval('app.twin'::regclass)"]);
         assert_eq!(defaults("y"), ["nextval('\"App\".\"Seq\"'::regclass)"]);
         assert_eq!(defaults("w"), ["nextval('seq'::regclass)"]);
     }
