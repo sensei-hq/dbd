@@ -1137,7 +1137,8 @@ dbd snapshot --list                        # List existing snapshots
 Smart multi-snapshot: When complex changes are detected (column rename, type change, enum value removal) dbd automatically generates multiple snapshots with correct intermediate states.
 
 - Column rename: 2 snapshots (add new column + data copy, drop old column)
-- Column type change: 2 snapshots (add new column + CAST, drop old column)
+- Column type change: 2 snapshots (add `<column>_new` + CAST into it, drop old column and rename it into place)
+- Either way the column put in place then gets the rest of its definition — NOT NULL, default, identity, and its constraints — with a foreign key holding one of its keys dropped first and re-added after (before 0.27.2 a type change's data copy filled the old column, so the values were lost, and the column came back with its type alone; see [Smart multi-snapshot](05-snapshots-migrations.md#smart-multi-snapshot))
 - Enum value removal: 2 snapshots (the data mapping, then the type swap — the type renamed aside and recreated, each column moved across with its views, materialized views, indexes and default dropped and restored around it)
 
 Data corrections (*.data.sql) are generated automatically where possible. Non-derivable corrections (enum value mapping) generate TODO comments.

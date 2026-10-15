@@ -9,6 +9,37 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+### Fixed
+
+- **A released column's type change keeps its values.** A type change is cut
+  in two stages: the first adds `<column>_new` and its `data.sql` fills it, the
+  second drops the column and renames `<column>_new` into its place. The
+  `data.sql` filled the column itself, which the second stage then dropped:
+  every value was lost, NULL in its place, and nothing was reported — and with
+  several columns of one table changed, only the last one's `data.sql` was
+  written. It now fills `<column>_new`, a line per column in the one file. A
+  database migrated through such a change has lost those values; restore them
+  from a backup.
+- **A column a migration's swap puts in place gets its whole definition back**
+  ([#72]). The column the first stage adds has its type alone; the second now
+  gives it what the design declares — NOT NULL, its default, an identity that
+  goes on past the values the rows hold — and the constraints the old column's
+  drop took with it: a type change's primary key, unique keys, foreign keys,
+  CHECKs and EXCLUDE constraints, a rename's own `primary key`, `unique` and
+  `references`. A foreign key on another table holding one of its keys is
+  dropped first and added back after the key, so a referenced `integer` key can
+  be widened to `bigint`; it failed with `cannot drop column id … because
+  other objects depend on it`. The column came back without any of it, which
+  `dbd diff` then reported.
+- **A column turned generated keeps its keys** ([#72]). Postgres cannot make a
+  plain column generated, so `reconcile` and a migration drop it and add it
+  again, which drops the primary and unique keys it is part of; both sides
+  still declared them, so nothing added them back, and a foreign key holding
+  one could not be re-added. They are now added back after the column, the
+  foreign keys holding them dropped first and re-added after.
+
+[#72]: https://github.com/sensei-hq/dbd/issues/72
+
 ## [0.27.1] — 2026-10-14
 
 **A key a foreign key holds can change, and so can what a function returns**
