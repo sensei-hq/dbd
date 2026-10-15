@@ -30,6 +30,9 @@ install and re-run the repros). Close #60/#72/#73 when `main` has them.
 
 - Low, reported: `diff` omits the FK holder drop/re-add reconcile runs;
   dotted schema names in `schema.table` entity names.
+- Unfiled (from before): `init --dry-run` writes files; SQLite scopes cannot
+  name a table; a dry run with `--allow-destructive` still says to re-run
+  with it; SQLite `deploy --module shared` fails on a bare FK error.
 - Scratch to delete (rm -rf was refused): /tmp/dbd-* (0271, 60, 65, 72
   logs/dirs), /tmp/dbd-review-0272, /tmp/dbd-review-target*,
   /tmp/dbd-spec-audit-* and a stopped cluster /tmp/dbd-spec-audit-pg-HIoE.
