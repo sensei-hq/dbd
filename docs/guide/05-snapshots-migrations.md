@@ -168,32 +168,41 @@ the table, and needs it dropped by hand.
 
 ## Smart multi-snapshot
 
-Complex changes are automatically split into multiple snapshots:
+A change Postgres can make in one step is one version; one it cannot is split
+into stages:
 
-### Column rename (2 snapshots)
-v(N): ADD new column + data.sql (UPDATE SET new = old)
-v(N+1): DROP old column; the new one gets the rest of its definition
+### Column rename (1 snapshot)
+v(N): `ALTER TABLE … RENAME COLUMN old TO new;`, ahead of the table's other changes
 
-### Column type change (2 snapshots)
-v(N): ADD `<column>_new` with the new type + data.sql (UPDATE SET `<column>_new` = old::type)
-v(N+1): DROP old column, RENAME `<column>_new` to it; it gets the rest of its definition
+### Column type change (1 snapshot, or 2 when dbd cannot cast it)
+v(N): `ALTER TABLE … ALTER COLUMN c TYPE t USING c::t;` — in place, as `reconcile` does
 
-The column v(N) adds has its type alone, so its rows can be filled first. Once
-v(N+1) has put it in place it gets the rest of what the design declares: NOT
-NULL, its default, an identity — which goes on past the values the rows
-already hold — and the constraints on it: a type change's primary key, unique
-keys, foreign keys, CHECKs and EXCLUDE constraints, all of which the old
-column's drop took with it, and a rename's own `primary key`, `unique` and
-`references`. A foreign key on another table holding one of its keys is dropped
-before the drop and added back after the key. A table with several columns
-changed keeps one `data.sql` with a line for each.
+A rename and a type change are made in place, so Postgres keeps everything on
+the column: its values, NOT NULL, default, identity (the sequence going on past
+the values it handed out), generated expression, keys, the foreign keys on
+either side of it, CHECKs, EXCLUDE constraints, indexes and comment — and
+refuses a value the new type cannot hold, failing the version, rather than
+losing it. Narrowing into a bounded character type (`text` → `varchar(3)`) is
+an assignment, without the `USING` cast that would cut a value to fit.
 
-Before 0.27.2 a type change's `data.sql` filled the old column, which v(N+1)
-then dropped: every value of the column was lost, NULL in its place, with
-nothing reported — and with several columns changed only the last one's script
-was written. The column in place had its type and nothing else, and a foreign
-key holding its key failed the drop. A database migrated through one has lost
-those values; `dbd diff` lists what else it is missing.
+A rename is read from the diff: a table's one column dropped and one added, of
+one type. The snapshot says when it took a change for one; if the added column
+is a new column, cut the drop and the add in separate versions.
+
+A type change dbd cannot cast (`jsonb` → `integer`) takes two versions, both on
+the column itself:
+
+v(N): data.sql — a TODO: make every value of the column castable to the new type, in place
+v(N+1): `ALTER TABLE … ALTER COLUMN c TYPE t USING c::t;` — edit the `USING` for a conversion a cast cannot make
+
+Before 0.27.2 a rename and a type change were a column swap over two versions:
+`<column>_new` added and filled, then the column dropped and `<column>_new`
+renamed into its place. A type change's `data.sql` filled the old column,
+which the second version then dropped — every value lost, NULL in its place —
+and the column came back with its type alone. A database migrated through one
+has lost those values; `dbd diff` lists what else it is missing. A pending
+version cut that way is refused by `apply` and `deploy`, naming its `data.sql`
+and the column: delete the unapplied versions and cut them again.
 
 ### Enum value removal (2 snapshots)
 v(N): data.sql (TODO: map removed values to remaining)
@@ -232,7 +241,7 @@ scripts run before the version's drops — see
 creates runs after the create — and the previews list it; a `data.sql` for a
 table the version neither alters nor adds does not run.
 
-Auto-generated data.sql uses Postgres CAST for type conversions. Non-derivable corrections (enum value mapping) generate TODO comments that the developer must fill in before committing. These are enforced: `dbd inspect` surfaces any unresolved `-- TODO:` in migration files, and `dbd apply` and `dbd deploy` refuse to run while pending TODOs remain — their dry runs too, with a database configured to say which migrations are pending — so an unfinished migration can't reach the database.
+A type change dbd can cast needs no data.sql — it is made in place. Non-derivable corrections (a type change dbd cannot cast, an enum value mapping) generate TODO comments that the developer must fill in before committing. These are enforced: `dbd inspect` surfaces any unresolved `-- TODO:` in migration files, and `dbd apply` and `dbd deploy` refuse to run while pending TODOs remain — their dry runs too, with a database configured to say which migrations are pending — so an unfinished migration can't reach the database.
 
 ## Listing snapshots
 

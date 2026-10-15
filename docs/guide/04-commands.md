@@ -1136,12 +1136,12 @@ dbd snapshot --list                        # List existing snapshots
 
 Smart multi-snapshot: When complex changes are detected (column rename, type change, enum value removal) dbd automatically generates multiple snapshots with correct intermediate states.
 
-- Column rename: 2 snapshots (add new column + data copy, drop old column)
-- Column type change: 2 snapshots (add `<column>_new` + CAST into it, drop old column and rename it into place)
-- Either way the column put in place then gets the rest of its definition — NOT NULL, default, identity, and its constraints — with a foreign key holding one of its keys dropped first and re-added after (before 0.27.2 a type change's data copy filled the old column, so the values were lost, and the column came back with its type alone; see [Smart multi-snapshot](05-snapshots-migrations.md#smart-multi-snapshot))
+- Column rename: 1 snapshot — `RENAME COLUMN`, in place
+- Column type change: 1 snapshot — `ALTER COLUMN … TYPE … USING`, in place, as `reconcile` does; 2 when dbd cannot cast it (a data.sql TODO readies the column's values, then the in-place alter)
+- In place, the column keeps its values and everything on it — NOT NULL, default, identity, generated expression, keys, the foreign keys on either side, CHECKs, EXCLUDEs, indexes, comment — and a value the new type cannot hold fails the version. Before 0.27.2 both were a column swap that lost the values of a type-changed column and the definition of either; a pending version cut that way is refused (see [Smart multi-snapshot](05-snapshots-migrations.md#smart-multi-snapshot))
 - Enum value removal: 2 snapshots (the data mapping, then the type swap — the type renamed aside and recreated, each column moved across with its views, materialized views, indexes and default dropped and restored around it)
 
-Data corrections (*.data.sql) are generated automatically where possible. Non-derivable corrections (enum value mapping) generate TODO comments.
+Data corrections (*.data.sql) are generated where a change needs one: a type change dbd cannot cast and an enum value mapping each generate TODO comments to fill in.
 
 A table removed from the design is written as its `DROP TABLE … CASCADE` in `migrations/<NNN>/<schema>/<table>.sql`, the file every per-table migration uses, and the next `dbd apply` runs it. A hand-written `<table>.drop.sql` there takes precedence. The drop runs only where the table still exists, and the summary counts only the drops that ran. (Before 0.25 apply looked only for `<table>.drop.sql`, so a generated drop never ran while the migration was recorded as applied.)
 
@@ -1504,9 +1504,13 @@ The desired schema is parsed from your DDL; the live schema is introspected. dbd
 representation noise so only real drift is reported: type aliases and array/date-time
 spellings (`int4` → `integer`, `text[3]` → `text[]`, `time` → `time without time zone`),
 default casts (so a `nextval('s')` default matches the `nextval('s'::regclass)` Postgres
-reports), a `nextval` default's sequence as Postgres prints it (`nextval('App.Seq')` and
-`nextval('"app"."seq"')` are `app.seq`, `public.` is left off, and a bare name is in the
-schema its file's path finds it in), enum and extension-type qualification (`citext` → `extensions.citext`), PK/UNIQUE-backing indexes (matched by the constraint's name, so a
+reports), a `nextval` default's sequence fully qualified on both sides (the live one by the
+schema its sequence is in, whatever path the session has; the design's as written —
+`nextval('App.Seq')` and `nextval('"app"."seq"')` are `app.seq`, `public.` kept — and a
+bare name in the first schema its file's path declares the sequence in, else the path's
+first), a column turned generated (rebuilt, so what its drop takes is shown coming back
+after it),
+enum and extension-type qualification (`citext` → `extensions.citext`), PK/UNIQUE-backing indexes (matched by the constraint's name, so a
 dropped index over a key's columns is still drift), FK `NO ACTION` defaults and
 auto-generated FK names, and CHECK-expression *spelling* via the Postgres parser — parens
 and case, `IN` ↔ `= ANY (ARRAY[…])`, casts on literals, `BETWEEN` ↔ the `>=`/`<=` pair
@@ -1532,7 +1536,11 @@ compared.
 **Best-effort edges** (reported, but may need a human glance): a foreign key that references a
 table in the *same non-public schema* without qualifying it can read as drift; a standalone
 index whose columns exactly match a PK/UNIQUE constraint is treated as that constraint's
-backing index and suppressed; an unparseable CHECK is shown with an `advisory`. A negative default (`-1`, which Postgres reports as
+backing index and suppressed; an unparseable CHECK is shown with an `advisory`. A bare
+`nextval('s')` whose sequence the design declares nowhere is taken to be in its file's first
+path schema, so one a hook or another project makes elsewhere reads as drift. When a key
+another table's foreign key holds changes, `diff` shows the key change but not the drop and
+re-add of that foreign key `reconcile` runs around it. A negative default (`-1`, which Postgres reports as
 `'-1'::integer`) and a `varbit` column read as drift on every run.
 
 **In a workspace** `diff` answers for every module the run selects, under its
