@@ -1,7 +1,6 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use dbd_core::Design;
 
 use super::safe_write;
 use crate::output::{self, Verbosity};
@@ -47,36 +46,24 @@ pub fn cmd_diagram(
     file: &Path,
     print_url: bool,
     site: Option<&str>,
+    module: Option<&str>,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
-    let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
+    let reading = super::reading(config, env, project_dir, module, scope, deps)?;
     // No context added: a scope that cannot resolve fails here with exactly the
     // error `dbml`, `apply` and the rest give for it.
-    let mut model = dbd_core::schema_model::build(&design, Some(&resolved))?;
-    let (kept, total) = design.scope_counts(&resolved)?;
-    output::scope_filtered(&resolved, kept, total);
-    output::left_out_unparsed(&design.unparsed(&resolved)?);
+    let mut model = dbd_core::schema_model::build_reading(&reading)?;
+    let (kept, total) = reading.counts()?;
+    output::scope_filtered(reading.scope(), kept, total);
+    output::left_out_unparsed(&reading.unparsed()?);
 
     // The changelog (#29), seen through the same scope as the diagram — which may
-    // be a `default` scope with no --scope given. A scope is a set of entities, and
-    // the history names tables that no longer exist, so each is asked of the scope's
-    // definition rather than of today's model; see `scope::admits`. The set is the
-    // working set the model was built from, so under `deps: include` the changelog
-    // covers every table the diagram draws.
-    let history = if resolved.is_all {
-        dbd_core::history::load(project_dir)
-    } else {
-        let working = design.working_set(&resolved)?;
-        let existing: std::collections::HashSet<String> = design.entities().iter().map(|e| e.name.clone()).collect();
-        let scopes = &design.config().scopes;
-        dbd_core::history::load_scoped(project_dir, |schema, name| {
-            dbd_core::scope::admits(scopes, &resolved, &working, &existing, &format!("{schema}.{name}"))
-        })
-    };
-    match history {
+    // be a `default` scope with no --scope given — each module's, in a workspace.
+    // The set is the working set the model was built from, so under `deps:
+    // include` the changelog covers every table the diagram draws.
+    match reading.history() {
         Ok(history) => model.history = history,
         // The diagram is still right without it; a history with a hole would not be.
         Err(e) => output::warn(&format!("changelog omitted — {e}")),
@@ -118,6 +105,7 @@ pub fn cmd_diagram(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dbd_core::Design;
 
     /// `--site` / `$DBD_DIAGRAM_URL` is operator-supplied and reaches the
     /// platform's URL opener, which on Windows runs `cmd /c start` — where a
@@ -165,6 +153,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Verbosity::Normal,
         )
         .unwrap();
@@ -186,6 +175,7 @@ mod tests {
             true,
             &out,
             false,
+            None,
             None,
             Some("conflicting"),
             None,
@@ -218,6 +208,7 @@ mod tests {
             true,
             &out,
             false,
+            None,
             None,
             None,
             None,
@@ -288,6 +279,7 @@ mod tests {
             true,
             &out,
             false,
+            None,
             None,
             Some(scope),
             None,
@@ -371,6 +363,7 @@ mod tests {
             std::path::Path::new("unused.json"),
             /*print_url*/ true,
             Some("http://localhost:5173"),
+            None,
             None,
             None,
             Verbosity::Normal,

@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use dbd_core::design::{ApplyComplete, ApplyStrategy, ImportComplete};
+use dbd_core::{Design, Workspace};
 
 use crate::cli::Commands;
 use crate::output::{self, Verbosity};
@@ -53,6 +54,7 @@ fn command_honors_scope(command: &Commands) -> bool {
         Commands::Doctor { .. }
         | Commands::Init { .. }
         | Commands::Merge { .. }
+        | Commands::Split { .. }
         | Commands::Format { .. }
         | Commands::Install { .. } => false,
     }
@@ -84,6 +86,337 @@ fn warn_if_scope_ignored(command: &Commands, scope: Option<&str>, deps: Option<d
     }
 }
 
+/// Refuse what a run cannot select (#7): a workspace in `init` and `merge`,
+/// which onboard a project into one design; and `--module` on a design
+/// without modules. A config dbd cannot read is left to the command to
+/// report.
+fn check_workspace_selection(command: &Commands, config: &Path, module: Option<&str>) -> Result<()> {
+    if matches!(command, Commands::Install { .. }) {
+        return Ok(());
+    }
+    let Ok(read) = dbd_core::config::read(config) else {
+        return Ok(());
+    };
+    if read.modules.is_empty() {
+        if let Some(module) = module {
+            anyhow::bail!("--module {module}: {} declares no modules:", config.display());
+        }
+        return Ok(());
+    }
+    if matches!(command, Commands::Init { .. } | Commands::Merge { .. }) {
+        anyhow::bail!(
+            "{} declares modules: — init and merge onboard a project into one design; a project becomes a \
+             workspace with dbd split --from-scopes",
+            config.display()
+        );
+    }
+    Ok(())
+}
+
+/// What a command writing an artifact of the design reads (#7): the project's
+/// design, or the modules `scope` and `module` select, as one — see
+/// [`dbd_core::design::Reading`].
+pub(super) fn reading(
+    config: &Path,
+    env: &str,
+    project_dir: &Path,
+    module: Option<&str>,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
+) -> Result<dbd_core::design::Reading> {
+    Ok(Workspace::load(config, env, Some(project_dir))
+        .context("Failed to load design")?
+        .reading(module, scope, deps)?)
+}
+
+/// Which way a run goes over a workspace's modules — see [`targets`].
+#[derive(Clone, Copy)]
+pub(super) enum Order {
+    /// A run that builds or reads: in `depends_on` order, `--module` with the
+    /// modules it depends on, the manifest's hooks around the run.
+    Build,
+    /// A run that reads one module — `export`: in `depends_on` order,
+    /// `--module` alone.
+    Alone,
+    /// A reset: in reverse, `--module` alone.
+    Reset,
+    /// A reconcile: as [`Order::Build`], leaving out — and saying so — a
+    /// released module other than the one `--module` names, which changes
+    /// by snapshot and `dbd apply`.
+    Reconcile,
+}
+
+/// One design a command runs: the project's, or one module of a workspace.
+pub(super) struct Target {
+    pub design: Design,
+    /// Where its files are: the project directory, or the module's folder.
+    pub dir: std::path::PathBuf,
+    /// The module's name — `None` for a project's own design.
+    pub module: Option<String>,
+}
+
+impl Target {
+    /// This target, its design remade by `f` — `--adopt-from` and the like.
+    pub fn map_design(self, f: impl FnOnce(Design) -> Design) -> Self {
+        Self {
+            design: f(self.design),
+            ..self
+        }
+    }
+
+    /// `result`, its error said to be this module's — a project's own is
+    /// left as it is.
+    pub fn labelled<T>(&self, result: Result<T>) -> Result<T> {
+        match self.label() {
+            Some(label) => result.context(label),
+            None => result,
+        }
+    }
+
+    /// `module core (shop/core)`, said before a module's run.
+    pub fn label(&self) -> Option<String> {
+        self.module
+            .as_ref()
+            .map(|m| format!("module {m} ({})", self.design.owner()))
+    }
+
+    /// Say which module the run is in — the first without a blank line before
+    /// it — and hand over its design and folder.
+    pub fn enter(self, first: bool) -> (Design, std::path::PathBuf) {
+        if let Some(label) = self.label() {
+            output::always(&if first { label } else { format!("\n{label}") });
+        }
+        (self.design, self.dir)
+    }
+}
+
+/// A workspace run's import, as one project's (#7): its first module empties,
+/// together, every table the run reloads that exists by then, and the others
+/// none — see `Design::emptying_for_import`. One design's run empties its own.
+pub(super) fn emptied_together(
+    targets: Vec<Target>,
+    name: Option<&str>,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
+) -> Result<(Vec<Target>, Emptied)> {
+    if targets.len() < 2 {
+        return Ok((targets, Emptied::default()));
+    }
+    let mut by_module: Vec<Vec<String>> = Vec::new();
+    for target in &targets {
+        let resolved = target.design.resolve_scope(scope, deps)?;
+        by_module.push(target.design.import_truncations(name, Some(&resolved))?);
+    }
+    let emptied = Emptied { by_module };
+    let all = emptied.from(0);
+    let targets = targets
+        .into_iter()
+        .enumerate()
+        .map(|(i, target)| {
+            let tables = if i == 0 { all.clone() } else { Vec::new() };
+            target.map_design(|design| design.emptying_for_import(tables))
+        })
+        .collect();
+    Ok((targets, emptied))
+}
+
+/// What a workspace run's import empties, module by module — see
+/// [`emptied_together`].
+#[derive(Default)]
+pub(super) struct Emptied {
+    by_module: Vec<Vec<String>>,
+}
+
+impl Emptied {
+    /// The tables the modules from `module` on reload, once each.
+    fn from(&self, module: usize) -> Vec<String> {
+        let mut tables: Vec<String> = Vec::new();
+        for table in self.by_module.iter().skip(module).flatten() {
+            if !tables.contains(table) {
+                tables.push(table.clone());
+            }
+        }
+        tables
+    }
+
+    /// `err`, from the module at `failed`'s import, saying what the run
+    /// emptied that no module has reloaded since: that module's tables and
+    /// those of the modules after it — when the first module's import did
+    /// empty them (`first_emptied`): one refused at the emptying emptied
+    /// nothing.
+    pub fn explain(&self, failed: usize, first_emptied: bool, err: anyhow::Error) -> anyhow::Error {
+        let left = self.from(failed);
+        if left.is_empty() || (failed == 0 && !first_emptied) {
+            return err;
+        }
+        err.context(format!(
+            "the import emptied {} to reload them and stopped before it did — run it again once this is fixed",
+            left.join(", ")
+        ))
+    }
+}
+
+/// `Grants applied.`, as a deploy's summary says it — empty when there were
+/// none to apply.
+pub(super) fn format_grants(grants: &dbd_core::design::GrantsOutcome) -> &'static str {
+    match grants {
+        dbd_core::design::GrantsOutcome::Applied => " Grants applied.",
+        dbd_core::design::GrantsOutcome::Unsupported => " Grants skipped (target has no grant model).",
+        dbd_core::design::GrantsOutcome::None => "",
+    }
+}
+
+/// `2 policy file(s) applied, 1 skipped (out of scope).`, as a deploy's
+/// summary says it.
+pub(super) fn format_policy_line(policies: &dbd_core::design::PolicyReport) -> String {
+    // A scoped deploy skips policies whose table is not in this plane. That is
+    // deliberate, but it must still be visible — otherwise the summary reports
+    // only what ran and nothing accounts for the rest.
+    format!(
+        "{} policy file(s) applied{}{}.",
+        policies.applied.len(),
+        match policies.failed.len() {
+            0 => String::new(),
+            n => format!(", {n} failed"),
+        },
+        match policies.skipped.len() {
+            0 => String::new(),
+            n => format!(", {n} skipped (out of scope)"),
+        }
+    )
+}
+
+/// The folders a command going over a project's files reads (#7): each
+/// module's of a workspace — or `module`'s alone — labelled for the module,
+/// or the project's own. Refuses a module the workspace does not declare.
+pub(super) fn file_folders(
+    config: &Path,
+    project_dir: &Path,
+    module: Option<&str>,
+) -> Result<Vec<(Option<String>, PathBuf)>> {
+    // A project a split was interrupted in is half-moved: read as it is, it
+    // is missing what moved — and `format` would rewrite its files.
+    if let Some(journal) = dbd_core::split::interrupted(project_dir) {
+        anyhow::bail!(
+            "a dbd split was interrupted here — its journal {} lists the files it moved: run `dbd split --undo` to \
+             put them back first",
+            journal.display()
+        );
+    }
+    let folders = if config.exists() {
+        Workspace::folders(config, project_dir)?
+    } else {
+        Vec::new()
+    };
+    if folders.is_empty() {
+        return Ok(vec![(None, project_dir.to_path_buf())]);
+    }
+    if let Some(wanted) = module
+        && !folders.iter().any(|(m, _)| m == wanted)
+    {
+        let declared: Vec<&str> = folders.iter().map(|(m, _)| m.as_str()).collect();
+        anyhow::bail!(
+            "no module \"{wanted}\" — design.yaml's modules: are {}",
+            declared.join(", ")
+        );
+    }
+    Ok(folders
+        .into_iter()
+        .filter(|(m, _)| module.is_none_or(|wanted| m == wanted))
+        .map(|(name, dir)| (Some(name), dir))
+        .collect())
+}
+
+/// Warn when a run's design has no DDL of its own. For a project it is the
+/// tell-tale of a wrong `--source`: the config path (`-c`) and the ddl/ scan
+/// root (`--source`) are independent, so an absolute `-c` with a defaulted
+/// `--source` loads the config yet silently scans the wrong directory, which
+/// would otherwise read as a successful no-op. For a module, an empty module.
+pub(super) fn warn_if_no_authored_ddl(design: &Design, dir: &Path, in_module: bool) {
+    if design.authored_entity_count() > 0 {
+        return;
+    }
+    if in_module {
+        output::warn(&format!("no authored DDL found under '{}/ddl'", dir.display()));
+    } else {
+        output::warn(&format!(
+            "no authored DDL found under '{dir}/ddl' — check that --source points at your \
+             project (currently '{dir}').",
+            dir = dir.display()
+        ));
+    }
+}
+
+/// The designs a run goes over (#7): the project's — or, for a workspace, each
+/// module `scope` and `module` select in `order` — narrowed with `name` to
+/// the module declaring that entity. Each module resolves `scope` (with
+/// `deps`) as its own, and a run that builds or reads is refused a gap between
+/// them.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn targets(
+    config: &Path,
+    env: &str,
+    project_dir: &Path,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
+    module: Option<&str>,
+    name: Option<&str>,
+    order: Order,
+) -> Result<Vec<Target>> {
+    let workspace = Workspace::load(config, env, Some(project_dir))
+        .context("Failed to load design")?
+        .under_scope_of(scope, module)?;
+    let has_modules = workspace.has_modules();
+    let modules = match (order, name) {
+        (Order::Build, Some(n)) if has_modules => workspace.select_declaring(module, n)?,
+        (Order::Build, _) => workspace.select(module)?,
+        (Order::Alone, name) => {
+            let mut modules = workspace.select_alone(module)?;
+            if has_modules && let Some(n) = name {
+                modules.retain(|m| {
+                    m.design()
+                        .resolve_name(n, None)
+                        .is_ok_and(|e| e.entity_type != dbd_core::EntityType::External)
+                });
+                if modules.is_empty() {
+                    anyhow::bail!("no module selected declares {n}");
+                }
+            }
+            modules
+        }
+        (Order::Reset, _) => workspace.selected_to_reset(module)?,
+        (Order::Reconcile, _) => {
+            let released = |m: &dbd_core::design::Module| {
+                m.design().config().project.released && m.name().is_some() && m.name() != module
+            };
+            let (kept, left_out) = workspace.select_except(module, released)?;
+            for name in left_out {
+                output::info(
+                    Verbosity::Normal,
+                    &format!(
+                        "module {name} is released — it changes by `dbd snapshot` and `dbd apply`; reconcile \
+                         leaves it out."
+                    ),
+                );
+            }
+            kept
+        }
+    };
+    // A run that builds or reads goes over its modules as one design goes over
+    // its entities: what one requires of another is in the run's scope.
+    if matches!(order, Order::Build | Order::Reconcile) {
+        dbd_core::design::check_scope_gaps(&modules, scope, deps)?;
+    }
+    Ok(modules
+        .into_iter()
+        .map(|m| Target {
+            module: m.name().map(str::to_string),
+            dir: m.design().project_dir().to_path_buf(),
+            design: m.into_design(),
+        })
+        .collect())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     command: &Commands,
@@ -94,6 +427,7 @@ pub async fn run(
     source: &str,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
+    module: Option<&str>,
     verbosity: Verbosity,
 ) -> Result<()> {
     warn_if_scope_ignored(command, scope, deps);
@@ -106,9 +440,10 @@ pub async fn run(
              For other commands, clone the repository and pass its local path to --source."
         );
     }
+    check_workspace_selection(command, config, module)?;
     match command {
         Commands::Inspect { shared: true, .. } => {
-            schema::cmd_inspect_shared(config, env, project_dir, database_url).await
+            schema::cmd_inspect_shared(config, env, project_dir, database_url, module).await
         }
         Commands::Inspect { name, fix, from_db, .. } => {
             schema::cmd_inspect(
@@ -119,6 +454,7 @@ pub async fn run(
                 name.as_deref(),
                 *fix,
                 *from_db,
+                module,
                 scope,
                 deps,
                 verbosity,
@@ -126,7 +462,9 @@ pub async fn run(
             .await
         }
 
-        Commands::Combine { file } => schema::cmd_combine(config, env, project_dir, file, scope, deps, verbosity),
+        Commands::Combine { file } => {
+            schema::cmd_combine(config, env, project_dir, file, module, scope, deps, verbosity)
+        }
 
         Commands::Emit { dialect, file, report } => schema::cmd_emit(
             config,
@@ -135,6 +473,7 @@ pub async fn run(
             dialect,
             file,
             report.as_deref(),
+            module,
             scope,
             deps,
             verbosity,
@@ -147,6 +486,7 @@ pub async fn run(
                 project_dir,
                 database_url,
                 name.as_deref(),
+                module,
                 scope,
                 deps,
                 verbosity,
@@ -154,9 +494,16 @@ pub async fn run(
             .await
         }
 
-        Commands::Graph { name } => {
-            project::cmd_graph(config, env, project_dir, name.as_deref(), scope, deps, verbosity)
-        }
+        Commands::Graph { name } => project::cmd_graph(
+            config,
+            env,
+            project_dir,
+            name.as_deref(),
+            module,
+            scope,
+            deps,
+            verbosity,
+        ),
 
         Commands::Apply {
             name,
@@ -176,6 +523,7 @@ pub async fn run(
                 *with_policies,
                 *allow_scope_change,
                 &OwnershipChange::new(adopt_from.as_deref(), *allow_ownership_change),
+                module,
                 scope,
                 deps,
                 verbosity,
@@ -192,6 +540,7 @@ pub async fn run(
                     database_url,
                     name.as_deref(),
                     file.as_deref(),
+                    module,
                     scope,
                     deps,
                     verbosity,
@@ -205,6 +554,7 @@ pub async fn run(
                     database_url,
                     name.as_deref(),
                     file.as_deref(),
+                    module,
                     scope,
                     deps,
                     verbosity,
@@ -238,6 +588,7 @@ pub async fn run(
                 database_url,
                 target.as_deref(),
                 opts,
+                module,
                 scope,
                 deps,
                 verbosity,
@@ -247,15 +598,14 @@ pub async fn run(
 
         Commands::Snapshot { list, name } => {
             if *list {
-                migration::cmd_snapshot_list(project_dir, verbosity);
-                return Ok(());
+                return migration::cmd_snapshot_list(config, project_dir, module, verbosity);
             }
-            migration::cmd_snapshot_create(config, env, project_dir, name.as_deref(), verbosity)
+            migration::cmd_snapshot_create(config, env, project_dir, module, name.as_deref(), verbosity)
         }
 
         Commands::Migrate { status } => {
             if *status {
-                migration::cmd_migrate_status(config, env, database_url, project_dir, verbosity).await
+                migration::cmd_migrate_status(config, env, database_url, project_dir, module, verbosity).await
             } else {
                 output::info(
                     verbosity,
@@ -286,6 +636,7 @@ pub async fn run(
                 *clear_cache,
                 *allow_scope_change,
                 &OwnershipChange::new(adopt_from.as_deref(), *allow_ownership_change),
+                module,
                 scope,
                 deps,
                 verbosity,
@@ -302,6 +653,7 @@ pub async fn run(
                 name.as_deref(),
                 format,
                 output.as_deref(),
+                module,
                 scope,
                 deps,
                 verbosity,
@@ -309,7 +661,7 @@ pub async fn run(
             .await
         }
 
-        Commands::Dbml { file } => project::cmd_dbml(config, env, project_dir, file, scope, deps, verbosity),
+        Commands::Dbml { file } => project::cmd_dbml(config, env, project_dir, file, module, scope, deps, verbosity),
 
         Commands::Diagram {
             json,
@@ -324,12 +676,13 @@ pub async fn run(
             file,
             *print_url,
             site.as_deref(),
+            module,
             scope,
             deps,
             verbosity,
         ),
 
-        Commands::Doctor { fix } => project::cmd_doctor(config, *fix, verbosity),
+        Commands::Doctor { fix } => project::cmd_doctor(config, project_dir, module, *fix, verbosity),
 
         Commands::Init {
             name,
@@ -444,10 +797,29 @@ pub async fn run(
             .await
         }
 
-        Commands::Format { check } => schema::cmd_format(config, project_dir, *check, verbosity),
+        Commands::Format { check } => schema::cmd_format(config, project_dir, module, *check, verbosity),
+
+        Commands::Split { undo: true, .. } => project::cmd_split_undo(config, project_dir),
+        Commands::Split {
+            from_scopes,
+            write,
+            rename,
+            undo: false,
+        } => project::cmd_split(config, env, project_dir, *from_scopes, *write, rename, verbosity),
 
         Commands::Policies { dry_run } => {
-            schema::cmd_policies(config, env, project_dir, database_url, *dry_run, scope, deps, verbosity).await
+            schema::cmd_policies(
+                config,
+                env,
+                project_dir,
+                database_url,
+                *dry_run,
+                module,
+                scope,
+                deps,
+                verbosity,
+            )
+            .await
         }
 
         Commands::Diff { json, exit_code } => {
@@ -458,6 +830,7 @@ pub async fn run(
                 database_url,
                 *json,
                 *exit_code,
+                module,
                 scope,
                 deps,
                 verbosity,
@@ -488,6 +861,7 @@ pub async fn run(
                 },
                 *allow_scope_change,
                 &OwnershipChange::new(adopt_from.as_deref(), *allow_ownership_change),
+                module,
                 scope,
                 deps,
                 verbosity,
@@ -495,7 +869,9 @@ pub async fn run(
             .await
         }
 
-        Commands::Release { name } => project::cmd_release(config, env, project_dir, name.as_deref(), verbosity),
+        Commands::Release { name } => {
+            project::cmd_release(config, env, project_dir, module, name.as_deref(), verbosity)
+        }
 
         Commands::Install { project, dry_run } => install::cmd_install(*project, *dry_run, project_dir, verbosity),
     }
@@ -557,26 +933,8 @@ pub(super) fn format_import_summary(s: &ImportComplete) -> String {
 pub(super) fn format_deploy_summary(s: &dbd_core::design::DeployComplete) -> String {
     let apply_line = format_apply_summary(&s.apply);
     let import_line = format_import_summary(&s.import);
-    // A scoped deploy skips policies whose table is not in this plane. That is
-    // deliberate, but it must still be visible — otherwise the summary reports
-    // only what ran and nothing accounts for the rest.
-    let policy_line = format!(
-        "{} policy file(s) applied{}{}.",
-        s.policies.applied.len(),
-        match s.policies.failed.len() {
-            0 => String::new(),
-            n => format!(", {n} failed"),
-        },
-        match s.policies.skipped.len() {
-            0 => String::new(),
-            n => format!(", {n} skipped (out of scope)"),
-        }
-    );
-    let grants = match s.grants {
-        dbd_core::design::GrantsOutcome::Applied => " Grants applied.",
-        dbd_core::design::GrantsOutcome::Unsupported => " Grants skipped (target has no grant model).",
-        dbd_core::design::GrantsOutcome::None => "",
-    };
+    let policy_line = format_policy_line(&s.policies);
+    let grants = format_grants(&s.grants);
     format!("{apply_line}{grants} {import_line} {policy_line}")
 }
 
@@ -585,6 +943,7 @@ pub(super) fn format_deploy_summary(s: &dbd_core::design::DeployComplete) -> Str
 pub(super) async fn get_adapter(
     config: &Path,
     database_url: Option<&str>,
+    owner: &str,
 ) -> Result<Box<dyn dbd_core::DatabaseAdapter>> {
     let design_config = dbd_core::config::read(config).context("Failed to read config")?;
 
@@ -623,8 +982,7 @@ pub(super) async fn get_adapter(
         }
     };
 
-    let project = &design_config.project.name;
-    dbd_core::connect(&url, project)
+    dbd_core::connect(&url, owner)
         .await
         .context("Failed to connect to database")
 }
@@ -662,15 +1020,12 @@ pub(super) fn configured_database_url(config: &Path, database_url: Option<&str>)
 pub(super) async fn dry_run_adapter(
     config: &Path,
     database_url: Option<&str>,
+    owner: &str,
 ) -> Result<Option<Box<dyn dbd_core::DatabaseAdapter>>> {
     let Some(url) = configured_database_url(config, database_url)? else {
         return Ok(None);
     };
-    let project = dbd_core::config::read(config)
-        .context("Failed to read config")?
-        .project
-        .name;
-    dbd_core::connect_existing(&url, &project)
+    dbd_core::connect_existing(&url, owner)
         .await
         .context("Failed to connect to database")
 }
@@ -846,6 +1201,18 @@ impl OwnershipChange {
             design = design.allowing_ownership_change();
         }
         design
+    }
+}
+
+/// Say a module's run retired the project as it was before it had modules:
+/// its claim took over the last of what that project held (#7).
+pub(super) fn say_if_retired(design: &dbd_core::Design) {
+    if design.retired_predecessor()
+        && let Some(predecessor) = design.predecessor()
+    {
+        output::always(&format!(
+            "project \"{predecessor}\" is retired — its modules hold everything it held"
+        ));
     }
 }
 
@@ -1306,6 +1673,7 @@ mod tests {
             source,
             None,
             None,
+            None,
             Verbosity::Normal,
         )
         .await
@@ -1328,6 +1696,7 @@ mod tests {
             None,
             &fixtures,
             fixtures.to_str().unwrap(),
+            None,
             None,
             None,
             Verbosity::Normal,
@@ -1354,6 +1723,7 @@ mod tests {
             None,
             dir,
             dir.to_str().unwrap(),
+            None,
             None,
             None,
             Verbosity::Normal,
@@ -1595,6 +1965,7 @@ mod tests {
             dir.to_str().unwrap(),
             None,
             None,
+            None,
             Verbosity::Normal,
         )
         .await
@@ -1642,6 +2013,7 @@ mod tests {
             dir.to_str().unwrap(),
             None,
             None,
+            None,
             Verbosity::Normal,
         )
         .await
@@ -1684,6 +2056,7 @@ mod tests {
             None,
             dir,
             dir.to_str().unwrap(),
+            None,
             None,
             None,
             Verbosity::Normal,
@@ -1754,7 +2127,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = get_adapter(&cfg, None).await.err().expect("expected an error");
+        let err = get_adapter(&cfg, None, "t").await.err().expect("expected an error");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("DATABASE_URL") || msg.contains("target.url") || msg.contains("No target"),
@@ -1765,7 +2138,7 @@ mod tests {
     /// An unreadable config is reported as a config error, not a connection one.
     #[tokio::test]
     async fn get_adapter_reports_unreadable_config() {
-        let err = get_adapter(Path::new("/nonexistent/design.yaml"), None)
+        let err = get_adapter(Path::new("/nonexistent/design.yaml"), None, "t")
             .await
             .err()
             .expect("expected an error");
@@ -1792,7 +2165,7 @@ mod tests {
             std::env::set_var("DBD_TEST_URL_VAR", "postgres://user@127.0.0.1:1/nope");
         }
 
-        let err = get_adapter(&cfg, None).await.err().expect("expected an error");
+        let err = get_adapter(&cfg, None, "t").await.err().expect("expected an error");
         let msg = format!("{err:#}");
         assert!(
             !msg.contains("$DBD_TEST_URL_VAR"),

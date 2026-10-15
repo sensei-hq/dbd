@@ -9,6 +9,7 @@ use crate::output::{self, Verbosity};
 /// The boolean flags that drive `dbd reset`, grouped so callers construct them
 /// by name. This prevents a transposition of, e.g., `allow_scope_change` (which
 /// would silently disable the scope guard) into an adjacent positional bool slot.
+#[derive(Clone, Copy)]
 pub(crate) struct ResetOptions {
     pub dry_run: bool,
     pub force: bool,
@@ -92,6 +93,82 @@ pub async fn cmd_reset(
     database_url: Option<&str>,
     target: Option<&str>,
     opts: ResetOptions,
+    module: Option<&str>,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
+    verbosity: Verbosity,
+) -> Result<()> {
+    // A workspace's modules in reverse: each before the modules it depends on,
+    // so what they use of one another is gone by the time each resets.
+    let targets = super::targets(config, env, project_dir, scope, deps, module, None, super::Order::Reset)?;
+    let owners: Vec<String> = targets.iter().map(|t| t.design.owner().to_string()).collect();
+    let ownership = super::OwnershipChange::new(None, opts.allow_ownership_change);
+    // Each beside the modules reset before it — not those after, which still
+    // hold what they hold, and use what they use, when it resets.
+    let targets: Vec<super::Target> = targets
+        .into_iter()
+        .enumerate()
+        .map(|(i, t)| t.map_design(|design| ownership.applied_to(design).resetting_beside(owners[..i].to_vec())))
+        .collect();
+    if targets.len() > 1 && !opts.dry_run {
+        // Every module's reset checked as its preview checks it before any
+        // module drops a thing: a reset refused for one module is refused
+        // whole (#7).
+        for reset in &targets {
+            let design = &reset.design;
+            let check = async {
+                let resolved = design.resolve_scope(scope, deps)?;
+                let platform = checked_reset_target(design, config, database_url, target)?;
+                let adapter = get_adapter(config, database_url, design.owner()).await?;
+                check_reset_guards(&*adapter, design, &resolved, opts.force, opts.allow_scope_change).await?;
+                design.check_ownership(&*adapter).await?;
+                design
+                    .reset_preview(
+                        &*adapter,
+                        platform,
+                        opts.force,
+                        opts.drop_schemas,
+                        opts.drop_extensions,
+                        Some(&resolved),
+                    )
+                    .await?;
+                anyhow::Ok(())
+            };
+            reset.labelled(check.await)?;
+        }
+    }
+    for (i, reset) in targets.into_iter().enumerate() {
+        let (design, _) = reset.enter(i == 0);
+        reset_design(design, config, database_url, target, opts, scope, deps, verbosity).await?;
+    }
+    Ok(())
+}
+
+/// The platform a reset drops on — `--target`, else the design's — refusing
+/// one reset has no script for, and one the connection says it is not.
+fn checked_reset_target<'a>(
+    design: &'a Design,
+    config: &Path,
+    database_url: Option<&str>,
+    target: Option<&'a str>,
+) -> Result<&'a str> {
+    let flagged = target.is_some();
+    let target = reset_target(target, design);
+    check_reset_target(target)?;
+    if let Some(url) = super::configured_database_url(config, database_url)? {
+        check_target_matches_connection(target, flagged, &url)?;
+    }
+    Ok(target)
+}
+
+/// [`cmd_reset`] for one design: the project's, or one module's.
+#[allow(clippy::too_many_arguments)]
+async fn reset_design(
+    design: Design,
+    config: &Path,
+    database_url: Option<&str>,
+    target: Option<&str>,
+    opts: ResetOptions,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
@@ -102,19 +179,12 @@ pub async fn cmd_reset(
         drop_schemas,
         drop_extensions,
         allow_scope_change,
-        allow_ownership_change,
+        allow_ownership_change: _,
     } = opts;
-    let design = super::OwnershipChange::new(None, allow_ownership_change)
-        .applied_to(Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?);
     let resolved = design.resolve_scope(scope, deps)?;
     let (kept, total) = design.scope_counts(&resolved)?;
     output::scope_filtered(&resolved, kept, total);
-    let flagged = target.is_some();
-    let target = reset_target(target, &design);
-    check_reset_target(target)?;
-    if let Some(url) = super::configured_database_url(config, database_url)? {
-        check_target_matches_connection(target, flagged, &url)?;
-    }
+    let target = checked_reset_target(&design, config, database_url, target)?;
     if target == "sqlite" && (drop_schemas || drop_extensions) {
         output::warn("SQLite has no schemas or extensions: --schemas, --extensions and --clean change nothing here.");
     }
@@ -126,7 +196,7 @@ pub async fn cmd_reset(
         // What the real run keeps — the roles another database holds, and what
         // other projects in this one have or use (#7) — is asked of the same
         // database, so the preview lists no drop the run will not perform.
-        let (sql, preview) = match super::dry_run_adapter(config, database_url).await? {
+        let (sql, preview) = match super::dry_run_adapter(config, database_url, design.owner()).await? {
             Some(adapter) => {
                 check_reset_guards(&*adapter, &design, &resolved, force, allow_scope_change).await?;
                 // The real reset claims the design's entities first (#7).
@@ -148,7 +218,7 @@ pub async fn cmd_reset(
         return Ok(());
     }
 
-    let adapter = get_adapter(config, database_url).await?;
+    let adapter = get_adapter(config, database_url, design.owner()).await?;
     let summary = reset_with_adapter(
         &*adapter,
         &design,
@@ -280,10 +350,35 @@ pub async fn cmd_migrate_status(
     env: &str,
     database_url: Option<&str>,
     project_dir: &Path,
+    module: Option<&str>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
-    let adapter = get_adapter(config, database_url).await?;
+    let targets = super::targets(
+        config,
+        env,
+        project_dir,
+        Some("all"),
+        None,
+        module,
+        None,
+        super::Order::Build,
+    )?;
+    for (i, target) in targets.into_iter().enumerate() {
+        let (design, dir) = target.enter(i == 0);
+        migrate_status_design(design, config, database_url, &dir, verbosity).await?;
+    }
+    Ok(())
+}
+
+/// [`cmd_migrate_status`] for one design: the project's, or one module's.
+async fn migrate_status_design(
+    design: Design,
+    config: &Path,
+    database_url: Option<&str>,
+    project_dir: &Path,
+    verbosity: Verbosity,
+) -> Result<()> {
+    let adapter = get_adapter(config, database_url, design.owner()).await?;
     // The versions are the whole project's; a database pinned to a scope was
     // built with that scope's entities alone, and said nothing of it.
     let unscoped = design.resolve_scope(None, None)?;
@@ -363,7 +458,26 @@ pub(crate) async fn migrate_status_with_adapter(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn cmd_snapshot_list(project_dir: &Path, verbosity: Verbosity) {
+pub fn cmd_snapshot_list(config: &Path, project_dir: &Path, module: Option<&str>, verbosity: Verbosity) -> Result<()> {
+    let folders = super::file_folders(config, project_dir, module)?;
+    let in_workspace = folders.iter().any(|(m, _)| m.is_some());
+    let project = in_workspace
+        .then(|| dbd_core::config::read(config).map(|c| c.project.name))
+        .transpose()?;
+    let mut first = true;
+    for (name, dir) in folders {
+        if let (Some(name), Some(project)) = (&name, &project) {
+            let label = format!("module {name} ({project}/{name})");
+            output::always(&if first { label } else { format!("\n{label}") });
+        }
+        first = false;
+        list_snapshots_in(&dir, verbosity);
+    }
+    Ok(())
+}
+
+/// The snapshots in `dir`'s `snapshots/`, a line each.
+fn list_snapshots_in(project_dir: &Path, verbosity: Verbosity) {
     let dir = project_dir;
     let snapshots = dbd_core::snapshot::list_snapshots(dir);
 
@@ -394,12 +508,39 @@ pub fn cmd_snapshot_create(
     config: &Path,
     env: &str,
     project_dir: &Path,
+    module: Option<&str>,
     description: Option<&str>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
+    // A snapshot records the design, whatever scope a database runs: every
+    // module's, or the one named — each in its folder, at its own version.
+    let targets = super::targets(
+        config,
+        env,
+        project_dir,
+        Some("all"),
+        None,
+        module,
+        None,
+        super::Order::Alone,
+    )?;
+    for (i, target) in targets.into_iter().enumerate() {
+        let (design, dir) = target.enter(i == 0);
+        snapshot_design(&design, config, &dir, description, verbosity)?;
+    }
+    Ok(())
+}
+
+/// [`cmd_snapshot_create`] for one design: the project's, or one module's.
+fn snapshot_design(
+    design: &Design,
+    config: &Path,
+    project_dir: &Path,
+    description: Option<&str>,
+    verbosity: Verbosity,
+) -> Result<()> {
     let desc = description.unwrap_or("snapshot");
-    let result = dbd_core::snapshot::create_snapshot(design.entities(), project_dir, config, desc)
+    let result = dbd_core::snapshot::create_snapshot_of(design.entities(), project_dir, config, design.module(), desc)
         .context("Failed to create snapshot")?;
 
     // Single snapshot, no changes
@@ -450,7 +591,11 @@ pub fn cmd_snapshot_create(
     }
 
     let final_version = result.snapshots.last().map(|s| s.snapshot.version).unwrap_or(0);
-    output::info(verbosity, &format!("\ndesign.yaml version updated to {final_version}"));
+    let field = match design.module() {
+        Some(module) => format!("modules.{module}.version"),
+        None => "version".to_string(),
+    };
+    output::info(verbosity, &format!("\ndesign.yaml {field} updated to {final_version}"));
 
     Ok(())
 }
@@ -478,13 +623,19 @@ mod tests {
     #[test]
     fn snapshot_list_empty_dir_is_noop() {
         let tmp = tempfile::tempdir().unwrap();
-        cmd_snapshot_list(tmp.path(), Verbosity::Normal);
+        cmd_snapshot_list(&tmp.path().join("design.yaml"), tmp.path(), None, Verbosity::Normal).unwrap();
     }
 
     /// Listing against the real fixture exercises the print-each-snapshot path.
     #[test]
     fn snapshot_list_on_fixture_project() {
-        cmd_snapshot_list(&testutil::fixtures(), Verbosity::Verbose);
+        cmd_snapshot_list(
+            &testutil::fixture_config(),
+            &testutil::fixtures(),
+            None,
+            Verbosity::Verbose,
+        )
+        .unwrap();
     }
 
     /// A Supabase project resets as a Supabase project without being told so:
@@ -561,6 +712,7 @@ mod tests {
             },
             None,
             None,
+            None,
             Verbosity::Normal,
         )
         .await
@@ -604,6 +756,7 @@ mod tests {
             },
             None,
             None,
+            None,
             Verbosity::Normal,
         )
         .await
@@ -616,7 +769,7 @@ mod tests {
     fn snapshot_create_writes_into_temp_project() {
         let proj = testutil::copy_fixture_project();
         let cfg = proj.path().join("design.yaml");
-        cmd_snapshot_create(&cfg, "dev", proj.path(), Some("test snapshot"), Verbosity::Normal).unwrap();
+        cmd_snapshot_create(&cfg, "dev", proj.path(), None, Some("test snapshot"), Verbosity::Normal).unwrap();
     }
 
     /// A second snapshot with nothing changed takes the no-changes branch and
@@ -625,10 +778,10 @@ mod tests {
     fn snapshot_create_twice_reports_no_changes() {
         let proj = testutil::copy_fixture_project();
         let cfg = proj.path().join("design.yaml");
-        cmd_snapshot_create(&cfg, "dev", proj.path(), Some("first"), Verbosity::Normal).unwrap();
+        cmd_snapshot_create(&cfg, "dev", proj.path(), None, Some("first"), Verbosity::Normal).unwrap();
         let after_first = dbd_core::snapshot::list_snapshots(proj.path()).len();
 
-        cmd_snapshot_create(&cfg, "dev", proj.path(), Some("second"), Verbosity::Normal).unwrap();
+        cmd_snapshot_create(&cfg, "dev", proj.path(), None, Some("second"), Verbosity::Normal).unwrap();
         let after_second = dbd_core::snapshot::list_snapshots(proj.path()).len();
 
         assert_eq!(
@@ -643,7 +796,7 @@ mod tests {
     fn snapshot_create_after_a_change_adds_a_snapshot() {
         let proj = testutil::copy_fixture_project();
         let cfg = proj.path().join("design.yaml");
-        cmd_snapshot_create(&cfg, "dev", proj.path(), Some("baseline"), Verbosity::Normal).unwrap();
+        cmd_snapshot_create(&cfg, "dev", proj.path(), None, Some("baseline"), Verbosity::Normal).unwrap();
         let before = dbd_core::snapshot::list_snapshots(proj.path()).len();
 
         std::fs::write(
@@ -653,7 +806,7 @@ mod tests {
         )
         .unwrap();
 
-        cmd_snapshot_create(&cfg, "dev", proj.path(), Some("after change"), Verbosity::Verbose).unwrap();
+        cmd_snapshot_create(&cfg, "dev", proj.path(), None, Some("after change"), Verbosity::Verbose).unwrap();
         let after = dbd_core::snapshot::list_snapshots(proj.path()).len();
 
         assert!(
@@ -668,12 +821,12 @@ mod tests {
     fn snapshot_list_prints_existing_snapshots() {
         let proj = testutil::copy_fixture_project();
         let cfg = proj.path().join("design.yaml");
-        cmd_snapshot_create(&cfg, "dev", proj.path(), Some("listed"), Verbosity::Normal).unwrap();
+        cmd_snapshot_create(&cfg, "dev", proj.path(), None, Some("listed"), Verbosity::Normal).unwrap();
         assert!(
             !dbd_core::snapshot::list_snapshots(proj.path()).is_empty(),
             "precondition: the project must have a snapshot to list"
         );
-        cmd_snapshot_list(proj.path(), Verbosity::Verbose);
+        cmd_snapshot_list(&proj.path().join("design.yaml"), proj.path(), None, Verbosity::Verbose).unwrap();
     }
 
     // ── Adapter-backed paths, via the mock ────────────────────────────────────
@@ -690,14 +843,14 @@ mod tests {
     async fn migrate_status_reports_pending_when_db_behind() {
         let proj = testutil::copy_fixture_project();
         let cfg = proj.path().join("design.yaml");
-        cmd_snapshot_create(&cfg, "dev", proj.path(), Some("baseline"), Verbosity::Normal).unwrap();
+        cmd_snapshot_create(&cfg, "dev", proj.path(), None, Some("baseline"), Verbosity::Normal).unwrap();
         std::fs::write(
             proj.path().join("ddl/table/config/pending_probe.ddl"),
             "set search_path to config;\n\
              create table if not exists pending_probe (id int primary key);\n",
         )
         .unwrap();
-        cmd_snapshot_create(&cfg, "dev", proj.path(), Some("change"), Verbosity::Normal).unwrap();
+        cmd_snapshot_create(&cfg, "dev", proj.path(), None, Some("change"), Verbosity::Normal).unwrap();
 
         // Precondition: a database at v1 has the v1→v2 migration outstanding.
         let pending = dbd_core::snapshot::pending_migrations(1, proj.path());

@@ -389,6 +389,14 @@ pub trait DatabaseAdapter: Send + Sync {
     /// key to (SQLite enforces foreign keys on dbd's connections), and with
     /// the table that failed named — the database's own error names none.
     /// Postgres truncates them in one statement instead (see its override).
+    /// Which of `tables` exist, in the order given. A workspace's import
+    /// empties what the whole run reloads before its first module loads, and
+    /// on a fresh database a later module's tables are not built yet (#7).
+    /// Adapters with no catalog to ask take every table to exist.
+    async fn existing_tables(&self, tables: &[String]) -> Result<Vec<String>> {
+        Ok(tables.to_vec())
+    }
+
     async fn truncate_tables(&self, tables: &[String]) -> Result<()> {
         for table in tables.iter().rev() {
             self.truncate_table(table).await.map_err(|e| {
@@ -572,6 +580,54 @@ pub trait DatabaseAdapter: Send + Sync {
     ) -> Result<Vec<HeldObject>> {
         let _ = (owner, objects, write, adopt_from);
         Ok(Vec::new())
+    }
+
+    /// [`Self::claim_objects`], taking over what any of `from` holds of
+    /// `objects` — a module of a workspace takes over from its project's other
+    /// owners (#7). By default [`Self::claim_objects`], taking over from the
+    /// one of them that holds anything — so an adapter written before it, or
+    /// one keeping no registry, keeps working — and refusing when several do;
+    /// an adapter keeping a registry takes over from several at once.
+    async fn claim_objects_from(
+        &self,
+        owner: &str,
+        objects: &[OwnedObject],
+        write: bool,
+        from: &[String],
+    ) -> Result<Vec<HeldObject>> {
+        match from {
+            [] => self.claim_objects(owner, objects, write, None).await,
+            [one] => self.claim_objects(owner, objects, write, Some(one)).await,
+            // Of several, the ones that hold anything this claim takes: rarely
+            // more than one, and none for an adapter that keeps no registry.
+            _ => {
+                let mut holding: Vec<String> = Vec::new();
+                for held in self.claim_objects(owner, objects, false, None).await? {
+                    if from.contains(&held.owner) && !holding.contains(&held.owner) {
+                        holding.push(held.owner);
+                    }
+                }
+                match holding.as_slice() {
+                    [] => self.claim_objects(owner, objects, write, None).await,
+                    [one] => self.claim_objects(owner, objects, write, Some(one)).await,
+                    _ => Err(crate::error::DbdError::Config(format!(
+                        "this database's adapter takes over from one owner at a time — {} each hold something \
+                         {owner} takes; take each over in a run of its own (--adopt-from)",
+                        holding.join(", ")
+                    ))),
+                }
+            }
+        }
+    }
+
+    /// Retire `owner` once it holds nothing that still exists: its record,
+    /// its uses, its claims of what is gone — in the open batch when there is
+    /// one (#7: a project split into modules, whose modules took everything
+    /// over). Whether it was retired. Adapters without a registry retire
+    /// nothing.
+    async fn retire_owner(&self, owner: &str) -> Result<bool> {
+        let _ = owner;
+        Ok(false)
     }
 
     /// What `owner` holds in the registry that still exists in the database

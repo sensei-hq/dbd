@@ -70,6 +70,8 @@ Files use the `.ddl` or `.sql` extension. Schemas are auto-added from these path
 
 There is no `ddl/extension/` or `ddl/schema/` folder: extensions are declared in the target's `extensions:` list and schemas under `schemas:` in `design.yaml`, because dbd generates both statements itself. `dbd inspect` reports a file in either folder as an error, and `dbd doctor` names the `design.yaml` entry to write instead.
 
+A project divided into **modules** (a workspace — a `modules:` block in `design.yaml`) has this tree once per module, in the module's own folder — `core/ddl/table/app/orders.ddl` — and none at the root. See [design.yaml](03-design-yaml.md).
+
 **Use the singular type folder** (`table`, `function`, …) — it's canonical. The plural form (`functions/`, `tables/`, …) is still accepted for backward compatibility (and `matview/` for `materialized_view/`), but `dbd doctor` flags it and `dbd doctor --fix` migrates plural folders to singular. If a singular folder already exists, the contents are merged in; on a same-name file collision the **newer** file (by modification time) is kept and the older one is saved alongside as `<name>.ddl.bkp` (reported so you can reconcile).
 
 ## Configure

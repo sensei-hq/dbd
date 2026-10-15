@@ -7,53 +7,69 @@ use dbd_core::{Design, Entity, EntityType};
 use super::{format_apply_summary, format_in_place, get_adapter, safe_canonicalize_within};
 use crate::output::{self, Verbosity};
 
-/// Warn when the config loaded but no authored DDL was scanned under the
-/// resolved project dir — the tell-tale of a wrong `--source`. The config path
-/// (`-c`) and the ddl/ scan root (`--source`) are independent, so an absolute
-/// `-c` with a defaulted `--source` loads the config yet silently scans the
-/// wrong directory, which would otherwise read as a successful no-op.
-fn warn_if_no_authored_ddl(design: &Design, project_dir: &Path) {
-    if design.authored_entity_count() == 0 {
-        output::warn(&format!(
-            "no authored DDL found under '{dir}/ddl' — check that --source points at your \
-             project (currently '{dir}').",
-            dir = project_dir.display()
-        ));
-    }
-}
-
 /// `dbd inspect --shared`: what shares the database — each project, what it
 /// owns and uses, and which record nothing of it yet — and what would refuse
-/// this design there, exiting non-zero over any (#7).
+/// this design there, exiting non-zero over any (#7). A workspace's modules
+/// are each an owner: what shares the database is said once, then what would
+/// refuse each module.
 pub async fn cmd_inspect_shared(
     config: &Path,
     env: &str,
     project_dir: &Path,
     database_url: Option<&str>,
+    module: Option<&str>,
 ) -> Result<()> {
-    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
-    let adapter = get_adapter(config, database_url).await?;
-    let shared = design.shared_database(&*adapter).await?;
-    let project = &design.config().project.name;
-    for line in format_shared_database(&shared, project) {
-        output::always(&line);
+    let mut reports = Vec::new();
+    for target in super::targets(
+        config,
+        env,
+        project_dir,
+        Some("all"),
+        None,
+        module,
+        None,
+        super::Order::Build,
+    )? {
+        let adapter = get_adapter(config, database_url, target.design.owner()).await?;
+        let shared = target.design.shared_database(&*adapter).await?;
+        reports.push((target, shared));
     }
-    if !shared.conflicts.is_empty() {
+    if let Some((_, shared)) = reports.first() {
+        for line in format_shared_projects(shared) {
+            output::always(&line);
+        }
+    }
+    let mut conflicts = 0;
+    for (target, shared) in &reports {
+        if let Some(label) = target.label() {
+            output::always(&format!("\n{label}"));
+        }
+        for line in format_conflicts(shared, target.design.owner()) {
+            output::always(&line);
+        }
+        conflicts += shared.conflicts.len();
+    }
+    if conflicts > 0 {
+        let owners: Vec<&str> = reports
+            .iter()
+            .filter(|(_, shared)| !shared.conflicts.is_empty())
+            .map(|(target, _)| target.design.owner())
+            .collect();
         anyhow::bail!(
-            "{} {} for project '{project}' in this database",
-            shared.conflicts.len(),
-            if shared.conflicts.len() == 1 {
-                "conflict"
-            } else {
-                "conflicts"
-            }
+            "{conflicts} {} for {} in this database",
+            if conflicts == 1 { "conflict" } else { "conflicts" },
+            owners
+                .iter()
+                .map(|o| format!("project '{o}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
     Ok(())
 }
 
-/// [`cmd_inspect_shared`]'s report, a line each.
-fn format_shared_database(shared: &dbd_core::design::SharedDatabase, project: &str) -> Vec<String> {
+/// Each project in the database, what it owns and what it uses.
+fn format_shared_projects(shared: &dbd_core::design::SharedDatabase) -> Vec<String> {
     const SHOWN: usize = 10;
     let mut lines = vec!["Projects in this database:".to_string()];
     if shared.projects.is_empty() {
@@ -99,6 +115,12 @@ fn format_shared_database(shared: &dbd_core::design::SharedDatabase, project: &s
             lines.push(format!("    uses {} through {}", u.target, u.via));
         }
     }
+    lines
+}
+
+/// What would refuse `project` in the database.
+fn format_conflicts(shared: &dbd_core::design::SharedDatabase, project: &str) -> Vec<String> {
+    let mut lines = Vec::new();
     if shared.conflicts.is_empty() {
         lines.push(format!("No conflicts for project '{project}'."));
     } else {
@@ -117,14 +139,68 @@ pub async fn cmd_inspect(
     name: Option<&str>,
     fix: bool,
     use_database: bool,
+    module: Option<&str>,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let mut design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
-    warn_if_no_authored_ddl(&design, project_dir);
+    let inspect = Inspect {
+        config,
+        database_url,
+        name,
+        fix,
+        use_database,
+        scope,
+        deps,
+        verbosity,
+    };
+    // Each module of a workspace in `depends_on` order — with `-n`, the one
+    // declaring that entity. The workspace's own checks (T19, T20) ran as it
+    // loaded.
+    let targets = super::targets(config, env, project_dir, scope, deps, module, name, super::Order::Build)?;
+    let mut blocking = 0;
+    for (i, target) in targets.into_iter().enumerate() {
+        let in_module = target.module.is_some();
+        let (mut design, dir) = target.enter(i == 0);
+        super::warn_if_no_authored_ddl(&design, &dir, in_module);
+        blocking += inspect_design(&mut design, &dir, &inspect).await?;
+    }
 
-    resolve_inspect_refs(&mut design, config, database_url, use_database, verbosity).await?;
+    // Report first, then fail. The findings are the useful output; an early
+    // return would print an "Error:" line instead of them.
+    let code = inspect_exit_code(blocking);
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
+}
+
+/// What `dbd inspect` was asked, for each design it inspects.
+struct Inspect<'a> {
+    config: &'a Path,
+    database_url: Option<&'a str>,
+    name: Option<&'a str>,
+    fix: bool,
+    use_database: bool,
+    scope: Option<&'a str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
+    verbosity: Verbosity,
+}
+
+/// Inspect one design — a project, or one module of a workspace — printing
+/// its findings and summary, and return how many of them block.
+async fn inspect_design(design: &mut Design, project_dir: &Path, inspect: &Inspect<'_>) -> Result<usize> {
+    let &Inspect {
+        config,
+        database_url,
+        name,
+        fix,
+        use_database,
+        scope,
+        deps,
+        verbosity,
+    } = inspect;
+    resolve_inspect_refs(design, config, database_url, use_database, verbosity).await?;
 
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
     // Resolve the working set the way every run does, before reporting on it.
@@ -260,13 +336,7 @@ pub async fn cmd_inspect(
         ));
     }
 
-    // Report first, then fail. The findings above are the useful output; an
-    // early return would print an "Error:" line instead of them.
-    let code = inspect_exit_code(blocking);
-    if code != 0 {
-        std::process::exit(code);
-    }
-    Ok(())
+    Ok(blocking)
 }
 
 /// Resolve unknown references against the live DB (persisting a refcache) or,
@@ -279,7 +349,7 @@ async fn resolve_inspect_refs(
     verbosity: Verbosity,
 ) -> Result<()> {
     if use_database {
-        let adapter = get_adapter(config, database_url).await?;
+        let adapter = get_adapter(config, database_url, design.owner()).await?;
         let dropped = design
             .resolve_unknown_refs_via_db(&*adapter)
             .await
@@ -831,6 +901,7 @@ pub fn cmd_emit(
     dialect: &str,
     file: &Path,
     report: Option<&Path>,
+    module: Option<&str>,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
@@ -841,12 +912,11 @@ pub fn cmd_emit(
     // path does not leave the script behind. See `cmd_combine` for the rule.
     let dest = safe_canonicalize_within(project_dir, file)?;
     let report_dest = report.map(|r| safe_canonicalize_within(project_dir, r)).transpose()?;
-    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
-    let resolved = design.resolve_scope(scope, deps)?;
-    let (kept, total) = design.scope_counts(&resolved)?;
-    output::scope_filtered(&resolved, kept, total);
+    let reading = super::reading(config, env, project_dir, module, scope, deps)?;
+    let (kept, total) = reading.counts()?;
+    output::scope_filtered(reading.scope(), kept, total);
 
-    let (sql, downgrades) = dbd_core::emit_dialect::emit_schema(&design, target, Some(&resolved))?;
+    let (sql, downgrades) = dbd_core::emit_dialect::emit_reading(&reading, target)?;
     std::fs::write(&dest, sql).with_context(|| format!("Failed to write {}", file.display()))?;
     output::info(verbosity, &format!("Generated {}", file.display()));
 
@@ -876,11 +946,13 @@ pub fn cmd_emit(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_combine(
     config: &Path,
     env: &str,
     project_dir: &Path,
     file: &Path,
+    module: Option<&str>,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
@@ -892,11 +964,10 @@ pub fn cmd_combine(
     // tree — overwrote a file dbd does not own without a word. Output wanted
     // outside the project is written inside it and moved.
     let dest = safe_canonicalize_within(project_dir, file)?;
-    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
-    let resolved = design.resolve_scope(scope, deps)?;
-    let (kept, total) = design.scope_counts(&resolved)?;
-    output::scope_filtered(&resolved, kept, total);
-    design.combine(&dest, Some(&resolved))?;
+    let reading = super::reading(config, env, project_dir, module, scope, deps)?;
+    let (kept, total) = reading.counts()?;
+    output::scope_filtered(reading.scope(), kept, total);
+    std::fs::write(&dest, reading.combined()?).with_context(|| format!("Failed to write {}", file.display()))?;
     output::info(verbosity, &format!("Generated {}", file.display()));
     Ok(())
 }
@@ -912,13 +983,93 @@ pub async fn cmd_apply(
     with_policies: bool,
     allow_scope_change: bool,
     ownership: &super::OwnershipChange,
+    module: Option<&str>,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let design = ownership
-        .applied_to(Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?);
-    warn_if_no_authored_ddl(&design, project_dir);
+    let targets: Vec<super::Target> =
+        super::targets(config, env, project_dir, scope, deps, module, name, super::Order::Build)?
+            .into_iter()
+            .map(|target| target.map_design(|design| ownership.applied_to(design)))
+            .collect();
+    let run = ApplyRun {
+        config,
+        database_url,
+        name,
+        dry_run,
+        with_policies,
+        allow_scope_change,
+        scope,
+        deps,
+        verbosity,
+    };
+    if targets.len() > 1 && !dry_run {
+        preflight_apply(&targets, &run).await?;
+    }
+    let mut code = 0;
+    for (i, target) in targets.into_iter().enumerate() {
+        let in_module = target.module.is_some();
+        let (design, dir) = target.enter(i == 0);
+        super::warn_if_no_authored_ddl(&design, &dir, in_module);
+        code = code.max(apply_design(&design, &dir, &run).await?);
+        super::say_if_retired(&design);
+    }
+    // A module's failed policy fails the run, once every module has run.
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
+}
+
+/// Before the first module of a workspace builds, each module's apply checked
+/// as its dry run checks it — its scope pin, its guards, what it would claim,
+/// its migrations, its hook files — so a refusal any module's run would meet
+/// comes before any module has written (#7).
+async fn preflight_apply(targets: &[super::Target], run: &ApplyRun<'_>) -> Result<()> {
+    for target in targets {
+        let design = &target.design;
+        let check = async {
+            let adapter = get_adapter(run.config, run.database_url, design.owner()).await?;
+            let resolved = design.resolve_scope(run.scope, run.deps)?;
+            let marks = design.database_marks(&*adapter).await?;
+            Design::check_scope_guard(&marks, &resolved.name, run.allow_scope_change)?;
+            design
+                .apply(&*adapter, run.name, true, Some(&resolved), Progress::none())
+                .await?;
+            anyhow::Ok(())
+        };
+        target.labelled(check.await)?;
+    }
+    Ok(())
+}
+
+/// What `dbd apply` was asked, for each design it applies.
+struct ApplyRun<'a> {
+    config: &'a Path,
+    database_url: Option<&'a str>,
+    name: Option<&'a str>,
+    dry_run: bool,
+    with_policies: bool,
+    allow_scope_change: bool,
+    scope: Option<&'a str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
+    verbosity: Verbosity,
+}
+
+/// [`cmd_apply`] for one design: the project's, or one module's.
+async fn apply_design(design: &Design, project_dir: &Path, run: &ApplyRun<'_>) -> Result<i32> {
+    let &ApplyRun {
+        config,
+        database_url,
+        name,
+        dry_run,
+        with_policies,
+        allow_scope_change,
+        scope,
+        deps,
+        verbosity,
+    } = run;
     let resolved = design.resolve_scope(scope, deps).context("Failed to resolve scope")?;
 
     // Named for the run as for its preview: the preview said what it narrowed
@@ -940,7 +1091,7 @@ pub async fn cmd_apply(
 
         // With a database to ask, refuse where the run refuses: the scope pin,
         // then the run's own environment and version guards.
-        let adapter = super::dry_run_adapter(config, database_url).await?;
+        let adapter = super::dry_run_adapter(config, database_url, design.owner()).await?;
         if let Some(adapter) = &adapter {
             let marks = design.database_marks(&**adapter).await?;
             Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
@@ -948,7 +1099,7 @@ pub async fn cmd_apply(
             // The real run claims the design's entities; its preview refuses
             // what that claim would, and names what it would adopt (#7).
             design.check_ownership(&**adapter).await?;
-            super::announce_adoptions(&design, &**adapter, true).await?;
+            super::announce_adoptions(design, &**adapter, true).await?;
         }
 
         // Built before anything is printed: it refuses where the run does — a
@@ -980,16 +1131,16 @@ pub async fn cmd_apply(
             None => super::note_unlisted_migrations(verbosity, project_dir),
         }
         output::summary(0, 0, entities.len());
-        return Ok(());
+        return Ok(0);
     }
 
-    let adapter = get_adapter(config, database_url).await?;
+    let adapter = get_adapter(config, database_url, design.owner()).await?;
 
     // Scope guard: refuse an apply under a different scope than this DB was
     // pinned to (unless the operator opted in to re-point it).
     let marks = design.database_marks(&*adapter).await?;
     Design::check_scope_guard(&marks, &resolved.name, allow_scope_change)?;
-    super::announce_adoptions(&design, &*adapter, false).await?;
+    super::announce_adoptions(design, &*adapter, false).await?;
 
     // Said before the run, not in its summary: a run that fails never prints
     // one, and a skipped hook is often why it failed. Always shown, whatever
@@ -1028,11 +1179,11 @@ pub async fn cmd_apply(
     // jobs through the shared path (no CLI-side sync call needed here).
 
     // Grants: shared with `Design::deploy`, so both commands grant alike.
-    super::apply_and_report_grants(&design, &*adapter, &resolved, verbosity).await?;
+    super::apply_and_report_grants(design, &*adapter, &resolved, verbosity).await?;
 
     // Apply RLS policies if requested
     if with_policies {
-        let policy_ws = policy_working_set(&design, &resolved)?;
+        let policy_ws = policy_working_set(design, &resolved)?;
         let report = dbd_core::design::apply_policies(
             &*adapter,
             project_dir,
@@ -1050,14 +1201,12 @@ pub async fn cmd_apply(
             output::always(&format!("  Policy FAILED: {} — {}", file.display(), err));
         }
         // Report first, then fail — same order as inspect, so the reason is on
-        // screen before the non-zero exit.
-        let code = policy_phase_exit_code(&report);
-        if code != 0 {
-            std::process::exit(code);
-        }
+        // screen before the non-zero exit, which the caller makes once every
+        // module has run.
+        return Ok(policy_phase_exit_code(&report));
     }
 
-    Ok(())
+    Ok(0)
 }
 
 /// Select the materialized views a `refresh` invocation should target, in
@@ -1122,12 +1271,29 @@ pub async fn cmd_refresh(
     project_dir: &Path,
     database_url: Option<&str>,
     name: Option<&str>,
+    module: Option<&str>,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let design = Design::from_config_with_dir(config, env, Some(project_dir)).context("Failed to load design")?;
+    let targets = super::targets(config, env, project_dir, scope, deps, module, name, super::Order::Build)?;
+    for (i, target) in targets.into_iter().enumerate() {
+        let (design, _) = target.enter(i == 0);
+        refresh_design(design, config, database_url, name, scope, deps, verbosity).await?;
+    }
+    Ok(())
+}
 
+/// [`cmd_refresh`] for one design: the project's, or one module's.
+async fn refresh_design(
+    design: Design,
+    config: &Path,
+    database_url: Option<&str>,
+    name: Option<&str>,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
+    verbosity: Verbosity,
+) -> Result<()> {
     // A matview the scope excludes does not exist on this plane, so refreshing
     // it fails with `relation … does not exist` — an expected condition dressed
     // as an error, the same failure the policy phase used to produce.
@@ -1145,7 +1311,7 @@ pub async fn cmd_refresh(
         return Ok(());
     }
 
-    let adapter = get_adapter(config, database_url).await?;
+    let adapter = get_adapter(config, database_url, design.owner()).await?;
     // Every other command that reaches the database checks its pin; `refresh`
     // did not, and on another scope's database refreshed views over tables it
     // was not built with — failing partway, after the ones that happened to
@@ -1178,27 +1344,67 @@ pub async fn cmd_policies(
     project_dir: &Path,
     database_url: Option<&str>,
     dry_run: bool,
+    module: Option<&str>,
     scope: Option<&str>,
     deps: Option<dbd_core::config::DepsPolicy>,
     verbosity: Verbosity,
 ) -> Result<()> {
+    let targets = super::targets(config, env, project_dir, scope, deps, module, None, super::Order::Build)?;
+    if targets.len() > 1 && !dry_run {
+        // Each module's guards before any module's policies apply (#7).
+        for target in &targets {
+            let design = &target.design;
+            let check = async {
+                let adapter = get_adapter(config, database_url, design.owner()).await?;
+                let resolved = design.resolve_scope(scope, deps)?;
+                super::check_pinned_scope(&*adapter, design, &resolved, POLICY_CONSEQUENCE).await?;
+                design.check_ownership(&*adapter).await?;
+                anyhow::Ok(())
+            };
+            target.labelled(check.await)?;
+        }
+    }
+    let mut code = 0;
+    for (i, target) in targets.into_iter().enumerate() {
+        let (design, dir) = target.enter(i == 0);
+        code = code.max(policies_design(design, &dir, config, database_url, dry_run, scope, deps, verbosity).await?);
+    }
+    // A module's failed policy fails the run, once every module has run.
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
+}
+
+/// What a policy for another scope would do to this database.
+const POLICY_CONSEQUENCE: &str =
+    "Applying another scope's policies would secure tables this database was not built with.";
+
+/// [`cmd_policies`] for one design: the project's, or one module's. Returns
+/// the exit code its failed policies ask for.
+#[allow(clippy::too_many_arguments)]
+async fn policies_design(
+    design: Design,
+    project_dir: &Path,
+    config: &Path,
+    database_url: Option<&str>,
+    dry_run: bool,
+    scope: Option<&str>,
+    deps: Option<dbd_core::config::DepsPolicy>,
+    verbosity: Verbosity,
+) -> Result<i32> {
     // `dbd policies` takes the global --scope like every other command; before
     // this it silently applied every file, so a policy for a schema this plane
     // does not have reported `schema "…" does not exist` on every run.
-    let design = Design::from_config_with_dir(config, env, Some(project_dir))?;
     let resolved = design.resolve_scope(scope, deps)?;
     let (kept, total) = design.scope_counts(&resolved)?;
     output::scope_filtered(&resolved, kept, total);
     let policy_ws = policy_working_set(&design, &resolved)?;
 
-    // What a policy for another scope would do to this database.
-    const POLICY_CONSEQUENCE: &str =
-        "Applying another scope's policies would secure tables this database was not built with.";
-
     if dry_run {
         // The real run's guard, whenever there is a database to ask: a preview
         // of policies the run refuses to apply promised something it won't do.
-        if let Some(adapter) = super::dry_run_adapter(config, database_url).await? {
+        if let Some(adapter) = super::dry_run_adapter(config, database_url, design.owner()).await? {
             super::check_pinned_scope(&*adapter, &design, &resolved, POLICY_CONSEQUENCE).await?;
             design.check_ownership(&*adapter).await?;
         }
@@ -1207,7 +1413,7 @@ pub async fn cmd_policies(
         let plan = dbd_core::design::plan_policies(project_dir, policy_ws.as_ref().map(|(n, ws)| (n.as_str(), ws)))?;
         if plan.applied.is_empty() && plan.skipped.is_empty() {
             output::info(verbosity, "No policy files found in policies/");
-            return Ok(());
+            return Ok(0);
         }
         // Each list under its own heading: "Would apply" over a list of skips
         // announced work the run will not do.
@@ -1225,10 +1431,10 @@ pub async fn cmd_policies(
                 output::info(verbosity, &format!("  skipped {} — {why}", file.display()));
             }
         }
-        return Ok(());
+        return Ok(0);
     }
 
-    let adapter = get_adapter(config, database_url).await?;
+    let adapter = get_adapter(config, database_url, design.owner()).await?;
     // The scope guard every other writing command runs. Policies do not re-pin
     // the database, so there is no `--allow-scope-change` to offer.
     super::check_pinned_scope(&*adapter, &design, &resolved, POLICY_CONSEQUENCE).await?;
@@ -1247,7 +1453,7 @@ pub async fn cmd_policies(
 
     if report.applied.is_empty() && report.failed.is_empty() && report.skipped.is_empty() {
         output::info(verbosity, "No policy files found in policies/");
-        return Ok(());
+        return Ok(0);
     }
 
     for file in &report.applied {
@@ -1266,15 +1472,16 @@ pub async fn cmd_policies(
         ),
     );
 
-    let code = policy_phase_exit_code(&report);
-    if code != 0 {
-        std::process::exit(code);
-    }
-
-    Ok(())
+    Ok(policy_phase_exit_code(&report))
 }
 
-pub fn cmd_format(config: &Path, project_dir: &Path, check: bool, verbosity: Verbosity) -> Result<()> {
+pub fn cmd_format(
+    config: &Path,
+    project_dir: &Path,
+    module: Option<&str>,
+    check: bool,
+    verbosity: Verbosity,
+) -> Result<()> {
     let format_config = if config.exists() {
         let design_config = dbd_core::config::read(config)?;
         design_config.format
@@ -1282,14 +1489,15 @@ pub fn cmd_format(config: &Path, project_dir: &Path, check: bool, verbosity: Ver
         dbd_core::config::FormatConfig::default()
     };
 
-    let files = dbd_core::scanner::scan_ddl(project_dir)?;
+    // A workspace's DDL is each module's, in its folder (#7).
     let mut changed = 0;
-
-    for file in &files {
-        if format_in_place(project_dir, file, &format_config, !check)? {
-            changed += 1;
-            let verb = if check { "would reformat" } else { "formatted" };
-            output::info(verbosity, &format!("  {verb}: {}", file.display()));
+    for (_, dir) in super::file_folders(config, project_dir, module)? {
+        for file in &dbd_core::scanner::scan_ddl(&dir)? {
+            if format_in_place(&dir, file, &format_config, !check)? {
+                changed += 1;
+                let verb = if check { "would reformat" } else { "formatted" };
+                output::info(verbosity, &format!("  {verb}: {}", file.display()));
+            }
         }
     }
 
@@ -1331,7 +1539,7 @@ mod tests {
             }],
             conflicts: Vec::new(),
         };
-        let lines = format_shared_database(&shared, "newcomer");
+        let lines = [format_shared_projects(&shared), format_conflicts(&shared, "newcomer")].concat();
         assert!(
             lines
                 .iter()
@@ -1803,6 +2011,7 @@ mod tests {
             /*use_database*/ false,
             None,
             None,
+            None,
             Verbosity::Normal,
         )
         .await
@@ -1821,6 +2030,7 @@ mod tests {
             "dev",
             tmp.path(),
             &out,
+            None,
             None,
             None,
             Verbosity::Normal,
@@ -1846,6 +2056,7 @@ mod tests {
             &crate::commands::OwnershipChange::default(),
             None,
             None,
+            None,
             Verbosity::Normal,
         )
         .await
@@ -1865,6 +2076,7 @@ mod tests {
             /*dry_run*/ true,
             None,
             None,
+            None,
             Verbosity::Normal,
         )
         .await
@@ -1877,7 +2089,7 @@ mod tests {
     fn format_write_mode_on_temp_copy() {
         let proj = testutil::copy_fixture_project();
         let cfg = proj.path().join("design.yaml");
-        cmd_format(&cfg, proj.path(), /*check*/ false, Verbosity::Normal).unwrap();
+        cmd_format(&cfg, proj.path(), None, /*check*/ false, Verbosity::Normal).unwrap();
     }
 
     /// `format --check` on an already-formatted project reports "all
@@ -1889,8 +2101,8 @@ mod tests {
         let proj = testutil::copy_fixture_project();
         let cfg = proj.path().join("design.yaml");
         // Normalize first so the check pass finds zero diffs.
-        cmd_format(&cfg, proj.path(), /*check*/ false, Verbosity::Normal).unwrap();
-        cmd_format(&cfg, proj.path(), /*check*/ true, Verbosity::Normal).unwrap();
+        cmd_format(&cfg, proj.path(), None, /*check*/ false, Verbosity::Normal).unwrap();
+        cmd_format(&cfg, proj.path(), None, /*check*/ true, Verbosity::Normal).unwrap();
     }
 
     /// `inspect --name` filters the report to a single, warning-free entity —
@@ -1907,6 +2119,7 @@ mod tests {
             /*name*/ Some("config.lookups"),
             /*fix*/ false,
             /*use_database*/ false,
+            None,
             None,
             None,
             Verbosity::Verbose,
@@ -1928,6 +2141,7 @@ mod tests {
             None,
             false,
             false,
+            None,
             Some("incomplete"),
             None,
             Verbosity::Normal,
@@ -1950,6 +2164,7 @@ mod tests {
             None,
             false,
             false,
+            None,
             Some("incomplete_auto"),
             None,
             Verbosity::Normal,
@@ -1974,6 +2189,7 @@ mod tests {
             /*with_policies*/ false,
             /*allow_scope_change*/ false,
             &crate::commands::OwnershipChange::default(),
+            None,
             Some("config_only"),
             None,
             Verbosity::Normal,
@@ -1996,6 +2212,7 @@ mod tests {
             proj.path(),
             None,
             /*dry_run*/ true,
+            None,
             None,
             None,
             Verbosity::Normal,
@@ -2074,6 +2291,7 @@ mod tests {
             /*use_database*/ false,
             None,
             None,
+            None,
             Verbosity::Normal,
         )
         .await
@@ -2141,6 +2359,7 @@ mod tests {
             None,
             false,
             false,
+            None,
             Some("config_wild"),
             None,
             Verbosity::Normal,
@@ -2177,7 +2396,14 @@ mod tests {
         let missing_config = tmp.path().join("design.yaml");
         assert!(!missing_config.exists());
 
-        cmd_format(&missing_config, tmp.path(), /*check*/ false, Verbosity::Normal).unwrap();
+        cmd_format(
+            &missing_config,
+            tmp.path(),
+            None,
+            /*check*/ false,
+            Verbosity::Normal,
+        )
+        .unwrap();
 
         let formatted = std::fs::read_to_string(tmp.path().join("ddl/table/public/thing.ddl")).unwrap();
         assert_ne!(formatted, "create table public.thing(id int,name text);");
@@ -2207,6 +2433,7 @@ mod tests {
         cmd_format(
             &tmp.path().join("design.yaml"),
             tmp.path(),
+            None,
             /*check*/ false,
             Verbosity::Normal,
         )

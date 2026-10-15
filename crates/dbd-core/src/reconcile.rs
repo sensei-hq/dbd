@@ -75,6 +75,28 @@ pub struct ReconcilePlan {
     pub dropped_parts: Vec<DroppedPart>,
 }
 
+impl ReconcilePlan {
+    /// Refuse a destructive reconcile (dropped columns, constraints, foreign keys,
+    /// or indexes) unless the caller explicitly opted in with `allow_destructive`.
+    pub fn refuse_destructive(&self, allow_destructive: bool) -> crate::error::Result<()> {
+        if !self.destructive || allow_destructive {
+            return Ok(());
+        }
+        // What is destructive, and only that: listing every altered table named
+        // ones that merely gained a column.
+        let details: String = self
+            .destructive_changes
+            .iter()
+            .map(|change| format!("  {change}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Err(crate::error::DbdError::Config(format!(
+            "reconcile would make destructive changes:\n{details}\n\
+             Re-run with --allow-destructive to proceed."
+        )))
+    }
+}
+
 /// One part of an existing table or enum a plan drops.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DroppedPart {

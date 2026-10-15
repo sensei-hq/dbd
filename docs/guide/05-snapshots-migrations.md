@@ -25,7 +25,8 @@ This:
 ## Version tracking
 
 - `design.yaml` version field tracks the latest snapshot version — `dbd snapshot`
-  edits it in place, keeping the file's comments and layout
+  edits it in place, keeping the file's comments and layout; in a workspace,
+  each module's (see [below](#per-module-history))
 - The bookkeeping table tracks the applied version in the database — `dbd.meta` in a dedicated
   `dbd` schema on Postgres/Supabase, `_dbd_meta` on SQLite
 - `dbd apply` compares these and runs pending migrations
@@ -200,6 +201,61 @@ Auto-generated data.sql uses Postgres CAST for type conversions. Non-derivable c
 ```sh
 dbd snapshot --list
 ```
+
+## Per-module history
+
+In a workspace — a `design.yaml` with [`modules:`](03-design-yaml.md#modules) —
+each module has a history of its own: its own `snapshots/` and `migrations/` in
+its folder, its own version, and its own release. A module releases when it is
+ready, and the others keep changing by `dbd reconcile` until they are.
+
+```yaml
+modules:
+  shared:
+    version: 3
+    released: true       # changes by snapshot and apply
+  core:
+    depends_on: [shared]
+    version: 1           # not released: still reconciled
+```
+
+- **`dbd snapshot`** snapshots every module, each in its folder at its own
+  version — `shared/snapshots/004.json` while core's is `core/snapshots/002.json`
+  — or with `--module core`, that module alone. It never snapshots a scope: a
+  snapshot records the design. A module with no changes says so and is skipped.
+- **`dbd release`** releases every module not released yet, each at its own
+  version — a module already released is said and passed over, and only a
+  workspace with every module released is refused — or with `--module core`,
+  that module alone, refused if it is released. Every module is checked before
+  any is written, so a release refused for one leaves `design.yaml` as it was.
+  A module's dependencies are not released with it.
+- **The version and release state are written in the module's block** —
+  `modules.<name>.version` and `modules.<name>.released`, never `project.*`,
+  which a workspace refuses. As for a project, the edit is in place: the file's
+  comments and layout stay, a module written `core: {}` becomes a block, and an
+  edit that cannot be made in place rewrites the file whole rather than change
+  anything else.
+- **`dbd apply`** migrates each module on its own version: core can be at v2
+  while shared stays at v1. Each module's record in the database is its own
+  (`dbd.meta` under its owner, `shop/core`), so `migrate --status` and the
+  version guard answer for each module.
+- **`dbd reconcile`** refuses a released module asked for — with `--module`, or
+  as the project — and leaves out, saying so, a released module the run would
+  otherwise take in, a dependency included:
+
+  ```
+  module shared is released — it changes by `dbd snapshot` and `dbd apply`; reconcile leaves it out.
+  ```
+
+  The manifest's `apply:` hooks still run around the modules it reconciles.
+
+`snapshot --list`, `format` and `doctor` go over each module's folder too — or
+`--module`'s, or the folder dbd runs in.
+
+A project splits into modules before its first release: `dbd split
+--from-scopes` refuses a project with `snapshots/` or `migrations/`, since a
+migration is SQL over several tables and does not divide by module (see
+[scopes](07-scopes.md#from-scopes-to-modules-dbd-split)).
 
 ## Migration status
 

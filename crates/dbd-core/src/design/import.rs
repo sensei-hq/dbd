@@ -336,10 +336,8 @@ impl Design {
     pub fn import_after_preview(&self, scope: Option<&ResolvedScope>) -> Result<(Vec<String>, Vec<String>)> {
         let working_set = self.scope_working_set(scope)?;
         let hook_scope = self.hook_scope(scope, working_set.as_ref());
-        let plan = hooks::plan_hooks(
-            self.hook_source(),
-            &self.config.import.after,
-            hooks::HookKind::After,
+        let plan = self.plan_hook_phase(
+            super::HookPhase::ImportAfter,
             hook_scope.as_ref().map(|(name, outside)| (*name, outside)),
         )?;
         Ok((
@@ -830,16 +828,15 @@ impl Design {
             .import_call_procedures(adapter, &plan, dry_run, &mut progress.on_start, &mut progress.on_done)
             .await?;
         let hook_scope = self.hook_scope(scope, working_set.as_ref());
-        let after = hooks::run_hooks(
-            adapter,
-            self.hook_source(),
-            &self.config.import.after,
-            hooks::HookKind::After,
-            hook_scope.as_ref().map(|(name, outside)| (*name, outside)),
-            dry_run,
-            &mut progress,
-        )
-        .await?;
+        let after = self
+            .run_hook_phase(
+                adapter,
+                super::HookPhase::ImportAfter,
+                hook_scope.as_ref().map(|(name, outside)| (*name, outside)),
+                dry_run,
+                &mut progress,
+            )
+            .await?;
         warnings.extend(after.warnings);
 
         (progress.on_complete)(ImportComplete {
@@ -871,14 +868,26 @@ impl Design {
             // Together, in one call: a table may have two data files (a shared
             // one and an env's own), and Postgres truncates tables linked by a
             // foreign key only together.
-            let mut truncated: Vec<String> = Vec::new();
-            for entry in plan {
-                let table = &entry.table.name;
-                if self.config.import.table_truncate(table) && !truncated.contains(table) {
-                    truncated.push(table.clone());
+            let truncated = match &self.import_truncates {
+                // A workspace run's: what the run reloads, of what exists by
+                // now — see `Design::emptying_for_import` — in load order by
+                // the database's own keys, as one project's plan is.
+                Some(tables) => in_load_order(adapter.existing_tables(tables).await?, &adapter.foreign_keys().await?),
+                None => {
+                    let mut truncated: Vec<String> = Vec::new();
+                    for entry in plan {
+                        let table = &entry.table.name;
+                        if self.config.import.table_truncate(table) && !truncated.contains(table) {
+                            truncated.push(table.clone());
+                        }
+                    }
+                    truncated
                 }
-            }
+            };
             adapter.truncate_tables(&truncated).await?;
+            if !truncated.is_empty() {
+                self.import_emptied.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
         }
 
         let mut loaded: HashSet<&str> = HashSet::new();
@@ -940,6 +949,31 @@ impl Design {
         }
         Ok(count)
     }
+}
+
+/// `tables` in load order by `keys` — the database's foreign keys, each
+/// `(referencing table, referenced table)` as it names them: each table after
+/// those it references, ties as given. A key naming no schema reaches a table
+/// by its bare name, without regard to case, as SQLite names one.
+fn in_load_order(tables: Vec<String>, keys: &[(String, String)]) -> Vec<String> {
+    let names =
+        |table: &str, live: &str| table == live || (!live.contains('.') && bare_name(table).eq_ignore_ascii_case(live));
+    let references = |table: &str, other: &str| {
+        table != other
+            && keys
+                .iter()
+                .any(|(referencing, referenced)| names(table, referencing) && names(other, referenced))
+    };
+    let mut ordered: Vec<String> = Vec::with_capacity(tables.len());
+    let mut left = tables;
+    while !left.is_empty() {
+        let ready = left
+            .iter()
+            .position(|t| !left.iter().any(|other| references(t, other)))
+            .unwrap_or(0);
+        ordered.push(left.remove(ready));
+    }
+    ordered
 }
 
 #[cfg(test)]

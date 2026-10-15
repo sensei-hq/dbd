@@ -4,6 +4,7 @@
   import EntityDiagram from './EntityDiagram.svelte';
   import EntityChangelog from './EntityChangelog.svelte';
   import Markdown from './Markdown.svelte';
+  import ModuleBadge from './ModuleBadge.svelte';
   import { noteBlocks } from './md';
 
   let {
@@ -99,6 +100,7 @@
           {:else}
             <span class="ds-badge">{table.columns.length} columns</span>
           {/if}
+          <ModuleBadge module={table.module} />
           {#if inRefs.length || outRefs.length}
             <span class="ds-badge">{outRefs.length} out · {inRefs.length} in</span>
           {/if}

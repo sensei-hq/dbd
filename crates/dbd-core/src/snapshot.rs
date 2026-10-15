@@ -1289,6 +1289,19 @@ pub fn create_snapshot(
     config_path: &Path,
     description: &str,
 ) -> Result<MultiSnapshotResult> {
+    create_snapshot_of(entities, project_dir, config_path, None, description)
+}
+
+/// [`create_snapshot`] for `module` of a workspace (#7): its snapshots and
+/// migrations in its folder, `project_dir`, and its version written in its
+/// block, `modules.<module>.version`. `None` is the project's.
+pub fn create_snapshot_of(
+    entities: &[Entity],
+    project_dir: &Path,
+    config_path: &Path,
+    module: Option<&str>,
+    description: &str,
+) -> Result<MultiSnapshotResult> {
     let previous = latest_snapshot(project_dir)?;
     let base_version = next_version(project_dir);
     let result = prepare_multi_snapshot(entities, previous.as_ref(), base_version, description);
@@ -1317,7 +1330,7 @@ pub fn create_snapshot(
         write_migration_files(project_dir, snap_result, version)?;
     }
 
-    crate::config::update_version(config_path, final_version)?;
+    crate::config::update_version_of(config_path, module, final_version)?;
     Ok(result)
 }
 
@@ -1358,6 +1371,19 @@ pub fn create_baseline_snapshot(
     description: &str,
     version: u32,
 ) -> Result<MultiSnapshotResult> {
+    create_baseline_snapshot_of(entities, project_dir, config_path, None, description, version)
+}
+
+/// [`create_baseline_snapshot`] for `module` of a workspace (#7) — see
+/// [`create_snapshot_of`].
+pub fn create_baseline_snapshot_of(
+    entities: &[Entity],
+    project_dir: &Path,
+    config_path: &Path,
+    module: Option<&str>,
+    description: &str,
+    version: u32,
+) -> Result<MultiSnapshotResult> {
     // A fresh project has no prior snapshot — baseline at the requested version.
     let result = prepare_multi_snapshot(entities, None, version, description);
 
@@ -1381,7 +1407,7 @@ pub fn create_baseline_snapshot(
         write_migration_files(project_dir, snap_result, v)?;
     }
 
-    crate::config::update_version(config_path, final_version)?;
+    crate::config::update_version_of(config_path, module, final_version)?;
     Ok(result)
 }
 

@@ -5,8 +5,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::design::Design;
-use crate::entity::{EntityType, FkAction, IdentityKind, SortOrder, TableConstraint};
+use crate::config::ExternalEntry;
+use crate::design::{Design, Reading};
+use crate::entity::{Entity, EntityType, FkAction, IdentityKind, SortOrder, TableConstraint};
 use crate::error::Result;
 use crate::scope::ResolvedScope;
 
@@ -68,6 +69,23 @@ pub struct SchemaModel {
     /// Enum types with their values (v3). Absent when the project has none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub enums: Vec<EnumNode>,
+    /// A workspace's modules read, in `depends_on` order (v3, additive; #7).
+    /// Each table, entity, enum and stub a module declares names it in its
+    /// `module`. Absent for a project's model.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modules: Vec<ModuleInfo>,
+}
+
+/// One module of a workspace: its name, the owner its entities are recorded
+/// under, what it depends on and its note.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub struct ModuleInfo {
+    pub name: String,
+    pub owner: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 fn default_version() -> u32 {
@@ -91,6 +109,9 @@ pub struct EntityNode {
     pub note: Option<String>,
     #[serde(rename = "noteMd", skip_serializing_if = "Option::is_none")]
     pub note_md: Option<String>,
+    /// The module declaring it, in a workspace's model (v3, additive; #7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module: Option<String>,
 }
 
 /// An enum type and its values, in declaration order (v3).
@@ -107,6 +128,9 @@ pub struct EnumNode {
     pub note: Option<String>,
     #[serde(rename = "noteMd", skip_serializing_if = "Option::is_none")]
     pub note_md: Option<String>,
+    /// The module declaring it, in a workspace's model (v3, additive; #7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module: Option<String>,
 }
 
 /// One dependency edge: a view reading a table, a routine calling a routine.
@@ -166,6 +190,9 @@ pub struct TableNode {
     /// table (v3, additive). Omitted when there are none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checks: Vec<Check>,
+    /// The module declaring it — a stub's, when it is `out_of_scope`, in a workspace's model (v3, additive; #7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module: Option<String>,
 }
 
 /// One CHECK constraint: what it requires, and its name when it was given one.
@@ -259,25 +286,88 @@ pub fn build(design: &Design, scope: Option<&ResolvedScope>) -> Result<SchemaMod
         Some(s) => design.scoped_entities(s)?,
         None => design.entities().to_vec(),
     };
+    Ok(build_from(&Input {
+        entities: &entities,
+        declared: design.entities(),
+        externals: &design.config().external,
+        project: ProjectInfo {
+            name: design.config().project.name.clone(),
+            db: design.config().source.dialect.clone(),
+            note: design.config().project.note.clone(),
+        },
+        module_of: &|_, _| None,
+    }))
+}
 
-    let enum_names = enum_names(&entities);
+/// [`build`] over what a command reads (#7): a project's design, or a
+/// workspace's modules, each entity drawn once, in the module declaring it
+/// and from its definition — so a key into a dependency's table lands on the
+/// table, not on a stub. A workspace's model names its modules, and each
+/// entity's.
+pub fn build_reading(reading: &Reading) -> Result<SchemaModel> {
+    let entities = reading.entities()?;
+    let declared = reading.declared();
+    let mut model = build_from(&Input {
+        entities: &entities,
+        declared: &declared,
+        externals: &reading.config().external,
+        project: ProjectInfo {
+            name: reading.project_name().to_string(),
+            db: reading.dialect().to_string(),
+            note: reading.project_note().map(str::to_string),
+        },
+        module_of: &|name, kind| reading.module_of(name, kind).map(str::to_string),
+    });
+    model.modules = reading
+        .modules()
+        .filter_map(|m| {
+            m.name().map(|name| ModuleInfo {
+                name: name.to_string(),
+                owner: m.owner().to_string(),
+                depends_on: m.depends_on().to_vec(),
+                note: m.design().config().project.note.clone(),
+            })
+        })
+        .collect();
+    Ok(model)
+}
+
+/// What a model is drawn from.
+struct Input<'a> {
+    /// The entities in view.
+    entities: &'a [Entity],
+    /// Every entity declared, before a scope narrowed `entities` — what a stub
+    /// is described from.
+    declared: &'a [Entity],
+    externals: &'a [ExternalEntry],
+    project: ProjectInfo,
+    /// The module declaring an entity, by qualified name and kind.
+    module_of: &'a dyn Fn(&str, EntityType) -> Option<String>,
+}
+
+fn build_from(input: &Input) -> SchemaModel {
+    let entities = input.entities;
+    let enum_names = enum_names(entities);
 
     let mut tables = Vec::new();
     let mut refs = Vec::new();
 
     for e in entities.iter().filter(|e| e.entity_type == EntityType::Table) {
         let Some(def) = &e.table_def else { continue };
-        tables.push(build_table_node(e, def, &enum_names));
+        tables.push(TableNode {
+            module: (input.module_of)(&e.name, e.entity_type),
+            ..build_table_node(e, def, &enum_names)
+        });
         refs.extend(collect_table_refs(e, def));
     }
-    let stubs = collect_stubs(design, &tables, &refs);
+    let stubs = collect_stubs(input, &tables, &refs);
 
     let mut schema_set: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
     // A schema is one of the model's when the model draws anything in it — a
     // schema of views or routines alone is listed with zero tables and enums,
     // not dropped while its entities are drawn under it. Externals, roles and
     // the like are not drawn, so they place no schema here.
-    for e in &entities {
+    for e in entities {
         let Some(s) = &e.schema else { continue };
         let drawn = matches!(e.entity_type, EntityType::Table | EntityType::Enum) || node_kind(e.entity_type).is_some();
         if !drawn {
@@ -307,6 +397,7 @@ pub fn build(design: &Design, scope: Option<&ResolvedScope>) -> Result<SchemaMod
                 kind: kind.to_string(),
                 note: note_first_line(e.comment.as_deref()),
                 note_md: e.comment.clone(),
+                module: (input.module_of)(&e.name, e.entity_type),
             })
         })
         .collect();
@@ -322,13 +413,14 @@ pub fn build(design: &Design, scope: Option<&ResolvedScope>) -> Result<SchemaMod
             values: e.enum_values.iter().map(|v| v.name.clone()).collect(),
             note: note_first_line(e.comment.as_deref()),
             note_md: e.comment.clone(),
+            module: (input.module_of)(&e.name, e.entity_type),
         })
         .collect();
     enums.sort_by(|a, b| (a.schema.as_str(), a.name.as_str()).cmp(&(b.schema.as_str(), b.name.as_str())));
 
     let known: std::collections::HashSet<&str> = entities.iter().map(|e| e.name.as_str()).collect();
     let mut deps: Vec<DepEdge> = Vec::new();
-    for e in &entities {
+    for e in entities {
         for r in &e.refs {
             deps.push(DepEdge {
                 from: node_ref(&e.name, e.schema.as_deref()),
@@ -342,14 +434,14 @@ pub fn build(design: &Design, scope: Option<&ResolvedScope>) -> Result<SchemaMod
         }
     }
 
-    Ok(SchemaModel {
+    SchemaModel {
         version: default_version(),
         entities: entities_out,
         deps,
         project: ProjectInfo {
-            name: design.config().project.name.clone(),
-            db: design.config().source.dialect.clone(),
-            note: design.config().project.note.clone(),
+            name: input.project.name.clone(),
+            db: input.project.db.clone(),
+            note: input.project.note.clone(),
         },
         schemas,
         tables,
@@ -357,7 +449,8 @@ pub fn build(design: &Design, scope: Option<&ResolvedScope>) -> Result<SchemaMod
         stubs,
         history: Vec::new(),
         enums,
-    })
+        modules: Vec::new(),
+    }
 }
 
 /// Every name a column's type can use to mean one of these enums.
@@ -384,7 +477,7 @@ fn enum_names(entities: &[crate::entity::Entity]) -> std::collections::HashSet<S
 /// says why it is not a full table, most specific first: declared under
 /// `external:`, a table of this project the scope leaves out, or nothing the
 /// project defines at all.
-fn collect_stubs(design: &Design, tables: &[TableNode], refs: &[Ref]) -> Vec<TableNode> {
+fn collect_stubs(input: &Input, tables: &[TableNode], refs: &[Ref]) -> Vec<TableNode> {
     let carried: std::collections::HashSet<(&str, &str)> =
         tables.iter().map(|t| (t.schema.as_str(), t.name.as_str())).collect();
     // Referenced columns per missing table, in first-reference order. An empty
@@ -403,16 +496,16 @@ fn collect_stubs(design: &Design, tables: &[TableNode], refs: &[Ref]) -> Vec<Tab
     }
     // A stub's columns are described against the whole design: an out-of-scope
     // table's enum may be out of scope with it.
-    let all_enums = enum_names(design.entities());
+    let all_enums = enum_names(input.declared);
     wanted
         .into_iter()
-        .map(|((schema, name), cols)| stub_node(design, schema, name, &cols, &all_enums))
+        .map(|((schema, name), cols)| stub_node(input, schema, name, &cols, &all_enums))
         .collect()
 }
 
 /// The stub for `schema.name`, carrying the columns named in `cols`.
 fn stub_node(
-    design: &Design,
+    input: &Input,
     schema: &str,
     name: &str,
     cols: &[&str],
@@ -444,7 +537,7 @@ fn stub_node(
             .collect()
     };
 
-    if let Some(ext) = design.config().external.iter().find(|x| x.name == qualified) {
+    if let Some(ext) = input.externals.iter().find(|x| x.name == qualified) {
         let declared = ext
             .columns
             .iter()
@@ -463,11 +556,12 @@ fn stub_node(
             columns: pick(declared),
             indexes: Vec::new(),
             checks: Vec::new(),
+            module: None,
         };
     }
 
-    let in_project = design
-        .entities()
+    let in_project = input
+        .declared
         .iter()
         .filter(|e| e.entity_type == EntityType::Table && e.name == qualified)
         .find_map(|e| e.table_def.as_ref().map(|def| build_table_node(e, def, enum_names)));
@@ -477,6 +571,7 @@ fn stub_node(
             columns: pick(full.columns),
             indexes: Vec::new(),
             checks: Vec::new(),
+            module: (input.module_of)(&qualified, EntityType::Table),
             ..full
         },
         None => TableNode {
@@ -488,6 +583,7 @@ fn stub_node(
             columns: pick(Vec::new()),
             indexes: Vec::new(),
             checks: Vec::new(),
+            module: None,
         },
     }
 }
@@ -583,6 +679,7 @@ fn build_table_node(
                 _ => None,
             })
             .collect(),
+        module: None,
     }
 }
 
@@ -801,6 +898,7 @@ mod tests {
             history: vec![],
             enums: vec![],
             stubs: vec![],
+            modules: vec![],
             project: ProjectInfo {
                 name: "p".into(),
                 db: "postgresql".into(),
@@ -832,6 +930,7 @@ mod tests {
                 }],
                 indexes: vec![],
                 checks: vec![],
+                module: None,
             }],
             refs: vec![],
         };
