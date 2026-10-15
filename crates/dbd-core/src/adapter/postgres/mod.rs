@@ -381,6 +381,14 @@ impl PostgresAdapter {
     /// the `Executor` bound resolves without the HRTB error that `#[async_trait]`
     /// desugaring produces for `raw_sql` against `&mut PgConnection`.
     async fn exec_raw(&self, sql: &str) -> Result<()> {
+        self.try_exec_raw(sql)
+            .await
+            .map_err(|e| DbdError::Config(format!("SQL execution failed: {e}")))
+    }
+
+    /// [`Self::exec_raw`], keeping the database's error as it came — for a
+    /// caller that acts on its SQLSTATE.
+    async fn try_exec_raw(&self, sql: &str) -> std::result::Result<(), sqlx::Error> {
         use sqlx::Executor as _;
         let mut guard = self.batch.lock().await;
         if let Some(mut tx) = guard.take() {
@@ -392,14 +400,93 @@ impl PostgresAdapter {
             // We own the transaction locally while executing, then put it back.
             let result = (&mut *tx).execute(sql).await;
             *guard = Some(tx);
-            result.map_err(|e| DbdError::Config(format!("SQL execution failed: {e}")))?;
+            result.map(|_| ())
         } else {
-            sqlx::raw_sql(sql)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| DbdError::Config(format!("SQL execution failed: {e}")))?;
+            sqlx::raw_sql(sql).execute(&self.pool).await.map(|_| ())
         }
-        Ok(())
+    }
+
+    /// Create or replace a function or procedure (#65).
+    ///
+    /// `CREATE OR REPLACE` keeps a routine's identity, so Postgres refuses one
+    /// that changes what it returns, renames a parameter, removes a parameter's
+    /// default or turns a function into a procedure — `42P13` with its hint
+    /// to drop the routine first, or `42809`: a design changing `returns jsonb`
+    /// to `returns table (…)` failed on every run. Such a routine is dropped
+    /// and created again, in one transaction — a savepoint inside an open
+    /// batch — when the database has exactly one routine of the name its
+    /// `CREATE` gives and nothing depends on it. What `CREATE OR REPLACE` would
+    /// have kept, it keeps: the grants, the owner and the comment are put back
+    /// on the new routine, and the file runs once more over them, so its own
+    /// grants and comment are the last word, as they are on a replace.
+    ///
+    /// With several of that name, or something depending on it, nothing is
+    /// dropped: the run fails naming them. Any other refusal — a definition
+    /// Postgres rejects for itself — is reported as it is. A file running its
+    /// own transaction (`BEGIN` … `COMMIT`) is run as it always was: its
+    /// `COMMIT` would end the transaction a replacement runs in.
+    async fn apply_routine(&self, entity: &Entity, sql: &str) -> Result<()> {
+        let sql = script::keep_public_on_search_path(sql);
+        let failed =
+            |e: String| DbdError::Config(format!("Failed to apply {:?} {}: {e}", entity.entity_type, entity.name));
+        if runs_its_own_transaction(&sql) {
+            return self
+                .try_exec_raw(&sql)
+                .await
+                .map_err(|e| failed(format!("SQL execution failed: {e}")));
+        }
+        let in_batch = self.batch.lock().await.is_some();
+        if in_batch {
+            self.exec_raw("SAVEPOINT dbd_routine").await?;
+        }
+        let refused = match self.try_exec_raw(&sql).await {
+            Ok(()) => return self.end_routine_savepoint(in_batch, Ok(())).await,
+            Err(e) => e,
+        };
+        if in_batch {
+            self.exec_raw("ROLLBACK TO SAVEPOINT dbd_routine").await?;
+        }
+        let as_refused = || Err(failed(format!("SQL execution failed: {refused}")));
+        let Some((schema, name)) = (is_replace_conflict(&refused))
+            .then(|| routine_identity(entity, &sql))
+            .flatten()
+        else {
+            return self.end_routine_savepoint(in_batch, as_refused()).await;
+        };
+        let replace = format!(
+            "{}\n{sql}\n{ROUTINE_RESTORE_BLOCK}\n{sql}",
+            routine_drop_block(&schema, &name)
+        );
+        let result = match self.try_exec_raw(&replace).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if in_batch {
+                    self.exec_raw("ROLLBACK TO SAVEPOINT dbd_routine").await?;
+                }
+                // No routine of that name: not one dbd can replace.
+                if bookkeeping::sqlstate(&e).as_deref() == Some("P0002") {
+                    as_refused()
+                } else {
+                    Err(failed(format!(
+                        "Postgres cannot replace it in place ({}), and dbd did not drop it to create it again: {}",
+                        database_message(&refused),
+                        database_message(&e)
+                    )))
+                }
+            }
+        };
+        self.end_routine_savepoint(in_batch, result).await
+    }
+
+    /// Release [`Self::apply_routine`]'s savepoint when it set one, and return
+    /// `result` — the routine's, which a failed release does not hide.
+    async fn end_routine_savepoint(&self, in_batch: bool, result: Result<()>) -> Result<()> {
+        if in_batch {
+            let released = self.exec_raw("RELEASE SAVEPOINT dbd_routine").await;
+            result?;
+            return released;
+        }
+        result
     }
 
     /// True if the pg_cron extension is installed (its `cron.job` relation
@@ -1848,6 +1935,9 @@ impl DatabaseAdapter for PostgresAdapter {
         if entity.entity_type == EntityType::Enum {
             return self.apply_enum(entity, &sql).await;
         }
+        if matches!(entity.entity_type, EntityType::Function | EntityType::Procedure) {
+            return self.apply_routine(entity, &sql).await;
+        }
 
         self.execute_script(&sql).await.map_err(|e| {
             DbdError::Config(format!(
@@ -2749,6 +2839,57 @@ ORDER BY 1, 2, 4, 5"#;
         Ok(())
     }
 
+    async fn bound_lock_waits(&self) -> Result<()> {
+        self.exec_raw(&format!("SET LOCAL lock_timeout = '{KEY_CHANGE_LOCK_TIMEOUT}'"))
+            .await
+    }
+
+    async fn foreign_keys_to(&self, tables: &[String]) -> Result<Vec<(String, crate::entity::ForeignKey)>> {
+        if tables.is_empty() {
+            return Ok(Vec::new());
+        }
+        // `pg_constraint`, not `information_schema`: the catalog lists every
+        // foreign key, whatever the role may read of the table it is on.
+        let columns = |key: &str, rel: &str| {
+            format!(
+                "ARRAY(SELECT a.attname::text FROM unnest(k.{key}) WITH ORDINALITY AS u(attnum, i) \
+                 JOIN pg_attribute a ON a.attrelid = k.{rel} AND a.attnum = u.attnum ORDER BY u.i)"
+            )
+        };
+        let rows = sqlx::query(&format!(
+            "SELECT hn.nspname || '.' || h.relname AS holder, k.conname::text AS name, \
+                    {} AS columns, rn.nspname::text AS ref_schema, r.relname::text AS ref_table, \
+                    {} AS ref_columns \
+             FROM pg_constraint k \
+             JOIN pg_class h ON h.oid = k.conrelid JOIN pg_namespace hn ON hn.oid = h.relnamespace \
+             JOIN pg_class r ON r.oid = k.confrelid JOIN pg_namespace rn ON rn.oid = r.relnamespace \
+             WHERE k.contype = 'f' AND rn.nspname || '.' || r.relname = ANY($1) \
+             ORDER BY 1, 2",
+            columns("conkey", "conrelid"),
+            columns("confkey", "confrelid"),
+        ))
+        .bind(tables)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbdError::Config(format!("reading the foreign keys to {} failed: {e}", tables.join(", "))))?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("holder"),
+                    crate::entity::ForeignKey {
+                        name: Some(row.get("name")),
+                        columns: row.get("columns"),
+                        ref_schema: Some(row.get("ref_schema")),
+                        ref_table: row.get("ref_table"),
+                        ref_columns: row.get("ref_columns"),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect())
+    }
+
     // ── Materialized-view refresh scheduling ────────────
 
     /// Live matview drift state: every materialized view (`pg_class.relkind =
@@ -2915,9 +3056,161 @@ ORDER BY 1, 2, 4, 5"#;
     }
 }
 
+/// How long a key change's steps wait for a lock another session holds
+/// before they give up (#65) — they hold the key's tables while they wait.
+const KEY_CHANGE_LOCK_TIMEOUT: &str = "10s";
+
+/// A `DO` block dropping the one routine named `schema.name` (#65), run
+/// before its file creates it again — in the same script, so on the
+/// connection and `search_path` the drop resolves the routine's signature on.
+/// It keeps, for [`ROUTINE_RESTORE_BLOCK`], what a replace would keep: the
+/// routine's signature, grants, owner and comment, as settings local to the
+/// transaction. It raises, dropping nothing: `P0002` when there is none of that
+/// name; naming them when there are several; naming what depends on the one.
+/// ASCII only: a LATIN1 database refuses what it cannot convert.
+fn routine_drop_block(schema: &str, name: &str) -> String {
+    let (schema, name) = (crate::sql_quote::literal(schema), crate::sql_quote::literal(name));
+    format!(
+        "DO $dbd$\n\
+         DECLARE\n  routines regprocedure[];\n  dependents text;\n  path text := current_setting('search_path');\n\
+         BEGIN\n\
+         \x20 SELECT array_agg(p.oid::regprocedure ORDER BY p.oid::regprocedure::text) INTO routines\n\
+         \x20 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace\n\
+         \x20 WHERE n.nspname = {schema} AND p.proname = {name};\n\
+         \x20 IF routines IS NULL THEN\n\
+         \x20   RAISE EXCEPTION USING ERRCODE = 'P0002', MESSAGE = 'no routine of that name';\n\
+         \x20 END IF;\n\
+         \x20 IF cardinality(routines) > 1 THEN\n\
+         \x20   RAISE EXCEPTION 'there are % routines of that name: %; drop the one the file replaces by hand',\n\
+         \x20     cardinality(routines), array_to_string(routines, ', ');\n\
+         \x20 END IF;\n\
+         \x20 SELECT string_agg(DISTINCT CASE WHEN d.classid = 'pg_rewrite'::regclass\n\
+         \x20     THEN (SELECT 'view ' || r.ev_class::regclass::text FROM pg_rewrite r WHERE r.oid = d.objid)\n\
+         \x20     ELSE pg_describe_object(d.classid, d.objid, d.objsubid) END, ', ')\n\
+         \x20   INTO dependents\n\
+         \x20   FROM pg_depend d\n\
+         \x20   WHERE d.refclassid = 'pg_proc'::regclass AND d.refobjid = routines[1]::oid AND d.deptype = 'n';\n\
+         \x20 IF dependents IS NOT NULL THEN\n\
+         \x20   RAISE EXCEPTION '% is depended on by %; drop what depends on it, then re-run', routines[1], dependents;\n\
+         \x20 END IF;\n\
+         \x20 PERFORM set_config('search_path', 'pg_catalog', true);\n\
+         \x20 PERFORM set_config('dbd.routine', routines[1]::text, true);\n\
+         \x20 PERFORM set_config('search_path', path, true);\n\
+         \x20 PERFORM set_config('dbd.routine_acl', coalesce((SELECT proacl::text FROM pg_proc WHERE oid = routines[1]), ''), true);\n\
+         \x20 PERFORM set_config('dbd.routine_owner',\n\
+         \x20   (SELECT r.rolname FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner WHERE p.oid = routines[1]), true);\n\
+         \x20 PERFORM set_config('dbd.routine_comment', coalesce('c' || obj_description(routines[1], 'pg_proc'), ''), true);\n\
+         \x20 EXECUTE format('DROP ROUTINE %s', routines[1]);\n\
+         END $dbd$;"
+    )
+}
+
+/// A `DO` block putting back on the routine [`routine_drop_block`] dropped,
+/// now created again, the grants, owner and comment it had (#65) — as `CREATE
+/// OR REPLACE` would have kept them. The file runs once more after it, so its
+/// own grants and comment go on top, as on a replace.
+const ROUTINE_RESTORE_BLOCK: &str = "DO $dbd$
+DECLARE
+  path text := current_setting('search_path');
+  routine regprocedure;
+  acl text := current_setting('dbd.routine_acl', true);
+  owner text := current_setting('dbd.routine_owner', true);
+  note text := current_setting('dbd.routine_comment', true);
+  g record;
+BEGIN
+  PERFORM set_config('search_path', 'pg_catalog', true);
+  routine := to_regprocedure(current_setting('dbd.routine', true));
+  PERFORM set_config('search_path', path, true);
+  IF routine IS NULL THEN
+    RETURN;
+  END IF;
+  IF acl <> '' THEN
+    EXECUTE format('REVOKE ALL ON ROUTINE %s FROM PUBLIC', routine);
+    FOR g IN SELECT grantee, privilege_type, is_grantable FROM aclexplode(acl::aclitem[]) LOOP
+      EXECUTE format('GRANT %s ON ROUTINE %s TO %s%s', g.privilege_type, routine,
+        CASE WHEN g.grantee = 0 THEN 'PUBLIC' ELSE g.grantee::regrole::text END,
+        CASE WHEN g.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END);
+    END LOOP;
+  END IF;
+  IF note <> '' THEN
+    EXECUTE format('COMMENT ON ROUTINE %s IS %L', routine, substr(note, 2));
+  END IF;
+  IF owner <> '' AND owner IS DISTINCT FROM
+      (SELECT r.rolname FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner WHERE p.oid = routine) THEN
+    EXECUTE format('ALTER ROUTINE %s OWNER TO %I', routine, owner);
+  END IF;
+END $dbd$;";
+
+/// Whether Postgres refused a `CREATE OR REPLACE` for what it would change of
+/// the routine there (#65): `42P13` with the hint to drop it first — not one
+/// for a definition it rejects for itself, which has none — or a routine kind
+/// changed, `42809`.
+fn is_replace_conflict(e: &sqlx::Error) -> bool {
+    let Some(db) = e.as_database_error() else {
+        return false;
+    };
+    match db.code().as_deref() {
+        Some("42809") => true,
+        Some("42P13") => db
+            .try_downcast_ref::<sqlx::postgres::PgDatabaseError>()
+            .is_some_and(|pg| pg.hint().is_some()),
+        _ => false,
+    }
+}
+
+/// The schema and name of the routine `sql` creates, as Postgres reads them —
+/// an unquoted name folded to lower case — the schema the file's search path
+/// gives it when the statement states none.
+fn routine_identity(entity: &Entity, sql: &str) -> Option<(String, String)> {
+    use crate::parser::pg::Created;
+    let (schema, name) =
+        crate::parser::pg::created_identities(sql)
+            .into_iter()
+            .find_map(|(created, schema, name)| {
+                matches!(created, Created::Entity(EntityType::Function | EntityType::Procedure))
+                    .then_some((schema, name))
+            })?;
+    let schema = schema
+        .or_else(|| entity.schema.clone().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "public".to_string());
+    Some((schema, name))
+}
+
+/// Whether `sql` runs a transaction of its own — a top-level `BEGIN`,
+/// `COMMIT`, `ROLLBACK` or savepoint.
+fn runs_its_own_transaction(sql: &str) -> bool {
+    pg_query::parse(sql).is_ok_and(|parsed| {
+        parsed.protobuf.stmts.iter().any(|raw| {
+            matches!(
+                raw.stmt.as_ref().and_then(|s| s.node.as_ref()),
+                Some(pg_query::NodeEnum::TransactionStmt(_))
+            )
+        })
+    })
+}
+
+/// A database error's own message, without sqlx's prefix.
+fn database_message(e: &sqlx::Error) -> String {
+    e.as_database_error()
+        .map(|db| db.message().to_string())
+        .unwrap_or_else(|| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What depends on the routine is read off `pg_depend` rows whose object
+    /// is a routine: an OID is unique only within its own catalog.
+    #[test]
+    fn the_routine_drop_reads_dependents_of_a_routine_only() {
+        let block = routine_drop_block("app", "stats");
+        assert!(block.contains("refclassid = 'pg_proc'::regclass"), "{block}");
+        assert!(
+            block.is_ascii(),
+            "a LATIN1 database refuses what it cannot convert: {block}"
+        );
+    }
 
     /// A port nothing listens on, and one whose listener never answers: each
     /// waited out sqlx's 30 s pool timeout, then said only `pool timed out

@@ -300,6 +300,24 @@ pub trait DatabaseAdapter: Send + Sync {
         Ok(())
     }
 
+    /// Bound how long the open batch transaction waits for a lock (#65). A key
+    /// change runs several steps in one transaction, holding its tables' locks
+    /// until it ends, so a step waiting on another session gives up rather
+    /// than hold them while it waits. Default is a no-op.
+    async fn bound_lock_waits(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Every foreign key the catalog has referencing one of `tables`
+    /// (`schema.name`), each with the table it is on (`schema.name`) — read
+    /// from the catalog itself, so one on a table the role has no privilege
+    /// on, which introspection does not list, is among them (#65). Default:
+    /// none.
+    async fn foreign_keys_to(&self, tables: &[String]) -> Result<Vec<(String, crate::entity::ForeignKey)>> {
+        let _ = tables;
+        Ok(Vec::new())
+    }
+
     // ── Materialized-view refresh scheduling ────────────
 
     /// Live materialized-view drift state: `"schema.name"` → the drift stamp
