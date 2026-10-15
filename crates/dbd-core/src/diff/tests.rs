@@ -941,6 +941,20 @@
         );
     }
 
+    /// A generated column turned plain is settled as any column once its
+    /// expression is dropped: a type change with it was lost.
+    #[test]
+    fn a_generated_column_turned_plain_settles_its_type_too() {
+        let old = col_generated("twice", "integer", "a * 2");
+        let new = col("twice", "bigint");
+        let sql = generate_migration_sql(&[alter_col("public.g", "twice", old, new)]);
+        assert_eq!(
+            sql,
+            "ALTER TABLE public.g ALTER COLUMN twice DROP EXPRESSION;\n\
+             ALTER TABLE public.g ALTER COLUMN twice TYPE bigint USING twice::bigint;"
+        );
+    }
+
     #[test]
     fn promoting_a_plain_column_to_generated_rebuilds_it() {
         let old = col("tsv", "tsvector");
