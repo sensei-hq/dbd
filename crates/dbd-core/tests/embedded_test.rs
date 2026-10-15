@@ -4325,6 +4325,115 @@ async fn a_key_held_from_outside_the_design_is_refused() {
     .await;
 }
 
+/// The steps a key change runs as one hold the key's tables until they end:
+/// one of them waiting on a lock another session holds gives up after a
+/// bounded wait and rolls back, rather than holding them while it waits.
+#[tokio::test]
+async fn a_key_change_waiting_on_a_lock_gives_up_and_rolls_back() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let zebra = |extra: &str| format!("create table if not exists app.zebra (\n  id integer primary key{extra}\n);\n");
+    let with_zebra = |child: &str| {
+        child.replace(
+            "\n, foreign key",
+            "\n, zebra_id integer references app.zebra (id)\n, foreign key",
+        )
+    };
+    let (_v1, design) = rekey_design(&[
+        ("parent", REKEY_PARENT_V1),
+        ("zebra", &zebra("")),
+        ("child", &with_zebra(REKEY_CHILD_V1)),
+    ]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("create");
+    let (_v2, design) = rekey_design(&[
+        ("parent", REKEY_PARENT_V2),
+        ("zebra", &zebra("\n, extra text")),
+        ("child", &with_zebra(REKEY_CHILD_V2)),
+    ]);
+    let order: Vec<&str> = design.entities().iter().map(|e| e.name.as_str()).collect();
+    let at = |name: &str| order.iter().position(|e| *e == name).unwrap();
+    assert!(
+        at("app.parent") < at("app.zebra") && at("app.zebra") < at("app.child"),
+        "zebra's step falls between the key change and the child's: {order:?}"
+    );
+
+    // Another session has read app.zebra, its transaction still open.
+    let other = connect(&url, "other").await.unwrap();
+    other.begin_batch().await.unwrap();
+    other.execute_script("SELECT 1 FROM app.zebra").await.unwrap();
+    let run = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        design.reconcile(&*adapter, false, true, false, None, Progress::none()),
+    )
+    .await;
+    other.rollback_batch().await.unwrap();
+    let err = run
+        .expect("the run gives up waiting for the other session")
+        .expect_err("the wait fails the run");
+    assert!(err.to_string().contains("lock"), "{err}");
+    assert_catalog(
+        &*adapter,
+        true,
+        &constraint_predicate("parent", "PRIMARY KEY (owner_id, path)"),
+        "the old primary key",
+    )
+    .await;
+}
+
+/// A table dbd's role has no privilege on is one `information_schema` does
+/// not list — its foreign key on the key is read from the catalog, and the
+/// key change refused naming it, before anything is written.
+#[tokio::test]
+async fn a_key_held_by_a_table_the_role_cannot_see_is_refused() {
+    let (pg, url) = start_pg().await;
+    let admin = connect(&url, "admin").await.unwrap();
+    admin
+        .execute_script("CREATE ROLE role_app LOGIN PASSWORD 'secret'; GRANT CREATE ON DATABASE testdb TO role_app;")
+        .await
+        .unwrap();
+    let settings = pg.settings();
+    let app = connect(
+        &format!(
+            "postgresql://role_app:secret@{}:{}/testdb",
+            settings.host, settings.port
+        ),
+        "rekey",
+    )
+    .await
+    .unwrap();
+    let (_v1, design) = rekey_design(&[("parent", REKEY_PARENT_V1), ("child", REKEY_CHILD_V1)]);
+    design
+        .reconcile(&*app, false, false, false, None, Progress::none())
+        .await
+        .expect("create");
+    admin
+        .execute_script(
+            "CREATE SCHEMA ext; CREATE TABLE ext.audit (owner_id uuid, path text, \
+             FOREIGN KEY (owner_id, path) REFERENCES app.parent (owner_id, path));",
+        )
+        .await
+        .unwrap();
+
+    let (_v2, design) = rekey_design(&[("parent", REKEY_PARENT_V2), ("child", REKEY_CHILD_V2)]);
+    for dry_run in [true, false] {
+        let refused = design
+            .reconcile(&*app, dry_run, true, false, None, Progress::none())
+            .await
+            .expect_err("refused");
+        assert!(refused.to_string().contains("ext.audit"), "{refused}");
+    }
+    assert_catalog(
+        &*admin,
+        false,
+        &column_predicate("app", "child", "branch"),
+        "child.branch",
+    )
+    .await;
+}
+
 /// A foreign key resting on a unique index: the design turns the index into
 /// a unique constraint, and reconcile moves the foreign key across.
 #[tokio::test]
