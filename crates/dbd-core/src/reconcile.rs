@@ -4428,6 +4428,65 @@ mod tests {
         }
     }
 
+    /// A bare `nextval('seq')` draws on the sequence Postgres found on the
+    /// table file's path when it ran: the first schema on it the design
+    /// declares `seq` in, which `pg_get_expr` prints when the session's path
+    /// does not reach it (#60). One the design declares on none of them, or a
+    /// table with no path of its own, is left as written.
+    #[test]
+    fn a_bare_nextval_default_names_the_schema_its_files_path_finds_the_sequence_in() {
+        use crate::entity::{PathEntry, SchemaPath, TableComments, TableDef};
+        let table = |name: &str, path: SchemaPath| {
+            let mut entity = Entity::new(EntityType::Table, name);
+            entity.schema_path = path;
+            entity.table_def = Some(TableDef {
+                columns: vec![
+                    col_default("d", "integer", "nextval('seq')"),
+                    col_default("e", "integer", "nextval('Seq'::regclass)"),
+                    col_default("f", "integer", "nextval('pseq')"),
+                ],
+                constraints: vec![],
+                indexes: vec![],
+                comments: TableComments::default(),
+            });
+            entity
+        };
+        let app = SchemaPath::from_file(vec![PathEntry::Schema("app".to_string())]);
+        let entities = vec![
+            Entity::new(EntityType::Sequence, "app.seq"),
+            Entity::new(EntityType::Sequence, "public.pseq"),
+            table("app.u", app),
+            table("app.v", SchemaPath::default()),
+        ];
+        let snap = snapshot_from_entities(&entities);
+        let defaults = |name: &str| -> Vec<String> {
+            snap.tables
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap()
+                .columns
+                .iter()
+                .map(|c| c.default_value.clone().unwrap())
+                .collect()
+        };
+        assert_eq!(
+            defaults("u"),
+            [
+                "nextval('app.seq'::regclass)",
+                "nextval('app.seq'::regclass)",
+                "nextval('pseq'::regclass)"
+            ]
+        );
+        assert_eq!(
+            defaults("v"),
+            [
+                "nextval('seq'::regclass)",
+                "nextval('seq'::regclass)",
+                "nextval('pseq'::regclass)"
+            ]
+        );
+    }
+
     /// Type-awareness must not change what the old text-only rules did for
     /// every other type.
     #[test]

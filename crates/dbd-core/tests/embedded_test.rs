@@ -7108,9 +7108,48 @@ async fn a_nextval_default_converges() {
     );
 }
 
+/// Raises unless the connection the pool hands out next is on the session's
+/// own search path.
+const ON_THE_SESSION_PATH: &str = "DO $$ BEGIN \
+     IF current_setting('search_path') <> (SELECT reset_val FROM pg_settings WHERE name = 'search_path') \
+     THEN RAISE EXCEPTION 'on %', current_setting('search_path'); END IF; END $$";
+
+/// A script's own `SET search_path` ends with it: the pooled connection it ran
+/// on goes back on the session's path, so what runs on it next — introspection
+/// printing a default's sequence, a type — reads names as a fresh connection
+/// would (#60). In a batch too, once it commits.
+#[tokio::test]
+async fn a_scripts_search_path_does_not_outlive_it_on_the_pool() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "paths").await.unwrap();
+    adapter
+        .execute_script("CREATE SCHEMA IF NOT EXISTS app;\nSET search_path TO app;\nCREATE TABLE t (id integer);")
+        .await
+        .unwrap();
+    for _ in 0..5 {
+        adapter
+            .execute_script(ON_THE_SESSION_PATH)
+            .await
+            .expect("after a script");
+    }
+    adapter.begin_batch().await.unwrap();
+    adapter
+        .execute_script("SET search_path TO app;\nCREATE TABLE u (id integer);")
+        .await
+        .unwrap();
+    adapter.commit_batch().await.unwrap();
+    for _ in 0..5 {
+        adapter
+            .execute_script(ON_THE_SESSION_PATH)
+            .await
+            .expect("after a batch");
+    }
+}
+
 /// A `nextval` default naming its sequence in a spelling Postgres does not
-/// print — mixed case unquoted, quoted where it need not be, or qualified by
-/// a schema on the search path — reconciles once, and then is in sync (#60).
+/// print — mixed case unquoted, quoted where it need not be, qualified by a
+/// schema on the search path, or bare in a schema the file's own path reaches
+/// and the session's does not — reconciles once, and then is in sync (#60).
 #[tokio::test]
 async fn a_nextval_default_postgres_spells_differently_converges() {
     let (_pg, url) = start_pg().await;
@@ -7141,6 +7180,15 @@ async fn a_nextval_default_postgres_spells_differently_converges() {
          , a integer default nextval('App.Seq')\n\
          , b integer default nextval('\"app\".\"seq\"')\n\
          , c integer default nextval('public.pseq')\n);\n",
+    )
+    .unwrap();
+    // Bare, through the file's own path: `seq` is `app.seq`, `pseq` is
+    // `public`'s — the path dbd runs a file on keeps `public` (#60).
+    std::fs::write(
+        dir.join("ddl/table/app/u.ddl"),
+        "set search_path to app;\ncreate table if not exists u (\n  id integer primary key\n\
+         , d integer default nextval('seq')\n\
+         , e integer default nextval('pseq')\n);\n",
     )
     .unwrap();
     let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load");
