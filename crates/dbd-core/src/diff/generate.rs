@@ -344,8 +344,8 @@ fn generate_field_sql(entity_name: &str, _entity_type: &EntityType, change: &Fie
             // migration runs on its file's search path, which that schema may
             // not be on, and `IF EXISTS` would make the miss a no-op (#73).
             let schema = match crate::entity::split_qualified_name(entity_name) {
-                (Some(schema), _) => format!("{}.", crate::sql_quote::ident(&schema)),
-                (None, _) => String::new(),
+                (Some(schema), _) if !schema.is_empty() => format!("{}.", crate::sql_quote::ident(&schema)),
+                _ => String::new(),
             };
             match &idx.name {
                 Some(name) => lines.push(format!(
