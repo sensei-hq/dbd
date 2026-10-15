@@ -4325,6 +4325,52 @@ async fn a_key_held_from_outside_the_design_is_refused() {
     .await;
 }
 
+/// A foreign key resting on a unique index: the design turns the index into
+/// a unique constraint, and reconcile moves the foreign key across.
+#[tokio::test]
+async fn reconcile_changes_a_unique_index_a_foreign_key_rests_on() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let child = "create table if not exists app.child (\n  id integer primary key\n, code text references app.parent (code)\n);\n";
+    let (_v1, design) = rekey_design(&[
+        (
+            "parent",
+            "create table if not exists app.parent (\n  id integer primary key\n, code text not null\n);\n\
+             create unique index if not exists parent_code_uidx on app.parent (code);\n",
+        ),
+        ("child", child),
+    ]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("create");
+    let (_v2, design) = rekey_design(&[
+        (
+            "parent",
+            "create table if not exists app.parent (\n  id integer primary key\n, code text not null unique\n);\n",
+        ),
+        ("child", child),
+    ]);
+    design
+        .reconcile(&*adapter, false, true, false, None, Progress::none())
+        .await
+        .expect("the index becomes a constraint");
+    assert_catalog(
+        &*adapter,
+        true,
+        &constraint_predicate("parent", "UNIQUE (code)"),
+        "the unique key",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        &constraint_predicate("child", "FOREIGN KEY (code) REFERENCES app.parent(code)"),
+        "the foreign key, back",
+    )
+    .await;
+}
+
 // ── A routine whose return type changes (#65) ─────────────────────────────────
 
 /// A project `routines` in a temporary folder with `files` (`(path, text)`).

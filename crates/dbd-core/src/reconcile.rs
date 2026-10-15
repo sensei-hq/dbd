@@ -5476,4 +5476,99 @@ mod key_holder_tests {
         assert_eq!(sql_of(&after, "app.parent"), sql_of(&before, "app.parent"));
         assert!(spans.unwrap().is_empty());
     }
+
+    /// A foreign key resting on a unique index, not a constraint: the index
+    /// the design turns into a constraint is a key the change drops, and the
+    /// foreign key goes first and comes back after the new key.
+    #[test]
+    fn a_unique_index_a_foreign_key_rests_on_is_a_key_it_holds() {
+        let mut parent = table("app.parent", &["id", "code"], vec![pk(Some("parent_pkey"), &["id"])]);
+        parent.indexes.push(crate::entity::IndexDef {
+            name: Some("parent_code_uidx".to_string()),
+            columns: vec![crate::entity::IndexColumn {
+                name: "code".to_string(),
+                ..Default::default()
+            }],
+            unique: true,
+            ..Default::default()
+        });
+        let child = |name: Option<&str>| {
+            table(
+                "app.child",
+                &["id", "code"],
+                vec![fk(name, &["code"], "app.parent", &["code"])],
+            )
+        };
+        let live = snap(vec![parent, child(Some("child_code_fkey"))]);
+        let desired = snap(vec![
+            table(
+                "app.parent",
+                &["id", "code"],
+                vec![pk(None, &["id"]), unique(None, &["code"])],
+            ),
+            child(None),
+        ]);
+        let (mut live_c, mut desired_c) = (live.clone(), desired.clone());
+        canonicalize(&mut live_c);
+        canonicalize(&mut desired_c);
+        let mut plan = plan_reconcile(&live_c, &desired_c);
+        plan_fk_convergence(&mut plan, &live, &desired);
+        plan_index_convergence(&mut plan, &live, &desired);
+        let spans = plan_key_holders(&mut plan, &live_c, &desired_c, &live, &desired, &HashSet::new());
+        let sql = sql_of(&plan, "app.parent");
+        let drop_fk = at(
+            sql,
+            "ALTER TABLE app.child DROP CONSTRAINT IF EXISTS \"child_code_fkey\"",
+        );
+        assert!(drop_fk < at(sql, "parent_code_uidx"), "{sql}");
+        let add = at(
+            sql,
+            "ALTER TABLE app.child ADD FOREIGN KEY (code) REFERENCES app.parent(code)",
+        );
+        assert!(
+            at(sql, "UNIQUE (code)") < add && at(sql, "parent_code_uidx") < add,
+            "{sql}"
+        );
+        assert!(spans.unwrap().is_empty());
+    }
+
+    /// A key column turned generated is dropped and added again: the foreign
+    /// key reading it goes first.
+    #[test]
+    fn a_key_column_turned_generated_drops_the_foreign_keys_on_it_first() {
+        let parent = |generated: Option<&str>| {
+            let mut t = table(
+                "app.parent",
+                &["id", "x", "code"],
+                vec![pk(None, &["id"]), unique(None, &["code"])],
+            );
+            t.columns[2].generated = generated.map(str::to_string);
+            t
+        };
+        let child = |name: Option<&str>| {
+            table(
+                "app.child",
+                &["id", "code"],
+                vec![fk(name, &["code"], "app.parent", &["code"])],
+            )
+        };
+        let live = {
+            let mut p = parent(None);
+            p.table_constraints = vec![
+                pk(Some("parent_pkey"), &["id"]),
+                unique(Some("parent_code_key"), &["code"]),
+            ];
+            snap(vec![p, child(Some("child_code_fkey"))])
+        };
+        let desired = snap(vec![parent(Some("x || 'a'")), child(None)]);
+        let (plan, _) = plan(&live, &desired, &[]);
+        let sql = sql_of(&plan, "app.parent");
+        assert!(
+            at(
+                sql,
+                "ALTER TABLE app.child DROP CONSTRAINT IF EXISTS \"child_code_fkey\""
+            ) < at(sql, "DROP COLUMN code"),
+            "{sql}"
+        );
+    }
 }
