@@ -7108,6 +7108,61 @@ async fn a_nextval_default_converges() {
     );
 }
 
+/// A `nextval` default naming its sequence in a spelling Postgres does not
+/// print — mixed case unquoted, quoted where it need not be, or qualified by
+/// a schema on the search path — reconciles once, and then is in sync (#60).
+#[tokio::test]
+async fn a_nextval_default_postgres_spells_differently_converges() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "nextval_spelling").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    for d in ["ddl/sequence/app", "ddl/sequence/public", "ddl/table/app"] {
+        std::fs::create_dir_all(dir.join(d)).unwrap();
+    }
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: nextval_spelling\nsource:\n  dialect: postgresql\nschemas:\n  - public\n  - app\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/sequence/app/seq.ddl"),
+        "create sequence if not exists app.seq;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/sequence/public/pseq.ddl"),
+        "create sequence if not exists public.pseq;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/t.ddl"),
+        "create table if not exists app.t (\n  id integer primary key\n\
+         , a integer default nextval('App.Seq')\n\
+         , b integer default nextval('\"app\".\"seq\"')\n\
+         , c integer default nextval('public.pseq')\n);\n",
+    )
+    .unwrap();
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load");
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("reconcile");
+
+    let again = design
+        .reconcile(&*adapter, true, false, false, None, Progress::none())
+        .await
+        .expect("second dry run");
+    assert!(again.altered.is_empty(), "converged: {:?}", again.altered);
+    let diff = design.diff_live(&*adapter, None).await.expect("diff");
+    let touched: Vec<String> = diff
+        .changes
+        .iter()
+        .map(|c| format!("{:?} {}", c.action, c.entity_name))
+        .collect();
+    assert!(touched.is_empty(), "in sync: {touched:?}");
+}
+
 /// A project with no `project.version` has applied no migration. Reconcile
 /// recorded version 1 for it (apply records 0), after which a dev `reset`
 /// refused with "database has applied migrations".

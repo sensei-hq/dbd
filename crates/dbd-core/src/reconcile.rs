@@ -4402,6 +4402,32 @@ mod tests {
         assert_eq!(canonical_default("'not a date'", "timestamptz"), "'not a date'");
     }
 
+    /// `nextval`'s argument is a `regclass` string, and `pg_get_expr` prints
+    /// the sequence it resolves to its own way (#60): each part as
+    /// `quote_identifier` writes it, and no schema for one on the search path.
+    /// Each pair measured on PostgreSQL 17, on the session's `"$user", public`.
+    #[test]
+    fn a_nextval_default_reads_as_postgres_prints_its_sequence() {
+        for (authored, reported) in [
+            ("nextval('App.Seq')", "nextval('app.seq'::regclass)"),
+            ("nextval('\"app\".\"seq\"')", "nextval('app.seq'::regclass)"),
+            ("nextval(' app . seq ')", "nextval('app.seq'::regclass)"),
+            ("nextval('APP.SEQ1')", "nextval('app.seq1'::regclass)"),
+            ("nextval('\"App\".\"Seq\"')", "nextval('\"App\".\"Seq\"'::regclass)"),
+            ("nextval('app.\"Seq\"')", "nextval('app.\"Seq\"'::regclass)"),
+            ("nextval('app.\"order\"')", "nextval('app.\"order\"'::regclass)"),
+            ("nextval('app.\"1s\"')", "nextval('app.\"1s\"'::regclass)"),
+            ("nextval('app.\"a''b\"')", "nextval('app.\"a''b\"'::regclass)"),
+            ("nextval('public.pseq')", "nextval('pseq'::regclass)"),
+            ("nextval('Public.PSEQ')", "nextval('pseq'::regclass)"),
+            ("nextval('PSeq')", "nextval('pseq'::regclass)"),
+            ("nextval('\"PSeq\"')", "nextval('\"PSeq\"'::regclass)"),
+        ] {
+            assert_eq!(canonical_default(authored, "integer"), reported, "{authored}");
+            assert_eq!(canonical_default(reported, "integer"), reported, "{reported}");
+        }
+    }
+
     /// Type-awareness must not change what the old text-only rules did for
     /// every other type.
     #[test]
