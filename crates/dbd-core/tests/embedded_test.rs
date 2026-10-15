@@ -4618,6 +4618,179 @@ async fn a_function_with_overloads_is_not_dropped_to_change_its_return_type() {
     assert_catalog(&*adapter, true, &stats_returns("jsonb"), "the old return type").await;
 }
 
+/// What `CREATE OR REPLACE` keeps, dropping and creating again keeps too: the
+/// grants made outside the file, the owner, the comment. `EXECUTE` revoked
+/// from `PUBLIC` stays revoked.
+#[tokio::test]
+async fn a_replaced_function_keeps_its_grants_owner_and_comment() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "routines").await.unwrap();
+    let (_v1, design) = routine_design(&[(STATS_FILE, STATS_JSONB)]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("create");
+    adapter
+        .execute_script(
+            "CREATE ROLE reader; CREATE ROLE app_owner; \
+             REVOKE EXECUTE ON FUNCTION app.stats() FROM PUBLIC; \
+             GRANT EXECUTE ON FUNCTION app.stats() TO reader; \
+             COMMENT ON FUNCTION app.stats() IS 'hand comment'; \
+             ALTER FUNCTION app.stats() OWNER TO app_owner;",
+        )
+        .await
+        .unwrap();
+    let (_v2, design) = routine_design(&[(STATS_FILE, STATS_TABLE)]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("the new return type reconciles");
+    assert_catalog(
+        &*adapter,
+        true,
+        &stats_returns("TABLE(files integer, refused_older integer, pruned integer)"),
+        "the new return type",
+    )
+    .await;
+    for (holds, predicate, what) in [
+        (
+            false,
+            "SELECT 1 WHERE has_function_privilege('public', 'app.stats()', 'EXECUTE')",
+            "PUBLIC's EXECUTE",
+        ),
+        (
+            true,
+            "SELECT 1 WHERE has_function_privilege('reader', 'app.stats()', 'EXECUTE')",
+            "reader's EXECUTE",
+        ),
+        (
+            true,
+            "SELECT 1 FROM pg_proc WHERE oid = 'app.stats()'::regprocedure AND proowner = 'app_owner'::regrole",
+            "the owner",
+        ),
+        (
+            true,
+            "SELECT 1 WHERE obj_description('app.stats()'::regprocedure, 'pg_proc') = 'hand comment'",
+            "the comment",
+        ),
+    ] {
+        assert_catalog(&*adapter, holds, predicate, what).await;
+    }
+}
+
+/// A function file that wraps itself in `BEGIN`/`COMMIT` applies as it did:
+/// its own transaction is left alone.
+#[tokio::test]
+async fn a_function_file_with_its_own_transaction_applies_as_before() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "routines").await.unwrap();
+    let (_v1, design) = routine_design(&[(STATS_FILE, &format!("BEGIN;\n{STATS_JSONB}COMMIT;\n"))]);
+    for run in ["first apply", "second apply"] {
+        design
+            .apply(&*adapter, None, false, None, Progress::none())
+            .await
+            .unwrap_or_else(|e| panic!("{run}: {e}"));
+    }
+    assert_catalog(&*adapter, true, &stats_returns("jsonb"), "the function").await;
+}
+
+/// The function a file replaces is the one its `CREATE` names, as Postgres
+/// reads it — `app.getStats` is `app.getstats` — whatever the file is called.
+#[tokio::test]
+async fn a_function_named_in_mixed_case_is_replaced() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "routines").await.unwrap();
+    let file = "ddl/function/app/getStats.ddl";
+    let (_v1, design) = routine_design(&[(file, &STATS_JSONB.replace("app.stats()", "app.getStats()"))]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("create");
+    let (_v2, design) = routine_design(&[(file, &STATS_TABLE.replace("app.stats()", "app.getStats()"))]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("the new return type reconciles");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 WHERE pg_get_function_result('app.getstats()'::regprocedure) = \
+         'TABLE(files integer, refused_older integer, pruned integer)'",
+        "the new return type",
+    )
+    .await;
+}
+
+/// A definition Postgres refuses for itself is reported as it is — not as one
+/// to drop by hand, with no function of that name, or with two.
+#[tokio::test]
+async fn a_function_definition_error_is_reported_as_it_is() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "routines").await.unwrap();
+    let broken = "create or replace function app.stats()\nreturns integer\nlanguage sql\nas $$ select 'x'::text $$;\n";
+    let (_v1, design) = routine_design(&[(STATS_FILE, broken)]);
+    let err = design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect_err("a body returning text")
+        .to_string();
+    assert!(
+        err.contains("return type mismatch") && !err.contains("by hand"),
+        "{err}"
+    );
+
+    adapter
+        .execute_script(
+            "CREATE SCHEMA IF NOT EXISTS app; \
+             CREATE FUNCTION app.stats(n integer) RETURNS integer LANGUAGE sql AS $$ SELECT n $$; \
+             CREATE FUNCTION app.stats(t text) RETURNS text LANGUAGE sql AS $$ SELECT t $$;",
+        )
+        .await
+        .unwrap();
+    let err = design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect_err("a body returning text, beside two of that name")
+        .to_string();
+    assert!(
+        err.contains("return type mismatch") && !err.contains("by hand"),
+        "{err}"
+    );
+}
+
+/// A database in LATIN1 takes the drop and create like any other: what dbd
+/// sends it is ASCII.
+#[tokio::test]
+async fn a_function_on_a_latin1_database_is_replaced() {
+    let (pg, url) = start_pg().await;
+    connect(&url, "admin")
+        .await
+        .unwrap()
+        .execute_script("CREATE DATABASE l1 ENCODING 'LATIN1' LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0")
+        .await
+        .unwrap();
+    let settings = pg.settings();
+    let adapter = connect(
+        &format!(
+            "postgresql://{}:{}@{}:{}/l1",
+            settings.username, settings.password, settings.host, settings.port
+        ),
+        "routines",
+    )
+    .await
+    .unwrap();
+    let (_v1, design) = routine_design(&[(STATS_FILE, STATS_JSONB)]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("create");
+    let (_v2, design) = routine_design(&[(STATS_FILE, STATS_TABLE)]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("the new return type reconciles on LATIN1");
+}
+
 // ── A released key change a foreign key holds (#65) ───────────────────────────
 
 /// Cut the next version of the `rekey` project in `dir` from `files` — tables

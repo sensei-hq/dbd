@@ -3081,6 +3081,18 @@ fn database_message(e: &sqlx::Error) -> String {
 mod tests {
     use super::*;
 
+    /// What depends on the routine is read off `pg_depend` rows whose object
+    /// is a routine: an OID is unique only within its own catalog.
+    #[test]
+    fn the_routine_drop_reads_dependents_of_a_routine_only() {
+        let block = routine_drop_block("app", "stats");
+        assert!(block.contains("refclassid = 'pg_proc'::regclass"), "{block}");
+        assert!(
+            block.is_ascii(),
+            "a LATIN1 database refuses what it cannot convert: {block}"
+        );
+    }
+
     /// A port nothing listens on, and one whose listener never answers: each
     /// waited out sqlx's 30 s pool timeout, then said only `pool timed out
     /// while waiting for an open connection`. A connection that cannot be made
