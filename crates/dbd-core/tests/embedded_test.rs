@@ -7892,7 +7892,10 @@ async fn a_scripts_search_path_does_not_outlive_it_on_the_pool() {
 async fn a_scripts_path_ends_with_it_however_it_was_set() {
     let (_pg, url) = start_pg().await;
     let adapter = connect(&url, "paths").await.unwrap();
-    adapter.execute_script("CREATE SCHEMA IF NOT EXISTS app;").await.unwrap();
+    adapter
+        .execute_script("CREATE SCHEMA IF NOT EXISTS app;")
+        .await
+        .unwrap();
     for script in [
         "SET SCHEMA 'app';\nCREATE TABLE s1 (id integer);",
         "SET SEARCH_PATH TO app;\nCREATE TABLE s2 (id integer);",

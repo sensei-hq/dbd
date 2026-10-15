@@ -1457,6 +1457,55 @@
         assert_eq!(sql, "DROP INDEX IF EXISTS \"public\".\"idx_email\";");
     }
 
+    /// A name read off a live catalog reaches a `DROP` as a name, never as
+    /// SQL: a constraint, column or table called to close the statement and
+    /// run another is quoted, its quotes doubled. An ordinary name reads as it
+    /// always did (0.27.2 review).
+    #[test]
+    fn a_hostile_live_name_in_a_drop_stays_a_name() {
+        let con = TableConstraint::Check {
+            name: Some("x\"; create table app.pwned(a int); --".to_string()),
+            expression: "a > 0".to_string(),
+        };
+        let column = col("z; create table app.pwned2(a int); --", "integer");
+        let diffs = vec![MigrationDiff {
+            entity_name: "app.t".to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(vec![
+                FieldChange {
+                    field_name: "ck".to_string(),
+                    field_type: FieldType::Constraint,
+                    action: ChangeAction::Drop(Box::new(FieldDetail::Constraint(con))),
+                },
+                FieldChange {
+                    field_name: column.name.clone(),
+                    field_type: FieldType::Column,
+                    action: ChangeAction::Drop(Box::new(FieldDetail::Column(column))),
+                },
+            ]),
+        }];
+        assert_eq!(
+            generate_migration_sql(&diffs),
+            "ALTER TABLE app.t DROP CONSTRAINT IF EXISTS \"x\"\"; create table app.pwned(a int); --\";\n\
+             ALTER TABLE app.t DROP COLUMN \"z; create table app.pwned2(a int); --\";"
+        );
+        let table = vec![MigrationDiff {
+            entity_name: "app.x; drop table app.t; --".to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Drop,
+        }];
+        assert_eq!(
+            generate_migration_sql(&table),
+            "DROP TABLE app.\"x; drop table app.t; --\" CASCADE;"
+        );
+        let ordinary = vec![MigrationDiff {
+            entity_name: "app.t".to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Drop,
+        }];
+        assert_eq!(generate_migration_sql(&ordinary), "DROP TABLE app.t CASCADE;");
+    }
+
     // ── S14: Enum value add / drop SQL ──────────────────────
 
     #[test]
