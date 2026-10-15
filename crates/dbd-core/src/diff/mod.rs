@@ -5,8 +5,8 @@ mod types;
 
 pub(crate) use classify::swap_column;
 pub use classify::{classify_changes, generate_data_sql, is_castable};
+pub(crate) use compare::constraints_on;
 pub use compare::diff;
-pub(crate) use compare::keys_on;
 pub(crate) use generate::{catalog_drop_sql, constraint_description, unnamed_drop_comment};
 pub use generate::{generate_migration_sql, migration_warnings};
 pub use types::*;
