@@ -5171,6 +5171,75 @@ async fn a_released_rename_keeps_table_constraints_and_collation() {
     .await;
 }
 
+/// A pending version a dbd before 0.27.2 cut for a type change — its data
+/// script fills the column the next version drops — is refused before any of
+/// it runs, naming the column and saying to cut it again: run as written, it
+/// loses every value of the column.
+#[tokio::test]
+async fn a_pending_swap_cut_before_0_27_2_is_refused() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let line = |ty: &str| format!("create table if not exists app.line (\n  id integer primary key\n, qty {ty}\n);\n");
+    cut_rekey(dir, &[("line", &line("integer"))]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    adapter
+        .execute_script("INSERT INTO app.line VALUES (1, 10);")
+        .await
+        .unwrap();
+    // v2 and v3 as 0.27.1 wrote them.
+    std::fs::write(dir.join("ddl/table/app/line.ddl"), line("bigint")).unwrap();
+    for (version, files) in [
+        (
+            2u32,
+            vec![
+                ("line.sql", "ALTER TABLE app.line ADD COLUMN qty_new bigint;"),
+                (
+                    "line.data.sql",
+                    "UPDATE \"app\".\"line\" SET \"qty\" = \"qty\"::bigint;\n",
+                ),
+            ],
+        ),
+        (
+            3,
+            vec![(
+                "line.sql",
+                "ALTER TABLE app.line DROP COLUMN qty;\nALTER TABLE app.line RENAME COLUMN qty_new TO qty;",
+            )],
+        ),
+    ] {
+        let at = dir.join(format!("migrations/{version:03}"));
+        std::fs::create_dir_all(at.join("app")).unwrap();
+        for (file, sql) in files {
+            std::fs::write(at.join("app").join(file), sql).unwrap();
+        }
+        std::fs::write(
+            at.join("graph.json"),
+            format!(
+                r#"{{"fromVersion":{},"toVersion":{version},"added":[],"altered":["app.line"],"dropped":[]}}"#,
+                version - 1
+            ),
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: rekey\n  version: 3\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    let err = released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect_err("refused")
+        .to_string();
+    assert!(err.contains("qty") && err.contains("0.27.2"), "{err}");
+    assert_catalog(&*adapter, true, "SELECT 1 FROM app.line WHERE qty = 10", "the value").await;
+}
+
 // ── A routine whose return type changes (#65) ─────────────────────────────────
 
 /// A project `routines` in a temporary folder with `files` (`(path, text)`).

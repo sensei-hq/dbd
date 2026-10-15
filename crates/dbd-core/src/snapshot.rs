@@ -2947,6 +2947,50 @@ mod tests {
         assert_eq!(todos[1].version, 3);
     }
 
+    /// A pending version cut by a dbd before 0.27.2 whose type change fills
+    /// the column the next version drops — every value lost — is found by its
+    /// shape: `<column>_new` added, and the data script setting the column
+    /// itself. One that fills `<column>_new`, or an ordinary update, is not.
+    #[test]
+    fn ds7_a_pending_swap_that_loses_its_values_is_found() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let write = |version: u32, file: &str, content: &str| {
+            let dir = tmp.path().join(format!("migrations/{version:03}/app"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(file), content).unwrap();
+        };
+        write(2, "line.sql", "ALTER TABLE app.line ADD COLUMN qty_new bigint;");
+        write(
+            2,
+            "line.data.sql",
+            "UPDATE \"app\".\"line\" SET \"qty\" = \"qty\"::bigint;\n",
+        );
+        write(2, "kept.sql", "ALTER TABLE app.kept ADD COLUMN n_new bigint;");
+        write(
+            2,
+            "kept.data.sql",
+            "UPDATE \"app\".\"kept\" SET \"n_new\" = \"n\"::bigint;\n",
+        );
+        write(
+            2,
+            "plain.data.sql",
+            "UPDATE \"app\".\"plain\" SET \"n\" = \"n\"::bigint;\n",
+        );
+        let pending = |version: u32| PendingMigration {
+            from_version: version - 1,
+            to_version: version,
+            migration_dir: tmp.path().join(format!("migrations/{version:03}")),
+            added: vec![],
+            altered: vec![],
+            dropped: vec![],
+            checksum: String::new(),
+        };
+        let found = pending_lossy_swaps(&[pending(2)]).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!((found[0].version, found[0].column.as_str()), (2, "qty"));
+        assert!(found[0].file.ends_with("app/line.data.sql"), "{found:?}");
+    }
+
     #[test]
     fn ds5_pending_data_sql_todos_scoped_to_pending() {
         let tmp = tempfile::TempDir::new().unwrap();
