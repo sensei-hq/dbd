@@ -736,6 +736,34 @@ pub fn canonical_exclusion(definition: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// A rename reaches every reference to the column — qualified, quoted,
+    /// inside a call — and nothing else: not a function of the same name, not
+    /// another column, not a string. Spelled as the parser renders an
+    /// expression, so it compares with one written against the new name.
+    #[test]
+    fn renaming_a_column_in_an_expression_reaches_its_references_only() {
+        let rendered = |e: &str| rename_column(e, "qty", "qty").unwrap();
+        for (written, renamed) in [
+            ("qty >= 0", "quantity >= 0"),
+            ("t.qty > other", "t.quantity > other"),
+            ("\"qty\" > 0", "quantity > 0"),
+            ("lower(qty) <> 'qty'", "lower(quantity) <> 'qty'"),
+            ("qty(1) > qty", "qty(1) > quantity"),
+            ("(qty + qtyx) > 0", "(quantity + qtyx) > 0"),
+        ] {
+            assert_eq!(
+                rename_column(written, "qty", "quantity").as_deref(),
+                Some(rendered(renamed).as_str()),
+                "{written}"
+            );
+        }
+        assert_eq!(
+            rename_column("qty > 0", "qty", "New Qty").as_deref(),
+            Some("\"New Qty\" > 0")
+        );
+        assert_eq!(rename_column("(((", "qty", "quantity"), None);
+    }
+
     /// An EXCLUDE reads a column through an element naming it, an element's
     /// expression, or its predicate — and only those: re-adding one the
     /// column's drop left alone fails on its name.
