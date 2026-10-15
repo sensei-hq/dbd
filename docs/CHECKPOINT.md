@@ -1,34 +1,38 @@
 # Checkpoint
 
-**Slice:** none open. 0.27.1 (#65) released; `main` at fcc5868c.
+**Slice:** the open issues — #73, #60, #72 — each on its own branch off
+`develop`, red tests first. Nothing pushed, no PRs yet.
 
 ## Done
 
-- 0.27.0 — #7 phase 3, workspaces and modules (PRs #70, #71).
-- 0.27.1 — #65 (PRs #74, #75), on crates.io, `main` CI green, issue closed.
-  The installed binary re-keyed the issue's repro on PostgreSQL 18 through
-  `reconcile` and through `dbd snapshot` + `apply` over existing rows, and
-  replaced `app.stats()` with its new return type.
-  - Reconcile: the foreign keys holding a dropped key go first, kept ones
-    come back after the new key, replaced ones in their own step (one
-    transaction, 10s lock timeout); a holder outside the run is refused.
-  - Routines: a replace conflict is dropped and created again, grants, owner
-    and comment kept; a file with its own `BEGIN`/`COMMIT` runs as before.
-  - Migrations: the same ordering; on PostgreSQL (by URL) an unnamed key is
-    dropped by catalog lookup.
+- #73 on `fix/73-drop-index-schema`: a migration's `DROP INDEX` names the
+  table's schema. Red f342c2e8, fix 0b016139, CHANGELOG 408511b0. Embedded
+  suite 339/339 (one run saw a load-only failure in
+  `reconcile_changes_a_unique_index_a_foreign_key_rests_on`; 15/15 alone and
+  the rerun green — message not captured).
+- #60 on `fix/60-nextval-spelling`: a `nextval` default's sequence spelled as
+  Postgres prints it; a bare one in the schema its file's path finds it in;
+  a script's `SET search_path` reset on the pooled connection after it, and
+  before a batch commits. Red 9a1ecc7e + 84802081, fixes d484da8d +
+  24e781d8, docs 77819586. Embedded 340/340; CLI: 0.27.1 drifts (`diff
+  --exit-code` 2), the branch exits 0.
 
 ## Next
 
-Pick from the open issues: #72 (a rebuilt column loses its keys), #73 (a
-migration's `DROP INDEX` names no schema), #60 (nextval spelling).
+#72 on `fix/72-rebuilt-column-keys` from `develop`: a column rebuilt (turned
+generated; a migration's type swap) gets back its PRIMARY KEY/UNIQUE, the
+foreign keys holding them dropped first and re-added after.
+`cargo test -p dbd-core --features embedded-tests --test embedded_test`
 
 ## Open
 
-- Unfiled: `init --dry-run` writes files; SQLite scopes cannot name a table
-  (a bare name reads as a schema, `main.` is dropped); a dry run with
-  `--allow-destructive` still says to re-run with it; SQLite `deploy --module
-  shared` fails on a bare FK error while emptying.
-- Scratch to delete by hand: /tmp/dbd-verify-pg (stopped),
-  /tmp/dbd-review-65-*, /tmp/dbd-r65-scratch, /tmp/dbd-65-*,
-  /tmp/dbd-repro-65*, /tmp/dbd-0271-*, /tmp/dbd-verify-0.27.0*; worktree
-  /tmp/dbd-review-tests-wt (`git worktree remove`, then `git worktree prune`).
+- To ask: push the three branches, open PRs, merge to `develop`.
+- Probe after #72: a rebuild likely also loses NOT NULL, default, indexes,
+  CHECKs and outgoing FKs (stage 1 adds `<col>_new` with its type only).
+- Two-reconcile convergence check on a schema-only sensei copy, once all
+  three are merged.
+- Unfiled (from before): `init --dry-run` writes files; SQLite scopes cannot
+  name a table; a dry run with `--allow-destructive` still says to re-run
+  with it; SQLite `deploy --module shared` fails on a bare FK error.
+- Scratch to delete: /tmp/dbd-60-cli, /tmp/dbd-60-*.log, /tmp/dbd-emb-run2.log
+  and the older /tmp/dbd-* dirs listed at 0.27.1.

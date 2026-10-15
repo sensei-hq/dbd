@@ -177,10 +177,19 @@ pub const DEFAULT_SCHEMA: &str = "public";
 /// Empty schemas are normalized to [`DEFAULT_SCHEMA`] so an unqualified project
 /// table (`""`) matches its introspected counterpart (`"public"`).
 pub fn raw_snapshot_from_entities(entities: &[Entity]) -> Snapshot {
+    let sequences: HashSet<&str> = entities
+        .iter()
+        .filter(|e| e.entity_type == EntityType::Sequence)
+        .map(|e| e.name.as_str())
+        .collect();
     let tables = entities
         .iter()
         .filter(|e| e.entity_type == EntityType::Table && e.table_def.is_some())
-        .filter_map(snapshot::entity_to_table_snapshot)
+        .filter_map(|e| {
+            let mut t = snapshot::entity_to_table_snapshot(e)?;
+            qualify_bare_sequences(&mut t, &e.schema_path, &sequences);
+            Some(t)
+        })
         .map(|mut t| {
             if t.schema.is_empty() {
                 t.schema = DEFAULT_SCHEMA.to_string();
@@ -205,6 +214,39 @@ pub fn raw_snapshot_from_entities(entities: &[Entity]) -> Snapshot {
         timestamp: String::new(),
         tables,
         enums,
+    }
+}
+
+/// Name the schema of the sequence a bare `nextval('seq')` default draws on,
+/// as Postgres found it when the table's file ran (#60): the first schema on
+/// the file's path that `sequences` declares `seq` in. `pg_get_expr` prints a
+/// sequence the session's path does not reach with its schema —
+/// `nextval('app.seq'::regclass)` — so the bare spelling read as a changed
+/// default on every run. One declared on none of them is left as written:
+/// where it resolved, the design cannot say. A table read from a database
+/// has no path of its own, so is left as it is.
+fn qualify_bare_sequences(
+    t: &mut snapshot::TableSnapshot,
+    path: &crate::entity::SchemaPath,
+    sequences: &HashSet<&str>,
+) {
+    use crate::parser::pg::common::{nextval_sequence_of, regclass_parts};
+    use crate::sql_quote::ident_if_needed;
+    for c in &mut t.columns {
+        let Some(sequence) = c.default_value.as_deref().and_then(|d| nextval_sequence_of(d.trim())) else {
+            continue;
+        };
+        let parts = regclass_parts(&sequence);
+        let Some([name]) = parts.as_deref() else {
+            continue;
+        };
+        if let Some(schema) = path
+            .schemas()
+            .find(|schema| sequences.contains(format!("{schema}.{name}").as_str()))
+        {
+            let qualified = format!("{}.{}", ident_if_needed(schema), ident_if_needed(name));
+            c.default_value = Some(format!("nextval('{}'::regclass)", qualified.replace('\'', "''")));
+        }
     }
 }
 
@@ -648,10 +690,32 @@ pub(crate) fn canonical_default(raw: &str, data_type: &str) -> String {
     // default on every run. Both sides take the reported form — valid SQL with
     // the same meaning, as everything this returns must be (it is emitted).
     if let Some(sequence) = crate::parser::pg::common::nextval_sequence_of(raw.trim()) {
-        return format!("nextval('{}'::regclass)", sequence.replace('\'', "''"));
+        return format!(
+            "nextval('{}'::regclass)",
+            regclass_spelling(&sequence).replace('\'', "''")
+        );
     }
     let base = fold_unquoted_case(strip_trailing_cast(raw.trim()).trim());
     canonical_default_for_type(&base, data_type).unwrap_or(base)
+}
+
+/// The relation a `regclass` string names, spelled as `pg_get_expr` prints
+/// it (#60): each part as `quote_identifier` writes it — `'App.Seq'` is
+/// `app.seq`, `'"app"."seq"'` too — and no `public.`, the implicit search
+/// path, as [`canonical_type`] takes it. A string naming no relation by name
+/// (an OID) is kept as written.
+fn regclass_spelling(text: &str) -> String {
+    let Some(mut parts) = crate::parser::pg::common::regclass_parts(text) else {
+        return text.to_string();
+    };
+    if parts.len() == 2 && parts[0] == DEFAULT_SCHEMA {
+        parts.remove(0);
+    }
+    parts
+        .iter()
+        .map(|part| crate::sql_quote::ident_if_needed(part))
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 /// Settle a literal the server rewrites when it stores it (#18).
@@ -4400,6 +4464,91 @@ mod tests {
         );
         assert_eq!(canonical_default("'{oops'", "jsonb"), "'{oops'");
         assert_eq!(canonical_default("'not a date'", "timestamptz"), "'not a date'");
+    }
+
+    /// `nextval`'s argument is a `regclass` string, and `pg_get_expr` prints
+    /// the sequence it resolves to its own way (#60): each part as
+    /// `quote_identifier` writes it, and no schema for one on the search path.
+    /// Each pair measured on PostgreSQL 17, on the session's `"$user", public`.
+    #[test]
+    fn a_nextval_default_reads_as_postgres_prints_its_sequence() {
+        for (authored, reported) in [
+            ("nextval('App.Seq')", "nextval('app.seq'::regclass)"),
+            ("nextval('\"app\".\"seq\"')", "nextval('app.seq'::regclass)"),
+            ("nextval(' app . seq ')", "nextval('app.seq'::regclass)"),
+            ("nextval('APP.SEQ1')", "nextval('app.seq1'::regclass)"),
+            ("nextval('\"App\".\"Seq\"')", "nextval('\"App\".\"Seq\"'::regclass)"),
+            ("nextval('app.\"Seq\"')", "nextval('app.\"Seq\"'::regclass)"),
+            ("nextval('app.\"order\"')", "nextval('app.\"order\"'::regclass)"),
+            ("nextval('app.\"1s\"')", "nextval('app.\"1s\"'::regclass)"),
+            ("nextval('app.\"a''b\"')", "nextval('app.\"a''b\"'::regclass)"),
+            ("nextval('public.pseq')", "nextval('pseq'::regclass)"),
+            ("nextval('Public.PSEQ')", "nextval('pseq'::regclass)"),
+            ("nextval('PSeq')", "nextval('pseq'::regclass)"),
+            ("nextval('\"PSeq\"')", "nextval('\"PSeq\"'::regclass)"),
+        ] {
+            assert_eq!(canonical_default(authored, "integer"), reported, "{authored}");
+            assert_eq!(canonical_default(reported, "integer"), reported, "{reported}");
+        }
+    }
+
+    /// A bare `nextval('seq')` draws on the sequence Postgres found on the
+    /// table file's path when it ran: the first schema on it the design
+    /// declares `seq` in, which `pg_get_expr` prints when the session's path
+    /// does not reach it (#60). One the design declares on none of them, or a
+    /// table with no path of its own, is left as written.
+    #[test]
+    fn a_bare_nextval_default_names_the_schema_its_files_path_finds_the_sequence_in() {
+        use crate::entity::{PathEntry, SchemaPath, TableComments, TableDef};
+        let table = |name: &str, path: SchemaPath| {
+            let mut entity = Entity::new(EntityType::Table, name);
+            entity.schema_path = path;
+            entity.table_def = Some(TableDef {
+                columns: vec![
+                    col_default("d", "integer", "nextval('seq')"),
+                    col_default("e", "integer", "nextval('Seq'::regclass)"),
+                    col_default("f", "integer", "nextval('pseq')"),
+                ],
+                constraints: vec![],
+                indexes: vec![],
+                comments: TableComments::default(),
+            });
+            entity
+        };
+        let app = SchemaPath::from_file(vec![PathEntry::Schema("app".to_string())]);
+        let entities = vec![
+            Entity::new(EntityType::Sequence, "app.seq"),
+            Entity::new(EntityType::Sequence, "public.pseq"),
+            table("app.u", app),
+            table("app.v", SchemaPath::default()),
+        ];
+        let snap = snapshot_from_entities(&entities);
+        let defaults = |name: &str| -> Vec<String> {
+            snap.tables
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap()
+                .columns
+                .iter()
+                .map(|c| c.default_value.clone().unwrap())
+                .collect()
+        };
+        assert_eq!(
+            defaults("u"),
+            [
+                "nextval('app.seq'::regclass)",
+                "nextval('app.seq'::regclass)",
+                "nextval('pseq'::regclass)"
+            ]
+        );
+        assert_eq!(
+            defaults("v"),
+            [
+                "nextval('seq'::regclass)",
+                "nextval('seq'::regclass)",
+                "nextval('pseq'::regclass)"
+            ]
+        );
     }
 
     /// Type-awareness must not change what the old text-only rules did for

@@ -17,8 +17,23 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   names and sets none. An index in another schema was not found, `IF EXISTS`
   made the miss a no-op, and the version was recorded as applied with the old
   index still there. It now names the schema, as `reconcile` does.
+- **A `nextval` default converges however the design spells its sequence**
+  ([#60]). Postgres keeps the sequence as an OID and prints it its own way —
+  each part folded or quoted as `quote_identifier` does, and no schema when the
+  session's path reaches it — so `nextval('App.Seq')`, `nextval('"app"."seq"')`
+  and `nextval('public.s')` read as changed on every `reconcile` and `diff`.
+  So did a bare `nextval('seq')` in a file whose own `search_path` finds it in
+  a schema the session's does not: it now names the schema its file's path
+  finds the sequence in, when the design declares it there.
+- **A file's `SET search_path` ends with the file.** On PostgreSQL it stayed on
+  the pooled connection the file ran on, and whatever ran there next — the
+  introspection `reconcile` and `diff` compare against — read names through
+  it, so the same default could print with or without its schema from one run
+  to the next. The connection now goes back on the session's own path after a
+  script that sets one, and when a batch commits.
 
 [#73]: https://github.com/sensei-hq/dbd/issues/73
+[#60]: https://github.com/sensei-hq/dbd/issues/60
 
 ## [0.27.1] — 2026-10-14
 

@@ -74,6 +74,15 @@ fn jsonb_import_tmp(project: &str) -> String {
     format!("{JSONB_IMPORT_SCHEMA}.\"{}\"", name.replace('"', "\"\""))
 }
 
+/// Whether `sql` spells `search_path` anywhere, in any case — the only way a
+/// script can set one, so one that does not leaves its connection's path as
+/// it found it. The same test as [`script::keep_public_on_search_path`]'s
+/// fast path, without lower-casing a large data script to make it.
+fn mentions_search_path(sql: &str) -> bool {
+    const NAME: &[u8] = b"search_path";
+    sql.as_bytes().windows(NAME.len()).any(|w| w.eq_ignore_ascii_case(NAME))
+}
+
 /// One column of a table or view, as [`PostgresAdapter::column_kinds`] reads it.
 struct ColumnKind {
     name: String,
@@ -401,6 +410,19 @@ impl PostgresAdapter {
             let result = (&mut *tx).execute(sql).await;
             *guard = Some(tx);
             result.map(|_| ())
+        } else if mentions_search_path(sql) {
+            // A script's own `SET search_path` outlives it on the pooled
+            // connection it ran on, and what runs there next reads names
+            // through it: introspection printed `app.seq` as `seq`, and a
+            // default read as changed on every run (#60). Back on the
+            // session's path before the connection goes back.
+            let mut conn = self.pool.acquire().await?;
+            let result = (&mut *conn).execute(sql).await.map(|_| ());
+            if (&mut *conn).execute("RESET search_path").await.is_err() {
+                // Never handed out again on a path it could not leave.
+                conn.close_on_drop();
+            }
+            result
         } else {
             sqlx::raw_sql(sql).execute(&self.pool).await.map(|_| ())
         }
@@ -2823,7 +2845,15 @@ ORDER BY 1, 2, 4, 5"#;
     }
 
     async fn commit_batch(&self) -> Result<()> {
-        if let Some(tx) = self.batch.lock().await.take() {
+        if let Some(mut tx) = self.batch.lock().await.take() {
+            // A `SET search_path` a script in the batch ran is the session's
+            // once committed: the connection goes back on its own path, as
+            // one a lone script ran on does (#60). A rollback undoes it anyway.
+            use sqlx::Executor as _;
+            (&mut *tx)
+                .execute("RESET search_path")
+                .await
+                .map_err(|e| DbdError::Config(format!("commit batch transaction failed: {e}")))?;
             tx.commit()
                 .await
                 .map_err(|e| DbdError::Config(format!("commit batch transaction failed: {e}")))?;
