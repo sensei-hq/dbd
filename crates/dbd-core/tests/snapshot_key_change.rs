@@ -240,7 +240,7 @@ fn a_renamed_unique_index_a_foreign_key_rests_on_drops_it_first() {
         MigrationDialect::Postgres,
     );
     let sql = migration(dir, "parent");
-    let drop_index = at(&sql, "DROP INDEX IF EXISTS \"parent_code_uq\"");
+    let drop_index = at(&sql, "DROP INDEX IF EXISTS \"app\".\"parent_code_uq\"");
     assert!(at(&sql, "contype = 'f'") < drop_index, "{sql}");
     assert!(drop_index < at(&sql, "ADD FOREIGN KEY (code)"), "{sql}");
 }

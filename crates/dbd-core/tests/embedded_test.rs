@@ -4418,6 +4418,47 @@ async fn a_released_rename_of_a_unique_index_a_foreign_key_rests_on_applies() {
     .await;
 }
 
+/// An index renamed in a release whose DDL qualifies its names, and sets no
+/// search path: the migration runs on the session's, which `app` is not on,
+/// and still drops the old index (#73).
+#[tokio::test]
+async fn a_released_rename_of_an_index_off_the_search_path_drops_the_old_one() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let table = |index: &str| {
+        format!(
+            "create table if not exists app.t (\n  id integer primary key\n, c text not null\n);\n\
+             create unique index if not exists {index} on app.t (c);\n"
+        )
+    };
+    cut_rekey(dir, &[("t", &table("t_c_uq"))]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    cut_rekey(dir, &[("t", &table("t_c_key"))]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v2 renames the index");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_indexes WHERE schemaname = 'app' AND indexname = 't_c_key'",
+        "the renamed index",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        false,
+        "SELECT 1 FROM pg_indexes WHERE schemaname = 'app' AND indexname = 't_c_uq'",
+        "the old index",
+    )
+    .await;
+}
+
 /// The steps a key change runs as one hold the key's tables until they end:
 /// one of them waiting on a lock another session holds gives up after a
 /// bounded wait and rolls back, rather than holding them while it waits.
