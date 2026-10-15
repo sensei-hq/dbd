@@ -622,12 +622,28 @@ pub enum MigrationDialect {
 }
 
 impl MigrationDialect {
-    /// The dialect of the migrations a target runs: PostgreSQL's on `postgres`
+    /// The dialect of the migrations the database at `url` runs: its
+    /// adapter's — PostgreSQL's for any URL dbd's PostgreSQL adapter connects
+    /// to, which is every one not `sqlite:`, `file:` or `convex:` (nor one dbd
+    /// has no adapter for). With no URL to go by — none configured, or a
+    /// `$VAR` not set — the target's name decides: PostgreSQL's on `postgres`
     /// and `supabase`.
-    pub fn of_target(target: &str) -> Self {
-        match target {
-            "postgres" | "supabase" => Self::Postgres,
-            _ => Self::Portable,
+    pub fn of(url: Option<&str>, target: &str) -> Self {
+        const NOT_POSTGRES: [&str; 8] = [
+            "sqlite:",
+            "file:",
+            "convex:",
+            "mysql:",
+            "mariadb:",
+            "sqlserver:",
+            "mssql:",
+            "jdbc:",
+        ];
+        match url {
+            Some(url) if NOT_POSTGRES.iter().any(|scheme| url.starts_with(scheme)) => Self::Portable,
+            Some(_) => Self::Postgres,
+            None if matches!(target, "postgres" | "supabase") => Self::Postgres,
+            None => Self::Portable,
         }
     }
 }
@@ -647,7 +663,7 @@ impl MigrationDialect {
 fn order_key_changes(result: &mut MultiSnapshotResult, previous: &Snapshot, dialect: MigrationDialect) {
     use crate::diff::{ChangeAction, FieldDetail, FieldType, catalog_drop_sql, unnamed_drop_comment};
     use crate::entity::TableConstraint;
-    use crate::reconcile::{fk_change_sql, fk_detail, key_holders};
+    use crate::reconcile::{IndexDrops, fk_change_sql, fk_detail, key_holders, same_foreign_key};
 
     let mut before = canonical_types(previous);
     for stage in &mut result.snapshots {
@@ -705,7 +721,21 @@ fn order_key_changes(result: &mut MultiSnapshotResult, previous: &Snapshot, dial
         let (mut old, mut new) = (before.clone(), after.clone());
         crate::reconcile::canonicalize(&mut old);
         crate::reconcile::canonicalize(&mut new);
-        for (changed, holders) in key_holders(&old, &new, &before, &after) {
+        // The foreign keys each table's own migration adds: one kept under
+        // another name is added there, and not added back again.
+        let mut added: Vec<(String, crate::entity::ForeignKey)> = Vec::new();
+        for d in diff::diff(&before, &after) {
+            if let DiffAction::Change(changes) = d.action {
+                for c in changes {
+                    if let ChangeAction::Add(detail) = c.action
+                        && let FieldDetail::Constraint(TableConstraint::ForeignKey(fk)) = *detail
+                    {
+                        added.push((d.entity_name.clone(), fk));
+                    }
+                }
+            }
+        }
+        for (changed, holders) in key_holders(&old, &new, &before, &after, IndexDrops::Diff) {
             let mut drops: Vec<String> = Vec::new();
             let mut adds: Vec<String> = Vec::new();
             for h in &holders {
@@ -713,7 +743,11 @@ fn order_key_changes(result: &mut MultiSnapshotResult, previous: &Snapshot, dial
                     .then(|| catalog_drop_sql(&h.table, &TableConstraint::ForeignKey(h.fk.clone())))
                     .flatten();
                 drops.push(catalog.unwrap_or_else(|| fk_change_sql(&h.table, ChangeAction::Drop(fk_detail(&h.fk)))));
-                if let Some(kept) = &h.kept {
+                if let Some(kept) = &h.kept
+                    && !added
+                        .iter()
+                        .any(|(table, fk)| table == &h.table && same_foreign_key(fk, kept))
+                {
                     adds.push(fk_change_sql(&h.table, ChangeAction::Add(fk_detail(kept))));
                 }
             }
@@ -1473,7 +1507,7 @@ pub fn create_snapshot_of(
 }
 
 /// [`create_snapshot_of`], its migrations written in `dialect` (#65) — see
-/// [`MigrationDialect::of_target`].
+/// [`MigrationDialect::of`].
 pub fn create_snapshot_in(
     entities: &[Entity],
     project_dir: &Path,

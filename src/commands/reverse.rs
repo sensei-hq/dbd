@@ -508,7 +508,17 @@ pub async fn cmd_merge(
                 supabase: reverse::looks_like_supabase(&entities) || config.default_target() == Some("supabase"),
                 ..sel
             };
-            merge_snapshot(project_dir, config_path, env, &entities, &left, sel, dry_run, &config)
+            merge_snapshot(
+                project_dir,
+                config_path,
+                env,
+                &entities,
+                &left,
+                sel,
+                dry_run,
+                &config,
+                Some(&conn),
+            )
         }
     }
 }
@@ -546,7 +556,18 @@ pub fn cmd_merge_from_dbml(
         supabase: config.default_target() == Some("supabase"),
         ..sel
     };
-    merge_snapshot(project_dir, config_path, env, &entities, &[], sel, dry_run, &config)
+    let url = super::configured_database_url(config_path, None)?;
+    merge_snapshot(
+        project_dir,
+        config_path,
+        env,
+        &entities,
+        &[],
+        sel,
+        dry_run,
+        &config,
+        url.as_deref(),
+    )
 }
 
 /// The unified `merge` apply path (foreign DB, or managed DB at/ahead of the project):
@@ -575,6 +596,9 @@ fn merge_snapshot(
     sel: SchemaSelect,
     dry_run: bool,
     config: &dbd_core::config::DesignConfig,
+    // The database the migrations will run on, when one is named — it
+    // decides their dialect (#65).
+    url: Option<&str>,
 ) -> Result<()> {
     let format = &config.format;
     // Select schemas + keep only entities under a selected schema (same logic as
@@ -714,7 +738,7 @@ fn merge_snapshot(
     let design = dbd_core::Design::from_config_with_dir(config_path, env, Some(project_dir)).context(
         "failed to reload project after writing DDL — recover via version control if files were partially written",
     )?;
-    let dialect = dbd_core::snapshot::MigrationDialect::of_target(design.target_name());
+    let dialect = dbd_core::snapshot::MigrationDialect::of(url, design.target_name());
     let snap = dbd_core::snapshot::create_snapshot_in(
         design.entities(),
         project_dir,

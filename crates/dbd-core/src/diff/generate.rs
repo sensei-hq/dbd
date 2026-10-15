@@ -202,10 +202,22 @@ pub(crate) fn catalog_drop_sql(entity_name: &str, con: &TableConstraint) -> Opti
                 Some(schema) => format!("{schema}.{}", fk.ref_table),
                 None => fk.ref_table.clone(),
             };
+            // The columns it references too: two keys from the same columns to
+            // one table are told apart by them.
+            let references = if fk.ref_columns.is_empty() {
+                String::new()
+            } else {
+                let list = fk.ref_columns.iter().map(|c| literal(c)).collect::<Vec<_>>().join(", ");
+                format!(
+                    " AND ARRAY(SELECT a.attname::text FROM unnest(k.confkey) WITH ORDINALITY AS u(attnum, i) \
+                     JOIN pg_attribute a ON a.attrelid = k.confrelid AND a.attnum = u.attnum ORDER BY u.i) \
+                     = ARRAY[{list}]::text[]"
+                )
+            };
             (
                 "f",
                 format!(
-                    "{} AND k.confrelid = to_regclass({})",
+                    "{} AND k.confrelid = to_regclass({}){references}",
                     columns_are(&fk.columns),
                     literal(&target)
                 ),
@@ -631,14 +643,21 @@ fn constraint_add_sql(entity_name: &str, con: &TableConstraint) -> String {
             // without a `CONSTRAINT <name>` clause so Postgres auto-names it —
             // rather than literally naming the constraint "unnamed".
             let con_clause = constraint_clause(fk.name.as_deref());
+            // A key naming no columns references the primary key: `()` is no
+            // column list, but a syntax error (#65).
+            let ref_columns = if fk.ref_columns.is_empty() {
+                String::new()
+            } else {
+                format!("({})", fk.ref_columns.join(", "))
+            };
             let mut sql = format!(
-                "ALTER TABLE {} ADD {}FOREIGN KEY ({}) REFERENCES {}{}({})",
+                "ALTER TABLE {} ADD {}FOREIGN KEY ({}) REFERENCES {}{}{}",
                 entity_name,
                 con_clause,
                 fk.columns.join(", "),
                 ref_schema,
                 fk.ref_table,
-                fk.ref_columns.join(", ")
+                ref_columns
             );
             crate::emit::push_fk_clauses(&mut sql, fk);
             sql.push(';');

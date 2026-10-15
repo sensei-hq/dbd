@@ -1148,6 +1148,21 @@ pub(crate) struct KeyHolder {
     pub replaced: bool,
 }
 
+/// How a change decides which indexes it drops — the rule its own SQL
+/// follows, so [`key_holders`] finds the keys that SQL takes away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IndexDrops {
+    /// By shape, name aside — [`plan_index_convergence`]'s rule.
+    Shape,
+    /// As the diff of the raw snapshots drops them: by name — a migration's.
+    Diff,
+}
+
+/// Whether two foreign keys are the same key, their names aside.
+pub(crate) fn same_foreign_key(a: &ForeignKey, b: &ForeignKey) -> bool {
+    fk_shape(a) == fk_shape(b)
+}
+
 /// The foreign keys holding a key a change drops (#65).
 ///
 /// Postgres refuses to drop a primary key or a unique constraint while a
@@ -1163,6 +1178,7 @@ pub(crate) fn key_holders(
     new: &Snapshot,
     old_all: &Snapshot,
     new_raw: &Snapshot,
+    indexes: IndexDrops,
 ) -> Vec<(String, Vec<KeyHolder>)> {
     use crate::diff::{FieldDetail, FieldType};
 
@@ -1209,28 +1225,59 @@ pub(crate) fn key_holders(
         lost.push((d.entity_name.clone(), keys, columns));
     }
     // A unique index a foreign key can rest on — on columns, whole — that
-    // goes, as [`plan_index_convergence`] decides: the canonical snapshots
+    // goes, by the change's own rule (`indexes`): the canonical snapshots
     // carry no indexes.
     let raw_old: HashMap<String, &TableSnapshot> = old_all.tables.iter().map(|t| (qualified(t), t)).collect();
+    let can_hold = |ix: &crate::entity::IndexDef| {
+        ix.unique && ix.predicate.is_none() && ix.columns.iter().all(|c| !c.is_expression)
+    };
+    let as_key = |ix: &crate::entity::IndexDef| {
+        let columns: Vec<String> = ix.columns.iter().map(|c| c.name.clone()).collect();
+        (key_label("unique index", &ix.name, &columns), columns)
+    };
     for name in old_tables.keys() {
         let (Some(was), Some(is)) = (raw_old.get(name), new_tables.get(name)) else {
             continue;
         };
-        let is_cols = coercible_columns(&is.columns);
-        let kept: HashSet<IndexShape> = secondary_indexes(is)
-            .iter()
-            .map(|ix| index_shape(ix, &is_cols))
-            .collect();
-        let was_cols = coercible_columns(&was.columns);
-        let dropped: Keys = secondary_indexes(was)
-            .into_iter()
-            .filter(|ix| ix.unique && ix.predicate.is_none() && ix.columns.iter().all(|c| !c.is_expression))
-            .filter(|ix| !kept.contains(&index_shape(ix, &was_cols)))
-            .map(|ix| {
-                let columns: Vec<String> = ix.columns.iter().map(|c| c.name.clone()).collect();
-                (key_label("unique index", &ix.name, &columns), columns)
-            })
-            .collect();
+        let dropped: Keys = match indexes {
+            IndexDrops::Shape => {
+                let is_cols = coercible_columns(&is.columns);
+                let kept: HashSet<IndexShape> = secondary_indexes(is)
+                    .iter()
+                    .map(|ix| index_shape(ix, &is_cols))
+                    .collect();
+                let was_cols = coercible_columns(&was.columns);
+                secondary_indexes(was)
+                    .into_iter()
+                    .filter(|ix| can_hold(ix) && !kept.contains(&index_shape(ix, &was_cols)))
+                    .map(as_key)
+                    .collect()
+            }
+            IndexDrops::Diff => {
+                let one = |t: &TableSnapshot| Snapshot {
+                    version: 0,
+                    description: String::new(),
+                    timestamp: String::new(),
+                    tables: vec![t.clone()],
+                    enums: vec![],
+                };
+                diff::diff(&one(was), &one(is))
+                    .into_iter()
+                    .filter_map(|d| match d.action {
+                        DiffAction::Change(changes) => Some(changes),
+                        _ => None,
+                    })
+                    .flatten()
+                    .filter_map(|c| match c.action {
+                        ChangeAction::Drop(detail) => match *detail {
+                            FieldDetail::Index(ix) if can_hold(&ix) => Some(as_key(&ix)),
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                    .collect()
+            }
+        };
         if dropped.is_empty() {
             continue;
         }
@@ -1355,7 +1402,7 @@ pub(crate) fn plan_key_holders(
     let mut spans: Vec<(String, String)> = Vec::new();
     let mut refusals: Vec<String> = Vec::new();
     let mut outside_count = 0;
-    for (changed, holders) in key_holders(live, desired, live_all, desired_raw) {
+    for (changed, holders) in key_holders(live, desired, live_all, desired_raw, IndexDrops::Shape) {
         let mut drops: Vec<String> = Vec::new();
         let mut adds: Vec<String> = Vec::new();
         let mut outside: Vec<String> = Vec::new();
