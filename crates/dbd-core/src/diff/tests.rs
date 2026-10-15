@@ -922,6 +922,25 @@
     /// `SET EXPRESSION` on one ("is not a generated column"), so the column is
     /// rebuilt. Safe for this shape alone: a generated column's values are
     /// derived, so the rebuild recomputes exactly what was dropped.
+    /// A generated column's type changes in place, and stays generated — its
+    /// expression, changed or not, after the type: the change was dropped.
+    #[test]
+    fn a_generated_columns_type_change_alters_it_in_place() {
+        let old = col_generated("twice", "integer", "a * 2");
+        let new = col_generated("twice", "bigint", "a * 2");
+        let sql = generate_migration_sql(&[alter_col("public.g", "twice", old, new)]);
+        assert_eq!(sql, "ALTER TABLE public.g ALTER COLUMN twice TYPE bigint;");
+
+        let old = col_generated("twice", "integer", "a * 2");
+        let new = col_generated("twice", "bigint", "a * 3");
+        let sql = generate_migration_sql(&[alter_col("public.g", "twice", old, new)]);
+        assert_eq!(
+            sql,
+            "ALTER TABLE public.g ALTER COLUMN twice TYPE bigint;\n\
+             ALTER TABLE public.g ALTER COLUMN twice SET EXPRESSION AS (a * 3);"
+        );
+    }
+
     #[test]
     fn promoting_a_plain_column_to_generated_rebuilds_it() {
         let old = col("tsv", "tsvector");
@@ -1771,7 +1790,8 @@
         assert!(warnings[0].contains("type change"));
         assert!(warnings[0].contains("VARCHAR(100)"));
         assert!(warnings[0].contains("TEXT"));
-        assert!(warnings[0].contains("splitting"));
+        // Made in place: the advice to split it across versions is gone.
+        assert!(warnings[0].contains("in place") && !warnings[0].contains("splitting"));
     }
 
     #[test]
