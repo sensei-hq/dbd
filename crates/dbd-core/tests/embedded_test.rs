@@ -7949,6 +7949,122 @@ async fn a_nextval_default_postgres_spells_differently_converges() {
     assert!(touched.is_empty(), "in sync: {touched:?}");
 }
 
+/// A `nextval` default is read as the sequence it draws on, whatever path
+/// the database or role sets: on `app, public` Postgres prints `app.seq` as
+/// `seq`, and a design naming it either way read as changed forever (0.27.2
+/// review).
+#[tokio::test]
+async fn a_nextval_default_converges_on_a_database_whose_own_path_reaches_it() {
+    let (pg, url) = start_pg().await;
+    let settings = pg.settings();
+    connect(&url, "admin")
+        .await
+        .unwrap()
+        .execute_script("CREATE SCHEMA IF NOT EXISTS app; ALTER DATABASE testdb SET search_path = app, public;")
+        .await
+        .unwrap();
+    let url = format!(
+        "postgresql://{}:{}@{}:{}/testdb",
+        settings.username, settings.password, settings.host, settings.port
+    );
+    let adapter = connect(&url, "nextval_path").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    for d in ["ddl/sequence/app", "ddl/table/app"] {
+        std::fs::create_dir_all(dir.join(d)).unwrap();
+    }
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: nextval_path\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/sequence/app/seq.ddl"),
+        "create sequence if not exists app.seq;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/t.ddl"),
+        "set search_path to app;\ncreate table if not exists t (\n  id integer primary key\n\
+         , a integer default nextval('seq')\n, b integer default nextval('app.seq')\n);\n",
+    )
+    .unwrap();
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load");
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("reconcile");
+    let again = design
+        .reconcile(&*adapter, true, false, false, None, Progress::none())
+        .await
+        .expect("second dry run");
+    assert!(again.altered.is_empty(), "converged: {:?}", again.altered);
+    assert_in_sync(&design, &*adapter).await;
+}
+
+/// `nextval('public.pseq')` beside an `app.pseq` the file's path reaches
+/// first draws on `public.pseq`: emitting it as `pseq` bound the default to
+/// `app.pseq` (0.27.2 review).
+#[tokio::test]
+async fn a_public_qualified_nextval_default_draws_on_publics_sequence() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "nextval_public").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    for d in ["ddl/sequence/app", "ddl/sequence/public", "ddl/table/app"] {
+        std::fs::create_dir_all(dir.join(d)).unwrap();
+    }
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: nextval_public\nsource:\n  dialect: postgresql\nschemas:\n  - public\n  - app\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/sequence/app/pseq.ddl"),
+        "create sequence if not exists app.pseq start 5000;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/sequence/public/pseq.ddl"),
+        "create sequence if not exists public.pseq;\n",
+    )
+    .unwrap();
+    let table = |default: &str| {
+        format!(
+            "set search_path to app;\ncreate table if not exists t (\n  id integer primary key\n, n integer{default}\n);\n"
+        )
+    };
+    std::fs::write(dir.join("ddl/table/app/t.ddl"), table("")).unwrap();
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load");
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("create");
+    std::fs::write(
+        dir.join("ddl/table/app/t.ddl"),
+        table(" default nextval('public.pseq')"),
+    )
+    .unwrap();
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load");
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("the default");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_attrdef d JOIN pg_depend dep ON dep.classid = 'pg_attrdef'::regclass AND dep.objid = d.oid \
+         WHERE d.adrelid = 'app.t'::regclass AND dep.refobjid = 'public.pseq'::regclass",
+        "the default drawing on public.pseq",
+    )
+    .await;
+    let again = design
+        .reconcile(&*adapter, true, false, false, None, Progress::none())
+        .await
+        .expect("second dry run");
+    assert!(again.altered.is_empty(), "converged: {:?}", again.altered);
+}
+
 /// A project with no `project.version` has applied no migration. Reconcile
 /// recorded version 1 for it (apply records 0), after which a dev `reset`
 /// refused with "database has applied migrations".

@@ -4508,13 +4508,14 @@ mod tests {
         assert_eq!(canonical_default("'not a date'", "timestamptz"), "'not a date'");
     }
 
-    /// `nextval`'s argument is a `regclass` string, and `pg_get_expr` prints
-    /// the sequence it resolves to its own way (#60): each part as
-    /// `quote_identifier` writes it, and no schema for one on the search path.
-    /// Each pair measured on PostgreSQL 17, on the session's `"$user", public`.
+    /// `nextval`'s argument is a `regclass` string, read as Postgres reads it
+    /// and spelled as `quote_identifier` spells each part (#60): `'App.Seq'` is
+    /// `app.seq`. A schema the author wrote stays — `public` too: dropping it
+    /// emitted a default another schema's sequence of that name could answer
+    /// (0.27.2 review). Each pair measured on PostgreSQL 17.
     #[test]
     fn a_nextval_default_reads_as_postgres_prints_its_sequence() {
-        for (authored, reported) in [
+        for (authored, canonical) in [
             ("nextval('App.Seq')", "nextval('app.seq'::regclass)"),
             ("nextval('\"app\".\"seq\"')", "nextval('app.seq'::regclass)"),
             ("nextval(' app . seq ')", "nextval('app.seq'::regclass)"),
@@ -4524,45 +4525,68 @@ mod tests {
             ("nextval('app.\"order\"')", "nextval('app.\"order\"'::regclass)"),
             ("nextval('app.\"1s\"')", "nextval('app.\"1s\"'::regclass)"),
             ("nextval('app.\"a''b\"')", "nextval('app.\"a''b\"'::regclass)"),
-            ("nextval('public.pseq')", "nextval('pseq'::regclass)"),
-            ("nextval('Public.PSEQ')", "nextval('pseq'::regclass)"),
+            ("nextval('app.\"a.b\"')", "nextval('app.\"a.b\"'::regclass)"),
+            ("nextval('public.pseq')", "nextval('public.pseq'::regclass)"),
+            ("nextval('Public.PSEQ')", "nextval('public.pseq'::regclass)"),
             ("nextval('PSeq')", "nextval('pseq'::regclass)"),
             ("nextval('\"PSeq\"')", "nextval('\"PSeq\"'::regclass)"),
+            ("nextval('12345'::regclass)", "nextval('12345'::regclass)"),
         ] {
-            assert_eq!(canonical_default(authored, "integer"), reported, "{authored}");
-            assert_eq!(canonical_default(reported, "integer"), reported, "{reported}");
+            assert_eq!(canonical_default(authored, "integer"), canonical, "{authored}");
+            assert_eq!(canonical_default(canonical, "integer"), canonical, "{canonical}");
         }
     }
 
     /// A bare `nextval('seq')` draws on the sequence Postgres found on the
-    /// table file's path when it ran: the first schema on it the design
-    /// declares `seq` in, which `pg_get_expr` prints when the session's path
-    /// does not reach it (#60). One the design declares on none of them, or a
-    /// table with no path of its own, is left as written.
+    /// table file's path when it ran — dbd runs every file with `public` on
+    /// its path — and is named with that schema, as the live side is read (#60,
+    /// 0.27.2 review): the first schema on the path the design declares `seq`
+    /// in, else the file's first, where a sequence its file makes lands. A
+    /// table read from a database is left as it is.
     #[test]
     fn a_bare_nextval_default_names_the_schema_its_files_path_finds_the_sequence_in() {
         use crate::entity::{PathEntry, SchemaPath, TableComments, TableDef};
-        let table = |name: &str, path: SchemaPath| {
+        let table = |name: &str, path: SchemaPath, defaults: &[&str]| {
             let mut entity = Entity::new(EntityType::Table, name);
+            entity.file = Some(std::path::PathBuf::from(format!("ddl/table/{name}.ddl")));
             entity.schema_path = path;
             entity.table_def = Some(TableDef {
-                columns: vec![
-                    col_default("d", "integer", "nextval('seq')"),
-                    col_default("e", "integer", "nextval('Seq'::regclass)"),
-                    col_default("f", "integer", "nextval('pseq')"),
-                ],
+                columns: defaults
+                    .iter()
+                    .enumerate()
+                    .map(|(i, d)| col_default(&format!("c{i}"), "integer", d))
+                    .collect(),
                 constraints: vec![],
                 indexes: vec![],
                 comments: TableComments::default(),
             });
             entity
         };
-        let app = SchemaPath::from_file(vec![PathEntry::Schema("app".to_string())]);
+        let path = |schemas: &[&str]| {
+            SchemaPath::from_file(schemas.iter().map(|s| PathEntry::Schema(s.to_string())).collect())
+        };
+        let mut live = table("app.w", SchemaPath::default(), &["nextval('seq')"]);
+        live.file = None;
         let entities = vec![
             Entity::new(EntityType::Sequence, "app.seq"),
             Entity::new(EntityType::Sequence, "public.pseq"),
-            table("app.u", app),
-            table("app.v", SchemaPath::default()),
+            Entity::new(EntityType::Sequence, "public.both"),
+            Entity::new(EntityType::Sequence, "app.both"),
+            Entity::new(EntityType::Sequence, "App.Seq"),
+            table(
+                "app.u",
+                path(&["app"]),
+                &[
+                    "nextval('seq')",
+                    "nextval('Seq'::regclass)",
+                    "nextval('pseq')",
+                    "nextval('made_here')",
+                ],
+            ),
+            table("app.v", SchemaPath::default(), &["nextval('seq')", "nextval('pseq')"]),
+            table("app.x", path(&["app", "public"]), &["nextval('both')"]),
+            table("app.y", path(&["App"]), &["nextval('\"Seq\"')"]),
+            live,
         ];
         let snap = snapshot_from_entities(&entities);
         let defaults = |name: &str| -> Vec<String> {
@@ -4580,17 +4604,17 @@ mod tests {
             [
                 "nextval('app.seq'::regclass)",
                 "nextval('app.seq'::regclass)",
-                "nextval('pseq'::regclass)"
+                "nextval('public.pseq'::regclass)",
+                "nextval('app.made_here'::regclass)"
             ]
         );
         assert_eq!(
             defaults("v"),
-            [
-                "nextval('seq'::regclass)",
-                "nextval('seq'::regclass)",
-                "nextval('pseq'::regclass)"
-            ]
+            ["nextval('public.seq'::regclass)", "nextval('public.pseq'::regclass)"]
         );
+        assert_eq!(defaults("x"), ["nextval('app.both'::regclass)"]);
+        assert_eq!(defaults("y"), ["nextval('\"App\".\"Seq\"'::regclass)"]);
+        assert_eq!(defaults("w"), ["nextval('seq'::regclass)"]);
     }
 
     /// Type-awareness must not change what the old text-only rules did for
