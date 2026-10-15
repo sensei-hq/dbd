@@ -15,6 +15,8 @@ return type changes; then the patch 0.27.1. Branch `fix/65-key-change`
 - Slice 2 (functions): Postgres `apply_routine` drops and re-creates a routine
   `CREATE OR REPLACE` refuses (42P13/42809) when it is the only one of its
   name and nothing depends on it — reconcile and apply (savepoint in a batch).
+- Failure-mode review fixes: 10s lock timeout in the span; holders read from
+  `pg_constraint`. Docs on every surface; CHANGELOG `[Unreleased]`.
 - Slice 3 (migrations): `MigrationDialect` + `create_snapshot_in`; a version's
   migration drops the foreign keys holding a key first, re-adds kept ones; on
   PostgreSQL an unnamed key is dropped by catalog lookup. Review fixes: a
@@ -22,10 +24,10 @@ return type changes; then the patch 0.27.1. Branch `fix/65-key-change`
 
 ## Next
 
-1. Failure-mode review fixes (red first): `SET LOCAL lock_timeout` in the
-   key-change span; holders from `pg_constraint` (a table the role cannot see
-   in information_schema refuses). Then review slices 2 and 3.
-2. Docs (guide reconcile/migrations, CHANGELOG), `make bump` patch 0.27.1.
+1. Review findings for slices 2 (routines) and 3 (migrations) — running.
+2. File: a column turned GENERATED is rebuilt without its PK/UNIQUE.
+3. PR `fix/65-key-change` → `develop`, CI, merge; 0.27.1 notes heading;
+   `make bump` (patch) on `develop`; PR `develop` → `main`; verify installed.
 
 ## Open
 
