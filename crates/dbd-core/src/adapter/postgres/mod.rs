@@ -381,6 +381,14 @@ impl PostgresAdapter {
     /// the `Executor` bound resolves without the HRTB error that `#[async_trait]`
     /// desugaring produces for `raw_sql` against `&mut PgConnection`.
     async fn exec_raw(&self, sql: &str) -> Result<()> {
+        self.try_exec_raw(sql)
+            .await
+            .map_err(|e| DbdError::Config(format!("SQL execution failed: {e}")))
+    }
+
+    /// [`Self::exec_raw`], keeping the database's error as it came — for a
+    /// caller that acts on its SQLSTATE.
+    async fn try_exec_raw(&self, sql: &str) -> std::result::Result<(), sqlx::Error> {
         use sqlx::Executor as _;
         let mut guard = self.batch.lock().await;
         if let Some(mut tx) = guard.take() {
@@ -392,14 +400,72 @@ impl PostgresAdapter {
             // We own the transaction locally while executing, then put it back.
             let result = (&mut *tx).execute(sql).await;
             *guard = Some(tx);
-            result.map_err(|e| DbdError::Config(format!("SQL execution failed: {e}")))?;
+            result.map(|_| ())
         } else {
-            sqlx::raw_sql(sql)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| DbdError::Config(format!("SQL execution failed: {e}")))?;
+            sqlx::raw_sql(sql).execute(&self.pool).await.map(|_| ())
         }
-        Ok(())
+    }
+
+    /// Create or replace a function or procedure (#65).
+    ///
+    /// `CREATE OR REPLACE` keeps a routine's identity, so Postgres refuses one
+    /// that changes what it returns, renames a parameter, drops a parameter's
+    /// default or turns a function into a procedure (SQLSTATE `42P13`,
+    /// `42809`): a design changing `returns jsonb` to `returns table (…)`
+    /// failed on every run. Such a routine is dropped and created again, in
+    /// one transaction — a savepoint inside an open batch — when the database
+    /// has exactly one routine of that name, the one the file replaces. With
+    /// none or several, or with something depending on it, nothing is dropped:
+    /// the run fails naming the routines, or what depends on the one.
+    async fn apply_routine(&self, entity: &Entity, sql: &str) -> Result<()> {
+        let sql = script::keep_public_on_search_path(sql);
+        let failed =
+            |e: String| DbdError::Config(format!("Failed to apply {:?} {}: {e}", entity.entity_type, entity.name));
+        let in_batch = self.batch.lock().await.is_some();
+        if in_batch {
+            self.exec_raw("SAVEPOINT dbd_routine").await?;
+        }
+        let refused = match self.try_exec_raw(&sql).await {
+            Ok(()) => return self.end_routine_savepoint(in_batch, Ok(())).await,
+            Err(e) => e,
+        };
+        if in_batch {
+            self.exec_raw("ROLLBACK TO SAVEPOINT dbd_routine").await?;
+        }
+        if !matches!(bookkeeping::sqlstate(&refused).as_deref(), Some("42P13" | "42809")) {
+            let result = Err(failed(format!("SQL execution failed: {refused}")));
+            return self.end_routine_savepoint(in_batch, result).await;
+        }
+        let (schema, name) = crate::entity::split_qualified_name(&entity.name);
+        let schema = schema
+            .or_else(|| entity.schema.clone().filter(|s| !s.is_empty()))
+            .unwrap_or_else(|| "public".to_string());
+        let replace = format!("{}\n{sql}", routine_drop_block(&schema, &name));
+        let result = match self.try_exec_raw(&replace).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if in_batch {
+                    self.exec_raw("ROLLBACK TO SAVEPOINT dbd_routine").await?;
+                }
+                Err(failed(format!(
+                    "Postgres cannot replace it in place ({}), and dbd did not drop it to create it again: {}",
+                    database_message(&refused),
+                    database_message(&e)
+                )))
+            }
+        };
+        self.end_routine_savepoint(in_batch, result).await
+    }
+
+    /// Release [`Self::apply_routine`]'s savepoint when it set one, and return
+    /// `result` — the routine's, which a failed release does not hide.
+    async fn end_routine_savepoint(&self, in_batch: bool, result: Result<()>) -> Result<()> {
+        if in_batch {
+            let released = self.exec_raw("RELEASE SAVEPOINT dbd_routine").await;
+            result?;
+            return released;
+        }
+        result
     }
 
     /// True if the pg_cron extension is installed (its `cron.job` relation
@@ -1848,6 +1914,9 @@ impl DatabaseAdapter for PostgresAdapter {
         if entity.entity_type == EntityType::Enum {
             return self.apply_enum(entity, &sql).await;
         }
+        if matches!(entity.entity_type, EntityType::Function | EntityType::Procedure) {
+            return self.apply_routine(entity, &sql).await;
+        }
 
         self.execute_script(&sql).await.map_err(|e| {
             DbdError::Config(format!(
@@ -2913,6 +2982,44 @@ ORDER BY 1, 2, 4, 5"#;
         );
         self.execute_script(&sql).await
     }
+}
+
+/// A `DO` block dropping the one routine named `schema.name` (#65), run
+/// before its file creates it again — in the same script, so on the
+/// connection and `search_path` the drop resolves the routine's signature on.
+/// It raises, dropping nothing, when there is not exactly one, naming those
+/// there are; and when something depends on it, naming what does.
+fn routine_drop_block(schema: &str, name: &str) -> String {
+    let (schema, name) = (crate::sql_quote::literal(schema), crate::sql_quote::literal(name));
+    format!(
+        "DO $dbd$\n\
+         DECLARE\n  routines regprocedure[];\n  dependents text;\n\
+         BEGIN\n\
+         \x20 SELECT array_agg(p.oid::regprocedure ORDER BY p.oid::regprocedure::text) INTO routines\n\
+         \x20 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace\n\
+         \x20 WHERE n.nspname = {schema} AND p.proname = {name};\n\
+         \x20 IF coalesce(cardinality(routines), 0) <> 1 THEN\n\
+         \x20   RAISE EXCEPTION 'there are % routines of that name — %; drop the one the file replaces by hand',\n\
+         \x20     coalesce(cardinality(routines), 0), coalesce(array_to_string(routines, ', '), 'none');\n\
+         \x20 END IF;\n\
+         \x20 SELECT string_agg(DISTINCT CASE WHEN d.classid = 'pg_rewrite'::regclass\n\
+         \x20     THEN (SELECT 'view ' || r.ev_class::regclass::text FROM pg_rewrite r WHERE r.oid = d.objid)\n\
+         \x20     ELSE pg_describe_object(d.classid, d.objid, d.objsubid) END, ', ')\n\
+         \x20   INTO dependents\n\
+         \x20   FROM pg_depend d WHERE d.refobjid = routines[1]::oid AND d.deptype = 'n';\n\
+         \x20 IF dependents IS NOT NULL THEN\n\
+         \x20   RAISE EXCEPTION '% is depended on by %; drop what depends on it, then re-run', routines[1], dependents;\n\
+         \x20 END IF;\n\
+         \x20 EXECUTE format('DROP ROUTINE %s', routines[1]);\n\
+         END $dbd$;"
+    )
+}
+
+/// A database error's own message, without sqlx's prefix.
+fn database_message(e: &sqlx::Error) -> String {
+    e.as_database_error()
+        .map(|db| db.message().to_string())
+        .unwrap_or_else(|| e.to_string())
 }
 
 #[cfg(test)]
