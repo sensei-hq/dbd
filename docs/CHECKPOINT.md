@@ -23,16 +23,16 @@
 
 ## Next
 
-Phase 3 complete on `feat/workspaces`. Next: PR `feat/workspaces` → main, CI,
-then — with the user's OK — merge and the 0.27.0 release checklist.
+Phase 3 complete on `feat/workspaces`. Next: PR to main, CI, then with the
+user's OK the merge and the 0.27.0 release checklist.
 
 ## Open
 
-- main needs the rustls 0.23.46 bump too (cargo audit fails there).
+- main needs the rustls 0.23.46 bump: feat/workspaces carries it.
 - `dbd init --dry-run` writes design.yaml and the scaffold (not #7; unfiled).
 - Issue #60: reconcile re-emits a mixed-case `nextval('App.Seq')` default.
-- Declined: best-effort batch rollback error; dropping the old `dbd.import_tmp`;
-  migrating a branch build's `dbd.uses` CHECK (no `owner`) — rebuild those.
+- SQLite `deploy --module shared` with core's keys to it fails on a bare FK
+  error while emptying (Postgres names the keys) — slice 2, unfiled.
 - Delete by hand: `/tmp/dbd-*` scratch and review dirs; `git worktree remove
   /tmp/dbd-review-tests-wt` (and `git worktree prune`).
 
