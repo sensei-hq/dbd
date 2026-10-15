@@ -4787,6 +4787,53 @@ async fn a_released_table_cut_to_bigint_keeps_every_columns_values_and_definitio
     .await;
 }
 
+/// A released column renamed keeps its values and what it declares itself —
+/// NOT NULL, a default, `unique`: stage 1 adds the new name with its type
+/// alone, and stage 2 dropped the old one and left it at that.
+#[tokio::test]
+async fn a_released_rename_keeps_the_columns_values_and_definition() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let line = |name: &str| {
+        format!(
+            "create table if not exists app.line (\n  id integer primary key\n\
+             , {name} integer not null default 0 unique\n);\n"
+        )
+    };
+    cut_rekey(dir, &[("line", &line("qty"))]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    adapter
+        .execute_script("INSERT INTO app.line VALUES (1, 10), (2, 20);")
+        .await
+        .unwrap();
+    cut_rekey(dir, &[("line", &line("quantity"))]);
+    let design = released(dir);
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("the rename applies");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.line HAVING count(*) FILTER (WHERE id = 1 AND quantity = 10) = 1 \
+         AND count(*) FILTER (WHERE id = 2 AND quantity = 20) = 1",
+        "both rows' quantity",
+    )
+    .await;
+    let diff = design.diff_live(&*adapter, None).await.expect("diff");
+    let touched: Vec<String> = diff
+        .changes
+        .iter()
+        .map(|c| format!("{:?} {}", c.action, c.entity_name))
+        .collect();
+    assert!(touched.is_empty(), "the database is the design: {touched:?}");
+}
+
 // ── A routine whose return type changes (#65) ─────────────────────────────────
 
 /// A project `routines` in a temporary folder with `files` (`(path, text)`).
