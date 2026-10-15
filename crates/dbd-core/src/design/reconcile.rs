@@ -73,6 +73,50 @@ async fn refuse_enum_swaps_a_matview_blocks(
     )))
 }
 
+/// `live_all` with every foreign key the catalog has to a table of `live` that
+/// introspection did not list — one on a table the role has no privilege on,
+/// which `information_schema` hides (#65). A key it holds is then refused by
+/// name, like any other outside the run, instead of failing at the drop.
+async fn with_unlisted_foreign_keys(
+    adapter: &dyn DatabaseAdapter,
+    mut live_all: crate::snapshot::Snapshot,
+    live: &crate::snapshot::Snapshot,
+) -> Result<crate::snapshot::Snapshot> {
+    let tables: Vec<String> = live.tables.iter().map(|t| format!("{}.{}", t.schema, t.name)).collect();
+    for (holder, fk) in adapter.foreign_keys_to(&tables).await? {
+        let listed = live_all.tables.iter().any(|t| {
+            format!("{}.{}", t.schema, t.name) == holder
+                && (t.table_constraints.iter().any(|c| match c {
+                    crate::entity::TableConstraint::ForeignKey(known) => known.name == fk.name,
+                    _ => false,
+                }) || t
+                    .columns
+                    .iter()
+                    .any(|c| c.inline_fk.as_ref().is_some_and(|known| known.name == fk.name)))
+        });
+        if listed {
+            continue;
+        }
+        let (schema, name) = holder.split_once('.').unwrap_or(("public", holder.as_str()));
+        let constraint = crate::entity::TableConstraint::ForeignKey(fk);
+        match live_all
+            .tables
+            .iter_mut()
+            .find(|t| t.schema == schema && t.name == name)
+        {
+            Some(t) => t.table_constraints.push(constraint),
+            None => live_all.tables.push(crate::snapshot::TableSnapshot {
+                name: name.to_string(),
+                schema: schema.to_string(),
+                columns: Vec::new(),
+                indexes: Vec::new(),
+                table_constraints: vec![constraint],
+            }),
+        }
+    }
+    Ok(live_all)
+}
+
 impl Design {
     /// Read-only materialized-view detection for `reconcile`: for each design
     /// matview, decide create/skip/restamp/warn against the live `dbd:hash`
@@ -265,6 +309,10 @@ impl Design {
                     }
                 }
                 adapter.begin_batch().await?;
+                if let Err(err) = adapter.bound_lock_waits().await {
+                    let _ = adapter.rollback_batch().await;
+                    return Err(err);
+                }
                 open = Some((end, format!("{}:{}", e.entity_type.tag(), e.name)));
             }
             if ran_ahead.contains(&i) {
@@ -683,7 +731,7 @@ impl Design {
             &mut plan,
             &live,
             &desired,
-            &raw_snapshot_from_entities(&live_entities),
+            &with_unlisted_foreign_keys(adapter, raw_snapshot_from_entities(&live_entities), &live).await?,
             &desired_raw,
             &pruned,
         )?;

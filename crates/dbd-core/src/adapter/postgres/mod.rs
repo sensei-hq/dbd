@@ -2818,6 +2818,57 @@ ORDER BY 1, 2, 4, 5"#;
         Ok(())
     }
 
+    async fn bound_lock_waits(&self) -> Result<()> {
+        self.exec_raw(&format!("SET LOCAL lock_timeout = '{KEY_CHANGE_LOCK_TIMEOUT}'"))
+            .await
+    }
+
+    async fn foreign_keys_to(&self, tables: &[String]) -> Result<Vec<(String, crate::entity::ForeignKey)>> {
+        if tables.is_empty() {
+            return Ok(Vec::new());
+        }
+        // `pg_constraint`, not `information_schema`: the catalog lists every
+        // foreign key, whatever the role may read of the table it is on.
+        let columns = |key: &str, rel: &str| {
+            format!(
+                "ARRAY(SELECT a.attname::text FROM unnest(k.{key}) WITH ORDINALITY AS u(attnum, i) \
+                 JOIN pg_attribute a ON a.attrelid = k.{rel} AND a.attnum = u.attnum ORDER BY u.i)"
+            )
+        };
+        let rows = sqlx::query(&format!(
+            "SELECT hn.nspname || '.' || h.relname AS holder, k.conname::text AS name, \
+                    {} AS columns, rn.nspname::text AS ref_schema, r.relname::text AS ref_table, \
+                    {} AS ref_columns \
+             FROM pg_constraint k \
+             JOIN pg_class h ON h.oid = k.conrelid JOIN pg_namespace hn ON hn.oid = h.relnamespace \
+             JOIN pg_class r ON r.oid = k.confrelid JOIN pg_namespace rn ON rn.oid = r.relnamespace \
+             WHERE k.contype = 'f' AND rn.nspname || '.' || r.relname = ANY($1) \
+             ORDER BY 1, 2",
+            columns("conkey", "conrelid"),
+            columns("confkey", "confrelid"),
+        ))
+        .bind(tables)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbdError::Config(format!("reading the foreign keys to {} failed: {e}", tables.join(", "))))?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("holder"),
+                    crate::entity::ForeignKey {
+                        name: Some(row.get("name")),
+                        columns: row.get("columns"),
+                        ref_schema: Some(row.get("ref_schema")),
+                        ref_table: row.get("ref_table"),
+                        ref_columns: row.get("ref_columns"),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect())
+    }
+
     // ── Materialized-view refresh scheduling ────────────
 
     /// Live matview drift state: every materialized view (`pg_class.relkind =
@@ -2983,6 +3034,10 @@ ORDER BY 1, 2, 4, 5"#;
         self.execute_script(&sql).await
     }
 }
+
+/// How long a key change's steps wait for a lock another session holds
+/// before they give up (#65) — they hold the key's tables while they wait.
+const KEY_CHANGE_LOCK_TIMEOUT: &str = "10s";
 
 /// A `DO` block dropping the one routine named `schema.name` (#65), run
 /// before its file creates it again — in the same script, so on the
