@@ -19,3 +19,7 @@
 
 # throwaway projects written by integration tests
 /tests/.tmp/
+
+# nix build output
+/result
+.direnv
