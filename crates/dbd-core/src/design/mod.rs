@@ -267,8 +267,23 @@ pub struct ApplyResult {
 }
 
 /// Refuse to apply while any pending migration still has unresolved `-- TODO:`
-/// lines in its `data.sql` files.
+/// lines in its `data.sql` files — or was cut by a dbd before 0.27.2 for a
+/// type change that, run as written, loses the column's values.
 fn ensure_no_pending_todos(pending: &[PendingMigration]) -> Result<()> {
+    let lossy = snapshot::pending_lossy_swaps(pending)?;
+    if !lossy.is_empty() {
+        let details: String = lossy
+            .iter()
+            .map(|l| format!("  {} (v{}): column {}", l.file.display(), l.version, l.column))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(DbdError::Config(format!(
+            "Pending migration(s) cut by a dbd before 0.27.2 lose a column's values — its data.sql fills \
+             the column the next version drops:\n{details}\n\
+             Delete these unapplied versions and cut them again with `dbd snapshot` (0.27.2 or later), \
+             which changes the column's type in place."
+        )));
+    }
     let todos = snapshot::pending_data_sql_todos(pending)?;
     if todos.is_empty() {
         return Ok(());

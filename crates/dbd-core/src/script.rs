@@ -102,6 +102,11 @@ pub fn runnable_ddl(entity: &Entity) -> Option<String> {
     let ddl = ddl_from_entity(entity)?;
     Some(match project_search_path(entity) {
         Some(set) => format!("{set}\n{ddl}"),
+        // A file that states no path and gets none from the project runs on
+        // the session's — not on one an earlier file set on the connection,
+        // which in a batch built this file's tables in that file's schema
+        // (0.27.2 review).
+        None if entity.file.is_some() && !entity.schema_path.stated() => format!("RESET search_path;\n{ddl}"),
         None => ddl,
     })
 }
@@ -143,6 +148,24 @@ pub(crate) fn project_search_path(entity: &Entity) -> Option<String> {
         return None;
     }
     Some(search_path_statement(&path.entries))
+}
+
+/// Whether `sql` may set a search path: it spells `search_path` in any case —
+/// `SET`, `set_config`, a function's `SET` clause — or says `SET [SESSION |
+/// LOCAL] SCHEMA`, Postgres's other name for it. A script for which this is
+/// false leaves its connection's path as it found it. Reads the text without
+/// lower-casing a large data script to do it.
+pub(crate) fn may_set_search_path(sql: &str) -> bool {
+    const NAME: &[u8] = b"search_path";
+    if sql.as_bytes().windows(NAME.len()).any(|w| w.eq_ignore_ascii_case(NAME)) {
+        return true;
+    }
+    let words: Vec<&str> = sql.split_ascii_whitespace().collect();
+    words.iter().enumerate().any(|(i, word)| {
+        let is = |at: usize, what: &str| words.get(at).is_some_and(|w| w.eq_ignore_ascii_case(what));
+        word.eq_ignore_ascii_case("set")
+            && (is(i + 1, "schema") || ((is(i + 1, "session") || is(i + 1, "local")) && is(i + 2, "schema")))
+    })
 }
 
 /// `SET search_path TO <entries>, "public";` — `public` appended unless the
@@ -495,7 +518,7 @@ pub(crate) fn keep_public_on_search_path(sql: &str) -> std::borrow::Cow<'_, str>
     // A fast path, not a decision: a script that never spells the setting's
     // name sets no search path, and parsing every large data script to learn
     // that is waste. One that does is parsed, and the tree decides.
-    if !sql.to_ascii_lowercase().contains("search_path") {
+    if !may_set_search_path(sql) {
         return Cow::Borrowed(sql);
     }
     let Some(statements) = top_level_statements(sql) else {

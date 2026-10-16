@@ -62,7 +62,10 @@ impl SchemaDiff {
         // yields an identical advisory twice — collapse duplicates, keeping order.
         let mut seen = std::collections::HashSet::new();
         advisories.retain(|a| seen.insert(a.clone()));
-        let changes = diff::diff(&live, &desired);
+        let mut changes = diff::diff(&live, &desired);
+        // As reconcile and a migration run it: a column's rebuild and what it
+        // gives back (#72).
+        diff::with_rebuilds(&mut changes, &desired);
         let warnings = diff::migration_warnings(&changes);
         // `compute` only sees tables+enums; matview drift is filled in by `diff_live`.
         SchemaDiff {

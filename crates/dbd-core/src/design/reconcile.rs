@@ -656,28 +656,30 @@ impl Design {
             restrict_snapshot_to_schemas(raw_snapshot_from_entities(&live_entities), &managed_schemas),
             &hidden,
         );
-        plan_fk_convergence(&mut plan, &live_raw, &desired_raw);
+        // What a column's rebuild drops is gone by the time these run (#72).
+        let live_rebuilt = crate::reconcile::without_what_rebuilds_drop(&live_raw, &desired_raw);
+        plan_fk_convergence(&mut plan, &live_rebuilt, &desired_raw);
 
         // Secondary indexes (issue #12): canonicalize also strips indexes, so —
         // like FKs — converge them from the RAW snapshots. Adds a declared index
         // the live DB lacks (idempotent CREATE), and drops (destructive) one the
         // design removed. PK/UNIQUE-backing indexes are excluded on both sides.
-        plan_index_convergence(&mut plan, &live_raw, &desired_raw);
+        plan_index_convergence(&mut plan, &live_rebuilt, &desired_raw);
 
         // CHECK constraints: canonicalize strips these too, and nothing used to
         // put them back — so `dbd diff` reported CHECK drift that reconcile could
         // never act on, even with --allow-destructive. Converge them from the RAW
         // snapshots, matching by canonical expression since Postgres auto-names
         // every CHECK.
-        plan_check_convergence(&mut plan, &live_raw, &desired_raw);
+        plan_check_convergence(&mut plan, &live_rebuilt, &desired_raw);
         // EXCLUDE constraints, stripped by canonicalize as CHECKs are, and
         // matched the same way: by definition, since Postgres names them.
-        plan_exclusion_convergence(&mut plan, &live_raw, &desired_raw);
+        plan_exclusion_convergence(&mut plan, &live_rebuilt, &desired_raw);
 
         // Column comments: canonicalize clears these as well, so reconcile could
         // never act on the comment drift `dbd diff` kept reporting. Metadata only,
         // so never destructive.
-        plan_comment_convergence(&mut plan, &live_raw, &desired_raw);
+        plan_comment_convergence(&mut plan, &live_rebuilt, &desired_raw);
 
         // Enum value removal (issue #12): Postgres has no `ALTER TYPE … DROP
         // VALUE`, so the diff engine emitted no SQL and reconcile reported

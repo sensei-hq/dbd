@@ -185,7 +185,7 @@ cat migrations/002/config/users.sql
 dbd apply
 ```
 
-Smart multi-snapshot: complex changes (column rename, type change, enum value removal) are automatically split into multiple safe migration stages.
+Smart multi-snapshot: a column rename and a type change are made in place — `RENAME COLUMN`, `ALTER COLUMN … TYPE … USING` — so the column keeps its values and everything on it; what cannot be done in one step (a type change dbd cannot cast, an enum value removal) is split into safe migration stages.
 
 Pending migrations run version by version, each whole before the next — its creates and alters, then
 its data scripts, then its drops — so a database several versions behind ends where upgrading one

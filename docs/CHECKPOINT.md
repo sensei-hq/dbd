@@ -1,38 +1,38 @@
 # Checkpoint
 
-**Slice:** the open issues — #73, #60, #72 — each on its own branch off
-`develop`, red tests first. Nothing pushed, no PRs yet.
+**Slice:** patch 0.27.2 — #73, #60, #72 merged to `develop` (PRs #76–#78); the
+adversarial review's fixes on `fix/review-0.27.2` (PR #79). Awaiting release
+sign-off.
 
 ## Done
 
-- #73 on `fix/73-drop-index-schema`: a migration's `DROP INDEX` names the
-  table's schema. Red f342c2e8, fix 0b016139, CHANGELOG 408511b0. Embedded
-  suite 339/339 (one run saw a load-only failure in
-  `reconcile_changes_a_unique_index_a_foreign_key_rests_on`; 15/15 alone and
-  the rerun green — message not captured).
-- #60 on `fix/60-nextval-spelling`: a `nextval` default's sequence spelled as
-  Postgres prints it; a bare one in the schema its file's path finds it in;
-  a script's `SET search_path` reset on the pooled connection after it, and
-  before a batch commits. Red 9a1ecc7e + 84802081, fixes d484da8d +
-  24e781d8, docs 77819586. Embedded 340/340; CLI: 0.27.1 drifts (`diff
-  --exit-code` 2), the branch exits 0.
+- #73, #60, #72 on `develop` (6b17d98b).
+- Review (6 reviewers, approve depth) → `fix/review-0.27.2`, every crit/high/
+  medium fixed red-first:
+  - G3 released rename/type change in place (RENAME COLUMN; ALTER … TYPE …
+    USING; un-castable = data.sql TODO + in-place alter); narrowing refuses a
+    too-long value; generated type change; pre-0.27.2 lossy swap refused.
+  - G4 column turned generated: every key/constraint/FK/index/comment back,
+    reconcile same run, diff shows it, history does not.
+  - G1 nextval fully qualified (live via pg_depend; design keeps public).
+  - G2 pathless file resets the path (batch too); SET SCHEMA resets the pool.
+  - G5 live names quoted in DROP; G6 #73 schema-less table.
+- Gate: embedded 361/361, cli_live 82/82, clippy -D warnings (embedded), fmt;
+  sensei copy converges; type-change probe keeps every value.
 
 ## Next
 
-#72 on `fix/72-rebuilt-column-keys` from `develop`: a column rebuilt (turned
-generated; a migration's type swap) gets back its PRIMARY KEY/UNIQUE, the
-foreign keys holding them dropped first and re-added after.
-`cargo test -p dbd-core --features embedded-tests --test embedded_test`
+On sign-off: merge PR #79 locally into `develop`, push; release checklist
+(CHANGELOG [Unreleased] → [0.27.2], `make bump`, main merge, CI green,
+install and re-run the repros). Close #60/#72/#73 when `main` has them.
 
 ## Open
 
-- To ask: push the three branches, open PRs, merge to `develop`.
-- Probe after #72: a rebuild likely also loses NOT NULL, default, indexes,
-  CHECKs and outgoing FKs (stage 1 adds `<col>_new` with its type only).
-- Two-reconcile convergence check on a schema-only sensei copy, once all
-  three are merged.
+- Low, reported: `diff` omits the FK holder drop/re-add reconcile runs;
+  dotted schema names in `schema.table` entity names.
 - Unfiled (from before): `init --dry-run` writes files; SQLite scopes cannot
   name a table; a dry run with `--allow-destructive` still says to re-run
   with it; SQLite `deploy --module shared` fails on a bare FK error.
-- Scratch to delete: /tmp/dbd-60-cli, /tmp/dbd-60-*.log, /tmp/dbd-emb-run2.log
-  and the older /tmp/dbd-* dirs listed at 0.27.1.
+- Scratch to delete (rm -rf was refused): /tmp/dbd-* (0271, 60, 65, 72
+  logs/dirs), /tmp/dbd-review-0272, /tmp/dbd-review-target*,
+  /tmp/dbd-spec-audit-* and a stopped cluster /tmp/dbd-spec-audit-pg-HIoE.

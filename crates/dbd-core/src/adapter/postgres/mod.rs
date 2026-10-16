@@ -74,15 +74,6 @@ fn jsonb_import_tmp(project: &str) -> String {
     format!("{JSONB_IMPORT_SCHEMA}.\"{}\"", name.replace('"', "\"\""))
 }
 
-/// Whether `sql` spells `search_path` anywhere, in any case — the only way a
-/// script can set one, so one that does not leaves its connection's path as
-/// it found it. The same test as [`script::keep_public_on_search_path`]'s
-/// fast path, without lower-casing a large data script to make it.
-fn mentions_search_path(sql: &str) -> bool {
-    const NAME: &[u8] = b"search_path";
-    sql.as_bytes().windows(NAME.len()).any(|w| w.eq_ignore_ascii_case(NAME))
-}
-
 /// One column of a table or view, as [`PostgresAdapter::column_kinds`] reads it.
 struct ColumnKind {
     name: String,
@@ -410,7 +401,7 @@ impl PostgresAdapter {
             let result = (&mut *tx).execute(sql).await;
             *guard = Some(tx);
             result.map(|_| ())
-        } else if mentions_search_path(sql) {
+        } else if script::may_set_search_path(sql) {
             // A script's own `SET search_path` outlives it on the pooled
             // connection it ran on, and what runs there next reads names
             // through it: introspection printed `app.seq` as `seq`, and a
@@ -1069,6 +1060,13 @@ impl PostgresAdapter {
                     a.attidentity::text AS attidentity, \
                     a.attgenerated::text AS attgenerated, \
                     pg_get_expr(ad.adbin, ad.adrelid) AS column_default, \
+                    (SELECT format('%I.%I', sn.nspname, sq.relname) \
+                       FROM pg_depend dep \
+                       JOIN pg_class sq ON sq.oid = dep.refobjid AND sq.relkind = 'S' \
+                       JOIN pg_namespace sn ON sn.oid = sq.relnamespace \
+                      WHERE dep.classid = 'pg_attrdef'::regclass AND dep.objid = ad.oid \
+                        AND dep.refclassid = 'pg_class'::regclass \
+                      ORDER BY 1 LIMIT 1) AS default_sequence, \
                     format_type(a.atttypid, a.atttypmod) AS col_type, \
                     a.atttypid::regtype::text AS underlying_type, \
                     col_description(a.attrelid, a.attnum) AS col_comment, \
@@ -1110,6 +1108,17 @@ impl PostgresAdapter {
                 let col_type: String = row.get("col_type");
                 let attnotnull: bool = row.get("attnotnull");
                 let default_value: Option<String> = row.get("column_default");
+                // A `nextval` default names its sequence by the schema it is
+                // in, not as `pg_get_expr` prints it — relative to the reading
+                // session's path, so `app.seq` reads as `seq` wherever `app`
+                // is on it (#60, 0.27.2 review).
+                let default_sequence: Option<String> = row.get("default_sequence");
+                let default_value = match (default_value, default_sequence) {
+                    (Some(d), Some(sequence)) if crate::parser::pg::common::nextval_sequence_of(d.trim()).is_some() => {
+                        Some(format!("nextval('{}'::regclass)", sequence.replace('\'', "''")))
+                    }
+                    (d, _) => d,
+                };
                 let attidentity: String = row.get("attidentity");
                 let attgenerated: String = row.get("attgenerated");
                 let underlying_type: String = row.get("underlying_type");

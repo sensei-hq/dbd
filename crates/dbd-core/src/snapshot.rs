@@ -205,6 +205,68 @@ pub fn pending_data_sql_todos(pending: &[PendingMigration]) -> Result<Vec<DataSq
     Ok(result)
 }
 
+/// A pending version a dbd before 0.27.2 cut for a column's type change, whose
+/// data script fills the column the next version drops: run as written, the
+/// column loses every value. 0.27.1 and earlier staged a type change as
+/// `ADD COLUMN <column>_new` with a `data.sql` meant to fill it, but wrote
+/// `SET "<column>" = "<column>"::<type>`.
+#[derive(Debug, Clone)]
+pub struct LossySwap {
+    /// Version number of the migration the data script belongs to.
+    pub version: u32,
+    /// The data script.
+    pub file: PathBuf,
+    /// The column whose values it loses.
+    pub column: String,
+}
+
+/// The pending versions' [`LossySwap`]s, found by that shape: a table file
+/// adding `<column>_new`, beside a data script setting `<column>` from itself.
+/// Fails closed, as [`pending_data_sql_todos`] does.
+pub fn pending_lossy_swaps(pending: &[PendingMigration]) -> Result<Vec<LossySwap>> {
+    let mut found = Vec::new();
+    for migration in pending {
+        let dir = &migration.migration_dir;
+        if !dir.exists() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(dir) {
+            let entry = entry.map_err(|e| DbdError::Config(format!("scan {}: {e}", dir.display())))?;
+            let path = entry.path();
+            let Some(table_file) = path
+                .to_str()
+                .and_then(|p| p.strip_suffix(".data.sql"))
+                .map(|stem| PathBuf::from(format!("{stem}.sql")))
+            else {
+                continue;
+            };
+            if !entry.file_type().is_file() || !table_file.exists() {
+                continue;
+            }
+            let data = crate::source_text::read_to_string(path)?;
+            let table = crate::source_text::read_to_string(&table_file)?;
+            for line in data.lines() {
+                // `UPDATE "s"."t" SET "<column>" = "<column>"::<type>;`
+                let Some((_, rest)) = line.trim().split_once(" SET \"") else {
+                    continue;
+                };
+                let Some((column, rest)) = rest.split_once("\" = \"") else {
+                    continue;
+                };
+                if rest.starts_with(&format!("{column}\"::")) && table.contains(&format!("ADD COLUMN {column}_new ")) {
+                    found.push(LossySwap {
+                        version: migration.to_version,
+                        file: path.to_path_buf(),
+                        column: column.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    found.sort_by(|a, b| (a.version, &a.file).cmp(&(b.version, &b.file)));
+    Ok(found)
+}
+
 // ── Snapshot I/O ────────────────────────────────────────
 
 /// The migration graph written alongside snapshot `version`, if there is one.
@@ -497,7 +559,9 @@ pub fn prepare_snapshot(
         Some(prev) => {
             // Compared in canonical spelling, stored as authored — see
             // [`canonical_types`] for why the two must not be the same thing.
-            let diffs = diff::diff(&canonical_types(prev), &canonical_types(&snapshot));
+            let canonical = canonical_types(&snapshot);
+            let mut diffs = diff::diff(&canonical_types(prev), &canonical);
+            diff::with_rebuilds(&mut diffs, &canonical);
 
             if diffs.is_empty() {
                 return SnapshotResult {
@@ -666,6 +730,13 @@ fn order_key_changes(result: &mut MultiSnapshotResult, previous: &Snapshot, dial
     use crate::reconcile::{KeyDrops, fk_change_sql, fk_detail, key_holders, same_foreign_key};
 
     let mut before = canonical_types(previous);
+    // The version's renames ran first, in place, and took every key and
+    // foreign key with them: what changed is read past them, as the stages
+    // were built.
+    if let Some(first) = result.snapshots.iter().find(|s| !s.is_baseline && !s.no_changes) {
+        let renames = detected_renames(&before, &canonical_types(&first.snapshot));
+        before = with_renames(&before, &renames);
+    }
     for stage in &mut result.snapshots {
         if stage.is_baseline || stage.no_changes {
             continue;
@@ -862,11 +933,20 @@ fn prepare_stages(
     // with an add into a rename, and the stage builders derive their snapshots
     // from it — feed those a raw `prev` beside canonical diffs and `TEXT` no
     // longer equals `text`, so a genuine rename stops being detected.
-    let prev = &canonical_types(prev);
+    let authored = final_snapshot.clone();
+    let prev = canonical_types(prev);
     let final_snapshot = canonical_types(&final_snapshot);
-    let diffs = diff::diff(prev, &final_snapshot);
+    // A rename is made in place — `RENAME COLUMN`, which keeps the column's
+    // values and every key, constraint, index and foreign key on it, and the
+    // foreign keys holding it. It leads the version, and the rest is diffed
+    // as if it had already run: what the design declares over the new name is
+    // what the rename made of the old (0.27.2 review).
+    let renames = detected_renames(&prev, &final_snapshot);
+    let prev = &with_renames(&prev, &renames);
+    let mut diffs = diff::diff(prev, &final_snapshot);
+    diff::with_rebuilds(&mut diffs, &final_snapshot);
 
-    if diffs.is_empty() {
+    if diffs.is_empty() && renames.is_empty() {
         return MultiSnapshotResult {
             snapshots: vec![SnapshotResult {
                 snapshot: final_snapshot,
@@ -881,147 +961,210 @@ fn prepare_stages(
         };
     }
 
-    // Classify into simple and complex
-    let (simple_diffs, complex_changes) = diff::classify_changes(&diffs, prev);
-
-    // No complex → delegate to existing prepare_snapshot (single stage)
-    if complex_changes.is_empty() {
-        let result = prepare_snapshot(entities, Some(prev), next_version, description);
-        return MultiSnapshotResult {
-            snapshots: vec![result],
-            todos: vec![],
-        };
+    // A type change dbd can cast is made in place too — `ALTER COLUMN … TYPE
+    // … USING`, as reconcile makes it: Postgres converts every value, and
+    // refuses one the new type cannot hold. Only what cannot be made in one
+    // step is staged: a type change dbd cannot cast, and an enum value
+    // removal. The column swap (`<column>_new`, filled, then renamed into
+    // place) lost the column's values, keys, identity and constraints.
+    let (mut simple_diffs, complex_changes) = diff::classify_changes(&diffs, prev);
+    let mut staged = Vec::new();
+    for change in complex_changes {
+        match change {
+            ComplexChange::ColumnTypeChange {
+                ref table_name,
+                ref column_name,
+                ref old_type,
+                ref new_type,
+                ref old_col,
+                ref new_col,
+            } if diff::is_castable(old_type, new_type) => in_place(
+                &mut simple_diffs,
+                table_name,
+                diff::FieldChange {
+                    field_name: column_name.clone(),
+                    field_type: diff::FieldType::Column,
+                    action: diff::ChangeAction::Alter {
+                        old: Box::new(diff::FieldDetail::Column(old_col.as_ref().clone())),
+                        new: Box::new(diff::FieldDetail::Column(new_col.as_ref().clone())),
+                    },
+                },
+            ),
+            other => staged.push(other),
+        }
     }
 
-    // Two stages: first what is safe to run before anything is lost — the
-    // additions, and the `data.sql` that moves rows off a column or a value
-    // about to go — then what drops or replaces. An enum value removal used to
-    // take a third stage that re-pointed its columns at a type the second had
-    // dropped; apply runs each entity's migrations at its place in dependency
-    // order, not stage by stage, so that never ran in the order it was written.
     let ctx = MultiStageCtx {
         prev,
         final_snapshot: &final_snapshot,
-        complex_changes: &complex_changes,
+        complex_changes: &staged,
+        renames: &renames,
         entities,
         next_version,
-        num_stages: 2,
+        num_stages: if staged.is_empty() { 1 } else { 2 },
         description,
     };
 
     let mut todos = Vec::new();
     let mut snapshots = Vec::new();
 
-    // Stage 1: additive changes (safe to apply first). Its snapshot is the base
+    // Stage 1 — the whole version, when nothing is staged: the renames, the
+    // diff, and the first step of each staged change. Its snapshot is the base
     // stage 2 evolves from.
-    let stage1 = build_stage1(&ctx, &diffs, &simple_diffs, &mut todos);
+    let mut stage1 = build_stage1(&ctx, &diffs, &simple_diffs, &mut todos);
+    if ctx.num_stages == 1 {
+        // Stored as authored, compared canonical — see [`canonical_types`].
+        stage1.snapshot = Snapshot {
+            version: next_version,
+            description: description.to_string(),
+            ..authored
+        };
+        snapshots.push(stage1);
+        return MultiSnapshotResult { snapshots, todos };
+    }
     let stage1_snap = stage1.snapshot.clone();
     snapshots.push(stage1);
 
-    // Stage 2: destructive changes on top of stage 1.
+    // Stage 2: what the staged changes do once their rows are ready.
     snapshots.push(build_stage2(&ctx, stage1_snap));
 
     MultiSnapshotResult { snapshots, todos }
 }
 
-/// Append `more` to `sql` on a line of its own, when there is any.
-fn append_sql(sql: &mut String, more: &str) {
-    if !more.is_empty() {
-        sql.push('\n');
-        sql.push_str(more);
-    }
+/// A column renamed: `table`'s `old` is `new`.
+#[derive(Debug, Clone)]
+struct Rename {
+    table: String,
+    old: String,
+    new: String,
 }
 
-/// The constraints `col` declares itself — `primary key`, `unique` and
-/// `references` written on the column — which a snapshot keeps on the column
-/// rather than among the table's.
-fn inline_constraints(col: &ColumnDef) -> Vec<crate::entity::TableConstraint> {
+/// The renames the diff of `prev` and `next` reads: a table's one column
+/// dropped and one added, of one type — [`diff::classify_changes`]'s rule.
+fn detected_renames(prev: &Snapshot, next: &Snapshot) -> Vec<Rename> {
+    let (_, complex) = diff::classify_changes(&diff::diff(prev, next), prev);
+    let mut renames: Vec<Rename> = complex
+        .into_iter()
+        .filter_map(|c| match c {
+            ComplexChange::ColumnRename {
+                table_name,
+                old_name,
+                new_name,
+                ..
+            } => Some(Rename {
+                table: table_name,
+                old: old_name,
+                new: new_name,
+            }),
+            _ => None,
+        })
+        .collect();
+    renames.sort_by(|a, b| (&a.table, &a.old).cmp(&(&b.table, &b.old)));
+    renames
+}
+
+/// `snap` with `renames` made, as Postgres makes them: the column, and every
+/// key, constraint, index and foreign key naming it — the table's own and any
+/// table's reference to it.
+fn with_renames(snap: &Snapshot, renames: &[Rename]) -> Snapshot {
     use crate::entity::TableConstraint;
-    let mut found = Vec::new();
-    if col.is_pk {
-        found.push(TableConstraint::PrimaryKey {
-            name: None,
-            columns: vec![col.name.clone()],
-        });
+    use crate::sql_expr::rename_column;
+    let mut out = snap.clone();
+    let qualified = |t: &TableSnapshot| format!("{}.{}", t.schema, t.name);
+    for r in renames {
+        let names = |list: &mut Vec<String>| {
+            for name in list.iter_mut().filter(|n| **n == r.old) {
+                *name = r.new.clone();
+            }
+        };
+        let expression = |text: &mut String| {
+            if let Some(renamed) = rename_column(text, &r.old, &r.new) {
+                *text = renamed;
+            }
+        };
+        for t in &mut out.tables {
+            let own = qualified(t) == r.table;
+            let schema = t.schema.clone();
+            let references_it = |fk: &crate::entity::ForeignKey| {
+                format!("{}.{}", fk.ref_schema.as_deref().unwrap_or(&schema), fk.ref_table) == r.table
+            };
+            for c in &mut t.columns {
+                if own && c.name == r.old {
+                    c.name = r.new.clone();
+                }
+                if let Some(fk) = c.inline_fk.as_mut() {
+                    if own {
+                        names(&mut fk.columns);
+                    }
+                    if references_it(fk) {
+                        names(&mut fk.ref_columns);
+                    }
+                }
+            }
+            for con in &mut t.table_constraints {
+                match con {
+                    TableConstraint::PrimaryKey { columns, .. } | TableConstraint::Unique { columns, .. } if own => {
+                        names(columns)
+                    }
+                    TableConstraint::ForeignKey(fk) => {
+                        if own {
+                            names(&mut fk.columns);
+                        }
+                        if references_it(fk) {
+                            names(&mut fk.ref_columns);
+                        }
+                    }
+                    TableConstraint::Check { expression: text, .. } if own => expression(text),
+                    _ => {}
+                }
+            }
+            if own {
+                for ix in &mut t.indexes {
+                    for c in &mut ix.columns {
+                        if c.is_expression {
+                            expression(&mut c.name);
+                        } else if c.name == r.old {
+                            c.name = r.new.clone();
+                        }
+                    }
+                    names(&mut ix.include);
+                    if let Some(predicate) = ix.predicate.as_mut() {
+                        expression(predicate);
+                    }
+                }
+            }
+        }
     }
-    if col.is_unique {
-        found.push(TableConstraint::Unique {
-            name: None,
-            columns: vec![col.name.clone()],
-            nulls_not_distinct: false,
-        });
-    }
-    found.extend(col.inline_fk.clone().map(TableConstraint::ForeignKey));
-    found
+    out
 }
 
-/// The rest of a column a migration's swap puts in place of another (#72).
-///
-/// Stage 1 adds it with its type alone — its rows are filled after — so
-/// stage 2, once it has its name, gives it what the design declares: NOT
-/// NULL, its default and identity, as the diff alters a column to them, the
-/// identity going on past the values the rows already hold; then
-/// `constraints`.
-fn restore_column_sql(table: &str, col: &ColumnDef, constraints: Vec<crate::entity::TableConstraint>) -> String {
-    use crate::sql_quote::{ident, literal, qualified};
-    let bare = ColumnDef {
-        nullable: true,
-        default_value: None,
-        identity: None,
-        ..col.clone()
-    };
-    // An identity column is NOT NULL, and must be before it can be one.
-    let whole = ColumnDef {
-        nullable: col.nullable && col.identity.is_none(),
-        ..col.clone()
-    };
-    let change = |action| diff::FieldChange {
-        field_name: col.name.clone(),
-        field_type: diff::FieldType::Column,
-        action,
-    };
-    let mut sql = diff::generate_migration_sql(&[MigrationDiff {
-        entity_name: table.to_string(),
-        entity_type: EntityType::Table,
-        action: DiffAction::Change(vec![change(diff::ChangeAction::Alter {
-            old: Box::new(diff::FieldDetail::Column(bare)),
-            new: Box::new(diff::FieldDetail::Column(whole)),
-        })]),
-    }]);
-    if col.identity.is_some() {
-        append_sql(
-            &mut sql,
-            &format!(
-                "SELECT setval(pg_get_serial_sequence({}, {}), max({column})) FROM {table} HAVING max({column}) IS NOT NULL;",
-                literal(&qualified(table)),
-                literal(&col.name),
-                column = ident(&col.name),
-            ),
-        );
-    }
-    append_sql(
-        &mut sql,
-        &diff::generate_migration_sql(&[MigrationDiff {
+/// Fold an in-place column change into `table`'s diff: after its other
+/// column changes, before its constraints and indexes — which may name it.
+fn in_place(diffs: &mut Vec<MigrationDiff>, table: &str, change: diff::FieldChange) {
+    match diffs.iter_mut().find(|d| d.entity_name == table) {
+        Some(MigrationDiff {
+            action: DiffAction::Change(changes),
+            ..
+        }) => {
+            let at = changes
+                .iter()
+                .position(|c| c.field_type != diff::FieldType::Column)
+                .unwrap_or(changes.len());
+            changes.insert(at, change);
+        }
+        _ => diffs.push(MigrationDiff {
             entity_name: table.to_string(),
             entity_type: EntityType::Table,
-            action: DiffAction::Change(
-                constraints
-                    .into_iter()
-                    .map(|c| diff::FieldChange {
-                        field_name: String::new(),
-                        field_type: diff::FieldType::Constraint,
-                        action: diff::ChangeAction::Add(Box::new(diff::FieldDetail::Constraint(c))),
-                    })
-                    .collect(),
-            ),
-        }]),
-    );
-    sql
+            action: DiffAction::Change(vec![change]),
+        }),
+    }
 }
 
 /// Shared inputs threaded through the multi-stage migration builders.
 struct MultiStageCtx<'a> {
     prev: &'a Snapshot,
+    /// The version's renames, made in place before anything else.
+    renames: &'a [Rename],
     final_snapshot: &'a Snapshot,
     complex_changes: &'a [ComplexChange],
     /// The design's entities: what an enum swap finds the views over its
@@ -1087,10 +1230,7 @@ impl StageBuilder {
                 self.dropped.push(d.entity_name.clone());
                 let sql = diff::generate_migration_sql(std::slice::from_ref(d));
                 if !sql.is_empty() {
-                    self.files.push(MigrationFile {
-                        relative_path: entity_migration_path(&d.entity_name),
-                        content: sql,
-                    });
+                    push_or_append_sql(&mut self.files, entity_migration_path(&d.entity_name), sql);
                 }
                 // Remove from snapshot
                 if d.entity_type == EntityType::Table {
@@ -1104,13 +1244,11 @@ impl StageBuilder {
                 }
             }
             DiffAction::Change(_) => {
-                self.altered.push(d.entity_name.clone());
+                // Appended: a rename leads the table's file.
+                self.mark_altered(&d.entity_name);
                 let sql = diff::generate_migration_sql(std::slice::from_ref(d));
                 if !sql.is_empty() {
-                    self.files.push(MigrationFile {
-                        relative_path: entity_migration_path(&d.entity_name),
-                        content: sql,
-                    });
+                    push_or_append_sql(&mut self.files, entity_migration_path(&d.entity_name), sql);
                 }
                 // Update snapshot table with simple changes from final
                 if d.entity_type == EntityType::Table
@@ -1143,81 +1281,33 @@ impl StageBuilder {
         }
     }
 
-    /// Stage 1: apply the additive first step of one complex change (add the new
-    /// column / emit `data.sql` plus a review TODO).
+    /// Stage 1: the first step of one change dbd stages — a type change it
+    /// cannot cast, an enum value removal: the `data.sql` that readies the
+    /// rows, and a review TODO. A rename and a type change dbd can cast are not
+    /// staged: they are made in place, in the version's own diff.
     fn apply_complex_stage1(&mut self, change: &ComplexChange, todos: &mut Vec<TodoItem>) {
         match change {
-            ComplexChange::ColumnRename {
-                table_name,
-                new_name,
-                col_def,
-                ..
-            }
-            | ComplexChange::ColumnTypeChange {
-                table_name,
-                new_col: col_def,
-                column_name: new_name,
-                ..
+            ComplexChange::ColumnRename { .. } => {}
+            ComplexChange::ColumnTypeChange {
+                table_name, old_col, ..
             } => {
-                // Add new column to table snapshot
+                // The column stays as it was until the next version alters it.
                 if let Some(snap_t) = self
                     .snap
                     .tables
                     .iter_mut()
                     .find(|t| format!("{}.{}", t.schema, t.name) == *table_name)
+                    && let Some(col) = snap_t.columns.iter_mut().find(|c| c.name == old_col.name)
                 {
-                    // For ColumnTypeChange, new_name is actually column_name and
-                    // col_def is new_col; we need to add the new column definition.
-                    // For ColumnRename, col_def has the new name already.
-                    let mut new_col_def = col_def.as_ref().clone();
-                    if let ComplexChange::ColumnTypeChange { .. } = change {
-                        // The new column gets a temp name: column_name_new
-                        new_col_def.name = diff::swap_column(new_name);
-                    }
-                    snap_t.columns.push(new_col_def);
+                    *col = old_col.as_ref().clone();
                 }
-
                 self.mark_altered(table_name);
-
-                // Generate ADD COLUMN SQL
-                let add_col_sql = match change {
-                    ComplexChange::ColumnRename { col_def, new_name, .. } => {
-                        format!(
-                            "ALTER TABLE {} ADD COLUMN {} {};",
-                            table_name, new_name, col_def.data_type
-                        )
-                    }
-                    ComplexChange::ColumnTypeChange {
-                        new_col, column_name, ..
-                    } => {
-                        format!(
-                            "ALTER TABLE {} ADD COLUMN {} {}{};",
-                            table_name,
-                            diff::swap_column(column_name),
-                            new_col.data_type,
-                            new_col
-                                .collation
-                                .as_deref()
-                                .map(|c| format!(" COLLATE {c}"))
-                                .unwrap_or_default()
-                        )
-                    }
-                    _ => unreachable!(),
-                };
-
-                // Append or create migration file for this table
-                push_or_append_sql(&mut self.files, entity_migration_path(table_name), add_col_sql);
-
-                // The table's one data script, each change's part appended:
-                // a second change pushed a file of the same name, which
-                // replaced the first's when written — its column kept no value.
                 let data_path = entity_data_migration_path(table_name);
                 push_or_append_sql(&mut self.files, data_path.clone(), diff::generate_data_sql(change));
-
                 if !todos.iter().any(|t| t.file == data_path) {
                     todos.push(TodoItem {
                         file: data_path,
-                        message: format!("Review data migration SQL for {}", table_name),
+                        message: format!("Make {}'s values castable before its type changes", table_name),
                     });
                 }
             }
@@ -1253,34 +1343,13 @@ impl StageBuilder {
         }
     }
 
-    /// Stage 2: apply the destructive/finalizing step of one complex change.
+    /// Stage 2: the second step of one change dbd stages. A type change it
+    /// cannot cast is made in place now that the rows are ready — `ALTER
+    /// COLUMN … TYPE … USING`, which keeps the column's values, keys, identity
+    /// and every constraint on it, and which the version's author may edit.
     fn apply_complex_stage2(&mut self, change: &ComplexChange, ctx: &MultiStageCtx) {
         match change {
-            ComplexChange::ColumnRename {
-                table_name,
-                old_name,
-                col_def,
-                ..
-            } => {
-                // Drop old column from snapshot
-                if let Some(snap_t) = self
-                    .snap
-                    .tables
-                    .iter_mut()
-                    .find(|t| format!("{}.{}", t.schema, t.name) == *table_name)
-                {
-                    snap_t.columns.retain(|c| c.name != *old_name);
-                }
-
-                // The table's own constraints on the new name came with stage
-                // 1's diff; what the column declares itself did not (#72).
-                let mut sql = format!("ALTER TABLE {} DROP COLUMN {};", table_name, old_name);
-                let inline = inline_constraints(col_def);
-                append_sql(&mut sql, &restore_column_sql(table_name, col_def, inline));
-                push_or_append_sql(&mut self.files, entity_migration_path(table_name), sql);
-
-                self.mark_altered(table_name);
-            }
+            ComplexChange::ColumnRename { .. } => {}
             ComplexChange::ColumnTypeChange {
                 table_name,
                 column_name,
@@ -1288,44 +1357,28 @@ impl StageBuilder {
                 new_col,
                 ..
             } => {
-                // Drop old column and rename new column in snapshot
                 if let Some(snap_t) = self
                     .snap
                     .tables
                     .iter_mut()
                     .find(|t| format!("{}.{}", t.schema, t.name) == *table_name)
+                    && let Some(col) = snap_t.columns.iter_mut().find(|c| c.name == *column_name)
                 {
-                    snap_t.columns.retain(|c| c.name != *column_name);
-                    // Rename temp column to original name
-                    let temp_name = diff::swap_column(column_name);
-                    if let Some(col) = snap_t.columns.iter_mut().find(|c| c.name == temp_name) {
-                        col.name = new_col.name.clone();
-                    }
+                    *col = new_col.as_ref().clone();
                 }
-
-                let mut sql = format!(
-                    "ALTER TABLE {} DROP COLUMN {};\nALTER TABLE {} RENAME COLUMN {} TO {};",
-                    table_name,
-                    old_col.name,
-                    table_name,
-                    diff::swap_column(column_name),
-                    column_name
-                );
-                // The dropped column took every constraint on it with it, and
-                // the column in its place has its type alone: the rest of it,
-                // and the design's constraints on it, come back (#72). The
-                // foreign keys holding its keys come back after — see
-                // `order_key_changes`.
-                let constraints = ctx
-                    .final_snapshot
-                    .tables
-                    .iter()
-                    .find(|t| format!("{}.{}", t.schema, t.name) == *table_name)
-                    .map(|t| diff::constraints_on(t, &[column_name.as_str()]))
-                    .unwrap_or_default();
-                append_sql(&mut sql, &restore_column_sql(table_name, new_col, constraints));
+                let sql = diff::generate_migration_sql(&[MigrationDiff {
+                    entity_name: table_name.clone(),
+                    entity_type: EntityType::Table,
+                    action: DiffAction::Change(vec![diff::FieldChange {
+                        field_name: column_name.clone(),
+                        field_type: diff::FieldType::Column,
+                        action: diff::ChangeAction::Alter {
+                            old: Box::new(diff::FieldDetail::Column(old_col.as_ref().clone())),
+                            new: Box::new(diff::FieldDetail::Column(new_col.as_ref().clone())),
+                        },
+                    }]),
+                }]);
                 push_or_append_sql(&mut self.files, entity_migration_path(table_name), sql);
-
                 self.mark_altered(table_name);
             }
             ComplexChange::EnumValueRemoval {
@@ -1528,10 +1581,33 @@ fn build_stage1(
 ) -> SnapshotResult {
     let mut base = ctx.prev.clone();
     base.version = ctx.next_version;
-    base.description = format!("{} (stage 1/{})", ctx.description, ctx.num_stages);
+    base.description = if ctx.num_stages == 1 {
+        ctx.description.to_string()
+    } else {
+        format!("{} (stage 1/{})", ctx.description, ctx.num_stages)
+    };
     base.timestamp = chrono::Utc::now().to_rfc3339();
 
     let mut builder = StageBuilder::new(base);
+    let mut warnings = diff::migration_warnings(diffs);
+    for r in ctx.renames {
+        builder.mark_altered(&r.table);
+        push_or_append_sql(
+            &mut builder.files,
+            entity_migration_path(&r.table),
+            format!(
+                "ALTER TABLE {} RENAME COLUMN {} TO {};",
+                r.table,
+                crate::sql_quote::ident_if_needed(&r.old),
+                crate::sql_quote::ident_if_needed(&r.new)
+            ),
+        );
+        warnings.push(format!(
+            "{}: column '{}' renamed to '{}' in place — the one column dropped and the one added, of one type; \
+             if '{}' is a new column, cut the drop and the add in separate versions",
+            r.table, r.old, r.new, r.new
+        ));
+    }
     for d in simple_diffs {
         builder.apply_simple_diff(d, ctx.final_snapshot);
     }
@@ -1556,7 +1632,7 @@ fn build_stage1(
         diffs: diffs.to_vec(),
         migration_files: builder.files,
         graph: Some(graph),
-        warnings: diff::migration_warnings(diffs),
+        warnings,
         is_baseline: false,
         no_changes: false,
     }
@@ -2637,8 +2713,10 @@ mod tests {
         assert!(result.todos.is_empty());
     }
 
+    /// A rename is one version that renames the column in place: Postgres
+    /// keeps its values and everything on it, so nothing is copied or dropped.
     #[test]
-    fn b2_column_rename_two_snapshots() {
+    fn b2_a_column_rename_is_one_snapshot_renaming_in_place() {
         let prev = Snapshot {
             version: 1,
             description: "v1".to_string(),
@@ -2657,27 +2735,76 @@ mod tests {
             vec![col("id", "INT"), col("display_name", "TEXT")],
         )];
         let result = prepare_multi_snapshot(&entities, Some(&prev), 2, "rename");
-        assert_eq!(result.snapshots.len(), 2, "column rename should produce 2 snapshots");
-        let stages: Vec<_> = result
-            .snapshots
-            .iter()
-            .map(|r| r.graph.as_ref().unwrap().stage)
-            .collect();
+        assert_eq!(result.snapshots.len(), 1, "a rename is one version");
         assert_eq!(
-            stages,
-            vec![
-                Some(MigrationStage { index: 1, of: 2 }),
-                Some(MigrationStage { index: 2, of: 2 })
-            ],
-            "each stage's graph names its place in the run"
+            result.snapshots[0].graph.as_ref().unwrap().stage,
+            Some(MigrationStage { index: 1, of: 1 })
         );
-        // Stage 1 should have data.sql file
+        let files = &result.snapshots[0].migration_files;
+        assert_eq!(files.len(), 1, "{}", files.len());
+        assert_eq!(
+            files[0].content.trim(),
+            "ALTER TABLE config.users RENAME COLUMN name TO display_name;"
+        );
+        assert!(result.todos.is_empty());
+    }
+
+    /// A type change dbd can cast is one version altering the column in place;
+    /// one it cannot takes two, the column at its old type in the first.
+    #[test]
+    fn b4_a_type_change_is_in_place_one_version_or_two_when_it_cannot_cast() {
+        let prev = |ty: &str| Snapshot {
+            version: 1,
+            description: "v1".to_string(),
+            timestamp: "t".to_string(),
+            tables: vec![TableSnapshot {
+                name: "users".to_string(),
+                schema: "config".to_string(),
+                columns: vec![col("id", "INT"), col("n", ty)],
+                indexes: vec![],
+                table_constraints: vec![],
+            }],
+            enums: vec![],
+        };
+        let castable = prepare_multi_snapshot(
+            &[make_table_entity(
+                "config.users",
+                vec![col("id", "INT"), col("n", "BIGINT")],
+            )],
+            Some(&prev("INT")),
+            2,
+            "widen",
+        );
+        assert_eq!(castable.snapshots.len(), 1);
         assert!(
-            result.snapshots[0]
-                .migration_files
+            castable.snapshots[0].migration_files[0]
+                .content
+                .contains("ALTER TABLE config.users ALTER COLUMN n TYPE bigint USING n::bigint;")
+        );
+
+        let staged = prepare_multi_snapshot(
+            &[make_table_entity(
+                "config.users",
+                vec![col("id", "INT"), col("n", "INT")],
+            )],
+            Some(&prev("JSONB")),
+            2,
+            "to int",
+        );
+        assert_eq!(staged.snapshots.len(), 2);
+        let n_type = |i: usize| {
+            staged.snapshots[i].snapshot.tables[0]
+                .columns
                 .iter()
-                .any(|f| f.relative_path.to_string_lossy().contains("data.sql")),
-            "stage 1 should have data.sql for copy"
+                .find(|c| c.name == "n")
+                .map(|c| c.data_type.clone())
+                .unwrap()
+        };
+        assert_eq!((n_type(0), n_type(1)), ("jsonb".to_string(), "integer".to_string()));
+        assert!(
+            staged.snapshots[1].migration_files[0]
+                .content
+                .contains("ALTER TABLE config.users ALTER COLUMN n TYPE integer USING n::integer;")
         );
     }
 
@@ -2751,8 +2878,9 @@ mod tests {
         );
     }
 
+    /// The renamed column's snapshot holds the new name only.
     #[test]
-    fn s1_stage1_adds_new_column_for_rename() {
+    fn s1_a_renames_snapshot_holds_the_new_name_only() {
         let prev = Snapshot {
             version: 1,
             description: "v1".to_string(),
@@ -2771,52 +2899,14 @@ mod tests {
             vec![col("id", "INT"), col("display_name", "TEXT")],
         )];
         let result = prepare_multi_snapshot(&entities, Some(&prev), 2, "rename");
-        assert!(result.snapshots.len() >= 2);
-        // Stage 1 should have 3 columns: id, name, display_name
-        let stage1_table = result.snapshots[0]
+        let table = result.snapshots[0]
             .snapshot
             .tables
             .iter()
             .find(|t| t.name == "users")
             .expect("should have users table");
-        let col_names: Vec<&str> = stage1_table.columns.iter().map(|c| c.name.as_str()).collect();
-        assert!(col_names.contains(&"id"), "should have id");
-        assert!(col_names.contains(&"name"), "should still have old name");
-        assert!(col_names.contains(&"display_name"), "should have new display_name");
-    }
-
-    #[test]
-    fn s2_stage2_drops_old_column_for_rename() {
-        let prev = Snapshot {
-            version: 1,
-            description: "v1".to_string(),
-            timestamp: "t".to_string(),
-            tables: vec![TableSnapshot {
-                name: "users".to_string(),
-                schema: "config".to_string(),
-                columns: vec![col("id", "INT"), col("name", "TEXT")],
-                indexes: vec![],
-                table_constraints: vec![],
-            }],
-            enums: vec![],
-        };
-        let entities = vec![make_table_entity(
-            "config.users",
-            vec![col("id", "INT"), col("display_name", "TEXT")],
-        )];
-        let result = prepare_multi_snapshot(&entities, Some(&prev), 2, "rename");
-        assert!(result.snapshots.len() >= 2);
-        // Stage 2 should have 2 columns: id, display_name (no "name")
-        let stage2_table = result.snapshots[1]
-            .snapshot
-            .tables
-            .iter()
-            .find(|t| t.name == "users")
-            .expect("should have users table");
-        let col_names: Vec<&str> = stage2_table.columns.iter().map(|c| c.name.as_str()).collect();
-        assert!(col_names.contains(&"id"));
-        assert!(col_names.contains(&"display_name"));
-        assert!(!col_names.contains(&"name"), "old name should be dropped in stage 2");
+        let col_names: Vec<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(col_names, ["id", "display_name"]);
     }
 
     #[test]
@@ -2920,6 +3010,50 @@ mod tests {
         assert_eq!(todos.len(), 2);
         assert_eq!(todos[0].version, 2);
         assert_eq!(todos[1].version, 3);
+    }
+
+    /// A pending version cut by a dbd before 0.27.2 whose type change fills
+    /// the column the next version drops — every value lost — is found by its
+    /// shape: `<column>_new` added, and the data script setting the column
+    /// itself. One that fills `<column>_new`, or an ordinary update, is not.
+    #[test]
+    fn ds7_a_pending_swap_that_loses_its_values_is_found() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let write = |version: u32, file: &str, content: &str| {
+            let dir = tmp.path().join(format!("migrations/{version:03}/app"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(file), content).unwrap();
+        };
+        write(2, "line.sql", "ALTER TABLE app.line ADD COLUMN qty_new bigint;");
+        write(
+            2,
+            "line.data.sql",
+            "UPDATE \"app\".\"line\" SET \"qty\" = \"qty\"::bigint;\n",
+        );
+        write(2, "kept.sql", "ALTER TABLE app.kept ADD COLUMN n_new bigint;");
+        write(
+            2,
+            "kept.data.sql",
+            "UPDATE \"app\".\"kept\" SET \"n_new\" = \"n\"::bigint;\n",
+        );
+        write(
+            2,
+            "plain.data.sql",
+            "UPDATE \"app\".\"plain\" SET \"n\" = \"n\"::bigint;\n",
+        );
+        let pending = |version: u32| PendingMigration {
+            from_version: version - 1,
+            to_version: version,
+            migration_dir: tmp.path().join(format!("migrations/{version:03}")),
+            added: vec![],
+            altered: vec![],
+            dropped: vec![],
+            checksum: String::new(),
+        };
+        let found = pending_lossy_swaps(&[pending(2)]).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!((found[0].version, found[0].column.as_str()), (2, "qty"));
+        assert!(found[0].file.ends_with("app/line.data.sql"), "{found:?}");
     }
 
     #[test]
