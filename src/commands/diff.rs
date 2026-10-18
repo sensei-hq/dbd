@@ -255,6 +255,7 @@ mod tests {
             changes: vec![add("public.audit_log")],
             warnings: vec![],
             advisories: vec!["CHECK ck on public.orders couldn't be normalized".into()],
+            key_holders: Vec::new(),
             matview_drift: vec![],
         };
         let out = diff_report_lines(&d).join("\n");
@@ -272,6 +273,7 @@ mod tests {
             changes: vec![add("public.audit_log")],
             warnings: vec![],
             advisories: vec![],
+            key_holders: Vec::new(),
             matview_drift: vec![],
         };
         let json = serde_json::to_string(&d).unwrap();
@@ -296,6 +298,7 @@ mod tests {
             changes: vec![],
             warnings: vec![],
             advisories: vec![],
+            key_holders: Vec::new(),
             matview_drift: vec![
                 mv("analytics.daily", MatviewDriftKind::Drifted),
                 mv("analytics.new", MatviewDriftKind::Missing),
@@ -316,6 +319,7 @@ mod tests {
             changes: vec![],
             warnings: vec![],
             advisories: vec![],
+            key_holders: Vec::new(),
             matview_drift: vec![
                 mv("analytics.legacy", MatviewDriftKind::Unstamped),
                 mv("analytics.stale", MatviewDriftKind::Orphan),
