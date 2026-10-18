@@ -19,18 +19,47 @@ pub(crate) fn diff_report_lines(d: &SchemaDiff) -> Vec<String> {
         return vec!["Live database is in sync with the design — no differences.".to_string()];
     }
     let mut lines = Vec::new();
+    // A key change a foreign key holds is shown as reconcile runs it: the
+    // foreign keys holding the key dropped first, the kept ones added back
+    // after (#65).
+    let holders = |table: &str| d.key_holders.iter().find(|h| h.table == table && h.refused.is_none());
+    let mut shown: Vec<&str> = Vec::new();
     for c in &d.changes {
         match &c.action {
             DiffAction::Add => lines.push(format!("  + create {}", c.entity_name)),
             DiffAction::Drop => lines.push(format!("  - drop   {}", c.entity_name)),
             DiffAction::Change(_) => {
                 lines.push(format!("  ~ alter  {}", c.entity_name));
+                let steps = holders(&c.entity_name);
                 let sql = diff::generate_migration_sql(std::slice::from_ref(c));
-                for l in sql.lines().filter(|l| !l.trim().is_empty()) {
+                let all = steps
+                    .into_iter()
+                    .flat_map(|h| h.drops.iter().map(String::as_str))
+                    .chain(sql.lines())
+                    .chain(steps.into_iter().flat_map(|h| h.adds.iter().map(String::as_str)));
+                for l in all.flat_map(str::lines).filter(|l| !l.trim().is_empty()) {
                     lines.push(format!("      {l}"));
+                }
+                if steps.is_some() {
+                    shown.push(&c.entity_name);
                 }
             }
         }
+    }
+    for h in d
+        .key_holders
+        .iter()
+        .filter(|h| h.refused.is_none() && !shown.contains(&h.table.as_str()))
+    {
+        lines.push(format!("  ~ alter  {}", h.table));
+        for l in h.drops.iter().chain(&h.adds).flat_map(|s| s.lines()) {
+            lines.push(format!("      {l}"));
+        }
+    }
+    for refused in d.key_holders.iter().filter_map(|h| h.refused.as_deref()) {
+        lines.push(format!(
+            "  ⚠ reconcile refuses the key change: {refused} — drop that foreign key by hand first"
+        ));
     }
     for w in &d.warnings {
         lines.push(format!("  ⚠ {w}"));
