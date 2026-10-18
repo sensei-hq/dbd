@@ -5311,6 +5311,104 @@ async fn a_released_column_turned_generated_keeps_everything_on_it() {
     assert_in_sync(&design, &*adapter).await;
 }
 
+// ── dbd diff shows what reconcile runs around a key change (0.27.2) ───────────
+
+/// The SQL `dbd diff` shows for a table, in its order: the foreign keys that
+/// hold its key dropped first, then its own change, then the ones the design
+/// keeps added back.
+fn diff_sql_of(diff: &dbd_core::SchemaDiff, table: &str) -> String {
+    let steps = diff.key_holders.iter().find(|h| h.table == table);
+    let own = diff
+        .changes
+        .iter()
+        .find(|c| c.entity_name == table)
+        .map(|c| dbd_core::diff::generate_migration_sql(std::slice::from_ref(c)))
+        .unwrap_or_default();
+    let mut lines: Vec<String> = steps.map(|h| h.drops.clone()).unwrap_or_default();
+    lines.extend(own.lines().map(str::to_string));
+    lines.extend(steps.map(|h| h.adds.clone()).unwrap_or_default());
+    lines.join("\n")
+}
+
+/// The SQL a reconcile plan runs for `table`.
+fn plan_sql_of(plan: &dbd_core::reconcile::ReconcilePlan, table: &str) -> String {
+    plan.altered
+        .iter()
+        .filter(|s| s.entity_name == table)
+        .map(|s| s.sql.clone())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A key a foreign key holds changes: `dbd diff` shows the foreign key's drop
+/// before the key change and, when the design keeps it, its re-add after — the
+/// SQL reconcile runs for the table, line for line. It showed the key change
+/// alone, SQL that fails if run as shown.
+#[tokio::test]
+async fn diff_shows_the_foreign_keys_a_key_change_drops_and_adds_back() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let parent_v2 = "create table if not exists app.parent (\n  id uuid not null\n, owner_id uuid not null\n\
+                     , path text not null\n, primary key (id)\n, unique (owner_id, path)\n);\n";
+    let parent_v1 = "create table if not exists app.parent (\n  id uuid not null\n, owner_id uuid not null\n\
+                     , path text not null\n, primary key (owner_id, path)\n);\n";
+    for (v1, v2, children) in [
+        (REKEY_PARENT_V1, REKEY_PARENT_V2, (REKEY_CHILD_V1, REKEY_CHILD_V2)),
+        (parent_v1, parent_v2, (REKEY_CHILD_V1, REKEY_CHILD_V1)),
+    ] {
+        adapter
+            .execute_script("DROP SCHEMA IF EXISTS app CASCADE;")
+            .await
+            .unwrap();
+        let (_d1, design) = rekey_design(&[("parent", v1), ("child", children.0)]);
+        design
+            .reconcile(&*adapter, false, false, false, None, Progress::none())
+            .await
+            .expect("create");
+        let (_d2, design) = rekey_design(&[("parent", v2), ("child", children.1)]);
+        let plan = design
+            .reconcile(&*adapter, true, true, false, None, Progress::none())
+            .await
+            .expect("dry run");
+        let diff = design.diff_live(&*adapter, None).await.expect("diff");
+        let holder = diff
+            .key_holders
+            .iter()
+            .find(|h| h.table == "app.parent")
+            .unwrap_or_else(|| panic!("no key holders for app.parent: {:?}", diff.key_holders));
+        assert!(holder.drops.iter().any(|d| d.contains("app.child")), "{holder:?}");
+        assert_eq!(diff_sql_of(&diff, "app.parent"), plan_sql_of(&plan, "app.parent"));
+    }
+}
+
+/// A key held from a table outside the design: reconcile refuses the change,
+/// and `dbd diff` says it would, naming the table.
+#[tokio::test]
+async fn diff_says_reconcile_refuses_a_key_held_from_outside_the_design() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let (_v1, design) = rekey_design(&[("parent", REKEY_PARENT_V1), ("child", REKEY_CHILD_V1)]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("create");
+    adapter
+        .execute_script(
+            "CREATE SCHEMA ext; CREATE TABLE ext.audit (owner_id uuid, path text, \
+             FOREIGN KEY (owner_id, path) REFERENCES app.parent (owner_id, path));",
+        )
+        .await
+        .unwrap();
+    let (_v2, design) = rekey_design(&[("parent", REKEY_PARENT_V2), ("child", REKEY_CHILD_V2)]);
+    let diff = design.diff_live(&*adapter, None).await.expect("diff");
+    let refused = diff
+        .key_holders
+        .iter()
+        .find_map(|h| h.refused.clone())
+        .unwrap_or_else(|| panic!("no refusal: {:?}", diff.key_holders));
+    assert!(refused.contains("ext.audit"), "{refused}");
+}
+
 // ── A routine whose return type changes (#65) ─────────────────────────────────
 
 /// A project `routines` in a temporary folder with `files` (`(path, text)`).
