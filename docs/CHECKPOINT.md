@@ -19,7 +19,3 @@
 
 - Release 0.27.5 when wanted (`make bump`, release PR to `main`); #99 closes
   when `main` has it. The docs say "before 0.27.5" for the #99 change.
-
-## Open
-
-- Scratch to delete: /tmp/dbd-99-view.*, /tmp/dbd-99-rel.*.
