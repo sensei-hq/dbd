@@ -2486,6 +2486,43 @@ mod tests {
         assert!(tmp.path().join("migrations/002/graph.json").exists());
     }
 
+    /// An entity dbd could not read is left out of a snapshot, so the diff
+    /// read its table as removed and the migration dropped it (#94): a
+    /// snapshot of such a design is refused, naming the file, writing nothing.
+    #[test]
+    fn a_snapshot_of_a_design_with_an_unread_file_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("design.yaml");
+        let config = "project:\n  name: test\ntarget: {}\n";
+        fs::write(&config_path, config).unwrap();
+        let users = || make_table_entity("config.users", vec![col("id", "BIGINT")]);
+        create_snapshot(&[users()], tmp.path(), &config_path, "initial").unwrap();
+        let config = fs::read_to_string(&config_path).unwrap();
+
+        let mut unread = users();
+        unread.table_def = None;
+        unread.file = Some("ddl/table/config/users.ddl".into());
+        unread.errors.push("syntax error at or near \",\"".to_string());
+        let Err(err) = create_snapshot(&[unread.clone()], tmp.path(), &config_path, "typo") else {
+            panic!("a design with an unread file is refused");
+        };
+
+        let said = err.to_string();
+        assert!(said.contains("ddl/table/config/users.ddl"), "{said}");
+        assert!(said.contains("syntax error"), "{said}");
+        assert!(!tmp.path().join("snapshots/002.json").exists());
+        assert!(!tmp.path().join("migrations/002").exists());
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), config);
+
+        // A baseline too: it would record the design without the table.
+        let fresh = TempDir::new().unwrap();
+        let fresh_config = fresh.path().join("design.yaml");
+        fs::write(&fresh_config, "project:\n  name: test\ntarget: {}\n").unwrap();
+        assert!(create_snapshot(&[unread.clone()], fresh.path(), &fresh_config, "initial").is_err());
+        assert!(create_baseline_snapshot(&[unread], fresh.path(), &fresh_config, "init", 1).is_err());
+        assert!(!fresh.path().join("snapshots").exists());
+    }
+
     #[test]
     fn create_baseline_snapshot_at_v1() {
         let tmp = TempDir::new().unwrap();
