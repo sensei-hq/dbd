@@ -9,6 +9,13 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+### Fixed
+
+- **A scope names a SQLite table (#87).** A SQLite project's tables have no
+  schema, and a scope item was a schema or `schema.entity`, so no scope could
+  name one: `items` was "no known schema or entity". A table with no schema is
+  now named bare (`items`) or as `main.items`; a schema of the same name wins.
+
 ## [0.27.3] — 2026-10-19
 
 ### Fixed
