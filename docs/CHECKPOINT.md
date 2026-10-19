@@ -1,38 +1,30 @@
 # Checkpoint
 
-**Slice:** patch 0.27.2 — #73, #60, #72 merged to `develop` (PRs #76–#78); the
-adversarial review's fixes on `fix/review-0.27.2` (PR #79). Awaiting release
-sign-off.
+**Slice:** patch 0.27.4 — #85, #86, #87, #88, #89 and #94 (a DDL file that
+fails to parse was cut by `snapshot` as `DROP TABLE … CASCADE`; found while
+documenting #89, reproduced on 0.27.3).
 
 ## Done
 
-- #73, #60, #72 on `develop` (6b17d98b).
-- Review (6 reviewers, approve depth) → `fix/review-0.27.2`, every crit/high/
-  medium fixed red-first:
-  - G3 released rename/type change in place (RENAME COLUMN; ALTER … TYPE …
-    USING; un-castable = data.sql TODO + in-place alter); narrowing refuses a
-    too-long value; generated type change; pre-0.27.2 lossy swap refused.
-  - G4 column turned generated: every key/constraint/FK/index/comment back,
-    reconcile same run, diff shows it, history does not.
-  - G1 nextval fully qualified (live via pg_depend; design keeps public).
-  - G2 pathless file resets the path (batch too); SET SCHEMA resets the pool.
-  - G5 live names quoted in DROP; G6 #73 schema-less table.
-- Gate: embedded 361/361, cli_live 82/82, clippy -D warnings (embedded), fmt;
-  sensei copy converges; type-change probe keeps every value.
+- 0.27.3 shipped: crates.io, PR #82 merged to `main`, main CI green,
+  #60/#72/#73 closed.
+- Each issue red-first on its own branch, docs on every surface, CHANGELOG:
+  PRs #90 (#85), #91 (#86), #92 (#87), #93 (#88), #95 (#89), #96 (#94).
+- CI fix PR #97: the test step passes `GITHUB_TOKEN` (#95/#96 failed every
+  embedded test on GitHub API 403/429, not on the code).
+- Local `develop` holds all seven merged, the 0.27.4 release notes, and a doc
+  fix (a dotted schema is refused by `snapshot` too). Gate on the merged tree:
+  check-ci, embedded 363/363, cli_live 83/83.
 
 ## Next
 
-On sign-off: merge PR #79 locally into `develop`, push; release checklist
-(CHANGELOG [Unreleased] → [0.27.2], `make bump`, main merge, CI green,
-install and re-run the repros). Close #60/#72/#73 when `main` has them.
+1. CI green on #95/#96 reruns and #97 → `git push origin develop` (PRs close
+   as merged).
+2. `make bump` (0.27.4), release PR develop→main, merge locally, main CI.
+3. Install, re-run each repro (#85 #86 #87 #88 #89 #94); confirm the issues
+   close; prune the branches.
 
 ## Open
 
-- Low, reported: `diff` omits the FK holder drop/re-add reconcile runs;
-  dotted schema names in `schema.table` entity names.
-- Unfiled (from before): `init --dry-run` writes files; SQLite scopes cannot
-  name a table; a dry run with `--allow-destructive` still says to re-run
-  with it; SQLite `deploy --module shared` fails on a bare FK error.
-- Scratch to delete (rm -rf was refused): /tmp/dbd-* (0271, 60, 65, 72
-  logs/dirs), /tmp/dbd-review-0272, /tmp/dbd-review-target*,
-  /tmp/dbd-spec-audit-* and a stopped cluster /tmp/dbd-spec-audit-pg-HIoE.
+- LOW: the unread-files message counts an auto-added schema as a "file".
+- Scratch to delete (rm -rf was refused): /tmp/dbd-* probe and log dirs.
