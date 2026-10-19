@@ -199,8 +199,9 @@ target:
   RFC 4180, as PostgreSQL reads them — quoted delimiters, line breaks and doubled
   quotes, nothing trimmed, a quoted field never NULL — so a file PostgreSQL
   exported imports unchanged. SQLite has no `TRUNCATE`, so the default truncate
-  runs `DELETE FROM` instead, one table at a time, a table that references
-  another emptied first; with `truncate: false`, rows are appended. The verbatim
+  runs `DELETE FROM` instead, every table the import reloads in one
+  transaction, a table that references another emptied first — a table outside
+  the import holding a key to one empties none, and is named; with `truncate: false`, rows are appended. The verbatim
   DDL gives dbd no references, so the import takes its order — a referenced
   table loaded first, emptied last — from the foreign keys the database reports;
   `import --dry-run` lists that order when the database exists.
