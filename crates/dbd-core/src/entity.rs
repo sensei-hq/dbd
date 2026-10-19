@@ -1024,8 +1024,8 @@ impl Entity {
         entity
     }
 
-    /// Create a schema entity. A name holding a dot is an error on it: see
-    /// [`dotted_name_error`] (#89).
+    /// Create a schema entity. A name holding a dot is an error on it: dbd
+    /// splits `schema.name` at the first dot (#89).
     pub fn schema(name: &str) -> Self {
         let mut entity = Self::new(EntityType::Schema, name);
         if name.contains('.') {
