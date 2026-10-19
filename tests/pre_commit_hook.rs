@@ -121,6 +121,47 @@ fn pre_commit_does_not_restate_the_release_preflight() {
     );
 }
 
+/// A command as the gate compares it: make's `@` dropped, `--quiet` (which
+/// changes only the output) left out.
+fn normalized(line: &str) -> String {
+    line.trim()
+        .trim_start_matches('@')
+        .split_whitespace()
+        .filter(|w| *w != "--quiet")
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Every check CI runs on the source, the commit gate runs too — all but the
+/// embedded suites (`cargo llvm-cov` over a live server, minutes long) and
+/// `cargo audit` (advisories, not the source). `cargo doc` was missing: a
+/// public doc linking a private item passed every commit and failed CI (#95).
+#[test]
+fn pre_commit_runs_every_source_check_ci_runs() {
+    let ci = fs::read_to_string(root().join(".github/workflows/ci.yml")).expect("ci.yml must be readable");
+    let gate: Vec<String> = effective_commands().iter().map(|l| normalized(l)).collect();
+    let covered = |check: &str| {
+        gate.iter().any(|g| g == check)
+            // A plain `cargo test --workspace` runs the doctests too.
+            || (check == "cargo test --workspace --doc" && gate.iter().any(|g| g == "cargo test --workspace"))
+    };
+    let missing: Vec<String> = ci
+        .lines()
+        .map(|l| l.trim().trim_start_matches("run:").trim())
+        .filter(|l| l.starts_with("cargo "))
+        .filter(|l| !l.starts_with("cargo llvm-cov") && !l.starts_with("cargo audit"))
+        .map(normalized)
+        .filter(|check| !covered(check))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "CI runs checks the pre-commit gate does not, so a commit the hook \
+         passed fails on push:\n{}\n\nAdd them to `_check-ci` in the Makefile.",
+        missing.join("\n")
+    );
+}
+
 /// A hook that is not executable is not a gate at all — git skips it silently,
 /// and every commit passes.
 #[test]
