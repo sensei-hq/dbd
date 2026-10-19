@@ -1014,14 +1014,11 @@ impl Entity {
             entity.errors.push(unread_folder_error(folder));
         }
         // dbd names an entity `schema.name` and reads it back by its first
-        // dot, so a dot in either part names something else: `"a.b".t` read
-        // as schema `a`, and diff took the real table for an orphan (#89).
-        if ddl_pos.is_some() {
-            for (what, part) in [("schema", schema.as_deref()), ("name", Some(stem))] {
-                if let Some(part) = part.filter(|p| p.contains('.')) {
-                    entity.errors.push(dotted_name_error(what, part));
-                }
-            }
+        // dot, so a dot in the schema names another one: `"a.b".t` read as
+        // schema `a`, and diff took the real table for an orphan (#89). A dot
+        // in the name is read right.
+        if let Some(dotted) = schema.as_deref().filter(|s| ddl_pos.is_some() && s.contains('.')) {
+            entity.errors.push(dotted_name_error("schema", dotted));
         }
         entity.schema = schema;
         entity
@@ -1109,13 +1106,13 @@ impl Entity {
 /// `schemas:` and the target's `extensions:` — so a file for one says where
 /// it belongs rather than only that its folder is unknown (`dbd doctor` names
 /// the entry to write).
-/// The error on an entity whose schema or name holds a dot (#89): dbd names
-/// an entity `schema.name` and splits it at its first dot, so `a.b` cannot be
-/// told from a schema `a`.
+/// The error on an entity whose schema holds a dot (#89): dbd names an
+/// entity `schema.name` and splits it at its first dot, so a schema `a.b`
+/// cannot be told from a schema `a`.
 fn dotted_name_error(what: &str, part: &str) -> String {
     format!(
-        "a dot in a {what} is not supported: `{part}` — dbd names an entity `schema.name` and splits it \
-         at the first dot, so this would be read as another one; rename it"
+        "a dot in a {what} name is not supported: `{part}` — dbd names an entity `schema.name` and splits \
+         it at the first dot, so this would be read as another one; rename it"
     )
 }
 
