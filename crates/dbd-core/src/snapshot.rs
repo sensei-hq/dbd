@@ -1718,6 +1718,7 @@ pub fn create_snapshot_in(
     description: &str,
     dialect: MigrationDialect,
 ) -> Result<MultiSnapshotResult> {
+    ensure_fully_read(entities)?;
     let previous = latest_snapshot(project_dir)?;
     let base_version = next_version(project_dir);
     let result = prepare_multi_snapshot_in(entities, previous.as_ref(), base_version, description, dialect);
@@ -1748,6 +1749,24 @@ pub fn create_snapshot_in(
 
     crate::config::update_version_of(config_path, module, final_version)?;
     Ok(result)
+}
+
+/// Refuse to snapshot a design dbd could not fully read (#94). An entity
+/// carrying an error — a file that failed to parse — is left out of the
+/// snapshot, so the diff read its table as removed and the migration dropped
+/// it, CASCADE. `apply` and `reconcile` refuse such a design the same way.
+fn ensure_fully_read(entities: &[Entity]) -> Result<()> {
+    let unread: Vec<&Entity> = entities
+        .iter()
+        .filter(|e| e.has_errors() && e.entity_type != EntityType::External)
+        .collect();
+    if unread.is_empty() {
+        return Ok(());
+    }
+    Err(crate::entity::unread_files_error(
+        &unread,
+        "snapshotted — a file left out would be cut as dropped",
+    ))
 }
 
 /// Write a snapshot's migration graph (`graph.json`) plus its migration files
@@ -1800,6 +1819,7 @@ pub fn create_baseline_snapshot_of(
     description: &str,
     version: u32,
 ) -> Result<MultiSnapshotResult> {
+    ensure_fully_read(entities)?;
     // A fresh project has no prior snapshot — baseline at the requested version.
     let result = prepare_multi_snapshot(entities, None, version, description);
 
