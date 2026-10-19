@@ -26,7 +26,10 @@ fn fixture_dir() -> PathBuf {
 /// Each test gets its own instance for full isolation.
 async fn start_pg() -> (PostgreSQL, String) {
     let settings = Settings {
-        version: postgresql_embedded::VersionReq::parse(">=16").unwrap(),
+        // Pinned: `>=16` took whatever build was published last, and 18.6.1
+        // (2026-10-18) refuses `TimeZone=UTC` on CI's runners, failing every
+        // test at its first connection. Move it on deliberately.
+        version: postgresql_embedded::VersionReq::parse("=18.6.0").unwrap(),
         ..Default::default()
     };
     let mut pg = PostgreSQL::new(settings);
