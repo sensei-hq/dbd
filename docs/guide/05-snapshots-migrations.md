@@ -17,7 +17,7 @@ dbd snapshot --name "add email to users"
 ```
 
 This:
-1. Parses current DDL files into a schema snapshot
+1. Parses current DDL files into a schema snapshot — refusing, naming each file, when one fails to parse (before 0.27.4 the file was left out, and the migration dropped its table)
 2. Compares against the previous snapshot
 3. Generates migration SQL (ALTER TABLE, DROP, etc.)
 4. Writes snapshots/NNN.json and migrations/NNN/

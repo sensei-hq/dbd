@@ -9,6 +9,17 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+### Fixed
+
+- **`dbd snapshot` never cuts a file it could not read as a dropped table
+  (#94).** A DDL file that failed to parse — a typo, a save mid-edit — was left
+  out of the snapshot, so the diff read its table as removed and the migration
+  dropped it, `DROP TABLE … CASCADE`, for the next `apply` to run. `snapshot`
+  now refuses such a design as `apply` and `reconcile` do, naming each file
+  and its error, and writes nothing. `dbd merge`, which snapshots what it
+  wrote, refuses the same way. In `dbd-core`, `create_snapshot*` and
+  `create_baseline_snapshot*` return that error.
+
 ## [0.27.3] — 2026-10-19
 
 ### Fixed
