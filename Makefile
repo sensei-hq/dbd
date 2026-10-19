@@ -197,7 +197,9 @@ _check-clean:
 	   exit 1; \
 	 fi
 
-# Pre-flight: tests, clippy and formatting must pass before a release.
+# Pre-flight: tests, clippy, formatting and documentation links must pass
+# before a release — every source check CI runs but the embedded suites and
+# the audit (guarded by tests/pre_commit_hook.rs).
 _check-ci:
 	@echo "Running cargo test..."
 	@cargo test --workspace --quiet
@@ -205,4 +207,6 @@ _check-ci:
 	@cargo clippy --workspace --all-targets --quiet -- -D warnings
 	@echo "Running cargo fmt --check..."
 	@cargo fmt --all --check
+	@echo "Running cargo doc..."
+	@cargo doc --workspace --no-deps --all-features --quiet
 	@echo "All checks passed."
