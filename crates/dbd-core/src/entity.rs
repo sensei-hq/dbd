@@ -1008,18 +1008,33 @@ impl Entity {
         };
 
         let mut entity = Self::new(entity_type, &name);
-        entity.schema = schema;
         entity.file = Some(path.to_path_buf());
         entity.format = Some(ext.to_string());
         if recognized_type.is_none() {
             entity.errors.push(unread_folder_error(folder));
         }
+        // dbd names an entity `schema.name` and reads it back by its first
+        // dot, so a dot in either part names something else: `"a.b".t` read
+        // as schema `a`, and diff took the real table for an orphan (#89).
+        if ddl_pos.is_some() {
+            for (what, part) in [("schema", schema.as_deref()), ("name", Some(stem))] {
+                if let Some(part) = part.filter(|p| p.contains('.')) {
+                    entity.errors.push(dotted_name_error(what, part));
+                }
+            }
+        }
+        entity.schema = schema;
         entity
     }
 
-    /// Create a schema entity.
+    /// Create a schema entity. A name holding a dot is an error on it: see
+    /// [`dotted_name_error`] (#89).
     pub fn schema(name: &str) -> Self {
-        Self::new(EntityType::Schema, name)
+        let mut entity = Self::new(EntityType::Schema, name);
+        if name.contains('.') {
+            entity.errors.push(dotted_name_error("schema", name));
+        }
+        entity
     }
 
     /// Create an external entity (FK stub).
@@ -1094,6 +1109,16 @@ impl Entity {
 /// `schemas:` and the target's `extensions:` — so a file for one says where
 /// it belongs rather than only that its folder is unknown (`dbd doctor` names
 /// the entry to write).
+/// The error on an entity whose schema or name holds a dot (#89): dbd names
+/// an entity `schema.name` and splits it at its first dot, so `a.b` cannot be
+/// told from a schema `a`.
+fn dotted_name_error(what: &str, part: &str) -> String {
+    format!(
+        "a dot in a {what} is not supported: `{part}` — dbd names an entity `schema.name` and splits it \
+         at the first dot, so this would be read as another one; rename it"
+    )
+}
+
 fn unread_folder_error(folder: &str) -> String {
     match folder {
         "extension" | "extensions" => format!(
