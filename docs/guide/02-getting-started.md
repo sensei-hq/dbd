@@ -68,6 +68,8 @@ ddl/
 
 Files use the `.ddl` or `.sql` extension. Schemas are auto-added from these paths, so a `ddl/table/config/…` file implies the `config` schema even if it isn't listed under `schemas:`.
 
+A schema name cannot hold a dot. dbd names an entity `schema.name` and splits it at the first dot, so a `ddl/table/a.b/` folder, or `a.b` under `schemas:`, is an error naming it: `dbd inspect` reports it, and `apply` and `reconcile` refuse the design. (Before 0.27.4 `"a.b".t` was read as schema `a`, and `diff` took the real table for an orphan.) A dot in an entity's own name is read right.
+
 There is no `ddl/extension/` or `ddl/schema/` folder: extensions are declared in the target's `extensions:` list and schemas under `schemas:` in `design.yaml`, because dbd generates both statements itself. `dbd inspect` reports a file in either folder as an error, and `dbd doctor` names the `design.yaml` entry to write instead.
 
 A project divided into **modules** (a workspace — a `modules:` block in `design.yaml`) has this tree once per module, in the module's own folder — `core/ddl/table/app/orders.ddl` — and none at the root. See [design.yaml](03-design-yaml.md).

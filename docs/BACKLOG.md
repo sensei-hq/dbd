@@ -84,10 +84,11 @@ release added. Each was reproduced or read in the code; locations are as of the
   script's `DROP … CASCADE`), ~1048 and ~1057 (`GRANT USAGE`); `reconcile.rs`
   ~1245 (comment convergence), ~1758 and ~1767 (index convergence);
   `diff/generate.rs` ~236 (`DROP CONSTRAINT`) and ~258 (`DROP INDEX`).
-- A dot in a schema, table or enum name is unsupported: dbd joins a schema and
-  a name with a dot and splits them again throughout
-  (`entity::split_qualified_name` and its kin), and `emit.rs` `bare()` (~16)
-  cuts at the last dot, so `app."we.ird"` is emitted as `app_ird`.
+- A dot in a table or enum name: dbd joins a schema and a name with a dot and
+  splits them again at the first (`entity::split_qualified_name` and its kin),
+  so the name reads right, but `emit.rs` `bare()` (~16) cuts at the last dot,
+  so `app."we.ird"` is emitted as `app_ird`. A dot in a schema name is refused,
+  named (#89).
 - A type in a schema that needs quoting never matches its introspected
   spelling: `format_type` writes `"Ext".citext`, `reconcile::canonical_type`
   lowercases inside the quotes (`"ext".citext`), and the enum map and

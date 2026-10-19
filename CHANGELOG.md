@@ -9,6 +9,15 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+### Fixed
+
+- **A dot in a schema name is an error, named (#89).** dbd names an entity
+  `schema.name` and splits it at the first dot, so `"a.b".t` was read as
+  schema `a`, and `diff` took the real table for an orphan. A `ddl/table/a.b/`
+  folder, or `a.b` under `schemas:`, is now an error naming it: `inspect`
+  reports it, and `apply` and `reconcile` refuse the design. A dot in an
+  entity's own name was read right, and stays allowed.
+
 ## [0.27.3] — 2026-10-19
 
 ### Fixed
