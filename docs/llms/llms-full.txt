@@ -254,7 +254,10 @@ dbd deploy --scope hub --database $HUB_URL
   under the schema, same `prefix.*` syntax as the `ignore:` list). The wildcard
   does NOT carry the schema entity, so `excludes: [staging.*]` drops staging's
   tables but keeps the `staging` schema, while `excludes: [staging]` drops the
-  schema too; for `includes`, `schema.*` and `schema` are equivalent. An unknown
+  schema too; for `includes`, `schema.*` and `schema` are equivalent. A table with
+  no schema — a SQLite project's `ddl/table/items.ddl` — is named bare (`items`) or
+  as `main.items`; a schema of that name wins (before 0.27.4 such a table could not
+  be named at all). An unknown
   name or wildcard prefix that matches nothing is an error (typo protection).
   Empty `includes` ⇒ start from the full set; `excludes` removes.
 - `deps: report | include` (default `report`):
