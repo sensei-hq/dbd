@@ -1348,7 +1348,9 @@ tables in other schemas. Two kinds of destruction each need an explicit opt-in:
 `--allow-destructive` drops a **column**/constraint from a managed table, or
 removes an enum **value** (see below) — without it the run refuses, listing each drop by
 entity (`app.people: drops column nickname`) and nothing else (before 0.25 it listed every
-altered table, ones that had only gained a column included);
+altered table, ones that had only gained a column included); a `--dry-run` with the flag ends
+`This plan drops columns/constraints, and the run applies them (--allow-destructive):` and names
+each drop (before 0.27.4 it said to re-run with the flag);
 `--prune` drops a whole **orphaned table** (in a managed schema, no longer in the
 design) that this project owns, or that nobody owns in a schema no other project uses;
 another project's table is never dropped, and one nobody owns where another project might is

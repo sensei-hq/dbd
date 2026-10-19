@@ -17,6 +17,11 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   unknown target, a `design.yaml` already there. `dbd_core::init::plan_project`
   returns that list for an embedder.
 
+- **`reconcile --dry-run --allow-destructive` says what the run does with its
+  drops (#86).** It said to re-run with `--allow-destructive`, the flag already
+  given. It now says the run applies the drops and names each one
+  (`app.people: drops column nickname`).
+
 ## [0.27.3] — 2026-10-19
 
 ### Fixed
