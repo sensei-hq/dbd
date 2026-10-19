@@ -9,7 +9,23 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.27.4] — 2026-10-19
+
+**A DDL file that fails to parse is never cut as a dropped table.** Through
+0.27.3, a typo in one file made `dbd snapshot` write a migration dropping
+that file's table, CASCADE — upgrade before the next snapshot, and check any
+unapplied version that drops a table whose file is still there.
+
 ### Fixed
+
+- **`dbd snapshot` never cuts a file it could not read as a dropped table
+  (#94).** A DDL file that failed to parse — a typo, a save mid-edit — was left
+  out of the snapshot, so the diff read its table as removed and the migration
+  dropped it, `DROP TABLE … CASCADE`, for the next `apply` to run. `snapshot`
+  now refuses such a design as `apply` and `reconcile` do, naming each file
+  and its error, and writes nothing. `dbd merge`, which snapshots what it
+  wrote, refuses the same way. In `dbd-core`, `create_snapshot*` and
+  `create_baseline_snapshot*` return that error.
 
 - **`dbd init --dry-run` writes nothing (#85).** Without `--from-db` or
   `--from-dbml` it wrote the whole scaffold. It now lists the files the
@@ -41,15 +57,6 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   folder, or `a.b` under `schemas:`, is now an error naming it: `inspect`
   reports it, and `apply`, `reconcile` and `snapshot` refuse the design. A dot
   in an entity's own name was read right, and stays allowed.
-
-- **`dbd snapshot` never cuts a file it could not read as a dropped table
-  (#94).** A DDL file that failed to parse — a typo, a save mid-edit — was left
-  out of the snapshot, so the diff read its table as removed and the migration
-  dropped it, `DROP TABLE … CASCADE`, for the next `apply` to run. `snapshot`
-  now refuses such a design as `apply` and `reconcile` do, naming each file
-  and its error, and writes nothing. `dbd merge`, which snapshots what it
-  wrote, refuses the same way. In `dbd-core`, `create_snapshot*` and
-  `create_baseline_snapshot*` return that error.
 
 ## [0.27.3] — 2026-10-19
 
