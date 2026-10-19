@@ -585,3 +585,44 @@ fn modules_help_names_what_takes_the_module_alone() {
         assert!(module.contains(command), "{command}: {module}");
     }
 }
+
+/// One module's import on SQLite, another module's table holding a key to
+/// one it reloads (#88): refused, naming that table, and nothing emptied.
+#[test]
+fn a_sqlite_modules_import_names_the_table_another_module_holds_a_key_from() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write(
+        dir,
+        "design.yaml",
+        &format!(
+            "project:\n  name: lite\nsource:\n  dialect: sqlite\ntarget:\n  sqlite:\n    url: sqlite://{}\n\
+             schemas: []\nmodules:\n  shared: {{}}\n  core:\n    depends_on: [shared]\n",
+            dir.join("app.db").display()
+        ),
+    );
+    write(
+        dir,
+        "shared/ddl/table/parent.ddl",
+        "CREATE TABLE IF NOT EXISTS parent (id INTEGER PRIMARY KEY);\n",
+    );
+    write(dir, "shared/import/parent.csv", "id\n1\n");
+    write(
+        dir,
+        "core/ddl/table/kid.ddl",
+        "CREATE TABLE IF NOT EXISTS kid (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent (id));\n",
+    );
+    write(dir, "core/import/kid.csv", "id,pid\n1,1\n");
+    let o = dbd(dir, &["deploy"]);
+    assert!(o.status.success(), "deploy: {}", text(&o));
+
+    let o = dbd(dir, &["deploy", "--module", "shared"]);
+    let said = text(&o);
+    assert!(!o.status.success(), "{said}");
+    assert!(said.contains("kid"), "{said}");
+    let out = dir.join("out");
+    let o = dbd(dir, &["export", "-o", out.to_str().unwrap()]);
+    assert!(o.status.success(), "export: {}", text(&o));
+    assert_eq!(fs::read_to_string(out.join("parent.csv")).unwrap(), "id\n1\n");
+    assert_eq!(fs::read_to_string(out.join("kid.csv")).unwrap(), "id,pid\n1,1\n");
+}

@@ -27,6 +27,14 @@ the crates are `0.x`, the **minor** position is the breaking one, so
   name one: `items` was "no known schema or entity". A table with no schema is
   now named bare (`items`) or as `main.items`; a schema of the same name wins.
 
+- **A SQLite import empties its tables all or none (#88).** It emptied them one
+  `DELETE FROM` at a time, so a table outside the import holding a key to one
+  of them failed the import after the tables before it were emptied, with
+  SQLite's bare `FOREIGN KEY constraint failed`. They are now emptied in one
+  transaction, as PostgreSQL's one `TRUNCATE` empties them: that table empties
+  none, and is named (`… held by audit (a key to parent), outside the tables
+  this import reloads; it empties only its own`).
+
 ## [0.27.3] — 2026-10-19
 
 ### Fixed

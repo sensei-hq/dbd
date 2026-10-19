@@ -175,9 +175,10 @@ In order:
 
 1. **Truncate** every staging table in the plan (unless `truncate: false`) —
    on PostgreSQL in one `TRUNCATE`, since it empties tables linked by a foreign
-   key only together; on SQLite with `DELETE FROM`, one table at a time, a
-   table that references another first. A table outside the import that holds
-   a key to one of them fails the run, named, before anything is emptied. On
+   key only together; on SQLite with `DELETE FROM`, a table that references another first, all in
+   one transaction. Either way, a table outside the import that holds a key to
+   one of them fails the run, named, with nothing emptied. (Before 0.27.4 SQLite
+   emptied the tables before it one at a time, and its error named no table.) On
    Convex the load itself replaces the table.
 2. **Load** each data file into its table — a staging table another one
    references before the table that references it. On SQLite, whose DDL dbd
