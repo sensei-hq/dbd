@@ -1168,7 +1168,7 @@ pub(crate) async fn reconcile_with_adapter(
             )
             .await
             .context("Reconcile planning failed")?;
-        print_reconcile_plan(&plan, prune != dbd_core::Prune::Off, verbosity);
+        print_reconcile_plan(&plan, prune != dbd_core::Prune::Off, allow_destructive, verbosity);
         // The run goes on to the apply hooks and the grants; a preview of it
         // that stops at the schema changes leaves them out.
         for hook in design.apply_hooks_to_run(Some(resolved))? {
@@ -1245,8 +1245,8 @@ pub(crate) async fn reconcile_with_adapter(
 }
 
 /// Print a reconcile plan (used by `--dry-run`).
-fn print_reconcile_plan(plan: &dbd_core::ReconcilePlan, prune: bool, verbosity: Verbosity) {
-    for line in reconcile_plan_lines(plan, prune, verbosity) {
+fn print_reconcile_plan(plan: &dbd_core::ReconcilePlan, prune: bool, allow_destructive: bool, verbosity: Verbosity) {
+    for line in reconcile_plan_lines(plan, prune, allow_destructive, verbosity) {
         output::always(&line);
     }
 }
@@ -1256,7 +1256,12 @@ fn print_reconcile_plan(plan: &dbd_core::ReconcilePlan, prune: bool, verbosity: 
 /// In verbose mode each altered entity's ALTER SQL is emitted (indented) beneath
 /// its summary line; normal mode shows only the one-line-per-entity summary,
 /// matching the CLI convention that SQL is a `-v` detail.
-fn reconcile_plan_lines(plan: &dbd_core::ReconcilePlan, prune: bool, verbosity: Verbosity) -> Vec<String> {
+fn reconcile_plan_lines(
+    plan: &dbd_core::ReconcilePlan,
+    prune: bool,
+    allow_destructive: bool,
+    verbosity: Verbosity,
+) -> Vec<String> {
     // `is_empty()` already covers added/altered/dropped/matview_creates/
     // matview_restamps, but warnings live in their own channel — a plan whose
     // ONLY content is a matview drift warning must still print it rather than
@@ -1299,7 +1304,15 @@ fn reconcile_plan_lines(plan: &dbd_core::ReconcilePlan, prune: bool, verbosity: 
         lines.push(format!("  ⚠ {w}"));
     }
     if plan.destructive && !plan.altered.is_empty() {
-        lines.push("This plan drops columns/constraints — re-run with --allow-destructive to apply.".to_string());
+        if allow_destructive {
+            // The flag is given: say what the run does with them (#86).
+            lines.push(
+                "This plan drops columns/constraints, and the run applies them (--allow-destructive):".to_string(),
+            );
+            lines.extend(plan.destructive_changes.iter().map(|change| format!("  {change}")));
+        } else {
+            lines.push("This plan drops columns/constraints — re-run with --allow-destructive to apply.".to_string());
+        }
     }
     lines
 }
