@@ -49,15 +49,12 @@ pub fn warn(msg: &str) {
 /// parse — see `Design::unparsed`.
 pub fn left_out_unparsed(entities: &[&dbd_core::Entity]) {
     for e in entities {
-        let file = e
-            .file
-            .as_ref()
-            .map_or_else(|| e.name.clone(), |f| f.display().to_string());
-        warn(&format!(
-            "{file} could not be parsed, so {} is left out: {}",
-            e.name,
-            e.errors.join("; ")
-        ));
+        let said = match &e.file {
+            Some(file) => format!("{} could not be parsed, so {} is left out", file.display(), e.name),
+            // No file to name — a schema from `schemas:` or a path (#99).
+            None => format!("{} is not valid, so it is left out", e.source_label()),
+        };
+        warn(&format!("{said}: {}", e.errors.join("; ")));
     }
 }
 
