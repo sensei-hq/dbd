@@ -67,8 +67,8 @@ Non-schema types: `ddl/<type>/<name>.<ext>`
 
 A schema name cannot hold a dot: dbd names an entity `schema.name` and splits it at the first
 dot, so a `ddl/table/a.b/` folder or `schemas: [a.b]` is an error naming it (``a dot in a schema
-name is not supported: `a.b` …``) — `inspect` reports it, `apply` and `reconcile` refuse the
-design. Before 0.27.4 `"a.b".t` was read as schema `a`, and `diff` took the real table for an
+name is not supported: `a.b` …``) — `inspect` reports it, `apply`, `reconcile` and `snapshot` refuse
+the design. Before 0.27.4 `"a.b".t` was read as schema `a`, and `diff` took the real table for an
 orphan. A dot in an entity's own name is read right.
 
 `<type>` ∈ `table` | `view` | `materialized_view` | `function` | `procedure` | `enum` | `sequence` | `role` (`matview` is accepted for `materialized_view`). Extensions: `.ddl` or `.sql`. There is no `trigger` folder, and no `extension` or `schema` folder either: extensions are declared in the target's `extensions:` and schemas under `schemas:` (dbd generates both statements), so `dbd inspect` refuses a file under `ddl/extension/` — or under `ddl/schema/` for a schema `schemas:` does not list — and `dbd doctor` names the entry to write. **Singular is canonical**; the plural folder name (`functions/`, `tables/`, …) is accepted but `dbd doctor --fix` migrates plural → singular (merging into an existing singular folder; on a same-name collision the newer file is kept and the older saved as `<name>.ddl.bkp`).
