@@ -927,7 +927,30 @@ impl Design {
         hidden.extend(self.relations_elsewhere());
         let live = hide_declared(live_full, &hidden);
 
+        // The foreign keys reconcile drops and adds back around a key change
+        // (#65), found as its plan finds them: from the canonical snapshots,
+        // every holder the database knows of.
+        let desired_canonical = crate::reconcile::compared_snapshot(&desired_owned, &extension_types);
+        let live_canonical = hide_declared(
+            restrict_snapshot_to_schemas(
+                crate::reconcile::compared_snapshot(&live_entities, &extension_types),
+                &managed_schemas,
+            ),
+            &hidden,
+        );
+        let live_all =
+            with_unlisted_foreign_keys(adapter, raw_snapshot_from_entities(&live_entities), &live_canonical).await?;
+        let key_holders = crate::reconcile::key_holder_steps(
+            &live_canonical,
+            &desired_canonical,
+            &live_all,
+            &desired,
+            &Default::default(),
+        )
+        .steps;
+
         let mut diff = crate::SchemaDiff::compute(live, desired);
+        diff.key_holders = key_holders;
 
         // Materialized-view drift (read-only) — matviews aren't in the tables/
         // enums snapshots above, so `compute` never reports them; categorize them

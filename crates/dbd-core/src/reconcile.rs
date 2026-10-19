@@ -1513,8 +1513,66 @@ pub(crate) fn plan_key_holders(
     desired_raw: &Snapshot,
     pruned: &HashSet<String>,
 ) -> crate::error::Result<Vec<(String, String)>> {
+    let HolderSteps { steps, spans, outside } = key_holder_steps(live, desired, live_all, desired_raw, pruned);
+    let refusals: Vec<&str> = steps.iter().filter_map(|s| s.refused.as_deref()).collect();
+    if !refusals.is_empty() {
+        return Err(crate::error::DbdError::Config(format!(
+            "reconcile cannot change a key that a foreign key on a table outside this run holds: {}. \
+             dbd drops no foreign key on a table it does not reconcile — another project's, another \
+             module's, one the scope leaves out, one no design declares — so nothing was changed. Drop \
+             {} by hand and re-run; reconcile adds back a foreign key its design declares.",
+            refusals.join("; "),
+            if outside == 1 {
+                "that foreign key"
+            } else {
+                "those foreign keys"
+            }
+        )));
+    }
+    for step in steps {
+        if step.drops.is_empty() {
+            continue;
+        }
+        let drops = step.drops.join("\n");
+        match plan.altered.iter_mut().find(|s| s.entity_name == step.table) {
+            Some(stmt) => stmt.sql = format!("{drops}\n{}", stmt.sql),
+            None => plan.altered.push(ReconcileStatement {
+                entity_name: step.table.clone(),
+                sql: drops,
+            }),
+        }
+        if !step.adds.is_empty() {
+            merge_altered_sql(plan, &step.table, step.adds.join("\n"));
+        }
+    }
+    Ok(spans)
+}
+
+/// [`key_holder_steps`]'s answer.
+pub(crate) struct HolderSteps {
+    /// One per table whose key a foreign key holds.
+    pub steps: Vec<crate::schema_diff::KeyHolderSteps>,
+    /// The changed table and a holder's, for each foreign key the design
+    /// replaces: the steps between run as one transaction.
+    pub spans: Vec<(String, String)>,
+    /// How many holders are on tables outside the run.
+    pub outside: usize,
+}
+
+/// The steps [`plan_key_holders`] splices into reconcile's plan, one per table
+/// whose key a foreign key holds — and `dbd diff` shows (see
+/// [`crate::SchemaDiff::key_holders`]) — with the pairs of steps a replaced
+/// foreign key spans. A step with a holder outside the run is the refusal
+/// alone: none of its foreign keys is dropped.
+pub(crate) fn key_holder_steps(
+    live: &Snapshot,
+    desired: &Snapshot,
+    live_all: &Snapshot,
+    desired_raw: &Snapshot,
+    pruned: &HashSet<String>,
+) -> HolderSteps {
+    let mut steps = Vec::new();
     let mut spans: Vec<(String, String)> = Vec::new();
-    let mut refusals: Vec<String> = Vec::new();
     let mut outside_count = 0;
     for (changed, holders) in key_holders(live, desired, live_all, desired_raw, KeyDrops::Reconcile) {
         let mut drops: Vec<String> = Vec::new();
@@ -1549,44 +1607,31 @@ pub(crate) fn plan_key_holders(
         }
         if !outside.is_empty() {
             outside_count += outside.len();
-            refusals.push(format!(
-                "{changed}'s {} — held by {}",
-                what_held.join(", "),
-                outside.join(", ")
-            ));
+            steps.push(crate::schema_diff::KeyHolderSteps {
+                refused: Some(format!(
+                    "{changed}'s {} — held by {}",
+                    what_held.join(", "),
+                    outside.join(", ")
+                )),
+                table: changed,
+                ..Default::default()
+            });
             continue;
         }
-        if drops.is_empty() {
-            continue;
-        }
-        let drops = drops.join("\n");
-        match plan.altered.iter_mut().find(|s| s.entity_name == changed) {
-            Some(stmt) => stmt.sql = format!("{drops}\n{}", stmt.sql),
-            None => plan.altered.push(ReconcileStatement {
-                entity_name: changed.clone(),
-                sql: drops,
-            }),
-        }
-        if !adds.is_empty() {
-            merge_altered_sql(plan, &changed, adds.join("\n"));
+        if !drops.is_empty() {
+            steps.push(crate::schema_diff::KeyHolderSteps {
+                table: changed,
+                drops,
+                adds,
+                refused: None,
+            });
         }
     }
-
-    if !refusals.is_empty() {
-        return Err(crate::error::DbdError::Config(format!(
-            "reconcile cannot change a key that a foreign key on a table outside this run holds: {}. \
-             dbd drops no foreign key on a table it does not reconcile — another project's, another \
-             module's, one the scope leaves out, one no design declares — so nothing was changed. Drop \
-             {} by hand and re-run; reconcile adds back a foreign key its design declares.",
-            refusals.join("; "),
-            if outside_count == 1 {
-                "that foreign key"
-            } else {
-                "those foreign keys"
-            }
-        )));
+    HolderSteps {
+        steps,
+        spans,
+        outside: outside_count,
     }
-    Ok(spans)
 }
 
 /// Whether `declared` — a table as the design declares it — adds a foreign key

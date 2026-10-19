@@ -86,14 +86,24 @@ too. Both are now made in place, as `reconcile` makes them.
   And a script's path, however it was set (`SET SCHEMA`, any case), no longer
   stays on the pooled connection it ran on, where `reconcile` and `diff` read
   the database through it.
+- **`dbd diff` shows what reconcile runs around a key change.** When another
+  table's foreign key holds a key that changes, reconcile drops the foreign key
+  first and adds it back after the new key (#65); `diff` showed the key change
+  alone — SQL that fails if run as shown. It now shows the foreign key's drop
+  above the table's own SQL and its re-add below, line for line what reconcile
+  plans, or — when the foreign key is on a table outside the run — that
+  reconcile refuses the change, naming it.
 - **A name a live catalog holds reaches a `DROP` as a name.** A constraint,
   column or table named to close the statement — `x"; create table …; --` —
   was pasted into `reconcile`'s and a migration's `DROP` as SQL, and ran.
 
 ### Added
 
-- **Library API**: `sql_expr::{exclusion_reads_column, rename_column}` and
-  `snapshot::{pending_lossy_swaps, LossySwap}`.
+- **Library API**: `sql_expr::{exclusion_reads_column, rename_column}`,
+  `snapshot::{pending_lossy_swaps, LossySwap}`, and
+  `schema_diff::KeyHolderSteps` with `SchemaDiff::key_holders` — a
+  `SchemaDiff` built by hand rather than returned by `diff_live` needs the new
+  field, or `..Default::default()`.
 
 ### Changed — Library API
 

@@ -26,6 +26,31 @@ pub struct SchemaDiff {
     /// is defensive: `SchemaDiff` is only ever serialized today (`dbd diff --json`).
     #[serde(default)]
     pub matview_drift: Vec<MatviewDrift>,
+    /// What reconcile runs around each key change a foreign key holds (#65):
+    /// the foreign keys holding the key dropped before the table's change and
+    /// the ones the design keeps added back after it — or that it refuses the
+    /// change. `diff_live` fills it, so the SQL `dbd diff` shows for a table is
+    /// the SQL reconcile runs for it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_holders: Vec<KeyHolderSteps>,
+}
+
+/// The foreign keys reconcile drops and adds back around one table's key
+/// change — see [`SchemaDiff::key_holders`].
+#[derive(Debug, Clone, PartialEq, Serialize, Default)]
+pub struct KeyHolderSteps {
+    /// The table whose key changes, `schema.name`.
+    pub table: String,
+    /// The statements dropping each foreign key holding the key, run before
+    /// the table's own change.
+    pub drops: Vec<String>,
+    /// The statements adding back each one the design keeps, run after it —
+    /// once the key it references is there again.
+    pub adds: Vec<String>,
+    /// When a foreign key on a table outside the run holds the key: what holds
+    /// it. Reconcile refuses the change, and drops none of them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
 }
 
 /// One drifted materialized view: its qualified `schema.name` and how it drifted.
@@ -73,6 +98,7 @@ impl SchemaDiff {
             warnings,
             advisories,
             matview_drift: Vec::new(),
+            key_holders: Vec::new(),
         }
     }
 

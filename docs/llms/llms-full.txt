@@ -1478,7 +1478,11 @@ unparseable CHECK is shown flagged `advisory`. Covers tables + enums
 structurally, plus **materialized-view drift** (each matview reported
 `missing`/`drifted`/`unstamped`/`orphan` via the `dbd:hash` drift stamp in
 `dbd.matview_stamps`; in `--json` as `matview_drift`, and counts toward
-`--exit-code`). Views/functions/roles/sequences are not structurally diffed, and
+`--exit-code`). A key another table's foreign key holds is shown changing as
+`reconcile` changes it — that foreign key dropped above the table's own SQL and, when
+the design keeps it, added back below; one on a table outside the run shown as the
+refusal reconcile gives (`--json`: `key_holders`; before 0.27.2 diff showed the key
+change alone). Views/functions/roles/sequences are not structurally diffed, and
 table, view and enum comments are not compared.
 
 ### dbd release (alias: dbd baseline)

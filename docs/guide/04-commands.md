@@ -1529,7 +1529,11 @@ matview is reported as `missing` (in the design, not the DB), `drifted` (deploye
 definition differs from the design, by the `dbd:hash` drift stamp dbd recorded
 in `dbd.matview_stamps`), `unstamped` (in the DB with no stamp dbd recorded), or
 `orphan` (in a managed schema, not in the design). Matview drift counts toward
-`--exit-code` and appears in `--json` (`matview_drift`). Views/functions/roles/
+`--exit-code` and appears in `--json` (`matview_drift`). A key another table's foreign key
+holds is shown changing as `reconcile` changes it: that foreign key's drop above the table's
+own SQL and, when the design keeps it, its re-add below — or, when the foreign key is on a
+table outside the run, that reconcile refuses the change (`--json`: `key_holders`).
+Views/functions/roles/
 sequences are not structurally diffed, and table, view and enum comments are not
 compared.
 
@@ -1538,9 +1542,7 @@ table in the *same non-public schema* without qualifying it can read as drift; a
 index whose columns exactly match a PK/UNIQUE constraint is treated as that constraint's
 backing index and suppressed; an unparseable CHECK is shown with an `advisory`. A bare
 `nextval('s')` whose sequence the design declares nowhere is taken to be in its file's first
-path schema, so one a hook or another project makes elsewhere reads as drift. When a key
-another table's foreign key holds changes, `diff` shows the key change but not the drop and
-re-add of that foreign key `reconcile` runs around it. A negative default (`-1`, which Postgres reports as
+path schema, so one a hook or another project makes elsewhere reads as drift. A negative default (`-1`, which Postgres reports as
 `'-1'::integer`) and a `varbit` column read as drift on every run.
 
 **In a workspace** `diff` answers for every module the run selects, under its
