@@ -15,7 +15,7 @@
 
 ## Next
 
-- Confirm `main` CI is green on df174b83.
+- Nothing pending: `main` CI green on df174b83.
 
 ## Open
 
