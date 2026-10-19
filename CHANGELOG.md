@@ -9,6 +9,8 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.27.5] — 2026-10-19
+
 ### Fixed
 
 - **A design dbd could not fully read is named right (#99).** A dotted schema,
