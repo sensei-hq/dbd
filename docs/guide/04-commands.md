@@ -1147,6 +1147,8 @@ A table removed from the design is written as its `DROP TABLE … CASCADE` in `m
 
 `dbd snapshot` sets `project.version` by editing `design.yaml` in place: its comments, blank lines and flow-style lists stay as you wrote them.
 
+A design with a file dbd could not read — a DDL file that fails to parse, a dotted schema — is refused, as `apply` refuses it, naming each file and its error; nothing is written. (Before 0.27.4 the file was left out of the snapshot, so the migration dropped its table, `DROP TABLE … CASCADE`, and the next `apply` ran the drop.)
+
 **In a workspace** each module is snapshotted on its own, in its folder, at its
 own version — every module, or the one `--module` names, never a scope: a
 snapshot records the design — and its version is written under

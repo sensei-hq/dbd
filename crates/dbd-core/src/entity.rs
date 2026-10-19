@@ -1139,6 +1139,29 @@ pub fn split_qualified_name(name: &str) -> (Option<String>, String) {
     }
 }
 
+/// The error for a design dbd could not fully read — `unread` the entities
+/// carrying an error, each named by its file with its errors — that a command
+/// refuses rather than act on what it read: the design `cannot be <what>`.
+pub(crate) fn unread_files_error(unread: &[&Entity], what: &str) -> crate::error::DbdError {
+    let mut msg = format!(
+        "{} file(s) could not be parsed, so the design is incomplete and cannot be {what}:\n",
+        unread.len()
+    );
+    for e in unread {
+        let where_ = e
+            .file
+            .as_ref()
+            .map(|f| f.display().to_string())
+            .unwrap_or_else(|| e.name.clone());
+        msg.push_str(&format!("\n  {where_}\n"));
+        for err in &e.errors {
+            msg.push_str(&format!("    {err}\n"));
+        }
+    }
+    msg.push_str("\nFix the file(s), or run `dbd inspect` for the full report.");
+    crate::error::DbdError::Config(msg)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

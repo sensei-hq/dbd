@@ -1556,7 +1556,10 @@ its `COMMENT ON TYPE` carried to the new one). Before 0.25 the removal took thre
 `TEXT`, failed on any view over the column and on an enum default, and lost the type's comment.
 
 `dbd snapshot` writes `project.version` by editing `design.yaml` in place, keeping its
-comments and layout.
+comments and layout. A design with a file dbd could not read (a parse error, a dotted schema)
+is refused, as `apply` refuses it — `N file(s) could not be parsed, so the design is incomplete
+and cannot be snapshotted`, each file named with its error — and nothing is written. Before
+0.27.4 the file was left out of the snapshot, so the migration dropped its table, CASCADE.
 
 **A key a foreign key holds.** The migration of a table whose primary or unique key (or a
 column of one) goes drops the foreign keys holding that key first — its file runs before
@@ -1570,7 +1573,9 @@ everywhere before 0.27.1 — it is left as a comment saying to drop it by hand. 
 to you. A primary key declared on its column (`id uuid primary key`) is not migrated when it
 changes — declare a key that will change as `primary key (…)`. Library: `snapshot::{MigrationDialect,
 create_snapshot_in, prepare_multi_snapshot_in}` (`MigrationDialect::of(url, target)`); the
-existing functions write `Portable`.
+existing functions write `Portable`. Every `create_snapshot*` and `create_baseline_snapshot*`
+refuses entities carrying an error (an `Err` naming each file, nothing written); the pure
+`prepare_multi_snapshot*` leaves the check to the caller.
 
 A table removed from the design is written as `DROP TABLE … CASCADE` in
 `migrations/<NNN>/<schema>/<table>.sql`, where every per-table migration goes, and the

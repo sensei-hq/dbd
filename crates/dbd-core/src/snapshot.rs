@@ -1718,6 +1718,7 @@ pub fn create_snapshot_in(
     description: &str,
     dialect: MigrationDialect,
 ) -> Result<MultiSnapshotResult> {
+    ensure_fully_read(entities)?;
     let previous = latest_snapshot(project_dir)?;
     let base_version = next_version(project_dir);
     let result = prepare_multi_snapshot_in(entities, previous.as_ref(), base_version, description, dialect);
@@ -1748,6 +1749,24 @@ pub fn create_snapshot_in(
 
     crate::config::update_version_of(config_path, module, final_version)?;
     Ok(result)
+}
+
+/// Refuse to snapshot a design dbd could not fully read (#94). An entity
+/// carrying an error — a file that failed to parse — is left out of the
+/// snapshot, so the diff read its table as removed and the migration dropped
+/// it, CASCADE. `apply` and `reconcile` refuse such a design the same way.
+fn ensure_fully_read(entities: &[Entity]) -> Result<()> {
+    let unread: Vec<&Entity> = entities
+        .iter()
+        .filter(|e| e.has_errors() && e.entity_type != EntityType::External)
+        .collect();
+    if unread.is_empty() {
+        return Ok(());
+    }
+    Err(crate::entity::unread_files_error(
+        &unread,
+        "snapshotted — a file left out would be cut as dropped",
+    ))
 }
 
 /// Write a snapshot's migration graph (`graph.json`) plus its migration files
@@ -1800,6 +1819,7 @@ pub fn create_baseline_snapshot_of(
     description: &str,
     version: u32,
 ) -> Result<MultiSnapshotResult> {
+    ensure_fully_read(entities)?;
     // A fresh project has no prior snapshot — baseline at the requested version.
     let result = prepare_multi_snapshot(entities, None, version, description);
 
@@ -2484,6 +2504,43 @@ mod tests {
         assert!(!result2.snapshots[0].no_changes);
         assert!(tmp.path().join("snapshots/002.json").exists());
         assert!(tmp.path().join("migrations/002/graph.json").exists());
+    }
+
+    /// An entity dbd could not read is left out of a snapshot, so the diff
+    /// read its table as removed and the migration dropped it (#94): a
+    /// snapshot of such a design is refused, naming the file, writing nothing.
+    #[test]
+    fn a_snapshot_of_a_design_with_an_unread_file_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("design.yaml");
+        let config = "project:\n  name: test\ntarget: {}\n";
+        fs::write(&config_path, config).unwrap();
+        let users = || make_table_entity("config.users", vec![col("id", "BIGINT")]);
+        create_snapshot(&[users()], tmp.path(), &config_path, "initial").unwrap();
+        let config = fs::read_to_string(&config_path).unwrap();
+
+        let mut unread = users();
+        unread.table_def = None;
+        unread.file = Some("ddl/table/config/users.ddl".into());
+        unread.errors.push("syntax error at or near \",\"".to_string());
+        let Err(err) = create_snapshot(&[unread.clone()], tmp.path(), &config_path, "typo") else {
+            panic!("a design with an unread file is refused");
+        };
+
+        let said = err.to_string();
+        assert!(said.contains("ddl/table/config/users.ddl"), "{said}");
+        assert!(said.contains("syntax error"), "{said}");
+        assert!(!tmp.path().join("snapshots/002.json").exists());
+        assert!(!tmp.path().join("migrations/002").exists());
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), config);
+
+        // A baseline too: it would record the design without the table.
+        let fresh = TempDir::new().unwrap();
+        let fresh_config = fresh.path().join("design.yaml");
+        fs::write(&fresh_config, "project:\n  name: test\ntarget: {}\n").unwrap();
+        assert!(create_snapshot(&[unread.clone()], fresh.path(), &fresh_config, "initial").is_err());
+        assert!(create_baseline_snapshot(&[unread], fresh.path(), &fresh_config, "init", 1).is_err());
+        assert!(!fresh.path().join("snapshots").exists());
     }
 
     #[test]
