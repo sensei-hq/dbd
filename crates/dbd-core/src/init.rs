@@ -119,6 +119,21 @@ pub const SCAFFOLD_TARGETS: &[&str] = &["postgres", "supabase"];
 
 /// Write init files to the project directory.
 pub fn create_project(project_dir: &std::path::Path, name: &str, target: &str) -> crate::error::Result<Vec<InitFile>> {
+    let files = plan_project(project_dir, name, target)?;
+    for file in &files {
+        let full_path = project_dir.join(&file.path);
+        if let Some(parent) = full_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&full_path, &file.content)?;
+    }
+    Ok(files)
+}
+
+/// What [`create_project`] would write in `project_dir`, refused as it would
+/// be — an unknown target, a project already there — writing nothing: what
+/// `dbd init --dry-run` shows (#85).
+pub fn plan_project(project_dir: &std::path::Path, name: &str, target: &str) -> crate::error::Result<Vec<InitFile>> {
     // Refuse rather than fall through: an unknown target used to get the
     // postgres scaffold, so `--target convex` (or a typo) looked like it worked.
     if !SCAFFOLD_TARGETS.contains(&target) {
@@ -135,17 +150,7 @@ pub fn create_project(project_dir: &std::path::Path, name: &str, target: &str) -
         ));
     }
 
-    let files = generate_init_files(name, target);
-
-    for file in &files {
-        let full_path = project_dir.join(&file.path);
-        if let Some(parent) = full_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&full_path, &file.content)?;
-    }
-
-    Ok(files)
+    Ok(generate_init_files(name, target))
 }
 
 #[cfg(test)]

@@ -766,7 +766,7 @@ pub async fn run(
                 let project_name = name
                     .as_deref()
                     .unwrap_or_else(|| project_dir.file_name().and_then(|n| n.to_str()).unwrap_or("my-project"));
-                project::cmd_init(project_dir, project_name, target, verbosity)
+                project::cmd_init(project_dir, project_name, target, *dry_run, verbosity)
             }
         }
 

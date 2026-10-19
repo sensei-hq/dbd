@@ -581,7 +581,17 @@ fn fix_plural_dirs(plural_dirs: &[dbd_core::doctor::PluralDdlDir], verbosity: Ve
     fixed
 }
 
-pub fn cmd_init(project_dir: &Path, name: &str, target: &str, verbosity: Verbosity) -> Result<()> {
+pub fn cmd_init(project_dir: &Path, name: &str, target: &str, dry_run: bool, verbosity: Verbosity) -> Result<()> {
+    if dry_run {
+        // What init would write, and nothing written (#85).
+        let files = dbd_core::init::plan_project(project_dir, name, target).context("Failed to initialize project")?;
+        output::always(&format!("Would initialize dbd project '{name}' ({target}), writing:"));
+        for file in &files {
+            output::always(&format!("  {}", file.path.display()));
+        }
+        output::always("[dry-run] Nothing written.");
+        return Ok(());
+    }
     let files = dbd_core::init::create_project(project_dir, name, target).context("Failed to initialize project")?;
 
     output::info(verbosity, &format!("Initialized dbd project '{name}' ({target})"));
