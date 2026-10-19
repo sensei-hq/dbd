@@ -1097,6 +1097,21 @@ impl Entity {
     pub fn has_errors(&self) -> bool {
         !self.errors.is_empty()
     }
+
+    /// Its kind as a message names it: `schema`, `materialized view`.
+    pub fn kind_label(&self) -> String {
+        self.entity_type.folder_name().replace('_', " ")
+    }
+
+    /// Where a message points for this entity: its file, or — one with no
+    /// file, a schema from `schemas:` or from a path — its kind and name
+    /// (`schema a.b`), so it never reads as a path (#99).
+    pub fn source_label(&self) -> String {
+        match &self.file {
+            Some(file) => file.display().to_string(),
+            None => format!("{} {}", self.kind_label(), self.name),
+        }
+    }
 }
 
 /// The error on an entity whose schema holds a dot (#89): dbd names an
@@ -1142,24 +1157,58 @@ pub fn split_qualified_name(name: &str) -> (Option<String>, String) {
 /// The error for a design dbd could not fully read — `unread` the entities
 /// carrying an error, each named by its file with its errors — that a command
 /// refuses rather than act on what it read: the design `cannot be <what>`.
+///
+/// An entity with no file — a schema from `schemas:` or from a path — is
+/// counted and named by its kind (`1 schema is not valid`, `schema a.b`),
+/// never as a file (#99).
 pub(crate) fn unread_files_error(unread: &[&Entity], what: &str) -> crate::error::DbdError {
+    let files = unread.iter().filter(|e| e.file.is_some()).count();
+    let mut parts = Vec::new();
+    if files > 0 {
+        parts.push(format!("{files} file(s) could not be parsed"));
+    }
+    let mut kinds: Vec<(String, usize)> = Vec::new();
+    for e in unread.iter().filter(|e| e.file.is_none()) {
+        let kind = e.kind_label();
+        match kinds.iter_mut().find(|(k, _)| *k == kind) {
+            Some((_, n)) => *n += 1,
+            None => kinds.push((kind, 1)),
+        }
+    }
+    for (kind, n) in kinds {
+        parts.push(match n {
+            1 => format!("1 {kind} is not valid"),
+            n => format!("{n} {kind}s are not valid"),
+        });
+    }
     let mut msg = format!(
-        "{} file(s) could not be parsed, so the design is incomplete and cannot be {what}:\n",
-        unread.len()
+        "{}, so the design is incomplete and cannot be {what}:\n",
+        parts.join(" and ")
     );
     for e in unread {
-        let where_ = e
-            .file
-            .as_ref()
-            .map(|f| f.display().to_string())
-            .unwrap_or_else(|| e.name.clone());
-        msg.push_str(&format!("\n  {where_}\n"));
+        msg.push_str(&format!("\n  {}\n", e.source_label()));
         for err in &e.errors {
             msg.push_str(&format!("    {err}\n"));
         }
     }
-    msg.push_str("\nFix the file(s), or run `dbd inspect` for the full report.");
+    msg.push_str("\nFix them, or run `dbd inspect` for the full report.");
     crate::error::DbdError::Config(msg)
+}
+
+/// Refuse a design dbd could not fully read: every entity carrying an error
+/// but an `external:` stub, which has no file to read. Left out, a table reads
+/// as dropped — `snapshot` cut it as `DROP TABLE … CASCADE` (#94) — so a
+/// command that records or applies the design refuses it, naming each file:
+/// the design `cannot be <what>`.
+pub fn ensure_fully_read(entities: &[Entity], what: &str) -> crate::error::Result<()> {
+    let unread: Vec<&Entity> = entities
+        .iter()
+        .filter(|e| e.has_errors() && e.entity_type != EntityType::External)
+        .collect();
+    if unread.is_empty() {
+        return Ok(());
+    }
+    Err(unread_files_error(&unread, what))
 }
 
 #[cfg(test)]
