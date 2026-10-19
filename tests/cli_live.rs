@@ -1976,6 +1976,43 @@ async fn reconcile_dry_run_names_the_hooks_and_grants_the_run_applies() {
     }
 }
 
+/// A dry run of a plan that drops a column says what the run does with it
+/// (#86): with `--allow-destructive` the run applies it, named; without, it
+/// says to re-run with the flag — which it said with the flag given, too.
+#[tokio::test]
+async fn a_destructive_dry_run_says_what_the_run_does_with_its_drops() {
+    let (_pg, url) = start_pg().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: clilive\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("ddl/table/app")).unwrap();
+    let table = |columns: &str| {
+        std::fs::write(
+            dir.join("ddl/table/app/t.ddl"),
+            format!("create table if not exists app.t (\n  id integer primary key{columns}\n);\n"),
+        )
+        .unwrap();
+    };
+    table("\n, old text");
+    let o = dbd(dir, &url, &["reconcile"]);
+    assert!(o.status.success(), "reconcile: {}", combined(&o));
+    table("");
+    let allowed = dbd(dir, &url, &["reconcile", "--dry-run", "--allow-destructive"]);
+    let said = combined(&allowed);
+    assert!(allowed.status.success(), "{said}");
+    assert!(!said.contains("re-run with --allow-destructive"), "{said}");
+    assert!(
+        said.contains("the run applies them") && said.contains("app.t: drops column old"),
+        "{said}"
+    );
+    let refused = combined(&dbd(dir, &url, &["reconcile", "--dry-run"]));
+    assert!(refused.contains("re-run with --allow-destructive"), "{refused}");
+}
+
 /// Under a scope that none of v2's changes touch, `apply --dry-run` said "No
 /// pending migration to run (database at v1, design at v2)", and the run then
 /// said "Migrated v1 → v2". The preview now says what the run does: v2 is

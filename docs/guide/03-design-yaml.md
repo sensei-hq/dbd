@@ -274,7 +274,7 @@ Append `?deploy=true` to the URL to run `npx convex deploy` automatically after 
 
 ### `schemas`
 
-List of schema names. dbd runs `CREATE SCHEMA IF NOT EXISTS` for each. Schemas referenced in entity file paths are auto-added.
+List of schema names. dbd runs `CREATE SCHEMA IF NOT EXISTS` for each. Schemas referenced in entity file paths are auto-added. A name holding a dot is an error, named — dbd splits `schema.name` at the first dot (see [DDL folder layout](02-getting-started.md#ddl-folder-layout)).
 
 A schema entry may also be an object carrying `grants:` (and [`exposed`](#exposed)). Schema grants and the first target's `grants:` both apply, whatever the target is named:
 

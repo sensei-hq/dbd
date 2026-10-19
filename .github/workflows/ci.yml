@@ -54,6 +54,12 @@ jobs:
       # and the workspace run reports it green. `--no-report` accumulates raw
       # profiles; the final `report` merges them into one lcov.
       - name: cargo test + coverage (workspace + embedded + CLI, merged)
+        # The embedded server looks its binaries up on the GitHub API. Signed
+        # out, a runner shares 60 requests an hour with its IP, and a burst of
+        # PRs failed every embedded test on 403/429; postgresql_archive sends
+        # GITHUB_TOKEN when set. The job's token is read-only (above).
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           cargo llvm-cov clean --workspace
           cargo llvm-cov --no-report --workspace

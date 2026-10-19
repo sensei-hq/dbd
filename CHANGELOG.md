@@ -9,6 +9,55 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.27.4] — 2026-10-19
+
+**A DDL file that fails to parse is never cut as a dropped table.** Through
+0.27.3, a typo in one file made `dbd snapshot` write a migration dropping
+that file's table, CASCADE — upgrade before the next snapshot, and check any
+unapplied version that drops a table whose file is still there.
+
+### Fixed
+
+- **`dbd snapshot` never cuts a file it could not read as a dropped table
+  (#94).** A DDL file that failed to parse — a typo, a save mid-edit — was left
+  out of the snapshot, so the diff read its table as removed and the migration
+  dropped it, `DROP TABLE … CASCADE`, for the next `apply` to run. `snapshot`
+  now refuses such a design as `apply` and `reconcile` do, naming each file
+  and its error, and writes nothing. `dbd merge`, which snapshots what it
+  wrote, refuses the same way. In `dbd-core`, `create_snapshot*` and
+  `create_baseline_snapshot*` return that error.
+
+- **`dbd init --dry-run` writes nothing (#85).** Without `--from-db` or
+  `--from-dbml` it wrote the whole scaffold. It now lists the files the
+  scaffold would write and writes none, refused as the run would be — an
+  unknown target, a `design.yaml` already there. `dbd_core::init::plan_project`
+  returns that list for an embedder.
+
+- **`reconcile --dry-run --allow-destructive` says what the run does with its
+  drops (#86).** It said to re-run with `--allow-destructive`, the flag already
+  given. It now says the run applies the drops and names each one
+  (`app.people: drops column nickname`).
+
+- **A scope names a SQLite table (#87).** A SQLite project's tables have no
+  schema, and a scope item was a schema or `schema.entity`, so no scope could
+  name one: `items` was "no known schema or entity". A table with no schema is
+  now named bare (`items`) or as `main.items`; a schema of the same name wins.
+
+- **A SQLite import empties its tables all or none (#88).** It emptied them one
+  `DELETE FROM` at a time, so a table outside the import holding a key to one
+  of them failed the import after the tables before it were emptied, with
+  SQLite's bare `FOREIGN KEY constraint failed`. They are now emptied in one
+  transaction, as PostgreSQL's one `TRUNCATE` empties them: that table empties
+  none, and is named (`… held by audit (a key to parent), outside the tables
+  this import reloads; it empties only its own`).
+
+- **A dot in a schema name is an error, named (#89).** dbd names an entity
+  `schema.name` and splits it at the first dot, so `"a.b".t` was read as
+  schema `a`, and `diff` took the real table for an orphan. A `ddl/table/a.b/`
+  folder, or `a.b` under `schemas:`, is now an error naming it: `inspect`
+  reports it, and `apply`, `reconcile` and `snapshot` refuse the design. A dot
+  in an entity's own name was read right, and stays allowed.
+
 ## [0.27.3] — 2026-10-19
 
 ### Fixed

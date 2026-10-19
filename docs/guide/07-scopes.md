@@ -39,6 +39,11 @@ schema's entities *and* its `CREATE SCHEMA`, while `excludes: [staging.*]` drops
 the entities and keeps an empty `staging` schema. For `includes` the two are
 equivalent — a schema whose entities are present is added back.
 
+A table with no schema — a SQLite project's `ddl/table/items.ddl` — is named by
+its name, `items`, or as `main.items`, SQLite's name for its main database. A
+schema of the same name wins. (Before 0.27.4 a scope could not name such a
+table at all.)
+
 `includes` omitted means "start from everything"; `excludes` removes from
 whatever `includes` produced. A name or wildcard that matches nothing is an
 error, so a typo cannot quietly select less than you meant.

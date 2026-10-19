@@ -1147,6 +1147,8 @@ A table removed from the design is written as its `DROP TABLE … CASCADE` in `m
 
 `dbd snapshot` sets `project.version` by editing `design.yaml` in place: its comments, blank lines and flow-style lists stay as you wrote them.
 
+A design with a file dbd could not read — a DDL file that fails to parse, a dotted schema — is refused, as `apply` refuses it, naming each file and its error; nothing is written. (Before 0.27.4 the file was left out of the snapshot, so the migration dropped its table, `DROP TABLE … CASCADE`, and the next `apply` ran the drop.)
+
 **In a workspace** each module is snapshotted on its own, in its folder, at its
 own version — every module, or the one `--module` names, never a scope: a
 snapshot records the design — and its version is written under
@@ -1336,7 +1338,10 @@ The plan lists one line per changed entity (`+ create`, `~ alter`, `- prune`). M
 appear too: `+ create materialized view <name>` for one reconcile would create, and a `⚠` warning
 for a matview whose deployed definition has drifted (dbd never auto-recreates a matview). Add `-v`
 to a `--dry-run` to print the generated `ALTER` SQL beneath each altered entity, so you can review
-the exact column-level change before applying.
+the exact column-level change before applying. A plan that drops columns or constraints ends by
+saying so: without `--allow-destructive`, that the run needs the flag; with it, that the run
+applies the drops, each named (`app.people: drops column nickname`). (Before 0.27.4 a dry run with
+the flag still said to re-run with it.)
 
 **Grants and hooks.** A reconciled database is the one an apply builds, so reconcile runs the
 design's `apply.before` and `apply.after` hooks and then its `grants:`, scoped as `apply` scopes
@@ -1680,10 +1685,13 @@ the DDL and writes the baseline snapshot for you, so you go straight to `dbd app
 dbd init                                # Postgres target, name from directory
 dbd init --name myproject               # Custom project name
 dbd init --target supabase              # Supabase target with externals + ignore patterns
+dbd init --dry-run                      # list the files init would write, write nothing
 ```
 
 `--target` takes `postgres` (the default) or `supabase`, the two targets with a scaffold; any
-other is refused rather than given the PostgreSQL scaffold.
+other is refused rather than given the PostgreSQL scaffold. `--dry-run` lists the files the
+scaffold would write and writes none, and is refused as the run would be — an unknown target, a
+`design.yaml` already there. (Before 0.27.4 it wrote the scaffold all the same.)
 
 Creates design.yaml, the ddl/ type folders (`table`, `view`, `materialized_view`,
 `function`, `procedure`, `enum`), an `import/` folder and a sample table DDL.
@@ -2207,7 +2215,7 @@ User's `.pre-commit-config.yaml`:
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.27.3
+  rev: v0.27.4
   hooks:
     - id: dbd-format
 ```

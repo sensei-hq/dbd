@@ -65,6 +65,12 @@ myproject/
 Schema-scoped types: `ddl/<type>/<schema>/<name>.<ext>`
 Non-schema types: `ddl/<type>/<name>.<ext>`
 
+A schema name cannot hold a dot: dbd names an entity `schema.name` and splits it at the first
+dot, so a `ddl/table/a.b/` folder or `schemas: [a.b]` is an error naming it (``a dot in a schema
+name is not supported: `a.b` …``) — `inspect` reports it, `apply`, `reconcile` and `snapshot` refuse
+the design. Before 0.27.4 `"a.b".t` was read as schema `a`, and `diff` took the real table for an
+orphan. A dot in an entity's own name is read right.
+
 `<type>` ∈ `table` | `view` | `materialized_view` | `function` | `procedure` | `enum` | `sequence` | `role` (`matview` is accepted for `materialized_view`). Extensions: `.ddl` or `.sql`. There is no `trigger` folder, and no `extension` or `schema` folder either: extensions are declared in the target's `extensions:` and schemas under `schemas:` (dbd generates both statements), so `dbd inspect` refuses a file under `ddl/extension/` — or under `ddl/schema/` for a schema `schemas:` does not list — and `dbd doctor` names the entry to write. **Singular is canonical**; the plural folder name (`functions/`, `tables/`, …) is accepted but `dbd doctor --fix` migrates plural → singular (merging into an existing singular folder; on a same-name collision the newer file is kept and the older saved as `<name>.ddl.bkp`).
 
 ---
@@ -254,7 +260,10 @@ dbd deploy --scope hub --database $HUB_URL
   under the schema, same `prefix.*` syntax as the `ignore:` list). The wildcard
   does NOT carry the schema entity, so `excludes: [staging.*]` drops staging's
   tables but keeps the `staging` schema, while `excludes: [staging]` drops the
-  schema too; for `includes`, `schema.*` and `schema` are equivalent. An unknown
+  schema too; for `includes`, `schema.*` and `schema` are equivalent. A table with
+  no schema — a SQLite project's `ddl/table/items.ddl` — is named bare (`items`) or
+  as `main.items`; a schema of that name wins (before 0.27.4 such a table could not
+  be named at all). An unknown
   name or wildcard prefix that matches nothing is an error (typo protection).
   Empty `includes` ⇒ start from the full set; `excludes` removes.
 - `deps: report | include` (default `report`):
@@ -574,7 +583,11 @@ The adapter (PostgreSQL/SQLite/Convex) is chosen from the connection **URL schem
 ```sh
 dbd init -n myproject
 dbd init -n myproject --target supabase
+dbd init --dry-run                      # list the files init would write, write nothing
 ```
+
+`--dry-run` lists the scaffold's files and writes none; it is refused as the run would be (an
+unknown target, a `design.yaml` already there). Before 0.27.4 it wrote the scaffold all the same.
 
 The scaffold: `design.yaml`, `ddl/{table,view,materialized_view,function,procedure,enum}/`,
 `ddl/table/public/example.ddl`, `import/`. `--target supabase` adds a `config` schema,
@@ -1063,8 +1076,11 @@ fails the import with nothing emptied, named (`emptying staging.items, staging.o
 the import failed, so nothing was emptied: … — held by app.lines (lines_item_fk, a key to
 staging.items), outside the tables this import reloads; it truncates only its own`). SQLite,
 whose DDL dbd reads verbatim and so gives no references, takes the order from the foreign keys
-the database reports: it loads a referenced table first and empties them one at a time with
-`DELETE FROM`, a referencing table first, naming the table that fails; `import --dry-run` lists
+the database reports: it loads a referenced table first and empties them with `DELETE FROM` in one
+transaction, a referencing table first, so a table outside the import holding a key to one
+empties none and is named (`… held by audit (a key to parent), outside the tables this import
+reloads; it empties only its own`; before 0.27.4 the tables before it were emptied and the error
+named no table); `import --dry-run` lists
 that order when the database exists (alphabetical with none to ask). (Before 0.25 the truncate failed naming no table.) Convex imports with
 `--replace`, so it always replaces and `truncate: false` has no effect there.
 CSV/TSV are RFC 4180 on both engines, as Postgres's `COPY … (FORMAT csv)` reads them:
@@ -1344,7 +1360,9 @@ tables in other schemas. Two kinds of destruction each need an explicit opt-in:
 `--allow-destructive` drops a **column**/constraint from a managed table, or
 removes an enum **value** (see below) — without it the run refuses, listing each drop by
 entity (`app.people: drops column nickname`) and nothing else (before 0.25 it listed every
-altered table, ones that had only gained a column included);
+altered table, ones that had only gained a column included); a `--dry-run` with the flag ends
+`This plan drops columns/constraints, and the run applies them (--allow-destructive):` and names
+each drop (before 0.27.4 it said to re-run with the flag);
 `--prune` drops a whole **orphaned table** (in a managed schema, no longer in the
 design) that this project owns, or that nobody owns in a schema no other project uses;
 another project's table is never dropped, and one nobody owns where another project might is
@@ -1538,7 +1556,10 @@ its `COMMENT ON TYPE` carried to the new one). Before 0.25 the removal took thre
 `TEXT`, failed on any view over the column and on an enum default, and lost the type's comment.
 
 `dbd snapshot` writes `project.version` by editing `design.yaml` in place, keeping its
-comments and layout.
+comments and layout. A design with a file dbd could not read (a parse error, a dotted schema)
+is refused, as `apply` refuses it — `N file(s) could not be parsed, so the design is incomplete
+and cannot be snapshotted`, each file named with its error — and nothing is written. Before
+0.27.4 the file was left out of the snapshot, so the migration dropped its table, CASCADE.
 
 **A key a foreign key holds.** The migration of a table whose primary or unique key (or a
 column of one) goes drops the foreign keys holding that key first — its file runs before
@@ -1552,7 +1573,9 @@ everywhere before 0.27.1 — it is left as a comment saying to drop it by hand. 
 to you. A primary key declared on its column (`id uuid primary key`) is not migrated when it
 changes — declare a key that will change as `primary key (…)`. Library: `snapshot::{MigrationDialect,
 create_snapshot_in, prepare_multi_snapshot_in}` (`MigrationDialect::of(url, target)`); the
-existing functions write `Portable`.
+existing functions write `Portable`. Every `create_snapshot*` and `create_baseline_snapshot*`
+refuses entities carrying an error (an `Err` naming each file, nothing written); the pure
+`prepare_multi_snapshot*` leaves the check to the caller.
 
 A table removed from the design is written as `DROP TABLE … CASCADE` in
 `migrations/<NNN>/<schema>/<table>.sql`, where every per-table migration goes, and the
@@ -1899,7 +1922,7 @@ Both set `pass_filenames: false` because `dbd format` scans the project itself. 
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.27.3
+  rev: v0.27.4
   hooks:
     - id: dbd-format
 ```
@@ -2220,7 +2243,7 @@ let graph = design.graph(None, None)?;
 
 ### Adapter quirks
 
-- **SQLite**: no schemas — `Schema` entities are silently no-op; entity names like `auth.users` resolve to the bare table `users` via `sqlite_master`. `Enum`/`Function`/`Procedure`/`Role`/`Extension`/`Sequence`/`MaterializedView` are rejected at apply time. No transactional apply; grants skipped; policy files fail; the import's truncate runs `DELETE FROM` (no `TRUNCATE`); CSV/TSV are read as RFC 4180 by header and exported as Postgres's `COPY` writes them, so files move between the engines unchanged; a SQLite project (`verbatim` reader) cannot `diff`/`reconcile`/`emit`; export writes `export/<table>.<fmt>` (the header even for an empty table, generated columns left out, a BLOB as `\x…` hex, which an import into a BLOB column decodes); an import loads a referenced table first and empties its tables one at a time, a referencing table first, in the order of the foreign keys the database reports (dbd's connections enforce foreign keys, and the verbatim DDL gives the design none); the shared data files sit directly in `import/` and env-only ones directly in `import/dev/`/`import/prod/`, loaded only under that `-e`; `reset` drops the project's tables and views in one transaction (`PRAGMA defer_foreign_keys = ON`), and `--schemas`/`--extensions` change nothing.
+- **SQLite**: no schemas — `Schema` entities are silently no-op; entity names like `auth.users` resolve to the bare table `users` via `sqlite_master`. `Enum`/`Function`/`Procedure`/`Role`/`Extension`/`Sequence`/`MaterializedView` are rejected at apply time. No transactional apply; grants skipped; policy files fail; the import's truncate runs `DELETE FROM` (no `TRUNCATE`); CSV/TSV are read as RFC 4180 by header and exported as Postgres's `COPY` writes them, so files move between the engines unchanged; a SQLite project (`verbatim` reader) cannot `diff`/`reconcile`/`emit`; export writes `export/<table>.<fmt>` (the header even for an empty table, generated columns left out, a BLOB as `\x…` hex, which an import into a BLOB column decodes); an import loads a referenced table first and empties its tables in one transaction, a referencing table first (a table outside the import holding a key to one empties none, named), in the order of the foreign keys the database reports (dbd's connections enforce foreign keys, and the verbatim DDL gives the design none); the shared data files sit directly in `import/` and env-only ones directly in `import/dev/`/`import/prod/`, loaded only under that `-e`; `reset` drops the project's tables and views in one transaction (`PRAGMA defer_foreign_keys = ON`), and `--schemas`/`--extensions` change nothing.
     - **Offline ref classifier** — `classify_reference` checks an alphabetically sorted table of ~150 built-ins (aggregates, window/math/date/JSON1/scalar functions, type names) via `binary_search`, plus a `sqlite_*` prefix rule that catches all reserved system tables/views (`sqlite_master`, `sqlite_sequence`, `sqlite_stat1`, …). Everything else falls through to `UserDefined`.
     - **Trigger-aware DDL splitter** — `dbd format`'s statement splitter recognises SQLite `CREATE TRIGGER … BEGIN <stmts;> END;` blocks and keeps them atomic. `BEGIN` is only treated as trigger-body when the in-flight block already contains the `TRIGGER` keyword, so bare `BEGIN; … COMMIT;` transactions still split correctly. `CASE … END` inside the body doesn't trip the close detector — only `END` immediately followed by `;` at a word boundary closes the block.
     - **Batched imports** — `import_delimited` and `import_json_records` flush rows in multi-row `INSERT … VALUES (?,?),(?,?), …` batches sized by `batch_row_size(col_count) = min(500, 32000 / col_count)`. CSV uses a fixed header; JSON records (a JSON array or JSON Lines) detect column-set changes and flush the previous group before starting a new one. All inside a single transaction per import.

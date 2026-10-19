@@ -1008,18 +1008,30 @@ impl Entity {
         };
 
         let mut entity = Self::new(entity_type, &name);
-        entity.schema = schema;
         entity.file = Some(path.to_path_buf());
         entity.format = Some(ext.to_string());
         if recognized_type.is_none() {
             entity.errors.push(unread_folder_error(folder));
         }
+        // dbd names an entity `schema.name` and reads it back by its first
+        // dot, so a dot in the schema names another one: `"a.b".t` read as
+        // schema `a`, and diff took the real table for an orphan (#89). A dot
+        // in the name is read right.
+        if let Some(dotted) = schema.as_deref().filter(|s| ddl_pos.is_some() && s.contains('.')) {
+            entity.errors.push(dotted_name_error("schema", dotted));
+        }
+        entity.schema = schema;
         entity
     }
 
-    /// Create a schema entity.
+    /// Create a schema entity. A name holding a dot is an error on it: dbd
+    /// splits `schema.name` at the first dot (#89).
     pub fn schema(name: &str) -> Self {
-        Self::new(EntityType::Schema, name)
+        let mut entity = Self::new(EntityType::Schema, name);
+        if name.contains('.') {
+            entity.errors.push(dotted_name_error("schema", name));
+        }
+        entity
     }
 
     /// Create an external entity (FK stub).
@@ -1087,6 +1099,16 @@ impl Entity {
     }
 }
 
+/// The error on an entity whose schema holds a dot (#89): dbd names an
+/// entity `schema.name` and splits it at its first dot, so a schema `a.b`
+/// cannot be told from a schema `a`.
+fn dotted_name_error(what: &str, part: &str) -> String {
+    format!(
+        "a dot in a {what} name is not supported: `{part}` — dbd names an entity `schema.name` and splits \
+         it at the first dot, so this would be read as another one; rename it"
+    )
+}
+
 /// Why a file under `ddl/<folder>/` is not read, for a folder that names no
 /// entity type.
 ///
@@ -1115,6 +1137,29 @@ pub fn split_qualified_name(name: &str) -> (Option<String>, String) {
         Some((schema, entity)) => (Some(schema.to_string()), entity.to_string()),
         None => (None, name.to_string()),
     }
+}
+
+/// The error for a design dbd could not fully read — `unread` the entities
+/// carrying an error, each named by its file with its errors — that a command
+/// refuses rather than act on what it read: the design `cannot be <what>`.
+pub(crate) fn unread_files_error(unread: &[&Entity], what: &str) -> crate::error::DbdError {
+    let mut msg = format!(
+        "{} file(s) could not be parsed, so the design is incomplete and cannot be {what}:\n",
+        unread.len()
+    );
+    for e in unread {
+        let where_ = e
+            .file
+            .as_ref()
+            .map(|f| f.display().to_string())
+            .unwrap_or_else(|| e.name.clone());
+        msg.push_str(&format!("\n  {where_}\n"));
+        for err in &e.errors {
+            msg.push_str(&format!("    {err}\n"));
+        }
+    }
+    msg.push_str("\nFix the file(s), or run `dbd inspect` for the full report.");
+    crate::error::DbdError::Config(msg)
 }
 
 #[cfg(test)]

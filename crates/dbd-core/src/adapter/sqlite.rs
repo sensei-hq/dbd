@@ -473,6 +473,58 @@ impl DatabaseAdapter for SqliteAdapter {
         .await
     }
 
+    /// Every table an import reloads emptied in one transaction, as
+    /// PostgreSQL's one `TRUNCATE` empties them (#88): the referencing table
+    /// first, and a key one of them still holds — from a table outside the
+    /// import — empties none. One at a time, the tables before it were
+    /// emptied, and SQLite's error names no table, so the tables outside the
+    /// import holding a key to one are named.
+    async fn truncate_tables(&self, tables: &[String]) -> Result<()> {
+        if tables.is_empty() {
+            return Ok(());
+        }
+        let mut tx =
+            self.pool.begin().await.map_err(|e| {
+                DbdError::Config(format!("emptying {} before the import failed: {e}", tables.join(", ")))
+            })?;
+        let mut failed = None;
+        for table in tables.iter().rev() {
+            let sql = format!("DELETE FROM {}", crate::sql_quote::ident(Self::bare_name(table)));
+            if let Err(e) = sqlx::query(&sql).execute(&mut *tx).await {
+                failed = Some(e);
+                break;
+            }
+        }
+        let Some(e) = failed else {
+            return tx.commit().await.map_err(|e| {
+                DbdError::Config(format!("emptying {} before the import failed: {e}", tables.join(", ")))
+            });
+        };
+        // Best effort: the error being reported is the one that matters.
+        let _ = tx.rollback().await;
+        let reloaded: Vec<String> = tables.iter().map(|t| Self::bare_name(t).to_lowercase()).collect();
+        let blockers: Vec<String> = self
+            .foreign_keys()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(from, to)| reloaded.contains(&to.to_lowercase()) && !reloaded.contains(&from.to_lowercase()))
+            .map(|(from, to)| format!("{from} (a key to {to})"))
+            .collect();
+        let why = if blockers.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " — held by {}, outside the tables this import reloads; it empties only its own",
+                blockers.join(", ")
+            )
+        };
+        Err(DbdError::Config(format!(
+            "emptying {} before the import failed, so nothing was emptied: {e}{why}",
+            tables.join(", ")
+        )))
+    }
+
     async fn foreign_keys(&self) -> Result<Vec<(String, String)>> {
         // A key names its table as its DDL wrote it, and SQLite matches table
         // names without regard to case — so the referenced table is looked up
@@ -2080,6 +2132,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(left, 0);
+    }
+
+    /// A table outside the import holding a key to one it reloads: nothing is
+    /// emptied, and the error names that table (#88) — as PostgreSQL's one
+    /// `TRUNCATE` does. One at a time, the tables before it were emptied, and
+    /// the error named none.
+    #[tokio::test]
+    async fn a_table_outside_the_import_holding_a_key_empties_nothing_and_is_named() {
+        let a = mem().await;
+        a.execute_script(
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY); \
+             CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent (id)); \
+             CREATE TABLE audit (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent (id)); \
+             INSERT INTO parent VALUES (1); INSERT INTO child VALUES (1, 1); INSERT INTO audit VALUES (1, 1);",
+        )
+        .await
+        .unwrap();
+        let err = a
+            .truncate_tables(&["parent".to_string(), "child".to_string()])
+            .await
+            .expect_err("audit holds a key to parent")
+            .to_string();
+        assert!(err.contains("audit"), "{err}");
+        let left: i64 = sqlx::query_scalar("SELECT (SELECT count(*) FROM parent) + (SELECT count(*) FROM child)")
+            .fetch_one(&a.pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 2, "nothing emptied: {err}");
     }
 
     /// A BLOB has no text, and the export's cell readers knew only text and

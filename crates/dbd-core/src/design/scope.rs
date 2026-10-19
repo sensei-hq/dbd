@@ -214,24 +214,7 @@ impl Design {
         if bad.is_empty() {
             return Ok(());
         }
-
-        let mut msg = format!(
-            "{} file(s) could not be parsed, so the design is incomplete and cannot be applied:\n",
-            bad.len()
-        );
-        for e in &bad {
-            let where_ = e
-                .file
-                .as_ref()
-                .map(|f| f.display().to_string())
-                .unwrap_or_else(|| e.name.clone());
-            msg.push_str(&format!("\n  {where_}\n"));
-            for err in &e.errors {
-                msg.push_str(&format!("    {err}\n"));
-            }
-        }
-        msg.push_str("\nFix the file(s), or run `dbd inspect` for the full report.");
-        Err(DbdError::Config(msg))
+        Err(crate::entity::unread_files_error(&bad, "applied"))
     }
 
     /// The tables and enums the whole design declares that `desired` leaves out,

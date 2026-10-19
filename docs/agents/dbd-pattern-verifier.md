@@ -113,6 +113,14 @@ file evidence).
      refuse to apply the lossy one, naming it; older dbd runs it silently. Fix: delete the
      unapplied versions and cut them again with dbd 0.27.2 or later, which renames and changes the
      type in place.
+   - A **migration that drops a table the design still has** — a `migrations/NNN/<schema>/<table>.sql`
+     holding `DROP TABLE … <table> CASCADE` while `ddl/table/<schema>/<table>.ddl` is still there →
+     violation: a dbd older than 0.27.4 cut it from a file that failed to parse (a typo, a save
+     mid-edit), leaving the file out of the snapshot, so its table read as removed; the next
+     `apply` drops the table and its data. dbd 0.27.4 and later refuse to snapshot such a design,
+     naming the file. Fix: if the version is not applied anywhere, delete it (its
+     `snapshots/NNN.json` and `migrations/NNN/`, and set `project.version` back), fix the file
+     (`dbd inspect`), and cut it again.
    - Evidence: `project.released`, `snapshots/` contents, and any command/README/script that
      names `reconcile`, `snapshot`, or raw SQL against the DB.
 2. **Non-idempotent DDL** (re-`apply` would error). Flag a `CREATE TABLE`/`CREATE MATERIALIZED
