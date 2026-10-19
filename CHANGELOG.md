@@ -9,6 +9,14 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+### Fixed
+
+- **`dbd init --dry-run` writes nothing (#85).** Without `--from-db` or
+  `--from-dbml` it wrote the whole scaffold. It now lists the files the
+  scaffold would write and writes none, refused as the run would be — an
+  unknown target, a `design.yaml` already there. `dbd_core::init::plan_project`
+  returns that list for an embedder.
+
 ## [0.27.3] — 2026-10-19
 
 ### Fixed

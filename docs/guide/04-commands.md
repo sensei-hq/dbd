@@ -1680,10 +1680,13 @@ the DDL and writes the baseline snapshot for you, so you go straight to `dbd app
 dbd init                                # Postgres target, name from directory
 dbd init --name myproject               # Custom project name
 dbd init --target supabase              # Supabase target with externals + ignore patterns
+dbd init --dry-run                      # list the files init would write, write nothing
 ```
 
 `--target` takes `postgres` (the default) or `supabase`, the two targets with a scaffold; any
-other is refused rather than given the PostgreSQL scaffold.
+other is refused rather than given the PostgreSQL scaffold. `--dry-run` lists the files the
+scaffold would write and writes none, and is refused as the run would be — an unknown target, a
+`design.yaml` already there. (Before 0.27.4 it wrote the scaffold all the same.)
 
 Creates design.yaml, the ddl/ type folders (`table`, `view`, `materialized_view`,
 `function`, `procedure`, `enum`), an `import/` folder and a sample table DDL.

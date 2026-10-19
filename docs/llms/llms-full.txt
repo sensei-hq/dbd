@@ -574,7 +574,11 @@ The adapter (PostgreSQL/SQLite/Convex) is chosen from the connection **URL schem
 ```sh
 dbd init -n myproject
 dbd init -n myproject --target supabase
+dbd init --dry-run                      # list the files init would write, write nothing
 ```
+
+`--dry-run` lists the scaffold's files and writes none; it is refused as the run would be (an
+unknown target, a `design.yaml` already there). Before 0.27.4 it wrote the scaffold all the same.
 
 The scaffold: `design.yaml`, `ddl/{table,view,materialized_view,function,procedure,enum}/`,
 `ddl/table/public/example.ddl`, `import/`. `--target supabase` adds a `config` schema,
