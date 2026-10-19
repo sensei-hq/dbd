@@ -495,6 +495,32 @@ mod tests {
         ]
     }
 
+    /// A SQLite project's table has no schema — `items` is its whole name —
+    /// so a scope names it bare, or as SQLite's `main.items` (#87). Neither
+    /// selected it: a bare item was read as a schema only. A schema's name, or
+    /// an entity's exact one, still wins.
+    #[test]
+    fn a_scope_names_a_table_that_has_no_schema() {
+        let lite = vec![
+            ent(EntityType::Table, "items", &[]),
+            ent(EntityType::Table, "notes", &[]),
+        ];
+        for item in ["items", "main.items"] {
+            assert_eq!(
+                match_item(item, &lite).unwrap(),
+                HashSet::from(["items".to_string()]),
+                "{item}"
+            );
+        }
+        assert!(match_item("missing", &lite).is_err());
+        assert!(match_item("main.missing", &lite).is_err());
+        // PostgreSQL: a bare item is the schema, as before.
+        assert_eq!(
+            match_item("app", &world()).unwrap(),
+            HashSet::from(["app".to_string(), "app.customers".to_string(), "app.orders".to_string()])
+        );
+    }
+
     fn scopes_yaml(yaml: &str) -> IndexMap<String, ScopeEntry> {
         let v: IndexMap<String, ScopeEntry> = serde_yaml::from_str(yaml).unwrap();
         v

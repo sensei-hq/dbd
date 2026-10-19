@@ -413,3 +413,44 @@ async fn a_sqlite_migration_in_sqlite_syntax_runs() {
         .expect("v2's SQLite migration runs");
     assert_eq!(db.get_db_version().await.unwrap(), 2);
 }
+
+/// A scope names a SQLite table bare, or as `main.<table>` (#87), and a run
+/// under it builds that table alone.
+#[tokio::test]
+async fn a_scope_builds_the_sqlite_table_it_names() {
+    for item in ["items", "main.items"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("ddl/table")).unwrap();
+        std::fs::write(
+            dir.join("design.yaml"),
+            format!(
+                "project:\n  name: lite\nsource:\n  dialect: sqlite\nschemas: []\n\
+                 scopes:\n  one:\n    includes: [{item}]\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/items.ddl"),
+            "CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY);\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ddl/table/notes.ddl"),
+            "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY);\n",
+        )
+        .unwrap();
+        let db = dbd_core::connect(&format!("sqlite://{}", dir.join("lite.db").display()), "lite")
+            .await
+            .expect("connect");
+        let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load");
+        let scope = design.resolve_scope(Some("one"), None).expect(item);
+        design
+            .apply(&*db, None, false, Some(&scope), dbd_core::design::Progress::none())
+            .await
+            .expect("apply under the scope");
+        let tables = db.list_entities().await.unwrap();
+        assert!(tables.iter().any(|t| t.ends_with("items")), "{item}: {tables:?}");
+        assert!(!tables.iter().any(|t| t.ends_with("notes")), "{item}: {tables:?}");
+    }
+}
