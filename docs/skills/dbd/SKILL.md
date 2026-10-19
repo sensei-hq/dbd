@@ -27,6 +27,7 @@ https://dbd.sensei-hq.com/llms.txt. When the two disagree with the binary, run
 Path = `ddl/<type>/<schema>/<name>.<ext>` (roles have no schema).
 `<type>` ∈ `table|view|materialized_view|function|procedure|enum|sequence|role`; ext
 `.ddl` or `.sql`. Folder = type, parent dir = schema, filename = entity name.
+A schema name holding a dot is an error, named (dbd splits `schema.name` at the first dot).
 **Singular** type folder is canonical (`dbd doctor --fix` migrates plural →
 singular).
 

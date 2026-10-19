@@ -6,7 +6,7 @@ dbd parses SQL DDL files, resolves dependencies, generates migrations, loads dat
 
 ## Core concept
 
-SQL files are the source of truth. Path = `ddl/<type>/<schema>/<name>.<ext>` (roles have no schema): `<type>` ∈ table|view|materialized_view|function|procedure|enum|sequence|role, ext `.ddl`|`.sql`. Folder = type, parent = schema, filename = entity name. There is no `ddl/extension/` or `ddl/schema/`: extensions go in the target's `extensions:`, schemas under `schemas:` (`inspect` refuses such a file; `doctor` names the entry). Singular type folder is canonical (plural accepted but `dbd doctor --fix` migrates it to singular).
+SQL files are the source of truth. Path = `ddl/<type>/<schema>/<name>.<ext>` (roles have no schema): `<type>` ∈ table|view|materialized_view|function|procedure|enum|sequence|role, ext `.ddl`|`.sql`. Folder = type, parent = schema, filename = entity name. A schema name holding a dot (`ddl/table/a.b/`, `schemas: [a.b]`) is an error, named — `inspect` reports it, `apply`/`reconcile` refuse — since dbd splits `schema.name` at the first dot (before 0.27.4 it was read as schema `a`); a dot in an entity's own name is read right. There is no `ddl/extension/` or `ddl/schema/`: extensions go in the target's `extensions:`, schemas under `schemas:` (`inspect` refuses such a file; `doctor` names the entry). Singular type folder is canonical (plural accepted but `dbd doctor --fix` migrates it to singular).
 - `ddl/table/config/lookups.ddl` → entity `config.lookups` (table)
 - `ddl/view/config/genders.ddl` → entity `config.genders` (view)
 - `ddl/materialized_view/analytics/daily_sales.ddl` → entity `analytics.daily_sales` (materialized view; write `create materialized view if not exists …` + trailing `create [unique] index …`)
