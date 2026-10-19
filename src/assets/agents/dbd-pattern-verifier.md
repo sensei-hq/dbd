@@ -105,6 +105,14 @@ file evidence).
      version runs the data scripts of the tables it alters or adds (before 0.25, of those it
      alters only — so a script seeding a table the version adds never ran either). Fix: put the
      script in the version that adds or alters the table.
+   - A **column type change or rename cut by a dbd older than 0.27.2 and not yet applied** — a
+     version whose `<table>.sql` adds `<column>_new` (the old column swap) → violation: a type
+     change's `<table>.data.sql` sets the column itself (`UPDATE … SET "<column>" =
+     "<column>"::<type>`), which the next version drops, so every value is lost; and either swap
+     leaves the column without its NOT NULL, default, identity or constraints. dbd 0.27.2 and later
+     refuse to apply the lossy one, naming it; older dbd runs it silently. Fix: delete the
+     unapplied versions and cut them again with dbd 0.27.2 or later, which renames and changes the
+     type in place.
    - Evidence: `project.released`, `snapshots/` contents, and any command/README/script that
      names `reconcile`, `snapshot`, or raw SQL against the DB.
 2. **Non-idempotent DDL** (re-`apply` would error). Flag a `CREATE TABLE`/`CREATE MATERIALIZED

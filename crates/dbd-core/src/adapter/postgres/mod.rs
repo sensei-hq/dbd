@@ -401,6 +401,19 @@ impl PostgresAdapter {
             let result = (&mut *tx).execute(sql).await;
             *guard = Some(tx);
             result.map(|_| ())
+        } else if script::may_set_search_path(sql) {
+            // A script's own `SET search_path` outlives it on the pooled
+            // connection it ran on, and what runs there next reads names
+            // through it: introspection printed `app.seq` as `seq`, and a
+            // default read as changed on every run (#60). Back on the
+            // session's path before the connection goes back.
+            let mut conn = self.pool.acquire().await?;
+            let result = (&mut *conn).execute(sql).await.map(|_| ());
+            if (&mut *conn).execute("RESET search_path").await.is_err() {
+                // Never handed out again on a path it could not leave.
+                conn.close_on_drop();
+            }
+            result
         } else {
             sqlx::raw_sql(sql).execute(&self.pool).await.map(|_| ())
         }
@@ -1047,6 +1060,13 @@ impl PostgresAdapter {
                     a.attidentity::text AS attidentity, \
                     a.attgenerated::text AS attgenerated, \
                     pg_get_expr(ad.adbin, ad.adrelid) AS column_default, \
+                    (SELECT format('%I.%I', sn.nspname, sq.relname) \
+                       FROM pg_depend dep \
+                       JOIN pg_class sq ON sq.oid = dep.refobjid AND sq.relkind = 'S' \
+                       JOIN pg_namespace sn ON sn.oid = sq.relnamespace \
+                      WHERE dep.classid = 'pg_attrdef'::regclass AND dep.objid = ad.oid \
+                        AND dep.refclassid = 'pg_class'::regclass \
+                      ORDER BY 1 LIMIT 1) AS default_sequence, \
                     format_type(a.atttypid, a.atttypmod) AS col_type, \
                     a.atttypid::regtype::text AS underlying_type, \
                     col_description(a.attrelid, a.attnum) AS col_comment, \
@@ -1088,6 +1108,17 @@ impl PostgresAdapter {
                 let col_type: String = row.get("col_type");
                 let attnotnull: bool = row.get("attnotnull");
                 let default_value: Option<String> = row.get("column_default");
+                // A `nextval` default names its sequence by the schema it is
+                // in, not as `pg_get_expr` prints it — relative to the reading
+                // session's path, so `app.seq` reads as `seq` wherever `app`
+                // is on it (#60, 0.27.2 review).
+                let default_sequence: Option<String> = row.get("default_sequence");
+                let default_value = match (default_value, default_sequence) {
+                    (Some(d), Some(sequence)) if crate::parser::pg::common::nextval_sequence_of(d.trim()).is_some() => {
+                        Some(format!("nextval('{}'::regclass)", sequence.replace('\'', "''")))
+                    }
+                    (d, _) => d,
+                };
                 let attidentity: String = row.get("attidentity");
                 let attgenerated: String = row.get("attgenerated");
                 let underlying_type: String = row.get("underlying_type");
@@ -2823,7 +2854,15 @@ ORDER BY 1, 2, 4, 5"#;
     }
 
     async fn commit_batch(&self) -> Result<()> {
-        if let Some(tx) = self.batch.lock().await.take() {
+        if let Some(mut tx) = self.batch.lock().await.take() {
+            // A `SET search_path` a script in the batch ran is the session's
+            // once committed: the connection goes back on its own path, as
+            // one a lone script ran on does (#60). A rollback undoes it anyway.
+            use sqlx::Executor as _;
+            (&mut *tx)
+                .execute("RESET search_path")
+                .await
+                .map_err(|e| DbdError::Config(format!("commit batch transaction failed: {e}")))?;
             tx.commit()
                 .await
                 .map_err(|e| DbdError::Config(format!("commit batch transaction failed: {e}")))?;

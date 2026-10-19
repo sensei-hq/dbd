@@ -368,39 +368,28 @@ pub fn generate_data_sql(change: &ComplexChange) -> String {
                 ident(old_name)
             )
         }
+        // A type change is made in place — `ALTER COLUMN … TYPE … USING` — so
+        // Postgres converts every value, and refuses one the new type cannot
+        // hold. One dbd can cast moves nothing; one it cannot is two versions,
+        // and this is the first's: the column, at its old type, made castable.
         ComplexChange::ColumnTypeChange {
             table_name,
+            column_name,
             old_type,
             new_type,
-            old_col,
-            new_col,
             ..
         } => {
             if is_castable(old_type, new_type) {
-                let mut sql = String::new();
-                // Truncation warning for TEXT → VARCHAR
-                let to_norm = normalize_type(new_type);
-                if (to_norm == "varchar" || to_norm == "character varying" || to_norm == "char")
-                    && type_category(&normalize_type(old_type)) == "text"
-                {
-                    sql.push_str(&format!(
-                        "-- WARNING: Casting {} to {} may truncate data. Review row lengths before applying.\n",
-                        old_type, new_type
-                    ));
-                }
-                sql.push_str(&format!(
-                    "UPDATE {} SET {} = {}::{new_type};\n",
-                    qualified(table_name),
-                    ident(&new_col.name),
-                    ident(&old_col.name)
-                ));
-                sql
+                String::new()
             } else {
                 format!(
-                    "-- TODO: Data correction required for {table_name}.{}.\n\
-                     -- Column type changed from {old_type} to {new_type}.\n\
-                     -- No safe automatic cast is available. Manual data migration needed.\n",
-                    new_col.name
+                    "-- TODO: make every value of {table} {column} castable to {new_type}.\n\
+                     -- No safe automatic cast exists from {old_type}. The next version alters the\n\
+                     -- column in place:\n\
+                     --   ALTER TABLE {table} ALTER COLUMN {column} TYPE {new_type} USING {column}::{new_type};\n\
+                     -- Update the column here so that cast holds for every row, or edit that USING clause.\n",
+                    table = qualified(table_name),
+                    column = ident(column_name),
                 )
             }
         }

@@ -9,6 +9,125 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.27.3] — 2026-10-19
+
+### Fixed
+
+- **`dbd snapshot` prints its warnings.** What a snapshot took a change for —
+  a table's one column dropped and one added, of one type, cut as a rename; a
+  type change made in place, refusing a value the new type cannot hold; an enum
+  value dropped; a constraint it cannot name — was in its result and never
+  shown. The 0.27.2 notes say the snapshot warns of a rename; it does from
+  this release.
+
+## [0.27.2] — 2026-10-19
+
+**A released column's type change and rename keep the column.** Since the
+first release a type change in a migration lost every value of the column,
+and with a rename lost its NOT NULL, default, identity, keys and constraints
+too. Both are now made in place, as `reconcile` makes them.
+
+### Changed
+
+- **A released column's type change and rename are made in place.** `dbd
+  snapshot` writes a rename as `ALTER TABLE … RENAME COLUMN` and a type change
+  dbd can cast as `ALTER TABLE … ALTER COLUMN … TYPE … USING`, as `reconcile`
+  does: one version, where they were two. The column swap is gone —
+  `<column>_new` added and filled, then the column dropped and `<column>_new`
+  renamed into its place. Postgres keeps the column's values, NOT NULL,
+  default, identity (its sequence going on past the values it handed out),
+  generated expression, keys, the foreign keys on either side of it, CHECKs,
+  EXCLUDE constraints, indexes and comment, and refuses a value the new type
+  cannot hold. A type change dbd cannot cast (`jsonb` → `integer`) is still two
+  versions, both on the column itself: the first's `data.sql` TODO is where its
+  values are made castable, the second alters it in place with a `USING` that
+  can be edited. A rename is a table's one column dropped and one added, of one
+  type; the snapshot says so, so a new column taken for one can be cut again in
+  separate versions.
+
+### Fixed
+
+- **A released column's type change kept none of its values.** The swap's
+  `data.sql` filled the column itself, not `<column>_new`, and the next
+  version dropped it: every value was lost, NULL in its place, with nothing
+  reported. With several columns of one table changed only the last one's
+  `data.sql` was written, and the column came back with its type alone. A
+  database migrated through such a change has lost those values — restore
+  them from a backup; `dbd diff` lists what else it is missing.
+- **A pending version cut before 0.27.2 that would lose a column's values is
+  refused.** `apply`, `deploy` and their dry runs name its `data.sql` and the
+  column: delete the unapplied versions and cut them again.
+- **A key another table's foreign key holds can be widened or renamed in a
+  release** ([#72]). Both failed with `cannot drop column id … because other
+  objects depend on it`; in place, Postgres keeps the foreign key.
+- **A column turned generated keeps everything on it** ([#72]). Postgres
+  cannot make a plain column generated, so `reconcile` and a migration drop it
+  and add it again, which drops every key, constraint, index and comment on it
+  — and both sides still declared them, so nothing put them back. Each now
+  comes back after the column: in the same `reconcile` run, in the migration,
+  and in what `dbd diff` shows; the foreign keys holding its keys are dropped
+  first and re-added after. The changelog the viewer draws does not count the
+  re-adds as changes.
+- **A generated column's type changes.** `reconcile` and a migration emitted
+  nothing for it; a generated column turned plain dropped a type change with
+  its expression.
+- **Narrowing a column into a bounded character type refuses a value too
+  long.** `reconcile` and a migration altered it `USING c::varchar(3)`, an
+  explicit cast that cut `'abcdef'` to `'abc'`; the value is now assigned, and
+  Postgres refuses it.
+- **A migration drops an index in its table's schema** ([#73]). It wrote
+  `DROP INDEX IF EXISTS "<name>"`, which looks the index up on the search path
+  the migration runs on — the session's, for a DDL file that qualifies its
+  names and sets none. An index in another schema was not found, `IF EXISTS`
+  made the miss a no-op, and the version was recorded as applied with the old
+  index still there. It now names the schema, as `reconcile` does; a table
+  with no schema of its own drops its index bare.
+- **A `nextval` default converges however it names its sequence** ([#60]).
+  Postgres prints the sequence relative to the reading session's path —
+  `app.seq` as `seq` wherever `app` is on it, `public.s` as `s` — so
+  `nextval('App.Seq')`, `nextval('"app"."seq"')`, `nextval('public.s')` and a
+  bare `nextval('seq')` read as changed on every `reconcile` and `diff`, and a
+  database or role setting its own path made it worse. Both sides are now
+  compared and emitted fully qualified: the live default by the schema its
+  sequence is in, the design's as its author wrote it (`public` kept — emitted
+  bare, it could bind to another schema's sequence of that name), and a bare
+  one by its file's path: the first schema on it the design declares the
+  sequence in, else the path's first, where a sequence the file makes lands.
+- **A file's search path ends with the file.** A file that states no path
+  runs on the session's — inside `apply`'s one transaction too, where it ran on
+  the one the file before it set and built its tables in that file's schema.
+  And a script's path, however it was set (`SET SCHEMA`, any case), no longer
+  stays on the pooled connection it ran on, where `reconcile` and `diff` read
+  the database through it.
+- **`dbd diff` shows what reconcile runs around a key change.** When another
+  table's foreign key holds a key that changes, reconcile drops the foreign key
+  first and adds it back after the new key (#65); `diff` showed the key change
+  alone — SQL that fails if run as shown. It now shows the foreign key's drop
+  above the table's own SQL and its re-add below, line for line what reconcile
+  plans, or — when the foreign key is on a table outside the run — that
+  reconcile refuses the change, naming it.
+- **A name a live catalog holds reaches a `DROP` as a name.** A constraint,
+  column or table named to close the statement — `x"; create table …; --` —
+  was pasted into `reconcile`'s and a migration's `DROP` as SQL, and ran.
+
+### Added
+
+- **Library API**: `sql_expr::{exclusion_reads_column, rename_column}`,
+  `snapshot::{pending_lossy_swaps, LossySwap}`, and
+  `schema_diff::KeyHolderSteps` with `SchemaDiff::key_holders` — a
+  `SchemaDiff` built by hand rather than returned by `diff_live` needs the new
+  field, or `..Default::default()`.
+
+### Changed — Library API
+
+- `diff::generate_data_sql` writes nothing for a type change dbd can cast, and
+  for one it cannot, a TODO on the column itself; `diff::migration_warnings`
+  says a type change is made in place and no longer suggests splitting it.
+
+[#73]: https://github.com/sensei-hq/dbd/issues/73
+[#60]: https://github.com/sensei-hq/dbd/issues/60
+[#72]: https://github.com/sensei-hq/dbd/issues/72
+
 ## [0.27.1] — 2026-10-14
 
 **A key a foreign key holds can change, and so can what a function returns**

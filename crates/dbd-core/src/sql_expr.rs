@@ -142,6 +142,133 @@ pub fn reads_column(expr: &str, column: &str) -> bool {
     })
 }
 
+/// Whether an EXCLUDE constraint's `definition` — `USING gist (c WITH &&)
+/// WHERE …`, as a snapshot keeps it — reads the column `column`: an element
+/// naming it, an expression or predicate reading it, or its `INCLUDE`. One that does not
+/// parse reads as `true`, as [`reads_column`]'s does.
+pub fn exclusion_reads_column(definition: &str, column: &str) -> bool {
+    let Ok(parsed) = pg_query::parse(&format!("ALTER TABLE t ADD EXCLUDE {definition}")) else {
+        return true;
+    };
+    // `nodes()` stops at an `ALTER TABLE`'s relation, so the constraint is
+    // reached by hand, and only its elements' expressions and its predicate
+    // walked.
+    let constraint = parsed
+        .protobuf
+        .stmts
+        .first()
+        .and_then(|s| s.stmt.as_ref())
+        .and_then(|s| match s.node.as_ref()? {
+            NodeEnum::AlterTableStmt(alter) => alter.cmds.first(),
+            _ => None,
+        })
+        .and_then(|cmd| match cmd.node.as_ref()? {
+            NodeEnum::AlterTableCmd(cmd) => cmd.def.as_deref(),
+            _ => None,
+        })
+        .and_then(|def| match def.node.as_ref()? {
+            NodeEnum::Constraint(c) => Some(c),
+            _ => None,
+        });
+    let Some(constraint) = constraint else {
+        return true;
+    };
+    let reads = |node: &Node| {
+        node.node.as_ref().is_some_and(|n| {
+            n.nodes().iter().any(|(node, ..)| match node {
+                pg_query::NodeRef::ColumnRef(c) => matches!(
+                    c.fields.last().and_then(|f| f.node.as_ref()),
+                    Some(NodeEnum::String(s)) if s.sval == column
+                ),
+                _ => false,
+            })
+        })
+    };
+    let element_reads = |pair: &Node| match pair.node.as_ref() {
+        Some(NodeEnum::List(list)) => list.items.first().is_some_and(|e| match e.node.as_ref() {
+            Some(NodeEnum::IndexElem(e)) => e.name == column || e.expr.as_deref().is_some_and(reads),
+            _ => false,
+        }),
+        _ => false,
+    };
+    let included = |name: &Node| matches!(name.node.as_ref(), Some(NodeEnum::String(s)) if s.sval == column);
+    constraint.exclusions.iter().any(element_reads)
+        || constraint.including.iter().any(included)
+        || constraint.where_clause.as_deref().is_some_and(reads)
+}
+
+/// `expr` — a CHECK, an index key expression or predicate — with every
+/// reference to the column `old` naming `new` instead, as Postgres makes of
+/// it when the column is renamed, rendered as the parser renders an
+/// expression. `None` when it cannot be read, or the result is not `expr`'s
+/// column references with that one renamed.
+///
+/// By the scanner's tokens, not text: a string or a function of the same name
+/// is not the column. The tree then checks the outcome, so a reading the
+/// tokens got wrong gives `None`, never a different expression.
+pub fn rename_column(expr: &str, old: &str, new: &str) -> Option<String> {
+    use pg_query::protobuf::Token;
+    let scanned = pg_query::scan(expr).ok()?;
+    let mut out = String::with_capacity(expr.len());
+    let mut copied = 0;
+    for (i, token) in scanned.tokens.iter().enumerate() {
+        if token.token != Token::Ident as i32 {
+            continue;
+        }
+        let (start, end) = (usize::try_from(token.start).ok()?, usize::try_from(token.end).ok()?);
+        let text = &expr[start..end];
+        let name = match text.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
+            Some(quoted) => quoted.replace("\"\"", "\""),
+            None => text.to_lowercase(),
+        };
+        let called = scanned
+            .tokens
+            .get(i + 1)
+            .is_some_and(|next| next.token == Token::Ascii40 as i32);
+        if name != old || called {
+            continue;
+        }
+        out.push_str(&expr[copied..start]);
+        out.push_str(&crate::sql_quote::ident_if_needed(new));
+        copied = end;
+    }
+    out.push_str(&expr[copied..]);
+    let rendered = render_expression(&out)?;
+    let before: Vec<String> = column_references(expr)?
+        .into_iter()
+        .map(|c| if c == old { new.to_string() } else { c })
+        .collect();
+    (column_references(&rendered)? == before).then_some(rendered)
+}
+
+/// `expr` as the parser renders an expression: `SELECT <expr>`, deparsed.
+fn render_expression(expr: &str) -> Option<String> {
+    let parsed = pg_query::parse(&format!("SELECT {expr}")).ok()?;
+    pg_query::deparse(&parsed.protobuf)
+        .ok()?
+        .strip_prefix("SELECT ")
+        .map(str::to_string)
+}
+
+/// The columns `expr` reads, in order, each by its last name part.
+fn column_references(expr: &str) -> Option<Vec<String>> {
+    let parsed = pg_query::parse(&format!("SELECT {expr}")).ok()?;
+    let mut found: Vec<(i32, String)> = parsed
+        .protobuf
+        .nodes()
+        .iter()
+        .filter_map(|(node, ..)| match node {
+            pg_query::NodeRef::ColumnRef(c) => match c.fields.last().and_then(|f| f.node.as_ref()) {
+                Some(NodeEnum::String(s)) => Some((c.location, s.sval.clone())),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    found.sort();
+    Some(found.into_iter().map(|(_, name)| name).collect())
+}
+
 /// Parse `sql`, normalize its expression tree, re-deparse, and strip `prefix`.
 fn canonicalize_wrapped(sql: &str, prefix: &str, cols: &CoercibleColumns) -> Option<String> {
     let mut parsed = pg_query::parse(sql).ok()?;
@@ -683,6 +810,57 @@ pub fn canonical_exclusion(definition: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A rename reaches every reference to the column — qualified, quoted,
+    /// inside a call — and nothing else: not a function of the same name, not
+    /// another column, not a string. Spelled as the parser renders an
+    /// expression, so it compares with one written against the new name.
+    #[test]
+    fn renaming_a_column_in_an_expression_reaches_its_references_only() {
+        let rendered = |e: &str| rename_column(e, "qty", "qty").unwrap();
+        for (written, renamed) in [
+            ("qty >= 0", "quantity >= 0"),
+            ("t.qty > other", "t.quantity > other"),
+            ("\"qty\" > 0", "quantity > 0"),
+            ("lower(qty) <> 'qty'", "lower(quantity) <> 'qty'"),
+            ("qty(1) > qty", "qty(1) > quantity"),
+            ("(qty + qtyx) > 0", "(quantity + qtyx) > 0"),
+        ] {
+            assert_eq!(
+                rename_column(written, "qty", "quantity").as_deref(),
+                Some(rendered(renamed).as_str()),
+                "{written}"
+            );
+        }
+        assert_eq!(
+            rename_column("qty > 0", "qty", "New Qty").as_deref(),
+            Some("\"New Qty\" > 0")
+        );
+        assert_eq!(rename_column("(((", "qty", "quantity"), None);
+    }
+
+    /// A column an EXCLUDE carries in its `INCLUDE` is one its drop takes too;
+    /// a definition that cannot be read is taken to read every column.
+    #[test]
+    fn an_exclusion_reads_the_columns_it_includes() {
+        assert!(exclusion_reads_column("USING gist (r WITH =) INCLUDE (note)", "note"));
+        assert!(!exclusion_reads_column("USING gist (r WITH =) INCLUDE (note)", "other"));
+        assert!(exclusion_reads_column("USING (((", "any"));
+    }
+
+    /// An EXCLUDE reads a column through an element naming it, an element's
+    /// expression, or its predicate — and only those: re-adding one the
+    /// column's drop left alone fails on its name.
+    #[test]
+    fn an_exclusion_reads_the_columns_its_elements_and_predicate_read() {
+        let during = "USING gist (room WITH =, during WITH &&) WHERE (NOT cancelled)";
+        for column in ["room", "during", "cancelled"] {
+            assert!(exclusion_reads_column(during, column), "{column}");
+        }
+        assert!(!exclusion_reads_column(during, "id"));
+        assert!(exclusion_reads_column("USING gist (lower(code) WITH =)", "code"));
+        assert!(!exclusion_reads_column("USING gist (lower(code) WITH =)", "lower"));
+    }
 
     /// Both spellings of the same predicate must canonicalize to one string —
     /// the property reconcile's convergence rests on.

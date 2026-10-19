@@ -26,7 +26,10 @@ fn fixture_dir() -> PathBuf {
 /// Each test gets its own instance for full isolation.
 async fn start_pg() -> (PostgreSQL, String) {
     let settings = Settings {
-        version: postgresql_embedded::VersionReq::parse(">=16").unwrap(),
+        // Pinned: `>=16` took whatever build was published last, and 18.6.1
+        // (2026-10-18) refuses `TimeZone=UTC` on CI's runners, failing every
+        // test at its first connection. Move it on deliberately.
+        version: postgresql_embedded::VersionReq::parse("=18.6.0").unwrap(),
         ..Default::default()
     };
     let mut pg = PostgreSQL::new(settings);
@@ -4418,6 +4421,47 @@ async fn a_released_rename_of_a_unique_index_a_foreign_key_rests_on_applies() {
     .await;
 }
 
+/// An index renamed in a release whose DDL qualifies its names, and sets no
+/// search path: the migration runs on the session's, which `app` is not on,
+/// and still drops the old index (#73).
+#[tokio::test]
+async fn a_released_rename_of_an_index_off_the_search_path_drops_the_old_one() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let table = |index: &str| {
+        format!(
+            "create table if not exists app.t (\n  id integer primary key\n, c text not null\n);\n\
+             create unique index if not exists {index} on app.t (c);\n"
+        )
+    };
+    cut_rekey(dir, &[("t", &table("t_c_uq"))]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    cut_rekey(dir, &[("t", &table("t_c_key"))]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v2 renames the index");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_indexes WHERE schemaname = 'app' AND indexname = 't_c_key'",
+        "the renamed index",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        false,
+        "SELECT 1 FROM pg_indexes WHERE schemaname = 'app' AND indexname = 't_c_uq'",
+        "the old index",
+    )
+    .await;
+}
+
 /// The steps a key change runs as one hold the key's tables until they end:
 /// one of them waiting on a lock another session holds gives up after a
 /// bounded wait and rolls back, rather than holding them while it waits.
@@ -4571,6 +4615,801 @@ async fn reconcile_changes_a_unique_index_a_foreign_key_rests_on() {
         "the foreign key, back",
     )
     .await;
+}
+
+// ── A column rebuilt keeps its keys (#72) ─────────────────────────────────────
+
+/// A unique key on a column turned generated survives reconcile — the column
+/// is dropped and added again — with the foreign key holding it, and a second
+/// run plans nothing.
+#[tokio::test]
+async fn reconcile_keeps_the_key_on_a_column_turned_generated() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let parent = |code: &str| {
+        format!(
+            "create table if not exists app.parent (\n  id integer primary key\n, name text not null\n\
+             , code text{code} unique\n);\n"
+        )
+    };
+    let child = "create table if not exists app.child (\n  id integer primary key\n\
+                 , code text references app.parent (code)\n);\n";
+    let (_v1, design) = rekey_design(&[("parent", &parent("")), ("child", child)]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("create");
+    adapter
+        .execute_script("INSERT INTO app.parent VALUES (1, 'a', 'A'); INSERT INTO app.child VALUES (1, 'A');")
+        .await
+        .unwrap();
+    let (_v2, design) = rekey_design(&[
+        ("parent", &parent(" generated always as (upper(name)) stored")),
+        ("child", child),
+    ]);
+    design
+        .reconcile(&*adapter, false, true, false, None, Progress::none())
+        .await
+        .expect("the column turns generated");
+    assert_catalog(
+        &*adapter,
+        true,
+        &constraint_predicate("parent", "UNIQUE (code)"),
+        "the unique key",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        &constraint_predicate("child", "FOREIGN KEY (code) REFERENCES app.parent(code)"),
+        "the foreign key, back",
+    )
+    .await;
+    let again = design
+        .reconcile(&*adapter, true, true, false, None, Progress::none())
+        .await
+        .expect("second dry run");
+    assert!(again.altered.is_empty(), "converged: {:?}", again.altered);
+}
+
+/// A released `id integer primary key` another table's foreign key holds, cut
+/// to `bigint`: the migration swaps the column in two stages, and the key and
+/// the foreign key both exist afterwards, every row with them.
+#[tokio::test]
+async fn a_released_key_column_cut_to_bigint_keeps_its_key_and_the_foreign_key() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let parent = |ty: &str| format!("create table if not exists app.parent (\n  id {ty} primary key\n);\n");
+    let child = "create table if not exists app.child (\n  id integer primary key\n\
+                 , parent_id integer references app.parent (id)\n);\n";
+    cut_rekey(dir, &[("parent", &parent("integer")), ("child", child)]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    adapter
+        .execute_script("INSERT INTO app.parent VALUES (1), (2); INSERT INTO app.child VALUES (1, 1), (2, 2);")
+        .await
+        .unwrap();
+    cut_rekey(dir, &[("parent", &parent("bigint")), ("child", child)]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("the type swap applies");
+    assert_catalog(
+        &*adapter,
+        true,
+        &constraint_predicate("parent", "PRIMARY KEY (id)"),
+        "the primary key",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_attribute WHERE attrelid = 'app.parent'::regclass AND attname = 'id' \
+         AND atttypid = 'bigint'::regtype",
+        "parent.id as bigint",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        &constraint_predicate("child", "FOREIGN KEY (parent_id) REFERENCES app.parent(id)"),
+        "the foreign key",
+    )
+    .await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.child c JOIN app.parent p ON p.id = c.parent_id HAVING count(*) = 2",
+        "both rows, joined",
+    )
+    .await;
+}
+
+/// A released column's type change keeps its values: stage 1's data script
+/// fills the column it adds, which stage 2 renames into place. It filled the
+/// column itself, which stage 2 then dropped — every value went, NULL in its
+/// place, with nothing reported.
+#[tokio::test]
+async fn a_released_type_change_keeps_the_columns_values() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let line = |ty: &str| format!("create table if not exists app.line (\n  id integer primary key\n, qty {ty}\n);\n");
+    cut_rekey(dir, &[("line", &line("integer"))]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    adapter
+        .execute_script("INSERT INTO app.line VALUES (1, 10), (2, 20);")
+        .await
+        .unwrap();
+    cut_rekey(dir, &[("line", &line("bigint"))]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("the type change applies");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.line HAVING count(*) FILTER (WHERE id = 1 AND qty = 10) = 1 \
+         AND count(*) FILTER (WHERE id = 2 AND qty = 20) = 1",
+        "both rows' qty",
+    )
+    .await;
+}
+
+/// Every column of a released table cut to `bigint` at once — an identity
+/// primary key, a column with NOT NULL, a default and a CHECK, and one with a
+/// foreign key — keeps its values and its whole definition: once the
+/// migrations ran, the database is the design, as `diff` reads it, and the
+/// identity goes on past the rows already there. Each column's data script
+/// overwrote the one before it, and the swap left every column with its type
+/// and nothing else.
+#[tokio::test]
+async fn a_released_table_cut_to_bigint_keeps_every_columns_values_and_definition() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let reference = "create table if not exists app.ref (\n  id integer primary key\n);\n";
+    let line = |ty: &str| {
+        format!(
+            "create table if not exists app.line (\n  id {ty} generated always as identity primary key\n\
+             , qty {ty} not null default 0 check (qty >= 0)\n\
+             , ref_id {ty} references app.ref (id)\n);\n"
+        )
+    };
+    cut_rekey(dir, &[("ref", reference), ("line", &line("integer"))]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    adapter
+        .execute_script(
+            "INSERT INTO app.ref VALUES (1), (2); \
+             INSERT INTO app.line (qty, ref_id) VALUES (10, 1), (20, 2);",
+        )
+        .await
+        .unwrap();
+    cut_rekey(dir, &[("ref", reference), ("line", &line("bigint"))]);
+    let design = released(dir);
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("the type changes apply");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.line HAVING count(*) FILTER (WHERE id = 1 AND qty = 10 AND ref_id = 1) = 1 \
+         AND count(*) FILTER (WHERE id = 2 AND qty = 20 AND ref_id = 2) = 1",
+        "both rows, every value",
+    )
+    .await;
+    let diff = design.diff_live(&*adapter, None).await.expect("diff");
+    let touched: Vec<String> = diff
+        .changes
+        .iter()
+        .map(|c| format!("{:?} {}", c.action, c.entity_name))
+        .collect();
+    assert!(touched.is_empty(), "the database is the design: {touched:?}");
+    adapter
+        .execute_script("INSERT INTO app.line (qty) VALUES (30);")
+        .await
+        .expect("the identity goes on past the rows there");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.line WHERE qty = 30 AND id = 3",
+        "the next identity",
+    )
+    .await;
+}
+
+/// A released column renamed keeps its values and what it declares itself —
+/// NOT NULL, a default, `unique`: stage 1 adds the new name with its type
+/// alone, and stage 2 dropped the old one and left it at that.
+#[tokio::test]
+async fn a_released_rename_keeps_the_columns_values_and_definition() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let line = |name: &str| {
+        format!(
+            "create table if not exists app.line (\n  id integer primary key\n\
+             , {name} integer not null default 0 unique\n);\n"
+        )
+    };
+    cut_rekey(dir, &[("line", &line("qty"))]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    adapter
+        .execute_script("INSERT INTO app.line VALUES (1, 10), (2, 20);")
+        .await
+        .unwrap();
+    cut_rekey(dir, &[("line", &line("quantity"))]);
+    let design = released(dir);
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("the rename applies");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.line HAVING count(*) FILTER (WHERE id = 1 AND quantity = 10) = 1 \
+         AND count(*) FILTER (WHERE id = 2 AND quantity = 20) = 1",
+        "both rows' quantity",
+    )
+    .await;
+    let diff = design.diff_live(&*adapter, None).await.expect("diff");
+    let touched: Vec<String> = diff
+        .changes
+        .iter()
+        .map(|c| format!("{:?} {}", c.action, c.entity_name))
+        .collect();
+    assert!(touched.is_empty(), "the database is the design: {touched:?}");
+}
+
+// ── A released column changed in place (0.27.2 review) ────────────────────────
+
+/// A released project at v1 with `v1`'s tables, `rows` run over it, then cut
+/// to `v2` and applied: the design as it ends, and the outcome of the apply.
+async fn release_then_change(
+    adapter: &dyn dbd_core::DatabaseAdapter,
+    dir: &std::path::Path,
+    v1: &[(&str, &str)],
+    rows: &str,
+    v2: &[(&str, &str)],
+) -> (Design, dbd_core::Result<()>) {
+    cut_rekey(dir, v1);
+    released(dir)
+        .apply(adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    if !rows.is_empty() {
+        adapter.execute_script(rows).await.unwrap();
+    }
+    cut_rekey(dir, v2);
+    let design = released(dir);
+    let outcome = design
+        .apply(adapter, None, false, None, Progress::none())
+        .await
+        .map(|_| ());
+    (design, outcome)
+}
+
+/// Whether the live database is the design, as `diff` reads it.
+async fn assert_in_sync(design: &Design, adapter: &dyn dbd_core::DatabaseAdapter) {
+    let diff = design.diff_live(adapter, None).await.expect("diff");
+    let touched: Vec<String> = diff
+        .changes
+        .iter()
+        .map(|c| format!("{:?} {}", c.action, c.entity_name))
+        .collect();
+    assert!(touched.is_empty(), "the database is the design: {touched:?}");
+}
+
+/// A generated column's type change keeps it generated: the swap put a plain
+/// column in its place, every new row's value NULL.
+#[tokio::test]
+async fn a_released_generated_columns_type_change_keeps_it_generated() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let g = |ty: &str| {
+        format!(
+            "create table if not exists app.g (\n  id integer primary key\n, a integer not null\n\
+             , twice {ty} not null generated always as (a * 2) stored\n);\n"
+        )
+    };
+    let (design, outcome) = release_then_change(
+        &*adapter,
+        tmp.path(),
+        &[("g", &g("integer"))],
+        "INSERT INTO app.g (id, a) VALUES (1, 10);",
+        &[("g", &g("bigint"))],
+    )
+    .await;
+    outcome.expect("the type change applies");
+    assert_in_sync(&design, &*adapter).await;
+    adapter
+        .execute_script("INSERT INTO app.g (id, a) VALUES (3, 30);")
+        .await
+        .unwrap();
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.g HAVING count(*) FILTER (WHERE id = 1 AND twice = 20) = 1 \
+         AND count(*) FILTER (WHERE id = 3 AND twice = 60) = 1",
+        "twice computed",
+    )
+    .await;
+}
+
+/// A table whose foreign key is to itself, both columns cut to `bigint`:
+/// one foreign key at the end, and the same migration on every cut.
+#[tokio::test]
+async fn a_released_tree_table_cut_to_bigint_keeps_its_one_foreign_key() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let node = |ty: &str| {
+        format!(
+            "create table if not exists app.node (\n  id {ty} primary key\n\
+             , parent_id {ty} references app.node (id)\n);\n"
+        )
+    };
+    let (design, outcome) = release_then_change(
+        &*adapter,
+        tmp.path(),
+        &[("node", &node("integer"))],
+        "INSERT INTO app.node VALUES (1, NULL), (2, 1);",
+        &[("node", &node("bigint"))],
+    )
+    .await;
+    outcome.expect("the type changes apply");
+    assert_in_sync(&design, &*adapter).await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_constraint WHERE conrelid = 'app.node'::regclass AND contype = 'f' HAVING count(*) = 1",
+        "one foreign key",
+    )
+    .await;
+}
+
+/// A referenced key widened in a release that also changes something else on
+/// its table applies: the foreign key's drop landed in the wrong stage.
+#[tokio::test]
+async fn a_referenced_key_widened_beside_another_change_applies() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let child = "create table if not exists app.child (\n  id integer primary key\n\
+                 , parent_id integer references app.parent (id)\n);\n";
+    let (design, outcome) = release_then_change(
+        &*adapter,
+        tmp.path(),
+        &[
+            (
+                "parent",
+                "create table if not exists app.parent (\n  id integer primary key\n);\n",
+            ),
+            ("child", child),
+        ],
+        "INSERT INTO app.parent VALUES (1); INSERT INTO app.child VALUES (1, 1);",
+        &[
+            (
+                "parent",
+                "create table if not exists app.parent (\n  id bigint primary key\n, note text\n);\n",
+            ),
+            ("child", child),
+        ],
+    )
+    .await;
+    outcome.expect("the change applies");
+    assert_in_sync(&design, &*adapter).await;
+}
+
+/// An identity widened goes on past the last value it handed out — not past
+/// the largest still in the table, which reissues a deleted row's id.
+#[tokio::test]
+async fn a_released_identity_widened_goes_on_past_its_last_value() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let line = |ty: &str| {
+        format!(
+            "create table if not exists app.line (\n  id {ty} generated always as identity primary key\n, qty integer\n);\n"
+        )
+    };
+    let (design, outcome) = release_then_change(
+        &*adapter,
+        tmp.path(),
+        &[("line", &line("integer"))],
+        "INSERT INTO app.line (qty) VALUES (1), (2), (3); DELETE FROM app.line WHERE id = 3;",
+        &[("line", &line("bigint"))],
+    )
+    .await;
+    outcome.expect("the type change applies");
+    assert_in_sync(&design, &*adapter).await;
+    adapter
+        .execute_script("INSERT INTO app.line (qty) VALUES (4);")
+        .await
+        .unwrap();
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.line WHERE qty = 4 AND id = 4",
+        "id 4",
+    )
+    .await;
+}
+
+/// Narrowing text to `varchar(3)` over a longer value fails the version, as
+/// Postgres refuses `value too long` — it never truncates the value.
+#[tokio::test]
+async fn a_released_narrowing_refuses_a_value_too_long_rather_than_truncate() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let t = |ty: &str| format!("create table if not exists app.t (\n  id integer primary key\n, name {ty}\n);\n");
+    let (_design, outcome) = release_then_change(
+        &*adapter,
+        tmp.path(),
+        &[("t", &t("text"))],
+        "INSERT INTO app.t VALUES (1, 'abcdef');",
+        &[("t", &t("varchar(3)"))],
+    )
+    .await;
+    let err = outcome.expect_err("a value too long refuses the version").to_string();
+    assert!(err.contains("too long"), "{err}");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.t WHERE name = 'abcdef'",
+        "the value",
+    )
+    .await;
+}
+
+/// The same on reconcile: its in-place type change never truncates either.
+#[tokio::test]
+async fn reconcile_narrowing_refuses_a_value_too_long_rather_than_truncate() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let t = |ty: &str| format!("create table if not exists app.t (\n  id integer primary key\n, name {ty}\n);\n");
+    let (_v1, design) = rekey_design(&[("t", &t("text"))]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("create");
+    adapter
+        .execute_script("INSERT INTO app.t VALUES (1, 'abcdef');")
+        .await
+        .unwrap();
+    let (_v2, design) = rekey_design(&[("t", &t("varchar(3)"))]);
+    let err = design
+        .reconcile(&*adapter, false, true, false, None, Progress::none())
+        .await
+        .expect_err("a value too long refuses the change")
+        .to_string();
+    assert!(err.contains("too long"), "{err}");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.t WHERE name = 'abcdef'",
+        "the value",
+    )
+    .await;
+}
+
+/// Renaming a key another table's foreign key holds: the foreign key follows
+/// the rename, as Postgres's `RENAME COLUMN` takes it along.
+#[tokio::test]
+async fn a_released_rename_of_a_held_key_applies() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = |key: &str| format!("create table if not exists app.parent (\n  {key} integer primary key\n);\n");
+    let child = |key: &str| {
+        format!(
+            "create table if not exists app.child (\n  id integer primary key\n\
+             , parent_id integer references app.parent ({key})\n);\n"
+        )
+    };
+    let (design, outcome) = release_then_change(
+        &*adapter,
+        tmp.path(),
+        &[("parent", &parent("id")), ("child", &child("id"))],
+        "INSERT INTO app.parent VALUES (1); INSERT INTO app.child VALUES (1, 1);",
+        &[("parent", &parent("pid")), ("child", &child("pid"))],
+    )
+    .await;
+    outcome.expect("the rename applies");
+    assert_in_sync(&design, &*adapter).await;
+}
+
+/// A rename keeps the table's own constraints over the column and its
+/// collation: the constraints were added before the column existed, and the
+/// collation was dropped.
+#[tokio::test]
+async fn a_released_rename_keeps_table_constraints_and_collation() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let line = |name: &str| {
+        format!(
+            "create table if not exists app.line (\n  id integer primary key\n\
+             , {name} integer not null default 0\n, unique ({name})\n, check ({name} >= 0)\n);\n"
+        )
+    };
+    let tag = |name: &str| {
+        format!("create table if not exists app.tag (\n  id integer primary key\n, {name} text collate \"C\"\n);\n")
+    };
+    let (design, outcome) = release_then_change(
+        &*adapter,
+        tmp.path(),
+        &[("line", &line("qty")), ("tag", &tag("code"))],
+        "INSERT INTO app.line VALUES (1, 10); INSERT INTO app.tag VALUES (1, 'x');",
+        &[("line", &line("quantity")), ("tag", &tag("label"))],
+    )
+    .await;
+    outcome.expect("the renames apply");
+    assert_in_sync(&design, &*adapter).await;
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM app.line l JOIN app.tag t ON t.id = l.id WHERE l.quantity = 10 AND t.label = 'x'",
+        "the values",
+    )
+    .await;
+}
+
+/// A pending version a dbd before 0.27.2 cut for a type change — its data
+/// script fills the column the next version drops — is refused before any of
+/// it runs, naming the column and saying to cut it again: run as written, it
+/// loses every value of the column.
+#[tokio::test]
+async fn a_pending_swap_cut_before_0_27_2_is_refused() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let line = |ty: &str| format!("create table if not exists app.line (\n  id integer primary key\n, qty {ty}\n);\n");
+    cut_rekey(dir, &[("line", &line("integer"))]);
+    released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("v1 applies");
+    adapter
+        .execute_script("INSERT INTO app.line VALUES (1, 10);")
+        .await
+        .unwrap();
+    // v2 and v3 as 0.27.1 wrote them.
+    std::fs::write(dir.join("ddl/table/app/line.ddl"), line("bigint")).unwrap();
+    for (version, files) in [
+        (
+            2u32,
+            vec![
+                ("line.sql", "ALTER TABLE app.line ADD COLUMN qty_new bigint;"),
+                (
+                    "line.data.sql",
+                    "UPDATE \"app\".\"line\" SET \"qty\" = \"qty\"::bigint;\n",
+                ),
+            ],
+        ),
+        (
+            3,
+            vec![(
+                "line.sql",
+                "ALTER TABLE app.line DROP COLUMN qty;\nALTER TABLE app.line RENAME COLUMN qty_new TO qty;",
+            )],
+        ),
+    ] {
+        let at = dir.join(format!("migrations/{version:03}"));
+        std::fs::create_dir_all(at.join("app")).unwrap();
+        for (file, sql) in files {
+            std::fs::write(at.join("app").join(file), sql).unwrap();
+        }
+        std::fs::write(
+            at.join("graph.json"),
+            format!(
+                r#"{{"fromVersion":{},"toVersion":{version},"added":[],"altered":["app.line"],"dropped":[]}}"#,
+                version - 1
+            ),
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: rekey\n  version: 3\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    let err = released(dir)
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect_err("refused")
+        .to_string();
+    assert!(err.contains("qty") && err.contains("0.27.2"), "{err}");
+    assert_catalog(&*adapter, true, "SELECT 1 FROM app.line WHERE qty = 10", "the value").await;
+}
+
+/// The column a table turns generated, with a CHECK, a foreign key to
+/// another table and an expression index on it.
+fn turned_generated(code: &str) -> [(&'static str, String); 2] {
+    [
+        (
+            "r",
+            "create table if not exists app.r (\n  code text primary key\n);\n".to_string(),
+        ),
+        (
+            "t",
+            format!(
+                "create table if not exists app.t (\n  id integer primary key\n, name text not null\n\
+                 , code text{code} references app.r (code)\n, check (code <> '')\n);\n\
+                 create index if not exists t_code_lower on app.t (lower(code));\n"
+            ),
+        ),
+    ]
+}
+
+/// Reconcile turns a column generated in one run: the CHECK, the foreign key
+/// and the index its rebuild drops come back in the same run, and the second
+/// plans nothing.
+#[tokio::test]
+async fn reconcile_turns_a_column_generated_with_everything_on_it_in_one_run() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let files = |code: &str| turned_generated(code);
+    let v1 = files("");
+    let (_v1, design) = rekey_design(&[("r", &v1[0].1), ("t", &v1[1].1)]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("create");
+    adapter
+        .execute_script("INSERT INTO app.r VALUES ('A'); INSERT INTO app.t VALUES (1, 'a', 'A');")
+        .await
+        .unwrap();
+    let v2 = files(" generated always as (upper(name)) stored");
+    let (_v2, design) = rekey_design(&[("r", &v2[0].1), ("t", &v2[1].1)]);
+    design
+        .reconcile(&*adapter, false, true, false, None, Progress::none())
+        .await
+        .expect("the column turns generated");
+    let again = design
+        .reconcile(&*adapter, true, true, false, None, Progress::none())
+        .await
+        .expect("second dry run");
+    assert!(again.altered.is_empty(), "converged: {:?}", again.altered);
+    assert_in_sync(&design, &*adapter).await;
+}
+
+/// A release turning a column generated leaves the database the design.
+#[tokio::test]
+async fn a_released_column_turned_generated_keeps_everything_on_it() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let v1 = turned_generated("");
+    let v2 = turned_generated(" generated always as (upper(name)) stored");
+    let (design, outcome) = release_then_change(
+        &*adapter,
+        tmp.path(),
+        &[("r", &v1[0].1), ("t", &v1[1].1)],
+        "INSERT INTO app.r VALUES ('A'); INSERT INTO app.t VALUES (1, 'a', 'A');",
+        &[("r", &v2[0].1), ("t", &v2[1].1)],
+    )
+    .await;
+    outcome.expect("the column turns generated");
+    assert_in_sync(&design, &*adapter).await;
+}
+
+// ── dbd diff shows what reconcile runs around a key change (0.27.2) ───────────
+
+/// The SQL `dbd diff` shows for a table, in its order: the foreign keys that
+/// hold its key dropped first, then its own change, then the ones the design
+/// keeps added back.
+fn diff_sql_of(diff: &dbd_core::SchemaDiff, table: &str) -> String {
+    let steps = diff.key_holders.iter().find(|h| h.table == table);
+    let own = diff
+        .changes
+        .iter()
+        .find(|c| c.entity_name == table)
+        .map(|c| dbd_core::diff::generate_migration_sql(std::slice::from_ref(c)))
+        .unwrap_or_default();
+    let mut lines: Vec<String> = steps.map(|h| h.drops.clone()).unwrap_or_default();
+    lines.extend(own.lines().map(str::to_string));
+    lines.extend(steps.map(|h| h.adds.clone()).unwrap_or_default());
+    lines.join("\n")
+}
+
+/// The SQL a reconcile plan runs for `table`.
+fn plan_sql_of(plan: &dbd_core::reconcile::ReconcilePlan, table: &str) -> String {
+    plan.altered
+        .iter()
+        .filter(|s| s.entity_name == table)
+        .map(|s| s.sql.clone())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A key a foreign key holds changes: `dbd diff` shows the foreign key's drop
+/// before the key change and, when the design keeps it, its re-add after — the
+/// SQL reconcile runs for the table, line for line. It showed the key change
+/// alone, SQL that fails if run as shown.
+#[tokio::test]
+async fn diff_shows_the_foreign_keys_a_key_change_drops_and_adds_back() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let parent_v2 = "create table if not exists app.parent (\n  id uuid not null\n, owner_id uuid not null\n\
+                     , path text not null\n, primary key (id)\n, unique (owner_id, path)\n);\n";
+    let parent_v1 = "create table if not exists app.parent (\n  id uuid not null\n, owner_id uuid not null\n\
+                     , path text not null\n, primary key (owner_id, path)\n);\n";
+    for (v1, v2, children) in [
+        (REKEY_PARENT_V1, REKEY_PARENT_V2, (REKEY_CHILD_V1, REKEY_CHILD_V2)),
+        (parent_v1, parent_v2, (REKEY_CHILD_V1, REKEY_CHILD_V1)),
+    ] {
+        adapter
+            .execute_script("DROP SCHEMA IF EXISTS app CASCADE;")
+            .await
+            .unwrap();
+        let (_d1, design) = rekey_design(&[("parent", v1), ("child", children.0)]);
+        design
+            .reconcile(&*adapter, false, false, false, None, Progress::none())
+            .await
+            .expect("create");
+        let (_d2, design) = rekey_design(&[("parent", v2), ("child", children.1)]);
+        let plan = design
+            .reconcile(&*adapter, true, true, false, None, Progress::none())
+            .await
+            .expect("dry run");
+        let diff = design.diff_live(&*adapter, None).await.expect("diff");
+        let holder = diff
+            .key_holders
+            .iter()
+            .find(|h| h.table == "app.parent")
+            .unwrap_or_else(|| panic!("no key holders for app.parent: {:?}", diff.key_holders));
+        assert!(holder.drops.iter().any(|d| d.contains("app.child")), "{holder:?}");
+        assert_eq!(diff_sql_of(&diff, "app.parent"), plan_sql_of(&plan, "app.parent"));
+    }
+}
+
+/// A key held from a table outside the design: reconcile refuses the change,
+/// and `dbd diff` says it would, naming the table.
+#[tokio::test]
+async fn diff_says_reconcile_refuses_a_key_held_from_outside_the_design() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "rekey").await.unwrap();
+    let (_v1, design) = rekey_design(&[("parent", REKEY_PARENT_V1), ("child", REKEY_CHILD_V1)]);
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("create");
+    adapter
+        .execute_script(
+            "CREATE SCHEMA ext; CREATE TABLE ext.audit (owner_id uuid, path text, \
+             FOREIGN KEY (owner_id, path) REFERENCES app.parent (owner_id, path));",
+        )
+        .await
+        .unwrap();
+    let (_v2, design) = rekey_design(&[("parent", REKEY_PARENT_V2), ("child", REKEY_CHILD_V2)]);
+    let diff = design.diff_live(&*adapter, None).await.expect("diff");
+    let refused = diff
+        .key_holders
+        .iter()
+        .find_map(|h| h.refused.clone())
+        .unwrap_or_else(|| panic!("no refusal: {:?}", diff.key_holders));
+    assert!(refused.contains("ext.audit"), "{refused}");
 }
 
 // ── A routine whose return type changes (#65) ─────────────────────────────────
@@ -7106,6 +7945,297 @@ async fn a_nextval_default_converges() {
         touched.is_empty(),
         "the default is already what the design says: {touched:?}"
     );
+}
+
+/// Raises unless the connection the pool hands out next is on the session's
+/// own search path.
+const ON_THE_SESSION_PATH: &str = "DO $$ BEGIN \
+     IF current_setting('search_path') <> (SELECT reset_val FROM pg_settings WHERE name = 'search_path') \
+     THEN RAISE EXCEPTION 'on %', current_setting('search_path'); END IF; END $$";
+
+/// A script's own `SET search_path` ends with it: the pooled connection it ran
+/// on goes back on the session's path, so what runs on it next — introspection
+/// printing a default's sequence, a type — reads names as a fresh connection
+/// would (#60). In a batch too, once it commits.
+#[tokio::test]
+async fn a_scripts_search_path_does_not_outlive_it_on_the_pool() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "paths").await.unwrap();
+    adapter
+        .execute_script("CREATE SCHEMA IF NOT EXISTS app;\nSET search_path TO app;\nCREATE TABLE t (id integer);")
+        .await
+        .unwrap();
+    for _ in 0..5 {
+        adapter
+            .execute_script(ON_THE_SESSION_PATH)
+            .await
+            .expect("after a script");
+    }
+    adapter.begin_batch().await.unwrap();
+    adapter
+        .execute_script("SET search_path TO app;\nCREATE TABLE u (id integer);")
+        .await
+        .unwrap();
+    adapter.commit_batch().await.unwrap();
+    for _ in 0..5 {
+        adapter
+            .execute_script(ON_THE_SESSION_PATH)
+            .await
+            .expect("after a batch");
+    }
+}
+
+/// The pool goes back on the session's path however a script set another:
+/// `SET SCHEMA` is `SET search_path` by another name, the setting's name may be
+/// any case, and a connection whose path cannot be reset — its transaction
+/// left aborted by the script — is not handed out again (0.27.2 review).
+#[tokio::test]
+async fn a_scripts_path_ends_with_it_however_it_was_set() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "paths").await.unwrap();
+    adapter
+        .execute_script("CREATE SCHEMA IF NOT EXISTS app;")
+        .await
+        .unwrap();
+    for script in [
+        "SET SCHEMA 'app';\nCREATE TABLE s1 (id integer);",
+        "SET SEARCH_PATH TO app;\nCREATE TABLE s2 (id integer);",
+        "set local schema 'app';\nCREATE TABLE s3 (id integer);",
+    ] {
+        adapter.execute_script(script).await.unwrap();
+        for _ in 0..5 {
+            adapter
+                .execute_script(ON_THE_SESSION_PATH)
+                .await
+                .unwrap_or_else(|e| panic!("after {script:?}: {e}"));
+        }
+    }
+    let _ = adapter
+        .execute_script("BEGIN; SET search_path TO app; SELECT 1/0;")
+        .await;
+    for _ in 0..6 {
+        adapter
+            .execute_script(ON_THE_SESSION_PATH)
+            .await
+            .expect("after a script whose path could not be reset");
+    }
+}
+
+/// In one `apply`, a file that sets no path runs on the session's — not on
+/// the one the file before it set, which built its table in that file's
+/// schema (0.27.2 review).
+#[tokio::test]
+async fn a_file_that_sets_no_path_runs_on_the_sessions_in_a_batch() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "batch_path").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    for d in ["ddl/table/app", "ddl/table/public"] {
+        std::fs::create_dir_all(dir.join(d)).unwrap();
+    }
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: batch_path\nsource:\n  dialect: postgresql\nschemas:\n  - public\n  - app\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/a.ddl"),
+        "set search_path to app;\ncreate table if not exists a (id integer primary key);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/table/public/b.ddl"),
+        "create table if not exists b (id integer primary key);\n",
+    )
+    .unwrap();
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load");
+    design
+        .apply(&*adapter, None, false, None, Progress::none())
+        .await
+        .expect("apply");
+    assert_table_exists(&*adapter, "public", "b").await;
+    assert_table_absent(&*adapter, "app", "b").await;
+}
+
+/// A `nextval` default naming its sequence in a spelling Postgres does not
+/// print — mixed case unquoted, quoted where it need not be, qualified by a
+/// schema on the search path, or bare in a schema the file's own path reaches
+/// and the session's does not — reconciles once, and then is in sync (#60).
+#[tokio::test]
+async fn a_nextval_default_postgres_spells_differently_converges() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "nextval_spelling").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    for d in ["ddl/sequence/app", "ddl/sequence/public", "ddl/table/app"] {
+        std::fs::create_dir_all(dir.join(d)).unwrap();
+    }
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: nextval_spelling\nsource:\n  dialect: postgresql\nschemas:\n  - public\n  - app\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/sequence/app/seq.ddl"),
+        "create sequence if not exists app.seq;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/sequence/public/pseq.ddl"),
+        "create sequence if not exists public.pseq;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/t.ddl"),
+        "create table if not exists app.t (\n  id integer primary key\n\
+         , a integer default nextval('App.Seq')\n\
+         , b integer default nextval('\"app\".\"seq\"')\n\
+         , c integer default nextval('public.pseq')\n);\n",
+    )
+    .unwrap();
+    // Bare, through the file's own path: `seq` is `app.seq`, `pseq` is
+    // `public`'s — the path dbd runs a file on keeps `public` (#60).
+    std::fs::write(
+        dir.join("ddl/table/app/u.ddl"),
+        "set search_path to app;\ncreate table if not exists u (\n  id integer primary key\n\
+         , d integer default nextval('seq')\n\
+         , e integer default nextval('pseq')\n);\n",
+    )
+    .unwrap();
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load");
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("reconcile");
+
+    let again = design
+        .reconcile(&*adapter, true, false, false, None, Progress::none())
+        .await
+        .expect("second dry run");
+    assert!(again.altered.is_empty(), "converged: {:?}", again.altered);
+    let diff = design.diff_live(&*adapter, None).await.expect("diff");
+    let touched: Vec<String> = diff
+        .changes
+        .iter()
+        .map(|c| format!("{:?} {}", c.action, c.entity_name))
+        .collect();
+    assert!(touched.is_empty(), "in sync: {touched:?}");
+}
+
+/// A `nextval` default is read as the sequence it draws on, whatever path
+/// the database or role sets: on `app, public` Postgres prints `app.seq` as
+/// `seq`, and a design naming it either way read as changed forever (0.27.2
+/// review).
+#[tokio::test]
+async fn a_nextval_default_converges_on_a_database_whose_own_path_reaches_it() {
+    let (pg, url) = start_pg().await;
+    let settings = pg.settings();
+    connect(&url, "admin")
+        .await
+        .unwrap()
+        .execute_script("CREATE SCHEMA IF NOT EXISTS app; ALTER DATABASE testdb SET search_path = app, public;")
+        .await
+        .unwrap();
+    let url = format!(
+        "postgresql://{}:{}@{}:{}/testdb",
+        settings.username, settings.password, settings.host, settings.port
+    );
+    let adapter = connect(&url, "nextval_path").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    for d in ["ddl/sequence/app", "ddl/table/app"] {
+        std::fs::create_dir_all(dir.join(d)).unwrap();
+    }
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: nextval_path\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/sequence/app/seq.ddl"),
+        "create sequence if not exists app.seq;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/table/app/t.ddl"),
+        "set search_path to app;\ncreate table if not exists t (\n  id integer primary key\n\
+         , a integer default nextval('seq')\n, b integer default nextval('app.seq')\n);\n",
+    )
+    .unwrap();
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load");
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("reconcile");
+    let again = design
+        .reconcile(&*adapter, true, false, false, None, Progress::none())
+        .await
+        .expect("second dry run");
+    assert!(again.altered.is_empty(), "converged: {:?}", again.altered);
+    assert_in_sync(&design, &*adapter).await;
+}
+
+/// `nextval('public.pseq')` beside an `app.pseq` the file's path reaches
+/// first draws on `public.pseq`: emitting it as `pseq` bound the default to
+/// `app.pseq` (0.27.2 review).
+#[tokio::test]
+async fn a_public_qualified_nextval_default_draws_on_publics_sequence() {
+    let (_pg, url) = start_pg().await;
+    let adapter = connect(&url, "nextval_public").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    for d in ["ddl/sequence/app", "ddl/sequence/public", "ddl/table/app"] {
+        std::fs::create_dir_all(dir.join(d)).unwrap();
+    }
+    std::fs::write(
+        dir.join("design.yaml"),
+        "project:\n  name: nextval_public\nsource:\n  dialect: postgresql\nschemas:\n  - public\n  - app\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/sequence/app/pseq.ddl"),
+        "create sequence if not exists app.pseq start 5000;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ddl/sequence/public/pseq.ddl"),
+        "create sequence if not exists public.pseq;\n",
+    )
+    .unwrap();
+    let table = |default: &str| {
+        format!(
+            "set search_path to app;\ncreate table if not exists t (\n  id integer primary key\n, n integer{default}\n);\n"
+        )
+    };
+    std::fs::write(dir.join("ddl/table/app/t.ddl"), table("")).unwrap();
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load");
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("create");
+    std::fs::write(
+        dir.join("ddl/table/app/t.ddl"),
+        table(" default nextval('public.pseq')"),
+    )
+    .unwrap();
+    let design = Design::from_config_with_dir(&dir.join("design.yaml"), "dev", Some(dir)).expect("load");
+    design
+        .reconcile(&*adapter, false, false, false, None, Progress::none())
+        .await
+        .expect("the default");
+    assert_catalog(
+        &*adapter,
+        true,
+        "SELECT 1 FROM pg_attrdef d JOIN pg_depend dep ON dep.classid = 'pg_attrdef'::regclass AND dep.objid = d.oid \
+         WHERE d.adrelid = 'app.t'::regclass AND dep.refobjid = 'public.pseq'::regclass",
+        "the default drawing on public.pseq",
+    )
+    .await;
+    let again = design
+        .reconcile(&*adapter, true, false, false, None, Progress::none())
+        .await
+        .expect("second dry run");
+    assert!(again.altered.is_empty(), "converged: {:?}", again.altered);
 }
 
 /// A project with no `project.version` has applied no migration. Reconcile

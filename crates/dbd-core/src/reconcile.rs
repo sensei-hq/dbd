@@ -177,10 +177,23 @@ pub const DEFAULT_SCHEMA: &str = "public";
 /// Empty schemas are normalized to [`DEFAULT_SCHEMA`] so an unqualified project
 /// table (`""`) matches its introspected counterpart (`"public"`).
 pub fn raw_snapshot_from_entities(entities: &[Entity]) -> Snapshot {
+    let sequences: HashSet<&str> = entities
+        .iter()
+        .filter(|e| e.entity_type == EntityType::Sequence)
+        .map(|e| e.name.as_str())
+        .collect();
     let tables = entities
         .iter()
         .filter(|e| e.entity_type == EntityType::Table && e.table_def.is_some())
-        .filter_map(snapshot::entity_to_table_snapshot)
+        .filter_map(|e| {
+            let mut t = snapshot::entity_to_table_snapshot(e)?;
+            // A design's table, read from its file: introspection reads a live
+            // one's sequence by its schema already.
+            if e.file.is_some() {
+                qualify_bare_sequences(&mut t, &e.schema_path, &sequences);
+            }
+            Some(t)
+        })
         .map(|mut t| {
             if t.schema.is_empty() {
                 t.schema = DEFAULT_SCHEMA.to_string();
@@ -205,6 +218,40 @@ pub fn raw_snapshot_from_entities(entities: &[Entity]) -> Snapshot {
         timestamp: String::new(),
         tables,
         enums,
+    }
+}
+
+/// Name the schema of the sequence a bare `nextval('seq')` default draws on,
+/// as Postgres found it when the table's file ran (#60): the first schema on
+/// the file's path that `sequences` declares `seq` in — dbd runs every file
+/// with `public` on its path — else the path's first, where a sequence the
+/// file makes itself lands. Introspection reads the live default the same
+/// way, by the schema the sequence is in, so the two compare whatever path
+/// the session has.
+fn qualify_bare_sequences(
+    t: &mut snapshot::TableSnapshot,
+    path: &crate::entity::SchemaPath,
+    sequences: &HashSet<&str>,
+) {
+    use crate::parser::pg::common::{nextval_sequence_of, regclass_parts};
+    let mut walk: Vec<&str> = path.schemas().collect();
+    if !walk.contains(&DEFAULT_SCHEMA) {
+        walk.push(DEFAULT_SCHEMA);
+    }
+    for c in &mut t.columns {
+        let Some(sequence) = c.default_value.as_deref().and_then(|d| nextval_sequence_of(d.trim())) else {
+            continue;
+        };
+        let parts = regclass_parts(&sequence);
+        let Some([name]) = parts.as_deref() else {
+            continue;
+        };
+        let schema = walk
+            .iter()
+            .find(|schema| sequences.contains(format!("{schema}.{name}").as_str()))
+            .unwrap_or(&walk[0]);
+        let qualified = qualified_spelling(&[schema.to_string(), name.clone()]);
+        c.default_value = Some(format!("nextval('{}'::regclass)", qualified.replace('\'', "''")));
     }
 }
 
@@ -363,7 +410,7 @@ pub fn canonicalize(snap: &mut Snapshot) {
 /// (`DROP CONSTRAINT pk:tenant_id,metric_id`), which blocked every PK replacement.
 /// Matching stays name-agnostic regardless: `diff::constraint_key` keys PK/UNIQUE
 /// on their columns and never on their name.
-fn lift_pk_unique_keep_others(t: &mut snapshot::TableSnapshot) {
+pub(crate) fn lift_pk_unique_keep_others(t: &mut snapshot::TableSnapshot) {
     let mut kept: Vec<TableConstraint> = Vec::new();
     let mut seen: HashSet<(char, String)> = HashSet::new();
     let push = |kept: &mut Vec<TableConstraint>, seen: &mut HashSet<(char, String)>, c: TableConstraint| {
@@ -648,10 +695,35 @@ pub(crate) fn canonical_default(raw: &str, data_type: &str) -> String {
     // default on every run. Both sides take the reported form — valid SQL with
     // the same meaning, as everything this returns must be (it is emitted).
     if let Some(sequence) = crate::parser::pg::common::nextval_sequence_of(raw.trim()) {
-        return format!("nextval('{}'::regclass)", sequence.replace('\'', "''"));
+        return format!(
+            "nextval('{}'::regclass)",
+            regclass_spelling(&sequence).replace('\'', "''")
+        );
     }
     let base = fold_unquoted_case(strip_trailing_cast(raw.trim()).trim());
     canonical_default_for_type(&base, data_type).unwrap_or(base)
+}
+
+/// The relation a `regclass` string names, spelled as Postgres reads it and
+/// `quote_identifier` writes each part (#60): `'App.Seq'` is `app.seq`,
+/// `'"app"."seq"'` too. Its schema is kept as written — `public` too: this is
+/// emitted, and a bare name is read on whatever path runs it, where another
+/// schema's relation of the name can answer (0.27.2 review). A string naming
+/// no relation by name (an OID) is kept as written.
+fn regclass_spelling(text: &str) -> String {
+    match crate::parser::pg::common::regclass_parts(text) {
+        Some(parts) => qualified_spelling(&parts),
+        None => text.to_string(),
+    }
+}
+
+/// `parts` joined as `quote_identifier` writes each.
+fn qualified_spelling(parts: &[String]) -> String {
+    parts
+        .iter()
+        .map(|part| crate::sql_quote::ident_if_needed(part))
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 /// Settle a literal the server rewrites when it stores it (#18).
@@ -886,7 +958,8 @@ pub fn qualified_entity_name(entity: &Entity) -> String {
 
 /// Compute a reconcile plan from a live→desired snapshot diff.
 pub fn plan_reconcile(live: &Snapshot, desired: &Snapshot) -> ReconcilePlan {
-    let diffs = diff::diff(live, desired);
+    let mut diffs = diff::diff(live, desired);
+    diff::with_rebuilds(&mut diffs, desired);
     let warnings = diff::migration_warnings(&diffs);
     let mut plan = ReconcilePlan {
         warnings,
@@ -1148,14 +1221,16 @@ pub(crate) struct KeyHolder {
     pub replaced: bool,
 }
 
-/// How a change decides which indexes it drops — the rule its own SQL
-/// follows, so [`key_holders`] finds the keys that SQL takes away.
+/// How a change decides which keys it drops — the rules its own SQL follows,
+/// so [`key_holders`] finds the keys that SQL takes away.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum IndexDrops {
-    /// By shape, name aside — [`plan_index_convergence`]'s rule.
-    Shape,
-    /// As the diff of the raw snapshots drops them: by name — a migration's.
-    Diff,
+pub(crate) enum KeyDrops {
+    /// Reconcile's: an index by shape, name aside —
+    /// [`plan_index_convergence`]'s rule.
+    Reconcile,
+    /// A migration's: an index as the diff of the raw snapshots drops it, by
+    /// name.
+    Migration,
 }
 
 /// Whether two foreign keys are the same key, their names aside.
@@ -1178,7 +1253,7 @@ pub(crate) fn key_holders(
     new: &Snapshot,
     old_all: &Snapshot,
     new_raw: &Snapshot,
-    indexes: IndexDrops,
+    rules: KeyDrops,
 ) -> Vec<(String, Vec<KeyHolder>)> {
     use crate::diff::{FieldDetail, FieldType};
 
@@ -1210,7 +1285,8 @@ pub(crate) fn key_holders(
                     }
                     _ => {}
                 },
-                // A column turned generated is dropped and added again.
+                // A column turned generated is dropped and added again. One
+                // whose type changes is altered in place, its keys kept.
                 ChangeAction::Alter { old, new } => {
                     if let (FieldDetail::Column(was), FieldDetail::Column(is)) = (old.as_ref(), new.as_ref())
                         && was.generated.is_none()
@@ -1225,7 +1301,7 @@ pub(crate) fn key_holders(
         lost.push((d.entity_name.clone(), keys, columns));
     }
     // A unique index a foreign key can rest on — on columns, whole — that
-    // goes, by the change's own rule (`indexes`): the canonical snapshots
+    // goes, by the change's own rules (`rules`): the canonical snapshots
     // carry no indexes.
     let raw_old: HashMap<String, &TableSnapshot> = old_all.tables.iter().map(|t| (qualified(t), t)).collect();
     let can_hold = |ix: &crate::entity::IndexDef| {
@@ -1239,8 +1315,8 @@ pub(crate) fn key_holders(
         let (Some(was), Some(is)) = (raw_old.get(name), new_tables.get(name)) else {
             continue;
         };
-        let dropped: Keys = match indexes {
-            IndexDrops::Shape => {
+        let dropped: Keys = match rules {
+            KeyDrops::Reconcile => {
                 let is_cols = coercible_columns(&is.columns);
                 let kept: HashSet<IndexShape> = secondary_indexes(is)
                     .iter()
@@ -1253,7 +1329,7 @@ pub(crate) fn key_holders(
                     .map(as_key)
                     .collect()
             }
-            IndexDrops::Diff => {
+            KeyDrops::Migration => {
                 let one = |t: &TableSnapshot| Snapshot {
                     version: 0,
                     description: String::new(),
@@ -1354,6 +1430,44 @@ pub(crate) fn key_holders(
     out
 }
 
+/// `live` without what reconcile's plan drops by rebuilding a column — one
+/// `desired` turns generated, which is dropped and added again (#72): its
+/// keys, constraints, indexes, foreign key and comment. The convergence passes
+/// compare against this, so they add each back after the rebuild, in the same
+/// run, rather than finding it there and leaving it to the next.
+pub(crate) fn without_what_rebuilds_drop(live: &Snapshot, desired: &Snapshot) -> Snapshot {
+    let qualified = |t: &TableSnapshot| format!("{}.{}", t.schema, t.name);
+    let mut out = live.clone();
+    for t in &mut out.tables {
+        let Some(want) = desired.tables.iter().find(|d| qualified(d) == qualified(t)) else {
+            continue;
+        };
+        let rebuilt: Vec<String> = t
+            .columns
+            .iter()
+            .filter(|c| c.generated.is_none())
+            .filter(|c| want.columns.iter().any(|w| w.name == c.name && w.generated.is_some()))
+            .map(|c| c.name.clone())
+            .collect();
+        if rebuilt.is_empty() {
+            continue;
+        }
+        let columns: Vec<&str> = rebuilt.iter().map(String::as_str).collect();
+        let dropped = diff::constraints_on(t, &columns);
+        let dropped_indexes: Vec<crate::entity::IndexDef> =
+            indexes_reading_columns(t, &columns).into_iter().cloned().collect();
+        t.table_constraints.retain(|c| !dropped.contains(c));
+        t.indexes.retain(|ix| !dropped_indexes.contains(ix));
+        for c in t.columns.iter_mut().filter(|c| rebuilt.contains(&c.name)) {
+            c.inline_fk = None;
+            c.comment = None;
+            c.is_pk = false;
+            c.is_unique = false;
+        }
+    }
+    out
+}
+
 /// `ALTER TABLE <table> …` for one foreign-key change, as the diff writes it.
 pub(crate) fn fk_change_sql(table: &str, change: ChangeAction) -> String {
     diff::generate_migration_sql(&[MigrationDiff {
@@ -1399,10 +1513,68 @@ pub(crate) fn plan_key_holders(
     desired_raw: &Snapshot,
     pruned: &HashSet<String>,
 ) -> crate::error::Result<Vec<(String, String)>> {
+    let HolderSteps { steps, spans, outside } = key_holder_steps(live, desired, live_all, desired_raw, pruned);
+    let refusals: Vec<&str> = steps.iter().filter_map(|s| s.refused.as_deref()).collect();
+    if !refusals.is_empty() {
+        return Err(crate::error::DbdError::Config(format!(
+            "reconcile cannot change a key that a foreign key on a table outside this run holds: {}. \
+             dbd drops no foreign key on a table it does not reconcile — another project's, another \
+             module's, one the scope leaves out, one no design declares — so nothing was changed. Drop \
+             {} by hand and re-run; reconcile adds back a foreign key its design declares.",
+            refusals.join("; "),
+            if outside == 1 {
+                "that foreign key"
+            } else {
+                "those foreign keys"
+            }
+        )));
+    }
+    for step in steps {
+        if step.drops.is_empty() {
+            continue;
+        }
+        let drops = step.drops.join("\n");
+        match plan.altered.iter_mut().find(|s| s.entity_name == step.table) {
+            Some(stmt) => stmt.sql = format!("{drops}\n{}", stmt.sql),
+            None => plan.altered.push(ReconcileStatement {
+                entity_name: step.table.clone(),
+                sql: drops,
+            }),
+        }
+        if !step.adds.is_empty() {
+            merge_altered_sql(plan, &step.table, step.adds.join("\n"));
+        }
+    }
+    Ok(spans)
+}
+
+/// [`key_holder_steps`]'s answer.
+pub(crate) struct HolderSteps {
+    /// One per table whose key a foreign key holds.
+    pub steps: Vec<crate::schema_diff::KeyHolderSteps>,
+    /// The changed table and a holder's, for each foreign key the design
+    /// replaces: the steps between run as one transaction.
+    pub spans: Vec<(String, String)>,
+    /// How many holders are on tables outside the run.
+    pub outside: usize,
+}
+
+/// The steps [`plan_key_holders`] splices into reconcile's plan, one per table
+/// whose key a foreign key holds — and `dbd diff` shows (see
+/// [`crate::SchemaDiff::key_holders`]) — with the pairs of steps a replaced
+/// foreign key spans. A step with a holder outside the run is the refusal
+/// alone: none of its foreign keys is dropped.
+pub(crate) fn key_holder_steps(
+    live: &Snapshot,
+    desired: &Snapshot,
+    live_all: &Snapshot,
+    desired_raw: &Snapshot,
+    pruned: &HashSet<String>,
+) -> HolderSteps {
+    let mut steps = Vec::new();
     let mut spans: Vec<(String, String)> = Vec::new();
-    let mut refusals: Vec<String> = Vec::new();
     let mut outside_count = 0;
-    for (changed, holders) in key_holders(live, desired, live_all, desired_raw, IndexDrops::Shape) {
+    for (changed, holders) in key_holders(live, desired, live_all, desired_raw, KeyDrops::Reconcile) {
         let mut drops: Vec<String> = Vec::new();
         let mut adds: Vec<String> = Vec::new();
         let mut outside: Vec<String> = Vec::new();
@@ -1435,44 +1607,31 @@ pub(crate) fn plan_key_holders(
         }
         if !outside.is_empty() {
             outside_count += outside.len();
-            refusals.push(format!(
-                "{changed}'s {} — held by {}",
-                what_held.join(", "),
-                outside.join(", ")
-            ));
+            steps.push(crate::schema_diff::KeyHolderSteps {
+                refused: Some(format!(
+                    "{changed}'s {} — held by {}",
+                    what_held.join(", "),
+                    outside.join(", ")
+                )),
+                table: changed,
+                ..Default::default()
+            });
             continue;
         }
-        if drops.is_empty() {
-            continue;
-        }
-        let drops = drops.join("\n");
-        match plan.altered.iter_mut().find(|s| s.entity_name == changed) {
-            Some(stmt) => stmt.sql = format!("{drops}\n{}", stmt.sql),
-            None => plan.altered.push(ReconcileStatement {
-                entity_name: changed.clone(),
-                sql: drops,
-            }),
-        }
-        if !adds.is_empty() {
-            merge_altered_sql(plan, &changed, adds.join("\n"));
+        if !drops.is_empty() {
+            steps.push(crate::schema_diff::KeyHolderSteps {
+                table: changed,
+                drops,
+                adds,
+                refused: None,
+            });
         }
     }
-
-    if !refusals.is_empty() {
-        return Err(crate::error::DbdError::Config(format!(
-            "reconcile cannot change a key that a foreign key on a table outside this run holds: {}. \
-             dbd drops no foreign key on a table it does not reconcile — another project's, another \
-             module's, one the scope leaves out, one no design declares — so nothing was changed. Drop \
-             {} by hand and re-run; reconcile adds back a foreign key its design declares.",
-            refusals.join("; "),
-            if outside_count == 1 {
-                "that foreign key"
-            } else {
-                "those foreign keys"
-            }
-        )));
+    HolderSteps {
+        steps,
+        spans,
+        outside: outside_count,
     }
-    Ok(spans)
 }
 
 /// Whether `declared` — a table as the design declares it — adds a foreign key
@@ -4400,6 +4559,115 @@ mod tests {
         );
         assert_eq!(canonical_default("'{oops'", "jsonb"), "'{oops'");
         assert_eq!(canonical_default("'not a date'", "timestamptz"), "'not a date'");
+    }
+
+    /// `nextval`'s argument is a `regclass` string, read as Postgres reads it
+    /// and spelled as `quote_identifier` spells each part (#60): `'App.Seq'` is
+    /// `app.seq`. A schema the author wrote stays — `public` too: dropping it
+    /// emitted a default another schema's sequence of that name could answer
+    /// (0.27.2 review). Each pair measured on PostgreSQL 17.
+    #[test]
+    fn a_nextval_default_reads_as_postgres_prints_its_sequence() {
+        for (authored, canonical) in [
+            ("nextval('App.Seq')", "nextval('app.seq'::regclass)"),
+            ("nextval('\"app\".\"seq\"')", "nextval('app.seq'::regclass)"),
+            ("nextval(' app . seq ')", "nextval('app.seq'::regclass)"),
+            ("nextval('APP.SEQ1')", "nextval('app.seq1'::regclass)"),
+            ("nextval('\"App\".\"Seq\"')", "nextval('\"App\".\"Seq\"'::regclass)"),
+            ("nextval('app.\"Seq\"')", "nextval('app.\"Seq\"'::regclass)"),
+            ("nextval('app.\"order\"')", "nextval('app.\"order\"'::regclass)"),
+            ("nextval('app.\"1s\"')", "nextval('app.\"1s\"'::regclass)"),
+            ("nextval('app.\"a''b\"')", "nextval('app.\"a''b\"'::regclass)"),
+            ("nextval('app.\"a.b\"')", "nextval('app.\"a.b\"'::regclass)"),
+            ("nextval('public.pseq')", "nextval('public.pseq'::regclass)"),
+            ("nextval('Public.PSEQ')", "nextval('public.pseq'::regclass)"),
+            ("nextval('PSeq')", "nextval('pseq'::regclass)"),
+            ("nextval('\"PSeq\"')", "nextval('\"PSeq\"'::regclass)"),
+            ("nextval('12345'::regclass)", "nextval('12345'::regclass)"),
+        ] {
+            assert_eq!(canonical_default(authored, "integer"), canonical, "{authored}");
+            assert_eq!(canonical_default(canonical, "integer"), canonical, "{canonical}");
+        }
+    }
+
+    /// A bare `nextval('seq')` draws on the sequence Postgres found on the
+    /// table file's path when it ran — dbd runs every file with `public` on
+    /// its path — and is named with that schema, as the live side is read (#60,
+    /// 0.27.2 review): the first schema on the path the design declares `seq`
+    /// in, else the file's first, where a sequence its file makes lands. A
+    /// table read from a database is left as it is.
+    #[test]
+    fn a_bare_nextval_default_names_the_schema_its_files_path_finds_the_sequence_in() {
+        use crate::entity::{PathEntry, SchemaPath, TableComments, TableDef};
+        let table = |name: &str, path: SchemaPath, defaults: &[&str]| {
+            let mut entity = Entity::new(EntityType::Table, name);
+            entity.file = Some(std::path::PathBuf::from(format!("ddl/table/{name}.ddl")));
+            entity.schema_path = path;
+            entity.table_def = Some(TableDef {
+                columns: defaults
+                    .iter()
+                    .enumerate()
+                    .map(|(i, d)| col_default(&format!("c{i}"), "integer", d))
+                    .collect(),
+                constraints: vec![],
+                indexes: vec![],
+                comments: TableComments::default(),
+            });
+            entity
+        };
+        let path = |schemas: &[&str]| {
+            SchemaPath::from_file(schemas.iter().map(|s| PathEntry::Schema(s.to_string())).collect())
+        };
+        let mut live = table("app.w", SchemaPath::default(), &["nextval('seq')"]);
+        live.file = None;
+        let entities = vec![
+            Entity::new(EntityType::Sequence, "app.seq"),
+            Entity::new(EntityType::Sequence, "public.pseq"),
+            Entity::new(EntityType::Sequence, "public.twin"),
+            Entity::new(EntityType::Sequence, "app.twin"),
+            Entity::new(EntityType::Sequence, "App.Seq"),
+            table(
+                "app.u",
+                path(&["app"]),
+                &[
+                    "nextval('seq')",
+                    "nextval('Seq'::regclass)",
+                    "nextval('pseq')",
+                    "nextval('made_here')",
+                ],
+            ),
+            table("app.v", SchemaPath::default(), &["nextval('seq')", "nextval('pseq')"]),
+            table("app.x", path(&["app", "public"]), &["nextval('twin')"]),
+            table("app.y", path(&["App"]), &["nextval('\"Seq\"')"]),
+            live,
+        ];
+        let snap = snapshot_from_entities(&entities);
+        let defaults = |name: &str| -> Vec<String> {
+            snap.tables
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap()
+                .columns
+                .iter()
+                .map(|c| c.default_value.clone().unwrap())
+                .collect()
+        };
+        assert_eq!(
+            defaults("u"),
+            [
+                "nextval('app.seq'::regclass)",
+                "nextval('app.seq'::regclass)",
+                "nextval('public.pseq'::regclass)",
+                "nextval('app.made_here'::regclass)"
+            ]
+        );
+        assert_eq!(
+            defaults("v"),
+            ["nextval('public.seq'::regclass)", "nextval('public.pseq'::regclass)"]
+        );
+        assert_eq!(defaults("x"), ["nextval('app.twin'::regclass)"]);
+        assert_eq!(defaults("y"), ["nextval('\"App\".\"Seq\"'::regclass)"]);
+        assert_eq!(defaults("w"), ["nextval('seq'::regclass)"]);
     }
 
     /// Type-awareness must not change what the old text-only rules did for

@@ -1467,14 +1467,23 @@ a declared index over a key's columns that the database lost is drift), FK `NO
 ACTION`/auto-generated names, EXCLUDE spelling, and CHECK-expression spelling via libpg_query — parens/case, `IN` ↔
 `= ANY (ARRAY[…])`, literal casts, `BETWEEN` ↔ its `>=`/`<=` expansion, casts on
 `ARRAY[…]` constructors, and `AND`/`OR` nesting; a `nextval('s')` default matches
-the `nextval('s'::regclass)` Postgres reports) so only real drift shows. An
+the `nextval('s'::regclass)` Postgres reports, its sequence fully qualified on both
+sides — the live one by the schema it is in, whatever path the session has; the
+design's as written, `nextval('App.Seq')` being `app.seq` and `public.` kept; a bare
+name in the first schema its file's path declares it in, else the path's first — and
+a column turned generated rebuilt, what its drop takes shown coming back after it) so
+only real drift shows. A bare `nextval` of a sequence the design declares nowhere is
+taken to be in its file's first path schema; one made elsewhere reads as drift. An
 unparseable CHECK is shown flagged `advisory`. Covers tables + enums
 structurally, plus **materialized-view drift** (each matview reported
 `missing`/`drifted`/`unstamped`/`orphan` via the `dbd:hash` drift stamp in
 `dbd.matview_stamps`; in `--json` as `matview_drift`, and counts toward
-`--exit-code`). Views/functions/roles/sequences are not structurally diffed, and
-table, view and enum comments are not compared. A pooled connection's inherited
-`search_path` can still make a bare `nextval('s')` read as drift now and then.
+`--exit-code`). A key another table's foreign key holds is shown changing as
+`reconcile` changes it — that foreign key dropped above the table's own SQL and, when
+the design keeps it, added back below; one on a table outside the run shown as the
+refusal reconcile gives (`--json`: `key_holders`; before 0.27.2 diff showed the key
+change alone). Views/functions/roles/sequences are not structurally diffed, and
+table, view and enum comments are not compared.
 
 ### dbd release (alias: dbd baseline)
 
@@ -1509,8 +1518,20 @@ dbd snapshot --list
 
 Diffs the current DDL against the latest snapshot and writes a versioned
 migration. **Smart multi-snapshot**: complex changes auto-split into safe stages —
-a column rename → 2 snapshots (add+copy, drop old), a type change → 2 (add+CAST,
-drop old), an enum value removal → 2 (the data mapping, a TODO to fill in; then the type swap —
+a column rename → 1 (`RENAME COLUMN`), a type change → 1 (`ALTER COLUMN … TYPE …
+USING`, as `reconcile` makes it), both in place, so the column keeps its values, NOT NULL,
+default, identity, generated expression, keys, the foreign keys on either side, CHECKs,
+EXCLUDEs, indexes and comment, and a value the new type cannot hold fails the version
+(narrowing into a bounded character type is an assignment, never a truncating cast); a type
+change dbd cannot cast → 2 (a `data.sql` TODO readies the column's values in place, then the
+in-place alter, its `USING` editable). A rename is a table's one column dropped and one added
+of one type, and the snapshot warns that it took it for one. Before 0.27.2 both were a column
+swap (`<column>_new` added and filled, the column dropped, `<column>_new` renamed into place)
+whose `data.sql` filled the old column — every value lost — and which left the column its type
+alone; `apply` and `deploy` refuse a pending version cut that way, naming the column: cut it
+again. A column turned generated is rebuilt, and gets back every key, constraint, foreign key,
+index and comment on it after the rebuild, the foreign keys holding its keys dropped first and
+re-added after; an enum value removal → 2 (the data mapping, a TODO to fill in; then the type swap —
 the type renamed aside and recreated, each column moved across with its views, materialized views,
 indexes and default dropped and restored around it, the old type dropped once no column uses it,
 its `COMMENT ON TYPE` carried to the new one). Before 0.25 the removal took three stages through
@@ -1541,8 +1562,8 @@ drop runs only where the table still exists, and only a drop that ran is counted
 migration was recorded as applied.
 
 `*.data.sql` corrections run after every schema change of their version, the other
-tables' included (CAST heuristics auto-fill type conversions; non-derivable cases like enum
-value mapping emit `-- TODO:` comments). These are **gated**: `dbd inspect` surfaces
+tables' included (a type change dbd can cast needs none — it is made in place; a type
+change it cannot cast and an enum value mapping emit `-- TODO:` comments). These are **gated**: `dbd inspect` surfaces
 unresolved TODOs, and `dbd apply`, `deploy` and — given a database — their dry runs refuse
 while any remain. How `apply` runs pending versions — one at a time, enum values committed
 first — is under [dbd apply](#dbd-apply).
@@ -1878,7 +1899,7 @@ Both set `pass_filenames: false` because `dbd format` scans the project itself. 
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.27.1
+  rev: v0.27.3
   hooks:
     - id: dbd-format
 ```

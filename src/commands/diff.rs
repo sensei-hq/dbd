@@ -19,18 +19,47 @@ pub(crate) fn diff_report_lines(d: &SchemaDiff) -> Vec<String> {
         return vec!["Live database is in sync with the design — no differences.".to_string()];
     }
     let mut lines = Vec::new();
+    // A key change a foreign key holds is shown as reconcile runs it: the
+    // foreign keys holding the key dropped first, the kept ones added back
+    // after (#65).
+    let holders = |table: &str| d.key_holders.iter().find(|h| h.table == table && h.refused.is_none());
+    let mut shown: Vec<&str> = Vec::new();
     for c in &d.changes {
         match &c.action {
             DiffAction::Add => lines.push(format!("  + create {}", c.entity_name)),
             DiffAction::Drop => lines.push(format!("  - drop   {}", c.entity_name)),
             DiffAction::Change(_) => {
                 lines.push(format!("  ~ alter  {}", c.entity_name));
+                let steps = holders(&c.entity_name);
                 let sql = diff::generate_migration_sql(std::slice::from_ref(c));
-                for l in sql.lines().filter(|l| !l.trim().is_empty()) {
+                let all = steps
+                    .into_iter()
+                    .flat_map(|h| h.drops.iter().map(String::as_str))
+                    .chain(sql.lines())
+                    .chain(steps.into_iter().flat_map(|h| h.adds.iter().map(String::as_str)));
+                for l in all.flat_map(str::lines).filter(|l| !l.trim().is_empty()) {
                     lines.push(format!("      {l}"));
+                }
+                if steps.is_some() {
+                    shown.push(&c.entity_name);
                 }
             }
         }
+    }
+    for h in d
+        .key_holders
+        .iter()
+        .filter(|h| h.refused.is_none() && !shown.contains(&h.table.as_str()))
+    {
+        lines.push(format!("  ~ alter  {}", h.table));
+        for l in h.drops.iter().chain(&h.adds).flat_map(|s| s.lines()) {
+            lines.push(format!("      {l}"));
+        }
+    }
+    for refused in d.key_holders.iter().filter_map(|h| h.refused.as_deref()) {
+        lines.push(format!(
+            "  ⚠ reconcile refuses the key change: {refused} — drop that foreign key by hand first"
+        ));
     }
     for w in &d.warnings {
         lines.push(format!("  ⚠ {w}"));
@@ -169,6 +198,58 @@ pub(crate) fn diff_exit_code(is_empty: bool, exit_code_flag: bool) -> Option<i32
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A key change a foreign key holds is shown as reconcile runs it: the
+    /// holder's drop above the table's own SQL, the kept one's re-add below;
+    /// a refusal is said, naming what holds the key.
+    #[test]
+    fn a_key_change_shows_the_foreign_keys_around_it() {
+        use dbd_core::diff::{ChangeAction, DiffAction, FieldChange, FieldDetail, FieldType, MigrationDiff};
+        use dbd_core::entity::TableConstraint;
+        use dbd_core::schema_diff::KeyHolderSteps;
+        let d = SchemaDiff {
+            changes: vec![MigrationDiff {
+                entity_name: "app.parent".to_string(),
+                entity_type: dbd_core::EntityType::Table,
+                action: DiffAction::Change(vec![FieldChange {
+                    field_name: "pk:id".to_string(),
+                    field_type: FieldType::Constraint,
+                    action: ChangeAction::Add(Box::new(FieldDetail::Constraint(TableConstraint::PrimaryKey {
+                        name: None,
+                        columns: vec!["id".to_string()],
+                    }))),
+                }]),
+            }],
+            key_holders: vec![
+                KeyHolderSteps {
+                    table: "app.parent".to_string(),
+                    drops: vec!["ALTER TABLE app.child DROP CONSTRAINT IF EXISTS child_fk;".to_string()],
+                    adds: vec!["ALTER TABLE app.child ADD FOREIGN KEY (pid) REFERENCES app.parent(id);".to_string()],
+                    refused: None,
+                },
+                KeyHolderSteps {
+                    table: "app.other".to_string(),
+                    refused: Some("app.other's primary key — held by ext.audit".to_string()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let lines = diff_report_lines(&d);
+        let at = |needle: &str| {
+            lines
+                .iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} not in {lines:#?}"))
+        };
+        assert!(at("~ alter  app.parent") < at("DROP CONSTRAINT IF EXISTS child_fk"));
+        assert!(at("DROP CONSTRAINT IF EXISTS child_fk") < at("ADD PRIMARY KEY (id)"));
+        assert!(at("ADD PRIMARY KEY (id)") < at("ADD FOREIGN KEY (pid)"));
+        assert!(
+            lines[at("held by ext.audit")].contains("reconcile refuses"),
+            "{lines:#?}"
+        );
+    }
     use dbd_core::diff::{DiffAction, MigrationDiff};
     use dbd_core::entity::EntityType;
     use dbd_core::schema_diff::{MatviewDrift, MatviewDriftKind};
@@ -203,6 +284,7 @@ mod tests {
             changes: vec![add("public.audit_log")],
             warnings: vec![],
             advisories: vec!["CHECK ck on public.orders couldn't be normalized".into()],
+            key_holders: Vec::new(),
             matview_drift: vec![],
         };
         let out = diff_report_lines(&d).join("\n");
@@ -220,6 +302,7 @@ mod tests {
             changes: vec![add("public.audit_log")],
             warnings: vec![],
             advisories: vec![],
+            key_holders: Vec::new(),
             matview_drift: vec![],
         };
         let json = serde_json::to_string(&d).unwrap();
@@ -244,6 +327,7 @@ mod tests {
             changes: vec![],
             warnings: vec![],
             advisories: vec![],
+            key_holders: Vec::new(),
             matview_drift: vec![
                 mv("analytics.daily", MatviewDriftKind::Drifted),
                 mv("analytics.new", MatviewDriftKind::Missing),
@@ -264,6 +348,7 @@ mod tests {
             changes: vec![],
             warnings: vec![],
             advisories: vec![],
+            key_holders: Vec::new(),
             matview_drift: vec![
                 mv("analytics.legacy", MatviewDriftKind::Unstamped),
                 mv("analytics.stale", MatviewDriftKind::Orphan),

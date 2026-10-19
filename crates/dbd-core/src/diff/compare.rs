@@ -87,6 +87,102 @@ fn diff_table_fields(old: &TableSnapshot, new: &TableSnapshot) -> Vec<FieldChang
     changes
 }
 
+/// Add back, after each column a diff turns generated, what that column's
+/// rebuild drops (#72): Postgres cannot make a plain column generated, so it
+/// is dropped and added again, and `DROP COLUMN` takes every key, constraint
+/// and index on it. Both sides still declare them, so the diff itself says
+/// nothing of them — and must not: [`crate::history`] reads it as what a
+/// version changed. Only what is run from a diff calls this — a migration,
+/// reconcile's plan, `dbd diff`'s — so each says the same.
+///
+/// Each of [`constraints_on`] the column, and each index reading it, that
+/// the diff does not add already.
+pub(crate) fn with_rebuilds(diffs: &mut [MigrationDiff], new: &Snapshot) {
+    for d in diffs.iter_mut() {
+        let DiffAction::Change(changes) = &mut d.action else {
+            continue;
+        };
+        let rebuilt: Vec<String> = changes
+            .iter()
+            .filter_map(|c| match &c.action {
+                ChangeAction::Alter { old, new } => match (old.as_ref(), new.as_ref()) {
+                    (FieldDetail::Column(was), FieldDetail::Column(is))
+                        if was.generated.is_none() && is.generated.is_some() =>
+                    {
+                        Some(is.name.clone())
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        let Some(table) = new.tables.iter().find(|t| qualified_name(t) == d.entity_name) else {
+            continue;
+        };
+        if rebuilt.is_empty() {
+            continue;
+        }
+        let columns: Vec<&str> = rebuilt.iter().map(String::as_str).collect();
+        let added = |changes: &[FieldChange], kind: FieldType, key: &str| {
+            changes
+                .iter()
+                .any(|c| c.field_type == kind && c.field_name == key && matches!(c.action, ChangeAction::Add(_)))
+        };
+        for con in constraints_on(table, &columns) {
+            let key = constraint_key(&con);
+            if !added(changes, FieldType::Constraint, &key) {
+                changes.push(FieldChange {
+                    field_name: key,
+                    field_type: FieldType::Constraint,
+                    action: ChangeAction::Add(Box::new(FieldDetail::Constraint(con))),
+                });
+            }
+        }
+        for ix in crate::reconcile::indexes_reading_columns(table, &columns) {
+            let key = index_key(ix);
+            if !added(changes, FieldType::Index, &key) {
+                changes.push(FieldChange {
+                    field_name: key,
+                    field_type: FieldType::Index,
+                    action: ChangeAction::Add(Box::new(FieldDetail::Index(ix.clone()))),
+                });
+            }
+        }
+    }
+}
+
+/// Every constraint of `table` that dropping any of `columns` drops with it:
+/// a primary or unique key over one of them — a column's inline `primary
+/// key` and `unique` read as reconcile lifts them, so a composite key's
+/// members are that one key — a foreign key from one, the table's or a
+/// column's inline `references`, and a CHECK or EXCLUDE reading one.
+pub(crate) fn constraints_on(table: &TableSnapshot, columns: &[&str]) -> Vec<TableConstraint> {
+    use crate::sql_expr::{exclusion_reads_column, reads_column};
+    let mut lifted = table.clone();
+    crate::reconcile::lift_pk_unique_keep_others(&mut lifted);
+    let on = |names: &[String]| names.iter().any(|n| columns.contains(&n.as_str()));
+    let mut found: Vec<TableConstraint> = lifted
+        .table_constraints
+        .into_iter()
+        .filter(|c| match c {
+            TableConstraint::PrimaryKey { columns, .. } | TableConstraint::Unique { columns, .. } => on(columns),
+            TableConstraint::ForeignKey(fk) => on(&fk.columns),
+            TableConstraint::Check { expression, .. } => columns.iter().any(|c| reads_column(expression, c)),
+            TableConstraint::Exclude { definition, .. } => {
+                columns.iter().any(|c| exclusion_reads_column(definition, c))
+            }
+        })
+        .collect();
+    found.extend(
+        table
+            .columns
+            .iter()
+            .filter(|c| columns.contains(&c.name.as_str()))
+            .filter_map(|c| c.inline_fk.clone().map(TableConstraint::ForeignKey)),
+    );
+    found
+}
+
 /// Diff columns by name: Add / Drop / Alter (via PartialEq).
 fn diff_columns(old: &[ColumnDef], new: &[ColumnDef]) -> Vec<FieldChange> {
     let old_map: HashMap<&str, &ColumnDef> = old.iter().map(|c| (c.name.as_str(), c)).collect();

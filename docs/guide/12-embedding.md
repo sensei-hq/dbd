@@ -409,7 +409,8 @@ for stmt in &plan.altered {
 another project might.
 
 `diff_live` is `dbd diff`: read-only, returning a `SchemaDiff` (`changes`,
-`warnings`, `advisories`, `matview_drift`; `is_empty()` when in sync).
+`warnings`, `advisories`, `matview_drift`, `key_holders` — the foreign keys reconcile drops
+and adds back around a key change, or its refusal; `is_empty()` when in sync).
 `reconcile` returns the `ReconcilePlan` and, unless `dry_run`, executes it —
 with the design's `apply.before` and `apply.after` hooks around the writes,
 scoped as `apply` scopes them, so a reconciled database is the one an apply

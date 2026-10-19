@@ -922,6 +922,39 @@
     /// `SET EXPRESSION` on one ("is not a generated column"), so the column is
     /// rebuilt. Safe for this shape alone: a generated column's values are
     /// derived, so the rebuild recomputes exactly what was dropped.
+    /// A generated column's type changes in place, and stays generated — its
+    /// expression, changed or not, after the type: the change was dropped.
+    #[test]
+    fn a_generated_columns_type_change_alters_it_in_place() {
+        let old = col_generated("twice", "integer", "a * 2");
+        let new = col_generated("twice", "bigint", "a * 2");
+        let sql = generate_migration_sql(&[alter_col("public.g", "twice", old, new)]);
+        assert_eq!(sql, "ALTER TABLE public.g ALTER COLUMN twice TYPE bigint;");
+
+        let old = col_generated("twice", "integer", "a * 2");
+        let new = col_generated("twice", "bigint", "a * 3");
+        let sql = generate_migration_sql(&[alter_col("public.g", "twice", old, new)]);
+        assert_eq!(
+            sql,
+            "ALTER TABLE public.g ALTER COLUMN twice TYPE bigint;\n\
+             ALTER TABLE public.g ALTER COLUMN twice SET EXPRESSION AS (a * 3);"
+        );
+    }
+
+    /// A generated column turned plain is settled as any column once its
+    /// expression is dropped: a type change with it was lost.
+    #[test]
+    fn a_generated_column_turned_plain_settles_its_type_too() {
+        let old = col_generated("twice", "integer", "a * 2");
+        let new = col("twice", "bigint");
+        let sql = generate_migration_sql(&[alter_col("public.g", "twice", old, new)]);
+        assert_eq!(
+            sql,
+            "ALTER TABLE public.g ALTER COLUMN twice DROP EXPRESSION;\n\
+             ALTER TABLE public.g ALTER COLUMN twice TYPE bigint USING twice::bigint;"
+        );
+    }
+
     #[test]
     fn promoting_a_plain_column_to_generated_rebuilds_it() {
         let old = col("tsv", "tsvector");
@@ -932,6 +965,51 @@
             "ALTER TABLE public.docs DROP COLUMN tsv;\n\
              ALTER TABLE public.docs ADD COLUMN tsv tsvector \
              GENERATED ALWAYS AS (to_tsvector('english', body)) STORED;"
+        );
+    }
+
+    /// The rebuild takes the keys on the column with it, and both sides still
+    /// declare them, so the diff re-adds each one the column is part of after
+    /// the column is back (#72) — and leaves a key it is no part of alone.
+    #[test]
+    fn a_column_turned_generated_gets_back_the_keys_it_is_part_of() {
+        let table = |code: ColumnDef| TableSnapshot {
+            table_constraints: vec![
+                TableConstraint::PrimaryKey {
+                    name: None,
+                    columns: vec!["id".to_string()],
+                },
+                TableConstraint::Unique {
+                    name: None,
+                    columns: vec!["code".to_string()],
+                    nulls_not_distinct: false,
+                },
+                TableConstraint::Unique {
+                    name: Some("docs_body_code_uq".to_string()),
+                    columns: vec!["body".to_string(), "code".to_string()],
+                    nulls_not_distinct: true,
+                },
+            ],
+            ..table(
+                "public",
+                "docs",
+                vec![col_not_null("id", "integer"), col("body", "text"), code],
+            )
+        };
+        let old = snap(vec![table(col("code", "text"))], vec![]);
+        let new = snap(vec![table(col_generated("code", "text", "upper(body)"))], vec![]);
+        // The diff itself says nothing of them — history reads it as what
+        // the version changed; what is run from it adds them back.
+        let mut diffs = diff(&old, &new);
+        assert_eq!(generate_migration_sql(&diffs).matches("UNIQUE").count(), 0);
+        with_rebuilds(&mut diffs, &new);
+        let sql = generate_migration_sql(&diffs);
+        assert_eq!(
+            sql,
+            "ALTER TABLE public.docs DROP COLUMN code;\n\
+             ALTER TABLE public.docs ADD COLUMN code text GENERATED ALWAYS AS (upper(body)) STORED;\n\
+             ALTER TABLE public.docs ADD UNIQUE (code);\n\
+             ALTER TABLE public.docs ADD CONSTRAINT docs_body_code_uq UNIQUE NULLS NOT DISTINCT (body, code);"
         );
     }
 
@@ -1373,8 +1451,82 @@
                 }))),
             }]),
         }];
+        // In the table's schema: a migration runs on its file's search path,
+        // which the schema may not be on (#73).
         let sql = generate_migration_sql(&diffs);
-        assert_eq!(sql, "DROP INDEX IF EXISTS \"idx_email\";");
+        assert_eq!(sql, "DROP INDEX IF EXISTS \"public\".\"idx_email\";");
+    }
+
+    /// A name read off a live catalog reaches a `DROP` as a name, never as
+    /// SQL: a constraint, column or table called to close the statement and
+    /// run another is quoted, its quotes doubled. An ordinary name reads as it
+    /// always did (0.27.2 review).
+    #[test]
+    fn a_hostile_live_name_in_a_drop_stays_a_name() {
+        let con = TableConstraint::Check {
+            name: Some("x\"; create table app.pwned(a int); --".to_string()),
+            expression: "a > 0".to_string(),
+        };
+        let column = col("z; create table app.pwned2(a int); --", "integer");
+        let diffs = vec![MigrationDiff {
+            entity_name: "app.t".to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(vec![
+                FieldChange {
+                    field_name: "ck".to_string(),
+                    field_type: FieldType::Constraint,
+                    action: ChangeAction::Drop(Box::new(FieldDetail::Constraint(con))),
+                },
+                FieldChange {
+                    field_name: column.name.clone(),
+                    field_type: FieldType::Column,
+                    action: ChangeAction::Drop(Box::new(FieldDetail::Column(column))),
+                },
+            ]),
+        }];
+        assert_eq!(
+            generate_migration_sql(&diffs),
+            "ALTER TABLE app.t DROP CONSTRAINT IF EXISTS \"x\"\"; create table app.pwned(a int); --\";\n\
+             ALTER TABLE app.t DROP COLUMN \"z; create table app.pwned2(a int); --\";"
+        );
+        let table = vec![MigrationDiff {
+            entity_name: "app.x; drop table app.t; --".to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Drop,
+        }];
+        assert_eq!(
+            generate_migration_sql(&table),
+            "DROP TABLE app.\"x; drop table app.t; --\" CASCADE;"
+        );
+        let ordinary = vec![MigrationDiff {
+            entity_name: "app.t".to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Drop,
+        }];
+        assert_eq!(generate_migration_sql(&ordinary), "DROP TABLE app.t CASCADE;");
+    }
+
+    /// A table with no schema of its own drops its index bare, never in a
+    /// schema named `""`; and an index name keeps its quotes doubled.
+    #[test]
+    fn s13b_index_drop_names_a_schema_only_when_the_table_has_one() {
+        let drop = |entity: &str, index: &str| {
+            generate_migration_sql(&[MigrationDiff {
+                entity_name: entity.to_string(),
+                entity_type: EntityType::Table,
+                action: DiffAction::Change(vec![FieldChange {
+                    field_name: index.to_string(),
+                    field_type: FieldType::Index,
+                    action: ChangeAction::Drop(Box::new(FieldDetail::Index(IndexDef {
+                        name: Some(index.to_string()),
+                        ..Default::default()
+                    }))),
+                }]),
+            }])
+        };
+        assert_eq!(drop(".t", "t_c"), "DROP INDEX IF EXISTS \"t_c\";");
+        assert_eq!(drop("t", "t_c"), "DROP INDEX IF EXISTS \"t_c\";");
+        assert_eq!(drop("app.t", "a\"b"), "DROP INDEX IF EXISTS \"app\".\"a\"\"b\";");
     }
 
     // ── S14: Enum value add / drop SQL ──────────────────────
@@ -1729,7 +1881,8 @@
         assert!(warnings[0].contains("type change"));
         assert!(warnings[0].contains("VARCHAR(100)"));
         assert!(warnings[0].contains("TEXT"));
-        assert!(warnings[0].contains("splitting"));
+        // Made in place: the advice to split it across versions is gone.
+        assert!(warnings[0].contains("in place") && !warnings[0].contains("splitting"));
     }
 
     #[test]
@@ -2173,6 +2326,8 @@
         assert_eq!(sql, "UPDATE \"config\".\"users\" SET \"display_name\" = \"name\";\n");
     }
 
+    /// A type change dbd can cast is altered in place, its values Postgres's
+    /// to convert: there is nothing to move.
     #[test]
     fn d_data_castable_type_change() {
         let change = ComplexChange::ColumnTypeChange {
@@ -2181,10 +2336,9 @@
             old_type: "INTEGER".to_string(),
             new_type: "TEXT".to_string(),
             old_col: Box::new(col("total", "INTEGER")),
-            new_col: Box::new(col("total_text", "TEXT")),
+            new_col: Box::new(col("total", "TEXT")),
         };
-        let sql = generate_data_sql(&change);
-        assert!(sql.contains("UPDATE \"config\".\"orders\" SET \"total_text\" = \"total\"::TEXT;"));
+        assert_eq!(generate_data_sql(&change), "");
     }
 
     #[test]
@@ -2199,6 +2353,11 @@
         };
         let sql = generate_data_sql(&change);
         assert!(sql.contains("-- TODO:"), "should contain TODO comment: {sql}");
+        // On the column itself, before the next version alters it in place.
+        assert!(
+            sql.contains("payload") && sql.contains("USING") && !sql.contains("payload_new"),
+            "{sql}"
+        );
     }
 
     #[test]
@@ -2257,7 +2416,9 @@
     }
 
     #[test]
-    fn d_data_text_to_varchar_has_truncation_warning() {
+    /// Narrowing text to `varchar(n)` moves nothing: the column is altered in
+    /// place, where Postgres refuses a value too long rather than cut it.
+    fn d_data_text_to_varchar_moves_nothing() {
         let change = ComplexChange::ColumnTypeChange {
             table_name: "config.users".to_string(),
             column_name: "name".to_string(),
@@ -2266,7 +2427,5 @@
             old_col: Box::new(col("name", "TEXT")),
             new_col: Box::new(col("name", "VARCHAR(50)")),
         };
-        let sql = generate_data_sql(&change);
-        assert!(sql.contains("WARNING"), "should contain WARNING: {sql}");
-        assert!(sql.contains("truncate"), "should mention truncate: {sql}");
+        assert_eq!(generate_data_sql(&change), "");
     }
