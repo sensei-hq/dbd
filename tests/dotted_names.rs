@@ -81,3 +81,57 @@ fn names_without_a_dot_are_unaffected() {
     let out = dbd(dir, &["inspect"]);
     assert!(out.status.success(), "{}", text(&out));
 }
+
+/// A dotted schema has no file, so the refusal and the warnings name it as a
+/// schema (#99): they read `2 file(s) could not be parsed` over one file, and
+/// `⚠ a.b could not be parsed`, as if `a.b` were a path.
+#[test]
+fn a_dotted_schema_is_named_as_a_schema_not_a_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write(
+        dir,
+        "design.yaml",
+        "project:\n  name: dotted\nsource:\n  dialect: postgresql\n",
+    );
+    write(
+        dir,
+        "ddl/table/a.b/t.ddl",
+        "create table if not exists \"a.b\".t (id integer primary key);\n",
+    );
+
+    let said = text(&dbd(dir, &["snapshot"]));
+    assert!(said.contains("1 file(s) could not be parsed"), "{said}");
+    assert!(said.contains("1 schema is not valid"), "{said}");
+    assert!(said.contains("schema a.b"), "{said}");
+
+    let said = text(&dbd(dir, &["graph"]));
+    assert!(said.contains("schema a.b is not valid"), "{said}");
+    assert!(!said.contains("a.b could not be parsed"), "{said}");
+}
+
+/// `release` refuses a design it could not fully read as the other commands
+/// do, naming each file and its error (#99): it said only `Design has 1
+/// entity error(s)`.
+#[test]
+fn release_names_the_file_it_could_not_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write(
+        dir,
+        "design.yaml",
+        "project:\n  name: rel\nsource:\n  dialect: postgresql\nschemas:\n  - app\n",
+    );
+    write(
+        dir,
+        "ddl/table/app/t.ddl",
+        "create table if not exists app.t (id integer primary key,, oops);\n",
+    );
+
+    let out = dbd(dir, &["release"]);
+    let said = text(&out);
+    assert!(!out.status.success(), "{said}");
+    assert!(said.contains("t.ddl"), "the file is named: {said}");
+    assert!(said.contains("syntax error"), "its error is given: {said}");
+    assert!(!dir.join("snapshots").exists(), "nothing is written: {said}");
+}

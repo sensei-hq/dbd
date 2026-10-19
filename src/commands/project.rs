@@ -1404,10 +1404,9 @@ fn check_release(design: &Design, project_dir: &Path) -> Result<Release> {
             None => "Project is already released.".to_string(),
         });
     }
-    let error_count = design.entities().iter().filter(|e| !e.errors.is_empty()).count();
-    if error_count > 0 {
-        anyhow::bail!("Design has {error_count} entity error(s); fix them before releasing (run `dbd inspect`).");
-    }
+    // Named as `apply` and `snapshot` name them: it said only "Design has N
+    // entity error(s)" (#99).
+    dbd_core::entity::ensure_fully_read(design.entities(), "released")?;
     if !dbd_core::snapshot::has_snapshots(project_dir) {
         return Ok(Release::Baseline {
             version: design.config().project.version(),
@@ -1771,7 +1770,10 @@ mod tests {
         let cfg = proj.path().join("design.yaml");
 
         let err = cmd_release(&cfg, "dev", proj.path(), None, None, Verbosity::Normal).unwrap_err();
-        assert!(err.to_string().contains("entity error"), "got: {err}");
+        // Named, with its error, as `apply` names it (#99).
+        let said = format!("{err:#}");
+        assert!(said.contains("cannot be released"), "got: {said}");
+        assert!(said.contains("broken.ddl"), "got: {said}");
     }
 
     /// `reconcile` is disabled once a project is released — this must be

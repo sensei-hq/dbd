@@ -1515,8 +1515,9 @@ dbd release --name "v1 GA"   # baseline snapshot + released: true
 dbd baseline                 # alias
 ```
 
-Refuses if the project is already released or the design has entity errors (run
-`dbd inspect` first). After release the flow is the ordinary one: edit DDL →
+Refuses if the project is already released or the design has a file dbd could not read —
+each named with its error, as `apply` and `snapshot` name them (`… cannot be released:`; before
+0.27.5 only `Design has N entity error(s)`). After release the flow is the ordinary one: edit DDL →
 `dbd snapshot` → `dbd apply`. `release` sets the flag by editing `design.yaml` in
 place, keeping its comments, blank lines and flow-style lists.
 
@@ -1558,7 +1559,8 @@ its `COMMENT ON TYPE` carried to the new one). Before 0.25 the removal took thre
 `dbd snapshot` writes `project.version` by editing `design.yaml` in place, keeping its
 comments and layout. A design with a file dbd could not read (a parse error, a dotted schema)
 is refused, as `apply` refuses it — `N file(s) could not be parsed, so the design is incomplete
-and cannot be snapshotted`, each file named with its error — and nothing is written. Before
+and cannot be snapshotted`, each file named with its error (a dotted schema, which has no file,
+counted and named as one: `1 schema is not valid`, `schema a.b`) — and nothing is written. Before
 0.27.4 the file was left out of the snapshot, so the migration dropped its table, CASCADE.
 
 **A key a foreign key holds.** The migration of a table whose primary or unique key (or a
@@ -1851,7 +1853,7 @@ Every table a Ref points at that the document does not define gets a stub — a 
 
 What DBML has no syntax for travels where DBML keeps it: CHECK constraints in a `checks { … }` block (backticked expressions, `[name: '…']` when named); expression index keys in backticks; a table-level UNIQUE as a unique index with its name and the note `unique constraint` (`(code, region) [unique, name: 'people_code_uq', note: 'unique constraint']`), read back by `init --from-dbml` as the named constraint; index notes with one fact per line — `where: <predicate>`, `order: <entry>, …` (`asc`/`desc`, optionally `nulls first`/`nulls last`, one per key; written only when some key is not plain ascending) and `nulls not distinct`, plus `include: <columns>`, `opclass: <entry>, …` (one per key, `-` for a key on its type's default) and `with: <name> = <value>, …` for `INCLUDE`, operator classes and storage parameters; an index's method as `type:`; a named primary key as a `pk` index entry with its `name:`, and a named foreign key as `Ref "name": …` — PostgreSQL's default names (`<table>_pkey`, `<table>_<columns>_fkey`) are left out, Postgres giving them back on apply; generated columns and ALWAYS identities as custom column properties (`generated always as: '<expr>'`, `generated as identity: 'always'` beside `increment` — a bare `increment` is BY DEFAULT). An enum column's type is written schema-qualified as the table's `search_path` resolves it, in DBML's own spelling of an enum (`app.mood`, or `"app"."mo\"od"` for a name that needs quotes), so the rebuilt DDL names a type that exists. Every name — schema, table, column, enum and enum value, index, primary-key, foreign-key, UNIQUE and CHECK names — is written in DBML's quoting and read back as itself, whatever it holds (a quote, a backslash, a space, a dot, a `'`, non-ASCII text; a schema, table or enum name also names a file, so a backslash in one is refused and a dot is not supported). Strings are escaped the way DBML's lexer reads them — an odd number of `"` in a `'…'` note included — and a column comment keeps its line breaks (DBML `\n`); a note that spans lines is written triple-quoted, which @dbml/core reads back exactly. A SQL value keyword default (`current_date`, `current_user`, …) is written as an expression (`` [default: `current_date`] ``), decided from its parse tree, not the string `'current_date'`. `checks` needs @dbml/core ≥ 5.0 and custom properties ≥ 9.1. `init --from-dbml` reads all of it back, a CHECK's name included (`CONSTRAINT "name" CHECK (…)`); a stub — recognised by its note — comes back as an `external:` entry, never a table to build (see reverse-engineering above), and a hand-written document is read as @dbml/core reads it. DBML has no syntax for a foreign key's deferral or `MATCH FULL`, an EXCLUDE constraint or a column collation, and the writer leaves them out, so they do not survive the round trip. An expression default or CHECK holding a backtick gives a document `init --from-dbml` refuses (DBML has no escape for one), and a line break inside a CHECK's or index predicate's string literal comes back as a space.
 
-A DDL file that does not parse is named — `⚠ ./ddl/table/app/broken.ddl could not be parsed, so app.broken is left out: …` — and the document is still written, exit 0.
+A DDL file that does not parse is named — `⚠ ./ddl/table/app/broken.ddl could not be parsed, so app.broken is left out: …`, and a schema dbd cannot use is named as one, `⚠ schema a.b is not valid, so it is left out: …` — and the document is still written, exit 0.
 
 Per-doc options:
 
@@ -1922,7 +1924,7 @@ Both set `pass_filenames: false` because `dbd format` scans the project itself. 
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.27.4
+  rev: v0.27.5
   hooks:
     - id: dbd-format
 ```

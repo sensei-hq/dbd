@@ -9,6 +9,21 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.27.5] — 2026-10-19
+
+### Fixed
+
+- **A design dbd could not fully read is named right (#99).** A dotted schema,
+  which has no file, was counted as one — `2 file(s) could not be parsed` over
+  one file — and listed as if `a.b` were a path; `graph`, `dbml`, `diagram`
+  and `emit` warned `⚠ a.b could not be parsed`. It is now counted and named
+  as a schema: `1 file(s) could not be parsed and 1 schema is not valid`,
+  `schema a.b`, `⚠ schema a.b is not valid, so it is left out`. And `release`
+  refuses such a design as `apply` and `snapshot` do, naming each file and its
+  error; it said only `Design has N entity error(s)`. In `dbd-core`,
+  `entity::ensure_fully_read` is that refusal, and `Entity::source_label`
+  names an entity's file, or its kind and name.
+
 ## [0.27.4] — 2026-10-19
 
 **A DDL file that fails to parse is never cut as a dropped table.** Through

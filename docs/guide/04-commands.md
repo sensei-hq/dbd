@@ -866,7 +866,7 @@ Table "auth"."users" {
 }
 ```
 
-**A file that does not parse** is named, and the document is still written (exit 0), with that entity missing: `⚠ ./ddl/table/app/broken.ddl could not be parsed, so app.broken is left out: Parse error: …`. `dbd diagram` does the same.
+**A file that does not parse** is named, and the document is still written (exit 0), with that entity missing: `⚠ ./ddl/table/app/broken.ddl could not be parsed, so app.broken is left out: Parse error: …`; a schema dbd cannot use is named as one (`⚠ schema a.b is not valid, so it is left out: a dot in a schema name …`). `dbd diagram` does the same.
 
 **Scope-aware.** `--scope` documents only the entities that deploy under that scope (its working set) and prints `scope 'hub': N of M entities`. `--deps include` (or a scope whose `deps: include`) first expands the selection to its dependency closure, so the diagram is self-contained. Unlike `apply`/`deploy`, `dbml` does not gate on dependency gaps — it is documentation, so it simply emits the filtered set, and an out-of-scope FK target appears as a stub typed from the design. (Before 0.25 a `--scope` document with such a Ref did not parse at all.) A `deps: include` scope whose closure needs something the scope excludes is refused.
 
@@ -1573,8 +1573,9 @@ dbd release --name "v1 GA"    # Baseline snapshot + released: true
 dbd baseline                  # Alias
 ```
 
-Refuses if the project is already released or the design has entity errors (run `dbd inspect`
-first). After release the flow is the ordinary one: edit DDL → `dbd snapshot` → `dbd apply`.
+Refuses if the project is already released or the design has a file dbd could not read, naming
+each one with its error, as `apply` and `snapshot` do (before 0.27.5 it said only `Design has N
+entity error(s)`; run `dbd inspect` for the full report). After release the flow is the ordinary one: edit DDL → `dbd snapshot` → `dbd apply`.
 
 **A project that already has snapshots** — one `dbd init --from-db` or `dbd merge` built, which
 write snapshots without setting `released` — is released at the version its latest snapshot
@@ -2215,7 +2216,7 @@ User's `.pre-commit-config.yaml`:
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.27.4
+  rev: v0.27.5
   hooks:
     - id: dbd-format
 ```
