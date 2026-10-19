@@ -1336,7 +1336,10 @@ The plan lists one line per changed entity (`+ create`, `~ alter`, `- prune`). M
 appear too: `+ create materialized view <name>` for one reconcile would create, and a `⚠` warning
 for a matview whose deployed definition has drifted (dbd never auto-recreates a matview). Add `-v`
 to a `--dry-run` to print the generated `ALTER` SQL beneath each altered entity, so you can review
-the exact column-level change before applying.
+the exact column-level change before applying. A plan that drops columns or constraints ends by
+saying so: without `--allow-destructive`, that the run needs the flag; with it, that the run
+applies the drops, each named (`app.people: drops column nickname`). (Before 0.27.4 a dry run with
+the flag still said to re-run with it.)
 
 **Grants and hooks.** A reconciled database is the one an apply builds, so reconcile runs the
 design's `apply.before` and `apply.after` hooks and then its `grants:`, scoped as `apply` scopes
