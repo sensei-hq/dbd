@@ -73,6 +73,8 @@ fn universe(all_entities: &[Entity]) -> HashSet<String> {
 /// - `schema` — a bare schema token: every scopable entity under the schema PLUS
 ///   the schema entity itself. A declared-but-empty schema resolves to just its
 ///   `CREATE SCHEMA` entity rather than an error (the schema is real, not a typo).
+///   No schema of the name, it is a table that has none — a SQLite project's —
+///   which `main.<table>` names too (#87).
 pub(crate) fn match_item(item: &str, all_entities: &[Entity]) -> Result<HashSet<String>> {
     if let Some(prefix) = item.strip_suffix(".*") {
         // `prefix.*` — every scopable entity whose name is `prefix.<something>`,
@@ -95,9 +97,23 @@ pub(crate) fn match_item(item: &str, all_entities: &[Entity]) -> Result<HashSet<
         return Ok(names);
     }
 
+    // A table with no schema of its own — a SQLite project's, whose `items`
+    // is its whole name — by that name (#87).
+    let schemaless = |name: &str| {
+        all_entities
+            .iter()
+            .any(|e| is_scopable(e) && e.schema.is_none() && e.name == name)
+    };
     if item.contains('.') {
         let exists = all_entities.iter().any(|e| is_scopable(e) && e.name == item);
         if !exists {
+            // `main.<table>`: SQLite's name for its main database, before a
+            // table that has no schema.
+            if let Some(table) = item.strip_prefix("main.")
+                && schemaless(table)
+            {
+                return Ok(HashSet::from([table.to_string()]));
+            }
             return Err(DbdError::Config(format!("scope item '{item}' matches no known entity")));
         }
         Ok(HashSet::from([item.to_string()]))
@@ -111,6 +127,9 @@ pub(crate) fn match_item(item: &str, all_entities: &[Entity]) -> Result<HashSet<
             .iter()
             .any(|e| e.entity_type == EntityType::Schema && e.name == item);
         if names.is_empty() && !schema_exists {
+            if schemaless(item) {
+                return Ok(HashSet::from([item.to_string()]));
+            }
             return Err(DbdError::Config(format!(
                 "scope item '{item}' matches no known schema or entity"
             )));
