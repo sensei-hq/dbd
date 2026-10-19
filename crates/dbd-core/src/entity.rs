@@ -1099,13 +1099,6 @@ impl Entity {
     }
 }
 
-/// Why a file under `ddl/<folder>/` is not read, for a folder that names no
-/// entity type.
-///
-/// Schemas and extensions are real kinds, but design.yaml declares them —
-/// `schemas:` and the target's `extensions:` — so a file for one says where
-/// it belongs rather than only that its folder is unknown (`dbd doctor` names
-/// the entry to write).
 /// The error on an entity whose schema holds a dot (#89): dbd names an
 /// entity `schema.name` and splits it at its first dot, so a schema `a.b`
 /// cannot be told from a schema `a`.
@@ -1116,6 +1109,13 @@ fn dotted_name_error(what: &str, part: &str) -> String {
     )
 }
 
+/// Why a file under `ddl/<folder>/` is not read, for a folder that names no
+/// entity type.
+///
+/// Schemas and extensions are real kinds, but design.yaml declares them —
+/// `schemas:` and the target's `extensions:` — so a file for one says where
+/// it belongs rather than only that its folder is unknown (`dbd doctor` names
+/// the entry to write).
 fn unread_folder_error(folder: &str) -> String {
     match folder {
         "extension" | "extensions" => format!(
