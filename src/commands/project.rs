@@ -1488,7 +1488,7 @@ mod tests {
     /// entity — the detail a plain summary omits.
     #[test]
     fn reconcile_plan_verbose_emits_alter_sql() {
-        let out = reconcile_plan_lines(&altered_plan(), false, Verbosity::Verbose).join("\n");
+        let out = reconcile_plan_lines(&altered_plan(), false, false, Verbosity::Verbose).join("\n");
         assert!(
             out.contains("~ alter") && out.contains("public.users"),
             "summary line missing:\n{out}"
@@ -1502,7 +1502,7 @@ mod tests {
     /// Normal `--dry-run` stays a terse summary: entity names, no SQL.
     #[test]
     fn reconcile_plan_normal_hides_alter_sql() {
-        let out = reconcile_plan_lines(&altered_plan(), false, Verbosity::Normal).join("\n");
+        let out = reconcile_plan_lines(&altered_plan(), false, false, Verbosity::Normal).join("\n");
         assert!(
             out.contains("~ alter") && out.contains("public.users"),
             "summary line missing:\n{out}"
@@ -2056,12 +2056,30 @@ mod tests {
         );
     }
 
+    /// A dry run says what the run does with the drops it plans (#86): with
+    /// `--allow-destructive` it applies them, each named; without, it says to
+    /// re-run with the flag. It said that with the flag already given.
+    #[test]
+    fn a_dry_run_says_what_the_run_does_with_its_drops() {
+        let plan = dbd_core::ReconcilePlan {
+            destructive: true,
+            destructive_changes: vec!["app.t: drops column old".to_string()],
+            ..altered_plan()
+        };
+        let allowed = reconcile_plan_lines(&plan, false, true, Verbosity::Normal).join("\n");
+        assert!(!allowed.contains("re-run with --allow-destructive"), "{allowed}");
+        assert!(allowed.contains("the run applies them"), "{allowed}");
+        assert!(allowed.contains("app.t: drops column old"), "{allowed}");
+        let refused = reconcile_plan_lines(&plan, false, false, Verbosity::Normal).join("\n");
+        assert!(refused.contains("re-run with --allow-destructive"), "{refused}");
+    }
+
     /// `reconcile_plan_lines` on an empty plan reports the in-sync message —
     /// the early-return branch the other reconcile tests never take.
     #[test]
     fn reconcile_plan_lines_empty_plan_reports_in_sync() {
         let plan = dbd_core::ReconcilePlan::default();
-        let out = reconcile_plan_lines(&plan, false, Verbosity::Normal).join("\n");
+        let out = reconcile_plan_lines(&plan, false, false, Verbosity::Normal).join("\n");
         assert_eq!(out, "Already in sync — no changes.");
     }
 
@@ -2086,7 +2104,7 @@ mod tests {
             ..Default::default()
         };
 
-        let pruned = reconcile_plan_lines(&plan, true, Verbosity::Normal).join("\n");
+        let pruned = reconcile_plan_lines(&plan, true, false, Verbosity::Normal).join("\n");
         assert!(pruned.contains("+ create public.new_table"), "got: {pruned}");
         assert!(
             pruned.contains("+ create materialized view analytics.daily_sales"),
@@ -2101,7 +2119,7 @@ mod tests {
         assert!(pruned.contains("⚠ enum value dropped"), "got: {pruned}");
         assert!(pruned.contains("--allow-destructive"), "got: {pruned}");
 
-        let unpruned = reconcile_plan_lines(&plan, false, Verbosity::Normal).join("\n");
+        let unpruned = reconcile_plan_lines(&plan, false, false, Verbosity::Normal).join("\n");
         assert!(
             unpruned.contains("· orphan public.orphan (use --prune to drop)"),
             "got: {unpruned}"
@@ -2117,7 +2135,7 @@ mod tests {
             warnings: vec!["materialized view app.mv: definition differs from the deployed object".to_string()],
             ..Default::default()
         };
-        let out = reconcile_plan_lines(&plan, false, Verbosity::Normal).join("\n");
+        let out = reconcile_plan_lines(&plan, false, false, Verbosity::Normal).join("\n");
         assert!(
             !out.contains("Already in sync"),
             "a drift-only plan must not claim in-sync; got: {out}"
