@@ -1167,6 +1167,34 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    /// An entity with no file — a schema from `schemas:` or from a path — is
+    /// counted and named as what it is, never as a file (#99): a dotted schema
+    /// read `2 file(s) could not be parsed` over one file, and was listed as
+    /// if `a.b` were a path.
+    #[test]
+    fn an_unread_entity_with_no_file_is_not_counted_as_a_file() {
+        let mut table = Entity::from_file(Path::new("ddl/table/app/t.ddl"));
+        table
+            .errors
+            .push("Parse error: syntax error at or near \",\"".to_string());
+        let schema = Entity::schema("a.b");
+        assert!(schema.has_errors(), "a dotted schema carries its error");
+
+        let said = unread_files_error(&[&table, &schema], "applied").to_string();
+        assert!(said.contains("1 file(s) could not be parsed"), "{said}");
+        assert!(!said.contains("2 file(s)"), "{said}");
+        assert!(said.contains("1 schema is not valid"), "{said}");
+        assert!(said.contains("\n  schema a.b\n"), "{said}");
+        assert!(said.contains("\n  ddl/table/app/t.ddl\n"), "{said}");
+
+        let said = unread_files_error(&[&schema], "snapshotted").to_string();
+        assert!(!said.contains("file(s)"), "no file is involved: {said}");
+        assert!(
+            said.contains("1 schema is not valid, so the design is incomplete"),
+            "{said}"
+        );
+    }
+
     /// `ddl/extension/` and `ddl/schema/` are not DDL folders: both kinds are
     /// declared in design.yaml. The scanner said only "unrecognized DDL folder",
     /// which left the reader to guess where an extension goes instead.
