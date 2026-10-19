@@ -587,6 +587,11 @@ fn snapshot_design(
                 output::detail(verbosity, &format!("  {}", mf.relative_path.display()));
             }
         }
+        // What the snapshot took a change for — a rename, a type change made
+        // in place, an enum value dropped — said where it is decided.
+        for w in &snap.warnings {
+            output::always(&format!("⚠ {w}"));
+        }
     }
 
     // Print TODO items
