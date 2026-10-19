@@ -9,6 +9,8 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.27.3] — 2026-10-19
+
 ### Fixed
 
 - **`dbd snapshot` prints its warnings.** What a snapshot took a change for —
