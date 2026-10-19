@@ -9,6 +9,17 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.27.3] — 2026-10-19
+
+### Fixed
+
+- **`dbd snapshot` prints its warnings.** What a snapshot took a change for —
+  a table's one column dropped and one added, of one type, cut as a rename; a
+  type change made in place, refusing a value the new type cannot hold; an enum
+  value dropped; a constraint it cannot name — was in its result and never
+  shown. The 0.27.2 notes say the snapshot warns of a rename; it does from
+  this release.
+
 ## [0.27.2] — 2026-10-19
 
 **A released column's type change and rename keep the column.** Since the
