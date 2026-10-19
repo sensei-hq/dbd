@@ -1609,7 +1609,7 @@ mod tests {
     #[test]
     fn init_creates_project_files() {
         let tmp = tempfile::tempdir().unwrap();
-        cmd_init(tmp.path(), "demo", "postgres", Verbosity::Normal).unwrap();
+        cmd_init(tmp.path(), "demo", "postgres", false, Verbosity::Normal).unwrap();
         assert!(tmp.path().join("design.yaml").exists());
     }
 
