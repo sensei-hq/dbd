@@ -2082,6 +2082,34 @@ mod tests {
         assert_eq!(left, 0);
     }
 
+    /// A table outside the import holding a key to one it reloads: nothing is
+    /// emptied, and the error names that table (#88) — as PostgreSQL's one
+    /// `TRUNCATE` does. One at a time, the tables before it were emptied, and
+    /// the error named none.
+    #[tokio::test]
+    async fn a_table_outside_the_import_holding_a_key_empties_nothing_and_is_named() {
+        let a = mem().await;
+        a.execute_script(
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY); \
+             CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent (id)); \
+             CREATE TABLE audit (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent (id)); \
+             INSERT INTO parent VALUES (1); INSERT INTO child VALUES (1, 1); INSERT INTO audit VALUES (1, 1);",
+        )
+        .await
+        .unwrap();
+        let err = a
+            .truncate_tables(&["parent".to_string(), "child".to_string()])
+            .await
+            .expect_err("audit holds a key to parent")
+            .to_string();
+        assert!(err.contains("audit"), "{err}");
+        let left: i64 = sqlx::query_scalar("SELECT (SELECT count(*) FROM parent) + (SELECT count(*) FROM child)")
+            .fetch_one(&a.pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 2, "nothing emptied: {err}");
+    }
+
     /// A BLOB has no text, and the export's cell readers knew only text and
     /// numbers, so every BLOB was written as NULL — the file imported back
     /// without its binary data, in every format. A BLOB is written as `\x`
