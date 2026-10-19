@@ -9,6 +9,8 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.27.2] — 2026-10-19
+
 **A released column's type change and rename keep the column.** Since the
 first release a type change in a migration lost every value of the column,
 and with a rename lost its NOT NULL, default, identity, keys and constraints
