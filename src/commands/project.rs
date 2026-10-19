@@ -2150,6 +2150,6 @@ mod tests {
     /// around `reconcile_plan_lines` — just needs to run without panicking.
     #[test]
     fn print_reconcile_plan_runs_for_a_populated_plan() {
-        print_reconcile_plan(&altered_plan(), false, Verbosity::Normal);
+        print_reconcile_plan(&altered_plan(), false, false, Verbosity::Normal);
     }
 }
