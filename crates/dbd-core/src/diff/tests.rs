@@ -793,6 +793,32 @@
         );
     }
 
+    /// A NEW generated column is added generated. It was added as a plain
+    /// column of its type, so every row read NULL and the next diff found it
+    /// drifted (sensei #298: `reconcile` and an upgrade both hit it).
+    #[test]
+    fn s5b_a_new_generated_column_is_added_generated() {
+        let diffs = vec![MigrationDiff {
+            entity_name: "public.events".to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(vec![FieldChange {
+                field_name: "tool_use_id".to_string(),
+                field_type: FieldType::Column,
+                action: ChangeAction::Add(Box::new(FieldDetail::Column(col_generated(
+                    "tool_use_id",
+                    "text",
+                    "payload ->> 'tool_use_id'",
+                )))),
+            }]),
+        }];
+        let sql = generate_migration_sql(&diffs);
+        assert_eq!(
+            sql,
+            "ALTER TABLE public.events ADD COLUMN tool_use_id text \
+             GENERATED ALWAYS AS (payload ->> 'tool_use_id') STORED;"
+        );
+    }
+
     // ── S6: Column drop SQL ─────────────────────────────────
 
     #[test]

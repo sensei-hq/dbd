@@ -391,6 +391,9 @@ fn column_add_sql(entity_name: &str, col: &crate::entity::ColumnDef) -> String {
     if let Some(ref default) = col.default_value {
         stmt.push_str(&format!(" DEFAULT {default}"));
     }
+    if let Some(ref expr) = col.generated {
+        stmt.push_str(&format!(" GENERATED ALWAYS AS ({expr}) STORED"));
+    }
     stmt.push(';');
     stmt
 }
