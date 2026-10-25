@@ -328,6 +328,31 @@ fn normalize(node: &mut Node, cols: &CoercibleColumns) {
                 normalize(arg, cols);
             }
         }
+        // `CASE [arg] WHEN … THEN … [ELSE …] END`: Postgres reports an omitted
+        // `ELSE` as `ELSE NULL::<type>`, which means exactly what omitting it
+        // does — so a NULL `ELSE` is dropped on both sides.
+        Some(NodeEnum::CaseExpr(c)) => {
+            drop_erasable_cast(&mut c.arg, cols);
+            if let Some(arg) = c.arg.as_mut() {
+                normalize(arg, cols);
+            }
+            normalize_each(&mut c.args, cols);
+            drop_erasable_cast(&mut c.defresult, cols);
+            if c.defresult.as_deref().is_some_and(is_null_literal) {
+                c.defresult = None;
+            }
+            if let Some(d) = c.defresult.as_mut() {
+                normalize(d, cols);
+            }
+        }
+        Some(NodeEnum::CaseWhen(w)) => {
+            for slot in [&mut w.expr, &mut w.result] {
+                drop_erasable_cast(slot, cols);
+                if let Some(child) = slot.as_mut() {
+                    normalize(child, cols);
+                }
+            }
+        }
         // A cast dbd keeps (its argument is not a bare literal) — normalize
         // beneath it so a nested `('x'::text)::varchar` still loses the inner one.
         Some(NodeEnum::TypeCast(c)) => {
@@ -457,6 +482,11 @@ fn is_bare_text_type(ty: &TypeName) -> bool {
         ty.names.last().and_then(|n| n.node.as_ref()),
         Some(NodeEnum::String(s)) if s.sval.eq_ignore_ascii_case("text")
     )
+}
+
+/// Whether `node` is the bare `NULL` constant.
+fn is_null_literal(node: &Node) -> bool {
+    matches!(&node.node, Some(NodeEnum::AConst(c)) if c.isnull)
 }
 
 /// The literal inside a `TypeCast` over an `A_Const`, if that's what this is.
@@ -809,6 +839,25 @@ pub fn canonical_exclusion(definition: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A generated column's CASE, as authored and as Postgres deparses it,
+    /// is one expression (sensei #298): Postgres adds `ELSE NULL::<type>`,
+    /// `::text` on each literal, and parens around every operand and cast.
+    #[test]
+    fn a_case_reads_the_same_authored_and_deparsed() {
+        let authored = "case when jsonb_typeof(payload->'duration_ms') = 'number' \
+                        then (payload->>'duration_ms')::numeric::bigint end";
+        let deparsed = "CASE\n    WHEN (jsonb_typeof((payload -> 'duration_ms'::text)) = 'number'::text) \
+                        THEN (((payload ->> 'duration_ms'::text))::numeric)::bigint\n    \
+                        ELSE NULL::bigint\nEND";
+        assert_eq!(canonicalize_expression(authored), canonicalize_expression(deparsed));
+        assert_ne!(
+            canonicalize_expression("case when a then 1 else 2 end"),
+            canonicalize_expression("case when a then 1 end"),
+            "an ELSE that is not NULL is part of the expression"
+        );
+    }
+
     use super::*;
 
     /// A rename reaches every reference to the column — qualified, quoted,

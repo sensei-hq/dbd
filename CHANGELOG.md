@@ -9,6 +9,23 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.27.6] — 2026-10-25
+
+### Fixed
+
+- **A new generated column is added generated (#104).** `reconcile` rendered a
+  column the design adds as `ADD COLUMN <name> <type>`, ignoring its
+  `GENERATED ALWAYS AS (…) STORED`: the column was created plain, NULL in every
+  row, and the next `diff` reported it drifted. An embedder upgrading through
+  `dbd-core` hit the same path. Only the plain → generated rebuild carried the
+  expression.
+- **A generated `CASE` compares equal to its live form (#104).** The expression
+  canonicaliser did not descend into `CASE`/`WHEN`, so the `::text` Postgres
+  adds to every literal inside one was never erased, and Postgres reports an
+  omitted `ELSE` as `ELSE NULL::<type>`. Such a column read as drifted on every
+  `diff` and `reconcile` re-issued `SET EXPRESSION` on every pass. A `NULL`
+  `ELSE` is now dropped on both sides; a non-`NULL` one is kept.
+
 ## [0.27.5] — 2026-10-19
 
 ### Fixed
