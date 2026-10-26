@@ -390,6 +390,8 @@ pub fn canonicalize(snap: &mut Snapshot) {
         t.indexes.clear();
         t.table_constraints
             .retain(|c| matches!(c, TableConstraint::PrimaryKey { .. } | TableConstraint::Unique { .. }));
+        // Comments converge from the RAW snapshots (plan_comment_convergence).
+        t.comment = None;
         for c in &mut t.columns {
             c.inline_fk = None;
             c.comment = None;
@@ -1027,6 +1029,8 @@ fn dropped_fields(d: &MigrationDiff) -> Vec<(String, DroppedKind, String)> {
                 FieldType::Constraint => ("constraint", DroppedKind::Constraint),
                 FieldType::Index => ("index", DroppedKind::Index),
                 FieldType::EnumValue => ("enum value", DroppedKind::EnumValue),
+                // A comment change is an Alter, never a Drop: filtered out above.
+                FieldType::TableComment => unreachable!("a table comment is altered, not dropped"),
             };
             // The part's own name, as the database knows it — a constraint's
             // diff key is its shape (`uq:code`), not its name.
@@ -1928,6 +1932,14 @@ pub fn plan_comment_convergence(plan: &mut ReconcilePlan, live: &Snapshot, desir
             .collect();
 
         let mut lines: Vec<String> = Vec::new();
+        // The table's own comment converges as its columns' do (dbd#110): it was
+        // never compared, so a changed one stayed while `dbd diff` read in sync.
+        if lt.comment != dt.comment {
+            lines.push(crate::emit::emit_table_comment_sql(
+                &format!("\"{}\".\"{}\"", dt.schema, dt.name),
+                dt.comment.as_deref(),
+            ));
+        }
         for dc in &dt.columns {
             // Absent from the live table: the column is added in this same plan,
             // by an ADD COLUMN generated from the CANONICAL snapshot, which has
@@ -2887,6 +2899,7 @@ mod tests {
 
     fn table(schema: &str, name: &str, columns: Vec<ColumnDef>) -> TableSnapshot {
         TableSnapshot {
+            comment: None,
             name: name.to_string(),
             schema: schema.to_string(),
             columns,
@@ -3309,6 +3322,26 @@ mod tests {
             "COMMENT ON COLUMN \"app\".\"docs\".\"title\" IS 'Display name';"
         );
         assert!(!plan.destructive, "a comment is metadata, never destructive");
+    }
+
+    /// dbd#110: a changed TABLE comment converges like a column's — it used to
+    /// be left as it was while `dbd diff` reported the database in sync.
+    #[test]
+    fn comment_convergence_updates_a_changed_table_comment() {
+        let mut live = docs_with(vec![commented("title", None)]);
+        let mut desired = docs_with(vec![commented("title", None)]);
+        live.tables[0].comment = Some("old table".into());
+        desired.tables[0].comment = Some("new table".into());
+        let mut plan = ReconcilePlan::default();
+        plan_comment_convergence(&mut plan, &live, &desired);
+        assert_eq!(plan.altered.len(), 1);
+        assert_eq!(plan.altered[0].sql, "COMMENT ON TABLE \"app\".\"docs\" IS 'new table';");
+        assert!(!plan.destructive, "a comment is metadata, never destructive");
+
+        desired.tables[0].comment = None;
+        let mut plan = ReconcilePlan::default();
+        plan_comment_convergence(&mut plan, &live, &desired);
+        assert_eq!(plan.altered[0].sql, "COMMENT ON TABLE \"app\".\"docs\" IS NULL;");
     }
 
     /// A changed comment is overwritten in place.
@@ -4191,6 +4224,7 @@ mod tests {
             description: String::new(),
             timestamp: String::new(),
             tables: vec![TableSnapshot {
+                comment: None,
                 name: "agents".to_string(),
                 schema: "config".to_string(),
                 columns: vec![
@@ -4211,6 +4245,7 @@ mod tests {
             description: String::new(),
             timestamp: String::new(),
             tables: vec![TableSnapshot {
+                comment: None,
                 name: "agents".to_string(),
                 schema: "config".to_string(),
                 columns: vec![
@@ -4251,6 +4286,7 @@ mod tests {
             description: String::new(),
             timestamp: String::new(),
             tables: vec![TableSnapshot {
+                comment: None,
                 name: "transcript_cursor".to_string(),
                 schema: "activity".to_string(),
                 columns: vec![
@@ -4273,6 +4309,7 @@ mod tests {
             description: String::new(),
             timestamp: String::new(),
             tables: vec![TableSnapshot {
+                comment: None,
                 name: "transcript_cursor".to_string(),
                 schema: "activity".to_string(),
                 columns: vec![
@@ -4708,6 +4745,7 @@ mod tests {
     fn normalize_common_preserves_fk_check_index_comment() {
         use crate::entity::{ForeignKey, IndexColumn, IndexDef};
         let mut snap = snap(vec![TableSnapshot {
+            comment: None,
             name: "orders".to_string(),
             schema: "public".to_string(),
             columns: vec![ColumnDef {
@@ -5054,6 +5092,7 @@ mod enum_recreation_tests {
 
     fn table(schema: &str, name: &str, columns: Vec<ColumnDef>) -> TableSnapshot {
         TableSnapshot {
+            comment: None,
             name: name.to_string(),
             schema: schema.to_string(),
             columns,
@@ -5446,6 +5485,7 @@ mod extension_type_tests {
             description: String::new(),
             timestamp: String::new(),
             tables: vec![TableSnapshot {
+                comment: None,
                 name: "docs".to_string(),
                 schema: "app".to_string(),
                 columns,
@@ -5582,6 +5622,7 @@ mod key_holder_tests {
     fn table(qualified: &str, columns: &[&str], constraints: Vec<TableConstraint>) -> TableSnapshot {
         let (schema, name) = qualified.split_once('.').unwrap();
         TableSnapshot {
+            comment: None,
             name: name.to_string(),
             schema: schema.to_string(),
             columns: columns.iter().map(|c| col(c, "text")).collect(),

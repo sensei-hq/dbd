@@ -105,6 +105,8 @@ pub enum FieldKind {
     Constraint,
     Index,
     Value,
+    /// The table's own comment (dbd#110).
+    Comment,
 }
 
 /// Declared in the order edits to one field are listed: what arrived, what left,
@@ -484,6 +486,7 @@ fn field_edit(change: &FieldChange) -> FieldEdit {
         FieldType::Constraint => FieldKind::Constraint,
         FieldType::Index => FieldKind::Index,
         FieldType::EnumValue => FieldKind::Value,
+        FieldType::TableComment => FieldKind::Comment,
     };
     match &change.action {
         ChangeAction::Add(detail) => described(kind, Op::Added, None, Some(detail)),
@@ -524,6 +527,10 @@ fn described(kind: FieldKind, op: Op, from: Option<&FieldDetail>, to: Option<&Fi
             _ => None,
         }),
         FieldDetail::EnumValue(v) => (v.clone(), |_| None),
+        FieldDetail::TableComment(_) => ("comment".to_string(), |d| match d {
+            FieldDetail::TableComment(text) => text.clone(),
+            _ => None,
+        }),
     };
     FieldEdit {
         kind,

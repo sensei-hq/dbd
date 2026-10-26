@@ -379,6 +379,16 @@ fn generate_field_sql(entity_name: &str, _entity_type: &EntityType, change: &Fie
             // No SQL for enum value drop — warning only
         }
 
+        // ── Table comment ───────────────────────────────
+        (FieldType::TableComment, ChangeAction::Alter { new, .. }) => {
+            if let FieldDetail::TableComment(comment) = new.as_ref() {
+                lines.push(match comment {
+                    Some(c) => format!("COMMENT ON TABLE {entity_name} IS '{}';", esc(c)),
+                    None => format!("COMMENT ON TABLE {entity_name} IS NULL;"),
+                });
+            }
+        }
+
         // Catch-all for any unexpected combinations
         _ => {}
     }

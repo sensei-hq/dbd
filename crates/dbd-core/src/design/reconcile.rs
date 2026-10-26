@@ -106,6 +106,7 @@ async fn with_unlisted_foreign_keys(
         {
             Some(t) => t.table_constraints.push(constraint),
             None => live_all.tables.push(crate::snapshot::TableSnapshot {
+                comment: None,
                 name: name.to_string(),
                 schema: schema.to_string(),
                 columns: Vec::new(),

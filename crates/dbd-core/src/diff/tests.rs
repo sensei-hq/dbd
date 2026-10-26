@@ -303,6 +303,25 @@
         assert!(diffs.is_empty(), "matching constraints must not churn; got {diffs:?}");
     }
 
+    /// dbd#110: a TABLE comment is part of the table. A changed one was neither
+    /// diffed nor migrated — `dbd diff` reported sync while the old comment stayed.
+    #[test]
+    fn a_changed_table_comment_is_migrated() {
+        let mut t_old = table("public", "thing", vec![col("id", "integer")]);
+        t_old.comment = Some("old text".to_string());
+        let mut t_new = table("public", "thing", vec![col("id", "integer")]);
+        t_new.comment = Some("it's new".to_string());
+        let diffs = diff(&snap(vec![t_old.clone()], vec![]), &snap(vec![t_new], vec![]));
+        let sql = generate_migration_sql(&diffs);
+        assert!(sql.contains("COMMENT ON TABLE public.thing IS 'it''s new';"), "got:\n{sql}");
+
+        // Removed from the design: cleared, as Postgres removes a comment.
+        let mut t_bare = table("public", "thing", vec![col("id", "integer")]);
+        t_bare.comment = None;
+        let sql = generate_migration_sql(&diff(&snap(vec![t_old], vec![]), &snap(vec![t_bare], vec![])));
+        assert!(sql.contains("COMMENT ON TABLE public.thing IS NULL;"), "got:\n{sql}");
+    }
+
     /// The generated ALTER must carry the clause, or reconcile applies a weaker
     /// constraint than the design declares and `diff` then certifies the result.
     #[test]

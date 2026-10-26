@@ -33,6 +33,9 @@ pub enum FieldType {
     Constraint,
     Index,
     EnumValue,
+    /// The table's own comment (dbd#110). One per table, so its field name is
+    /// fixed; the change is always an `Alter` from the old text to the new.
+    TableComment,
 }
 
 /// What happened to a specific field.
@@ -60,6 +63,8 @@ pub enum FieldDetail {
     Constraint(TableConstraint),
     Index(IndexDef),
     EnumValue(String),
+    /// A table comment; `None` is no comment.
+    TableComment(Option<String>),
 }
 
 /// A complex schema change that requires special handling beyond simple DDL.
