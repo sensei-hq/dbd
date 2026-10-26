@@ -220,9 +220,14 @@ pub struct ModuleConfig {
 // ── Source ───────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[serde(from = "RawSourceConfig")]
 pub struct SourceConfig {
-    #[serde(default = "default_dialect")]
+    /// `source.dialect`, or `postgresql` when the file leaves it out.
     pub dialect: String,
+    /// Whether the file STATED `source.dialect` (dbd#109). A reader that infers a
+    /// dialect from the SQL when the file is silent needs "said postgresql"
+    /// apart from "said nothing": the default is a fact about dbd, not the project.
+    pub dialect_stated: bool,
     /// Which DDL parser reads this project's files. `None` lets `dialect`
     /// decide; set it only to override that choice.
     #[serde(default)]
@@ -246,8 +251,31 @@ impl Default for SourceConfig {
     fn default() -> Self {
         Self {
             dialect: default_dialect(),
+            dialect_stated: false,
             parser: None,
             search_path: None,
+        }
+    }
+}
+
+/// `source:` as written, so [`SourceConfig`] can say whether the dialect was.
+#[derive(Deserialize)]
+struct RawSourceConfig {
+    #[serde(default)]
+    dialect: Option<String>,
+    #[serde(default)]
+    parser: Option<String>,
+    #[serde(default)]
+    search_path: Option<Vec<String>>,
+}
+
+impl From<RawSourceConfig> for SourceConfig {
+    fn from(raw: RawSourceConfig) -> Self {
+        Self {
+            dialect_stated: raw.dialect.is_some(),
+            dialect: raw.dialect.unwrap_or_else(default_dialect),
+            parser: raw.parser,
+            search_path: raw.search_path,
         }
     }
 }
@@ -736,8 +764,14 @@ pub fn read(path: &Path) -> Result<DesignConfig> {
     // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     let content = std::fs::read_to_string(path)
         .map_err(|e| DbdError::Config(format!("Cannot read {}: {}", path.display(), e)))?;
-    let config: DesignConfig = serde_yaml::from_str(&content)?;
-    Ok(config)
+    parse(&content)
+}
+
+/// Parse a design.yaml's text — for a caller that already holds it (an indexer
+/// handed a file's content) and must read it as dbd does, not with a copy of
+/// this struct.
+pub fn parse(content: &str) -> Result<DesignConfig> {
+    Ok(serde_yaml::from_str(content)?)
 }
 
 /// Update the `project.version` field in a design.yaml file.
@@ -927,6 +961,24 @@ mod version_default_tests {
 
 #[cfg(test)]
 mod tests {
+    /// dbd#109: whether the file STATED its dialect, apart from the default it
+    /// falls back to. A reader that infers the dialect from the SQL when the
+    /// file is silent must be able to tell "said postgresql" from "said nothing".
+    #[test]
+    fn a_dialect_is_stated_or_defaulted() {
+        let silent = parse("project:\n  name: t\n").unwrap();
+        assert_eq!(silent.source.dialect, "postgresql");
+        assert!(!silent.source.dialect_stated);
+
+        let parser_only = parse("project:\n  name: t\nsource:\n  parser: pg_query\n").unwrap();
+        assert_eq!(parser_only.source.dialect, "postgresql");
+        assert!(!parser_only.source.dialect_stated);
+
+        let stated = parse("project:\n  name: t\nsource:\n  dialect: postgresql\n").unwrap();
+        assert_eq!(stated.source.dialect, "postgresql");
+        assert!(stated.source.dialect_stated);
+    }
+
     use super::*;
 
     fn fixture(name: &str) -> PathBuf {
