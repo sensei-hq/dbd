@@ -4085,6 +4085,7 @@ import:
             collation: None,
         };
         let table = |name: &str, columns: &[&str]| TableSnapshot {
+            comment: None,
             name: name.to_string(),
             schema: "app".to_string(),
             columns: columns.iter().map(|c| column(c)).collect(),

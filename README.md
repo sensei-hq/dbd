@@ -70,7 +70,7 @@ myproject/
 | `dbd diagram` | Open the schema in the hosted interactive viewer (`--print-url` to print the link, `--json` for the raw model) |
 | `dbd dbml` | Generate DBML documentation |
 | `dbd reconcile` | Pre-release: diff the live DB against the design and apply ALTER/CREATE in place (no snapshots), with the design's apply hooks and grants |
-| `dbd diff` | Read-only: the complete difference between the live DB and the design — columns, keys, constraints, indexes, column comments, enums, matview drift. Works after release; `--exit-code` for CI |
+| `dbd diff` | Read-only: the complete difference between the live DB and the design — columns, keys, constraints, indexes, table and column comments, enums, matview drift. Works after release; `--exit-code` for CI |
 | `dbd release` (alias `baseline`) | Write a baseline snapshot — or, when snapshots exist, release at the latest — and lock in the snapshot/migration workflow (disables `reconcile`) |
 | `dbd snapshot` | Capture schema state, generate migration SQL |
 | `dbd migrate --status` | Show migration version status |
@@ -373,7 +373,7 @@ left to you (drop + recreate, or the snapshot/migrate workflow).
 
 ```yaml
 - repo: https://github.com/sensei-hq/dbd
-  rev: v0.27.7
+  rev: v0.27.8
   hooks:
     - id: dbd-format
 ```

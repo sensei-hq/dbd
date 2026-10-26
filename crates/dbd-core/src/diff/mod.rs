@@ -81,6 +81,7 @@ mod tests {
     /// Build a TableSnapshot with given columns (no indexes/constraints).
     fn table(schema: &str, name: &str, columns: Vec<ColumnDef>) -> TableSnapshot {
         TableSnapshot {
+            comment: None,
             name: name.to_string(),
             schema: schema.to_string(),
             columns,

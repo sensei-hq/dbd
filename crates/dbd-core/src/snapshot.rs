@@ -52,6 +52,10 @@ pub struct TableSnapshot {
     pub columns: Vec<ColumnDef>,
     pub indexes: Vec<IndexDef>,
     pub table_constraints: Vec<TableConstraint>,
+    /// The table's own `COMMENT ON TABLE` text (dbd#110). Absent from snapshots
+    /// written before it, which read back as no comment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
 }
 
 /// A version's place in a multi-stage run: `index` of `of` (#29).
@@ -431,6 +435,7 @@ pub fn entity_to_table_snapshot(entity: &Entity) -> Option<TableSnapshot> {
         columns: table_def.columns.clone(),
         indexes: table_def.indexes.clone(),
         table_constraints: table_def.constraints.clone(),
+        comment: table_def.comments.table.clone(),
     })
 }
 
@@ -2057,6 +2062,7 @@ mod tests {
             description: "initial".to_string(),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
             tables: vec![TableSnapshot {
+                comment: None,
                 name: "users".to_string(),
                 schema: "config".to_string(),
                 columns: vec![col("id", "int")],
@@ -2092,6 +2098,7 @@ mod tests {
             description: "v1".to_string(),
             timestamp: "t".to_string(),
             tables: vec![TableSnapshot {
+                comment: None,
                 name: "users".to_string(),
                 schema: "config".to_string(),
                 columns: vec![col("id", "int")],
@@ -2117,6 +2124,7 @@ mod tests {
             description: "initial".to_string(),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
             tables: vec![TableSnapshot {
+                comment: None,
                 name: "users".to_string(),
                 schema: "config".to_string(),
                 columns: vec![col("id", "int")],
@@ -2151,6 +2159,7 @@ mod tests {
             description: "initial".to_string(),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
             tables: vec![TableSnapshot {
+                comment: None,
                 name: "users".to_string(),
                 schema: "config".to_string(),
                 // What sqlparser stored.
@@ -2191,6 +2200,7 @@ mod tests {
             description: "initial".to_string(),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
             tables: vec![TableSnapshot {
+                comment: None,
                 name: "users".to_string(),
                 schema: "config".to_string(),
                 columns: vec![col("id", "INTEGER"), col("name", "VARCHAR(30)")],
@@ -2231,6 +2241,7 @@ mod tests {
             description: "initial".to_string(),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
             tables: vec![TableSnapshot {
+                comment: None,
                 name: "users".to_string(),
                 schema: "config".to_string(),
                 columns: vec![col("name", "VARCHAR(30)")],
@@ -2256,6 +2267,7 @@ mod tests {
             description: "initial".to_string(),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
             tables: vec![TableSnapshot {
+                comment: None,
                 name: "users".to_string(),
                 schema: "config".to_string(),
                 columns: vec![col("name", "VARCHAR(30)")],
@@ -2282,6 +2294,7 @@ mod tests {
             description: "initial".to_string(),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
             tables: vec![TableSnapshot {
+                comment: None,
                 name: "users".to_string(),
                 schema: "config".to_string(),
                 columns: vec![col("id", "int")],
@@ -2319,6 +2332,7 @@ mod tests {
             timestamp: "2026-01-01T00:00:00Z".to_string(),
             tables: vec![
                 TableSnapshot {
+                    comment: None,
                     name: "users".to_string(),
                     schema: "config".to_string(),
                     columns: vec![col("id", "int")],
@@ -2326,6 +2340,7 @@ mod tests {
                     table_constraints: vec![],
                 },
                 TableSnapshot {
+                    comment: None,
                     name: "legacy".to_string(),
                     schema: "config".to_string(),
                     columns: vec![col("id", "int")],
@@ -2411,6 +2426,7 @@ mod tests {
             description: "test".to_string(),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
             tables: vec![TableSnapshot {
+                comment: None,
                 name: "users".to_string(),
                 schema: "config".to_string(),
                 columns: vec![col("id", "int")],
@@ -2669,6 +2685,7 @@ mod tests {
             description: "initial".to_string(),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
             tables: vec![TableSnapshot {
+                comment: None,
                 name: "users".to_string(),
                 schema: "config".to_string(),
                 columns: vec![col("id", "int")],
@@ -2706,6 +2723,7 @@ mod tests {
             description: "initial".to_string(),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
             tables: vec![TableSnapshot {
+                comment: None,
                 name: "users".to_string(),
                 schema: "config".to_string(),
                 columns: vec![col("id", "int")],
@@ -2743,6 +2761,7 @@ mod tests {
             description: "v1".to_string(),
             timestamp: "t".to_string(),
             tables: vec![TableSnapshot {
+                comment: None,
                 name: "users".to_string(),
                 schema: "config".to_string(),
                 columns: vec![col("id", "INT")],
@@ -2769,6 +2788,7 @@ mod tests {
             description: "v1".to_string(),
             timestamp: "t".to_string(),
             tables: vec![TableSnapshot {
+                comment: None,
                 name: "users".to_string(),
                 schema: "config".to_string(),
                 columns: vec![col("id", "INT"), col("name", "TEXT")],
@@ -2805,6 +2825,7 @@ mod tests {
             description: "v1".to_string(),
             timestamp: "t".to_string(),
             tables: vec![TableSnapshot {
+                comment: None,
                 name: "users".to_string(),
                 schema: "config".to_string(),
                 columns: vec![col("id", "INT"), col("n", ty)],
@@ -2862,6 +2883,7 @@ mod tests {
             description: "v1".to_string(),
             timestamp: "t".to_string(),
             tables: vec![TableSnapshot {
+                comment: None,
                 name: "events".to_string(),
                 schema: "config".to_string(),
                 columns: vec![
@@ -2933,6 +2955,7 @@ mod tests {
             description: "v1".to_string(),
             timestamp: "t".to_string(),
             tables: vec![TableSnapshot {
+                comment: None,
                 name: "users".to_string(),
                 schema: "config".to_string(),
                 columns: vec![col("id", "INT"), col("name", "TEXT")],
@@ -2971,6 +2994,7 @@ mod tests {
             description: "v1".to_string(),
             timestamp: "t".to_string(),
             tables: vec![TableSnapshot {
+                comment: None,
                 name: "users".to_string(),
                 schema: "config".to_string(),
                 columns: vec![col("id", "INT")],

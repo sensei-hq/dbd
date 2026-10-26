@@ -84,6 +84,16 @@ fn diff_table_fields(old: &TableSnapshot, new: &TableSnapshot) -> Vec<FieldChang
     changes.extend(diff_columns(&old.columns, &new.columns));
     changes.extend(diff_constraints(&old.table_constraints, &new.table_constraints));
     changes.extend(diff_indexes(&old.indexes, &new.indexes));
+    if old.comment != new.comment {
+        changes.push(FieldChange {
+            field_name: "comment".to_string(),
+            field_type: FieldType::TableComment,
+            action: ChangeAction::Alter {
+                old: Box::new(FieldDetail::TableComment(old.comment.clone())),
+                new: Box::new(FieldDetail::TableComment(new.comment.clone())),
+            },
+        });
+    }
     changes
 }
 

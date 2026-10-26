@@ -152,6 +152,14 @@ fn push_triggers(out: &mut String, entity: &Entity) {
 ///
 /// `None` renders `IS NULL`, which is how Postgres *removes* a comment — needed
 /// when the design drops a comment the live database still carries.
+/// `COMMENT ON TABLE …` setting a table's comment, or clearing it with `None`.
+pub fn emit_table_comment_sql(qname: &str, comment: Option<&str>) -> String {
+    match comment {
+        Some(text) => format!("COMMENT ON TABLE {qname} IS '{}';", esc(text)),
+        None => format!("COMMENT ON TABLE {qname} IS NULL;"),
+    }
+}
+
 pub fn emit_column_comment_sql(qname: &str, column: &str, comment: Option<&str>) -> String {
     match comment {
         Some(text) => format!("COMMENT ON COLUMN {qname}.{} IS '{}';", q(column), esc(text)),

@@ -345,6 +345,7 @@ mod tests {
     }
     fn table(cols: Vec<ColumnDef>) -> TableSnapshot {
         TableSnapshot {
+            comment: None,
             name: "users".into(),
             schema: "public".into(),
             columns: cols,
@@ -614,6 +615,17 @@ mod tests {
         assert!(!d.is_empty(), "comment change must surface");
     }
 
+    /// dbd#110: a changed TABLE comment surfaces too.
+    #[test]
+    fn a_table_comment_change_is_detected() {
+        let mut live = table(vec![col("id", "integer")]);
+        live.comment = Some("old".into());
+        let mut desired = table(vec![col("id", "integer")]);
+        desired.comment = Some("new".into());
+        let d = SchemaDiff::compute(snap(live), snap(desired));
+        assert!(!d.is_empty(), "a table comment change must surface");
+    }
+
     /// The implicit index backing a PK (live-only, from introspection) is not a
     /// real drift and must be suppressed.
     #[test]
@@ -749,6 +761,7 @@ mod tests {
 
         let live = Snapshot {
             tables: vec![TableSnapshot {
+                comment: None,
                 name: "schedules".into(),
                 schema: "sensei".into(),
                 columns: vec![
@@ -779,6 +792,7 @@ mod tests {
 
         let desired = Snapshot {
             tables: vec![TableSnapshot {
+                comment: None,
                 name: "schedules".into(),
                 schema: "sensei".into(),
                 columns: vec![
