@@ -768,6 +768,32 @@
         assert_eq!(sql, "ALTER TABLE public.users ADD COLUMN email text;");
     }
 
+    /// dbd#107: a column added WITH a comment gets its comment in the same pass.
+    /// `plan_comment_convergence` skips a column the live table lacks, on the
+    /// stated rule that its comment rides along with the ADD COLUMN, but the
+    /// ADD COLUMN carried none. So the comment landed only on the next run, and
+    /// the first run's plan was never what it applied.
+    #[test]
+    fn s4b_a_column_added_with_a_comment_gets_it_in_the_same_pass() {
+        let mut c = col("email", "text");
+        c.comment = Some("line one\nline two".to_string());
+        let diffs = vec![MigrationDiff {
+            entity_name: "public.users".to_string(),
+            entity_type: EntityType::Table,
+            action: DiffAction::Change(vec![FieldChange {
+                field_name: "email".to_string(),
+                field_type: FieldType::Column,
+                action: ChangeAction::Add(Box::new(FieldDetail::Column(c))),
+            }]),
+        }];
+        let sql = generate_migration_sql(&diffs);
+        assert_eq!(
+            sql,
+            "ALTER TABLE public.users ADD COLUMN email text;\n\
+             COMMENT ON COLUMN public.users.email IS 'line one\nline two';"
+        );
+    }
+
     // ── S5: Column add with NOT NULL and DEFAULT ────────────
 
     #[test]

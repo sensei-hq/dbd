@@ -1902,9 +1902,9 @@ pub fn plan_exclusion_convergence(plan: &mut ReconcilePlan, live: &Snapshot, des
 /// `COMMENT ON COLUMN … IS '…'`, or `IS NULL` when the design has no comment and
 /// the live database does.
 ///
-/// Comments are metadata, so a change is never destructive. Columns only on one
-/// side are skipped: a new column's comment rides along with its `ADD COLUMN`, and
-/// a dropped column takes its comment with it.
+/// Comments are metadata, so a change is never destructive. A column only in the
+/// design gets its comment here, after its `ADD COLUMN` (the canonical diff that
+/// adds it carries no comments); a dropped column takes its comment with it.
 ///
 /// Table-level comments are not converged here because `TableSnapshot` does not
 /// model them at all — they are invisible to both this pass and `dbd diff`, so
@@ -1929,11 +1929,14 @@ pub fn plan_comment_convergence(plan: &mut ReconcilePlan, live: &Snapshot, desir
 
         let mut lines: Vec<String> = Vec::new();
         for dc in &dt.columns {
-            // Absent from the live table → its comment comes with the ADD COLUMN.
-            let Some(live_comment) = live_comments.get(dc.name.as_str()) else {
-                continue;
-            };
-            if *live_comment == dc.comment.as_ref() {
+            // Absent from the live table: the column is added in this same plan,
+            // by an ADD COLUMN generated from the CANONICAL snapshot, which has
+            // had its comments stripped. So the comment is set here, appended
+            // after that ADD COLUMN. It does not ride along with it; the skip
+            // that assumed it did left every new column uncommented until the
+            // next run (dbd#107).
+            let live_comment = live_comments.get(dc.name.as_str()).copied().flatten();
+            if live_comment == dc.comment.as_ref() {
                 continue;
             }
             lines.push(crate::emit::emit_column_comment_sql(
@@ -3377,10 +3380,13 @@ mod tests {
         );
     }
 
-    /// A column only in the design gets its comment from the `ADD COLUMN`, and a
-    /// table only in the design from its `CREATE TABLE` — neither belongs here.
+    /// dbd#107: a column only in the design gets its comment HERE, in the same
+    /// run that adds it. The ADD COLUMN comes from the canonical snapshot, which
+    /// carries no comments, so assuming the comment rode along with it left it
+    /// unset until the next run. A table only in the design still gets its
+    /// comments from its `CREATE TABLE`.
     #[test]
-    fn comment_convergence_skips_columns_and_tables_not_in_both_sides() {
+    fn comment_convergence_comments_a_new_column_but_not_a_new_table() {
         // New column: live table exists but lacks the column.
         let mut plan = ReconcilePlan::default();
         plan_comment_convergence(
@@ -3388,10 +3394,20 @@ mod tests {
             &docs_with(vec![commented("title", None)]),
             &docs_with(vec![commented("title", None), commented("summary", Some("new col"))]),
         );
+        let sql = plan.altered.iter().map(|s| s.sql.as_str()).collect::<String>();
         assert!(
-            plan.is_empty(),
-            "a new column's comment rides its ADD COLUMN; got {plan:?}"
+            sql.contains("\"summary\" IS 'new col';"),
+            "a new column's comment is planned: {plan:?}"
         );
+
+        // A new column with no comment plans nothing.
+        let mut plan = ReconcilePlan::default();
+        plan_comment_convergence(
+            &mut plan,
+            &docs_with(vec![commented("title", None)]),
+            &docs_with(vec![commented("title", None), commented("summary", None)]),
+        );
+        assert!(plan.is_empty(), "nothing to set: {plan:?}");
 
         // New table entirely.
         let mut plan = ReconcilePlan::default();
