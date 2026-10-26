@@ -288,6 +288,11 @@ fn generate_field_sql(entity_name: &str, _entity_type: &EntityType, change: &Fie
         (FieldType::Column, ChangeAction::Add(detail)) => {
             if let FieldDetail::Column(col) = detail.as_ref() {
                 lines.push(column_add_sql(entity_name, col));
+                // The comment rides with the ADD COLUMN: comment convergence
+                // skips a column the live table lacks, so nothing else sets it.
+                if col.comment.is_some() {
+                    lines.push(column_comment_sql(entity_name, &col.name, col.comment.as_deref()));
+                }
             }
         }
         (FieldType::Column, ChangeAction::Drop(_)) => {
@@ -380,6 +385,14 @@ fn generate_field_sql(entity_name: &str, _entity_type: &EntityType, change: &Fie
 }
 
 /// `ALTER TABLE … ADD COLUMN …` for a newly added column.
+/// `COMMENT ON COLUMN …` setting a column's comment, or clearing it with `None`.
+fn column_comment_sql(entity_name: &str, column: &str, comment: Option<&str>) -> String {
+    match comment {
+        Some(c) => format!("COMMENT ON COLUMN {entity_name}.{column} IS '{}';", esc(c)),
+        None => format!("COMMENT ON COLUMN {entity_name}.{column} IS NULL;"),
+    }
+}
+
 fn column_add_sql(entity_name: &str, col: &crate::entity::ColumnDef) -> String {
     let mut stmt = format!("ALTER TABLE {} ADD COLUMN {} {}", entity_name, col.name, col.data_type);
     if let Some(collation) = &col.collation {
@@ -576,15 +589,11 @@ fn push_column_alter_sql(
         _ => {}
     }
     if old_col.comment != new_col.comment {
-        match &new_col.comment {
-            Some(c) => lines.push(format!(
-                "COMMENT ON COLUMN {}.{} IS '{}';",
-                entity_name,
-                new_col.name,
-                esc(c)
-            )),
-            None => lines.push(format!("COMMENT ON COLUMN {}.{} IS NULL;", entity_name, new_col.name)),
-        }
+        lines.push(column_comment_sql(
+            entity_name,
+            &new_col.name,
+            new_col.comment.as_deref(),
+        ));
     }
     if old_col.identity != new_col.identity {
         match (&old_col.identity, &new_col.identity) {

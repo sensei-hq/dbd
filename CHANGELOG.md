@@ -9,6 +9,25 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.27.7] — 2026-10-26
+
+### Fixed
+
+- **A column `reconcile` adds gets its comment in the same run (#107).**
+  - **Cause:** the `ADD COLUMN` is generated from the canonical snapshot, which
+    has its comments stripped. Comment convergence then skipped every column the
+    live table lacked, on the stated assumption that its comment "rides along
+    with the ADD COLUMN". It did not, so the comment was set only by the next
+    run. The first run's plan was never what it applied, and a deploy that runs
+    reconcile once left the column uncommented.
+  - **Fix:** convergence now comments a new column after its `ADD COLUMN`.
+  - **Also fixed, same cause:** the `diff`/migration path now emits the comment
+    of a column it adds.
+  - Line breaks in the comment play no part (the original report blamed them).
+- **Dependency advisories:** the release lockfile no longer pins the
+  `rustls-webpki`, `webpki-roots` and `ctutils` versions with open RustSec
+  advisories, so `cargo install --locked dbd-cli` installs patched ones.
+
 ## [0.27.6] — 2026-10-25
 
 ### Fixed

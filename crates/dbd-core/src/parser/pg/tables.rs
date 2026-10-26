@@ -1549,6 +1549,16 @@ mod tests {
         assert_eq!(d.columns[1].comment.as_deref(), Some("the name"));
     }
 
+    /// A column comment spanning lines is read with its line breaks exactly as
+    /// written, so it equals what `col_description` returns (ruled out while
+    /// finding dbd#107, whose cause was the ADD COLUMN path, not the line breaks).
+    #[test]
+    fn a_multi_line_column_comment_keeps_its_line_breaks() {
+        let d = def("create table t (id int);\n\
+             comment on column t.id is\n'line one\nline two';");
+        assert_eq!(d.columns[0].comment.as_deref(), Some("line one\nline two"));
+    }
+
     // ── 5. Indexes ──────────────────────────────────────────────────────────
 
     #[test]
