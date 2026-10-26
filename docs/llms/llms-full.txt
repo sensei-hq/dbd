@@ -1404,7 +1404,7 @@ introspection, and normalizes type aliases (`int4` →
 (name/type/collation/nullability/default/identity — a collation change is `ALTER COLUMN …
 TYPE … COLLATE`), **PK/UNIQUE** constraints, **foreign keys** (`MATCH FULL`, `DEFERRABLE` and
 `INITIALLY DEFERRED` included), **CHECK** and **EXCLUDE** constraints (EXCLUDE in a pass of its
-own), **indexes** and **column comments**. What an extension owns is not read from the live
+own), **indexes** and **table and column comments**. What an extension owns is not read from the live
 side, so it is never drift nor an orphan.
 
 Everything is matched by shape, never by name — Postgres auto-names what the
@@ -1501,7 +1501,7 @@ structurally, plus **materialized-view drift** (each matview reported
 the design keeps it, added back below; one on a table outside the run shown as the
 refusal reconcile gives (`--json`: `key_holders`; before 0.27.2 diff showed the key
 change alone). Views/functions/roles/sequences are not structurally diffed, and
-table, view and enum comments are not compared.
+view and enum comments are not compared (table comments are, since 0.27.8).
 
 ### dbd release (alias: dbd baseline)
 

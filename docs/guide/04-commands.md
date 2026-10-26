@@ -1406,8 +1406,8 @@ version: the older-project guard covers `apply` and `deploy`.
 
 **What reconcile compares** (against the introspected live schema): columns
 (name, type, nullability, default, identity), primary-key / unique constraints, **foreign
-keys**, secondary **indexes**, **CHECK** constraints and **column comments** — the same
-tables-and-enums model `dbd diff` reports on. Table comments are not compared. Bare enum types are schema-qualified to match introspection, and so is a type an extension installs outside `public`, however the DDL reached it (`citext` → `extensions.citext`, `vector(384)` → `extensions.vector(384)`); common type aliases are
+keys**, secondary **indexes**, **CHECK** constraints and **table and column comments** — the same
+tables-and-enums model `dbd diff` reports on (table comments since 0.27.8). Bare enum types are schema-qualified to match introspection, and so is a type an extension installs outside `public`, however the DDL reached it (`citext` → `extensions.citext`, `vector(384)` → `extensions.vector(384)`); common type aliases are
 normalized (`int4` → `integer`, `timestamptz` → `timestamp with time zone`). Foreign keys are
 matched by shape (columns, referenced table/columns, actions), so the design's inline `references …`
 and the live DB's auto-named constraint reconcile to no change; a declared FK the live DB lacks is
@@ -1488,7 +1488,7 @@ moving there, and that module's run takes it over (see
 ## `dbd diff`
 
 Read-only. Show the complete difference between the live database and the design:
-columns, PK/unique, foreign keys, CHECK constraints, indexes, column comments and enum
+columns, PK/unique, foreign keys, CHECK constraints, indexes, table and column comments and enum
 values, plus materialized-view drift. Never writes, and available even after `dbd release`.
 
 `diff` and `reconcile` compare the same model. The difference is what each is for:
@@ -1529,7 +1529,7 @@ refused — what that scope does not build would otherwise read as missing with 
 of why. Objects an extension owns are left out on both sides.
 
 **Coverage:** diff covers **tables and enums** (their columns, keys, constraints,
-indexes, column comments and values) plus **materialized-view drift** — each
+indexes, table and column comments and values) plus **materialized-view drift** — each
 matview is reported as `missing` (in the design, not the DB), `drifted` (deployed
 definition differs from the design, by the `dbd:hash` drift stamp dbd recorded
 in `dbd.matview_stamps`), `unstamped` (in the DB with no stamp dbd recorded), or
@@ -1539,8 +1539,8 @@ holds is shown changing as `reconcile` changes it: that foreign key's drop above
 own SQL and, when the design keeps it, its re-add below — or, when the foreign key is on a
 table outside the run, that reconcile refuses the change (`--json`: `key_holders`).
 Views/functions/roles/
-sequences are not structurally diffed, and table, view and enum comments are not
-compared.
+sequences are not structurally diffed, and view and enum comments are not compared
+(table comments are, since 0.27.8).
 
 **Best-effort edges** (reported, but may need a human glance): a foreign key that references a
 table in the *same non-public schema* without qualifying it can read as drift; a standalone

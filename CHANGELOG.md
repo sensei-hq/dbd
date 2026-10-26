@@ -9,6 +9,32 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.27.8] — 2026-10-26
+
+### Fixed
+
+- **A changed table comment is diffed, migrated and converged (#110).**
+  - **Cause:** a table's own `COMMENT ON TABLE` was never compared: the
+    snapshot both sides are reduced to had no field for it. `reconcile` left a
+    changed one in place while `dbd diff` reported the database in sync; column
+    comments already converged.
+  - **Fix:** `TableSnapshot` carries `comment`, from what the DDL parser and
+    introspection already read (`#[serde(default)]`: a snapshot written before
+    reads as no comment). The diff engine reports a `TableComment` change and
+    migrations emit `COMMENT ON TABLE … IS …` / `IS NULL`; reconcile converges it
+    with the column comments.
+  - **Embedders:** `FieldType::TableComment`, `FieldDetail::TableComment` and
+    `history::FieldKind::Comment` are new variants, and `TableSnapshot` a new
+    field; a `match` over them that is exhaustive needs the arm.
+
+### Added
+
+- **`SourceConfig::dialect_stated` and `config::parse` (#109).** `dialect` still
+  reads `postgresql` when `design.yaml` is silent; `dialect_stated` says whether
+  the file said so — "said postgresql" apart from "said nothing", for a reader
+  that infers a dialect from the SQL when the file is silent. `config::parse`
+  reads a design from its text, as `config::read` does after reading the file.
+
 ## [0.27.7] — 2026-10-26
 
 ### Fixed
