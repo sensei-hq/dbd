@@ -9,6 +9,8 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.27.9] — 2026-11-05
+
 ### Fixed
 
 - A function call no longer resolves to a table, view, materialized view, sequence or enum of the same
