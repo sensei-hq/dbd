@@ -34,6 +34,64 @@ fn text(out: &Output) -> String {
     )
 }
 
+/// `git args` in `dir`, asserting success, answering stdout.
+fn git(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .args(["-c", "user.name=test", "-c", "user.email=test@example.com"])
+        .args(args)
+        .current_dir(dir)
+        // #114: the parent's GIT_* env stays behind — under `git commit -a`'s
+        // hook GIT_INDEX_FILE is the real repo's index.lock, which a child
+        // git must never use.
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_COMMON_DIR")
+        .output()
+        .expect("git");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// An env var held at `value` until the guard drops, then put back as it
+/// was. Env is process-wide and this file's tests share the process, so a
+/// `set_var` without this leaks into every test after a failure.
+struct EnvHold {
+    key: &'static str,
+    prev: Option<std::ffi::OsString>,
+}
+
+impl EnvHold {
+    fn set(key: &'static str, value: &str) -> Self {
+        let prev = std::env::var_os(key);
+        // SAFETY: test-only; nothing else in the process sets this var,
+        // and the guard restores it on drop.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        EnvHold { key, prev }
+    }
+}
+
+impl Drop for EnvHold {
+    fn drop(&mut self) {
+        // SAFETY: the restore half of `set`, same grounds.
+        match self.prev.take() {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            Some(prev) => unsafe { std::env::set_var(self.key, prev) },
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            None => unsafe { std::env::remove_var(self.key) },
+        }
+    }
+}
+
 /// `sensei`, with a main database's scope and the Dōjō's.
 fn sensei_like(dir: &Path) {
     write(
@@ -138,27 +196,38 @@ fn split_write_moves_files_with_git_in_a_work_tree() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     sensei_like(dir);
-    let git = |args: &[&str]| {
-        let out = std::process::Command::new("git")
-            .args(["-c", "user.name=test", "-c", "user.email=test@example.com"])
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("git");
-        assert!(
-            out.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8_lossy(&out.stdout).to_string()
-    };
-    git(&["init", "-q"]);
-    git(&["add", "-A"]);
-    git(&["commit", "-q", "-m", "the project"]);
+    git(dir, &["init", "-q"]);
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-q", "-m", "the project"]);
 
     let out = dbd(dir, &["split", "--from-scopes", "--write"]);
     assert!(out.status.success(), "{}", text(&out));
-    let status = git(&["status", "--porcelain"]);
+    let status = git(dir, &["status", "--porcelain"]);
+    assert!(
+        status
+            .lines()
+            .any(|l| l.starts_with("R ") && l.contains("ddl/table/app/orders.ddl -> core/ddl/table/app/orders.ddl")),
+        "{status}"
+    );
+}
+
+/// Under a leaked `GIT_INDEX_FILE` (#114) the git work-tree flow still
+/// passes: `git commit -a` exports the real repo's `index.lock` to its
+/// pre-commit hook, and every git the test and dbd spawn must clear the
+/// inherited git env instead of writing that index.
+#[test]
+fn split_write_moves_files_with_git_under_a_leaked_git_index_file() {
+    let _held = EnvHold::set("GIT_INDEX_FILE", "/nonexistent/dbd-114/index");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sensei_like(dir);
+    git(dir, &["init", "-q"]);
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-q", "-m", "the project"]);
+
+    let out = dbd(dir, &["split", "--from-scopes", "--write"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let status = git(dir, &["status", "--porcelain"]);
     assert!(
         status
             .lines()
@@ -226,18 +295,9 @@ fn a_put_back_git_refuses_is_moved_back_by_hand() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("sensei");
     sensei_like(&dir);
-    let git = |args: &[&str]| {
-        let out = std::process::Command::new("git")
-            .args(["-c", "user.name=test", "-c", "user.email=test@example.com"])
-            .args(args)
-            .current_dir(&dir)
-            .output()
-            .expect("git");
-        assert!(out.status.success(), "git {args:?}");
-    };
-    git(&["init", "-q"]);
-    git(&["add", "-A"]);
-    git(&["commit", "-q", "-m", "the project"]);
+    git(&dir, &["init", "-q"]);
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-q", "-m", "the project"]);
     // A git whose `mv` works twice and then fails, forward and back.
     let real = String::from_utf8(std::process::Command::new("which").arg("git").output().unwrap().stdout).unwrap();
     let bin = tmp.path().join("bin");
