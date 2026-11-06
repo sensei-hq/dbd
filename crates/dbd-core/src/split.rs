@@ -1153,25 +1153,9 @@ fn list(names: &[&String]) -> String {
     names.iter().map(|n| n.as_str()).collect::<Vec<_>>().join(", ")
 }
 
-/// `git` in `dir`, without the parent's `GIT_*` env (#114): under
-/// `git commit -a`'s hook `GIT_INDEX_FILE` is the real repo's
-/// `index.lock`, which a child git must never use — a write lands in the
-/// wrong index, and a failed read silently drops the `git mv` path.
-fn git(dir: &Path) -> std::process::Command {
-    let mut cmd = std::process::Command::new("git");
-    cmd.current_dir(dir);
-    cmd.env_remove("GIT_DIR")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_OBJECT_DIRECTORY")
-        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-        .env_remove("GIT_COMMON_DIR");
-    cmd
-}
-
 /// Whether `dir` is inside a git work tree.
 fn in_git_work_tree(dir: &Path) -> bool {
-    git(dir)
+    crate::git::command(dir)
         .args(["rev-parse", "--is-inside-work-tree"])
         .output()
         .is_ok_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true")
@@ -1179,7 +1163,7 @@ fn in_git_work_tree(dir: &Path) -> bool {
 
 /// Whether git tracks `file` in `dir`'s work tree.
 fn tracked(dir: &Path, file: &Path) -> bool {
-    git(dir)
+    crate::git::command(dir)
         .args(["ls-files", "--error-unmatch", "--"])
         .arg(file)
         .output()
@@ -1188,7 +1172,7 @@ fn tracked(dir: &Path, file: &Path) -> bool {
 
 /// `git mv from to` in `dir` — git's own words, when it will not.
 fn git_mv(dir: &Path, from: &Path, to: &Path) -> std::result::Result<(), String> {
-    let out = git(dir)
+    let out = crate::git::command(dir)
         .args(["mv", "--"])
         .arg(from)
         .arg(to)

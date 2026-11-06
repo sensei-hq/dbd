@@ -36,19 +36,9 @@ fn text(out: &Output) -> String {
 
 /// `git args` in `dir`, asserting success, answering stdout.
 fn git(dir: &Path, args: &[&str]) -> String {
-    let out = std::process::Command::new("git")
+    let out = dbd_core::git::command(dir)
         .args(["-c", "user.name=test", "-c", "user.email=test@example.com"])
         .args(args)
-        .current_dir(dir)
-        // #114: the parent's GIT_* env stays behind — under `git commit -a`'s
-        // hook GIT_INDEX_FILE is the real repo's index.lock, which a child
-        // git must never use.
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_OBJECT_DIRECTORY")
-        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-        .env_remove("GIT_COMMON_DIR")
         .output()
         .expect("git");
     assert!(

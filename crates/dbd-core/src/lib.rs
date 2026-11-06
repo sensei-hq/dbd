@@ -34,6 +34,7 @@ pub mod emit_dialect;
 pub mod entity;
 pub mod error;
 pub mod formatter;
+pub mod git;
 pub mod github;
 pub mod history;
 pub mod init;
