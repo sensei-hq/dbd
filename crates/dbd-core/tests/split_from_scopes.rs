@@ -557,10 +557,9 @@ mod writing {
         sensei_like(root);
         let manifest = std::fs::read_to_string(root.join("design.yaml")).unwrap();
         let git = |args: &[&str]| {
-            std::process::Command::new("git")
+            dbd_core::git::command(root)
                 .args(["-c", "user.name=test", "-c", "user.email=test@example.com"])
                 .args(args)
-                .current_dir(root)
                 .output()
                 .expect("git")
         };

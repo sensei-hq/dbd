@@ -143,9 +143,8 @@ fn the_full_reference_documents_every_command() {
 /// from stop being recorded anywhere.
 #[test]
 fn the_lockfile_is_committed() {
-    let out = Command::new("git")
+    let out = dbd_core::git::command(Path::new(env!("CARGO_MANIFEST_DIR")))
         .args(["ls-files", "--error-unmatch", "Cargo.lock"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .expect("git must be on PATH");
     assert!(
