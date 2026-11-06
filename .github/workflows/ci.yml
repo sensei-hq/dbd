@@ -16,7 +16,10 @@ permissions:
 jobs:
   test:
     name: test + clippy + coverage
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest became 26.04, which has no libxml2.so.2, and the
+    # embedded PostgreSQL 18 binaries link it — initdb failed on every
+    # embedded test. Move up when the embedded build links what 26.04 ships.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
