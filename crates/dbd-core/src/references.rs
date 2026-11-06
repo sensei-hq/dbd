@@ -67,8 +67,26 @@ pub(crate) fn resolve_references_with(
         }
     }
 
+    // What a call can never reach: a call resolves to a routine (or an
+    // external), never to a relation or a type that shares its name — a view
+    // named `now` is not what `default now()` calls (#112).
+    let uncallable: HashSet<String> = entities
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.entity_type,
+                EntityType::Table
+                    | EntityType::View
+                    | EntityType::MaterializedView
+                    | EntityType::Sequence
+                    | EntityType::Enum
+            )
+        })
+        .map(Entity::qualified_key)
+        .collect();
+
     for entity in entities.iter_mut() {
-        resolve_entity_references(entity, &known_names, &folded, &known_catalogs, ignore);
+        resolve_entity_references(entity, &known_names, &uncallable, &folded, &known_catalogs, ignore);
     }
 }
 
@@ -76,6 +94,7 @@ pub(crate) fn resolve_references_with(
 fn resolve_entity_references(
     entity: &mut Entity,
     known: &HashSet<String>,
+    uncallable: &HashSet<String>,
     folded: &HashMap<String, Option<String>>,
     known_catalogs: &HashSet<String>,
     ignore: &[String],
@@ -101,6 +120,7 @@ fn resolve_entity_references(
         &search_path,
         catalog.as_deref(),
         known,
+        uncallable,
         folded,
         known_catalogs,
         ignore,
@@ -122,6 +142,7 @@ fn resolve_entity_refers(
     search_path: &[String],
     catalog: Option<&str>,
     known: &HashSet<String>,
+    uncallable: &HashSet<String>,
     folded: &HashMap<String, Option<String>>,
     known_catalogs: &HashSet<String>,
     ignore: &[String],
@@ -133,12 +154,14 @@ fn resolve_entity_refers(
         if is_ignored(&r.name, ignore) {
             continue;
         }
+        let is_call = r.kind == crate::entity::RefKind::Calls;
+        let reaches = |name: &str| known.contains(name) && !(is_call && uncallable.contains(name));
         // A reference that NAMES a catalog is taken at its word — that is the
         // whole point of writing one. It must not fall through to the bare
         // forms below, or a cross-database edge would quietly resolve to the
         // local table of the same name.
         if let Some(named) = names_a_catalog(&r.name, known_catalogs) {
-            if !known.contains(named) {
+            if !reaches(named) {
                 unresolved.push(r.name.clone());
                 r.unresolved = true;
             }
@@ -150,13 +173,13 @@ fn resolve_entity_refers(
         // catalogued T-SQL tree beside a catalog-less PostgreSQL project.
         if let Some(catalog) = catalog {
             let local = format!("{catalog}.{}", r.name);
-            if known.contains(&local) {
+            if reaches(&local) {
                 r.name = local;
                 resolved.push(r);
                 continue;
             }
         }
-        if known.contains(&r.name) {
+        if reaches(&r.name) {
             // Resolves as written. A schema dbd guessed has now been checked
             // against every entity in the scan and held.
             if r.schema_source.is_guess() {
@@ -170,6 +193,7 @@ fn resolve_entity_refers(
         // used to force, so a schema the SOURCE wrote is never moved.
         if let Some((_, table)) = r.name.split_once('.')
             && let Some(sch) = recover_bare_target(r.schema_source, table, search_path, known)
+            && reaches(&format!("{sch}.{table}"))
         {
             r.name = format!("{sch}.{table}");
             r.schema_source = SchemaSource::Resolved;

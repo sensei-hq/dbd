@@ -9,6 +9,14 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.27.9] — 2026-11-05
+
+### Fixed
+
+- A function call no longer resolves to a table, view, materialized view, sequence or enum of the same
+  name. A view named `now` beside a column's `default now()` made a false cycle that refused every apply
+  (#112).
+
 ## [0.27.8] — 2026-10-26
 
 ### Fixed
