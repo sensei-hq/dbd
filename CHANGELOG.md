@@ -9,6 +9,24 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+### Fixed
+
+- **A dependent that does not use SQLite no longer resolves sqlx-sqlite (#118).** `dbd-core` took sqlx with
+  its default features, whose macros pulled `sqlx-sqlite` — and its `libsqlite3-sys` pin — into a
+  dependent's resolution even with dbd-core's `sqlite` feature off. sqlx is now taken without its defaults
+  (dbd uses no sqlx macros); `postgres` and `sqlite` still add their drivers. A dependent built with
+  `default-features = false, features = ["postgres", …]` can link a fixed SQLite of its own (sensei: rusqlite
+  on `libsqlite3-sys` 0.40, RUSTSEC-2026-0459).
+- **Every spawned git ignores the caller's `GIT_*` environment (#114).** Under `git commit -a` a pre-commit
+  hook inherits `GIT_INDEX_FILE`; dbd's own git calls (rev-parse, ls-files, mv) and the split helpers wrote at
+  the parent's index, and a failed tracked read silently dropped the `git mv` path for hand moves.
+
+### Security
+
+- `quinn-udp` 0.5.16 (RUSTSEC-2026-0538).
+- RUSTSEC-2026-0459 (bundled SQLite in `libsqlite3-sys` 0.30.1) is an approved, tracked exception (#119): the
+  `sqlite` feature ships it through sqlx-sqlite, and no released sqlx allows the fixed `libsqlite3-sys` yet.
+
 ## [0.27.9] — 2026-11-05
 
 ### Fixed
