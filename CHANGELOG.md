@@ -9,6 +9,8 @@ the crates are `0.x`, the **minor** position is the breaking one, so
 
 ## [Unreleased]
 
+## [0.27.10] — 2026-11-16
+
 ### Fixed
 
 - **A dependent that does not use SQLite no longer resolves sqlx-sqlite (#118).** `dbd-core` took sqlx with
