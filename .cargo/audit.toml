@@ -22,4 +22,13 @@ ignore = [
     # resolved by feature selection — it will clear when sqlx drops the
     # dependency or `rsa` ships a constant-time fix. Re-check on each sqlx bump.
     "RUSTSEC-2023-0071",
+
+    # RUSTSEC-2026-0459 — C SQLite CVE-2026-119375 in libsqlite3-sys 0.30.1.
+    #
+    # AN EXCEPTION, NOT A NEVER-COMPILED ENTRY: it fails the bar above — the
+    # `sqlite` feature (default in dbd-cli) bundles it via sqlx-sqlite. No
+    # released sqlx allows libsqlite3-sys >= 0.39 (0.8.6 pins 0.30; 0.9.0 pins
+    # < 0.38). Approved for the v0.27.10 release (2026-11-16); #119 tracks the
+    # sqlx move that clears it. Remove this entry then.
+    "RUSTSEC-2026-0459",
 ]

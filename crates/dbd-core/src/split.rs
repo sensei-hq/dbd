@@ -1155,30 +1155,27 @@ fn list(names: &[&String]) -> String {
 
 /// Whether `dir` is inside a git work tree.
 fn in_git_work_tree(dir: &Path) -> bool {
-    std::process::Command::new("git")
+    crate::git::command(dir)
         .args(["rev-parse", "--is-inside-work-tree"])
-        .current_dir(dir)
         .output()
         .is_ok_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true")
 }
 
 /// Whether git tracks `file` in `dir`'s work tree.
 fn tracked(dir: &Path, file: &Path) -> bool {
-    std::process::Command::new("git")
+    crate::git::command(dir)
         .args(["ls-files", "--error-unmatch", "--"])
         .arg(file)
-        .current_dir(dir)
         .output()
         .is_ok_and(|o| o.status.success())
 }
 
 /// `git mv from to` in `dir` — git's own words, when it will not.
 fn git_mv(dir: &Path, from: &Path, to: &Path) -> std::result::Result<(), String> {
-    let out = std::process::Command::new("git")
+    let out = crate::git::command(dir)
         .args(["mv", "--"])
         .arg(from)
         .arg(to)
-        .current_dir(dir)
         .output()
         .map_err(|e| e.to_string())?;
     if out.status.success() {
