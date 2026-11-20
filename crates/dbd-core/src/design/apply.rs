@@ -311,7 +311,7 @@ impl Design {
         let latest_version = self.config.project.version.unwrap_or(0);
         let pending = snapshot::pending_migrations(db_version, &self.project_dir);
         refuse_a_named_apply_over_pending_migrations(name, db_version, latest_version, &pending)?;
-        // A pending migration whose `data.sql` still holds a `-- TODO:` is
+        // A pending migration whose `data.sql` still holds a marker is
         // refused here, before the first hook — and under `dry_run`, which
         // listed it and said "no issues" while the run refused it. A batch
         // adapter runs no migration, so has none to refuse.

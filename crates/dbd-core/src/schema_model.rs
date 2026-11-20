@@ -455,7 +455,7 @@ fn build_from(input: &Input) -> SchemaModel {
 
 /// Every name a column's type can use to mean one of these enums.
 ///
-/// NOTE: matches c.data_type against the enum entity's name (file-stem, e.g.
+/// Matches c.data_type against the enum entity's name (file-stem, e.g.
 /// "config.status" / "status"), not necessarily the CREATE TYPE identifier
 /// ("status_type"). Works when they coincide; a stricter match is future work.
 fn enum_names(entities: &[crate::entity::Entity]) -> std::collections::HashSet<String> {

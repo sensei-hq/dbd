@@ -266,8 +266,8 @@ pub struct ApplyResult {
     pub to_version: u32,
 }
 
-/// Refuse to apply while any pending migration still has unresolved `-- TODO:`
-/// lines in its `data.sql` files — or was cut by a dbd before 0.27.2 for a
+/// Refuse to apply while any pending migration still has an unresolved marker
+/// in its `data.sql` files — or was cut by a dbd before 0.27.2 for a
 /// type change that, run as written, loses the column's values.
 fn ensure_no_pending_todos(pending: &[PendingMigration]) -> Result<()> {
     let lossy = snapshot::pending_lossy_swaps(pending)?;
@@ -1327,7 +1327,7 @@ impl Design {
         &self.project_dir
     }
 
-    /// Scan all migration directories for unresolved `-- TODO:` comments in
+    /// Scan all migration directories for unresolved marker comments in
     /// `*.data.sql` files. Returns one entry per affected file.
     ///
     /// Used by `inspect` to surface outstanding data corrections.
@@ -4480,7 +4480,7 @@ import:
         assert_eq!(s.created, 1, "the one the migration adds");
     }
 
-    // ── data.sql TODO blocking ────────────────────────────
+    // ── data.sql marker blocking ──────────────────────────
 
     #[tokio::test]
     async fn apply_blocked_when_pending_migration_has_todo() {
@@ -4533,7 +4533,7 @@ import:
         )
         .unwrap();
 
-        // data.sql with no TODO (already resolved)
+        // data.sql with no marker (already resolved)
         let mig_dir = project_dir.join("migrations/001/config");
         std::fs::create_dir_all(&mig_dir).unwrap();
         std::fs::write(

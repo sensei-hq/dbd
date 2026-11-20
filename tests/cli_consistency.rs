@@ -1564,7 +1564,7 @@ fn reconcile_dry_run_does_not_create_a_sqlite_database_file() {
 }
 
 /// `deploy --dry-run` printed "1 entities would be applied." and only then
-/// refused a pending migration's unresolved `-- TODO`, so a refused preview
+/// refused a pending migration's unresolved marker, so a refused preview
 /// began by promising a plan. It refuses first, as `apply --dry-run` does.
 #[test]
 fn deploy_dry_run_refuses_an_unresolved_todo_before_listing_anything() {

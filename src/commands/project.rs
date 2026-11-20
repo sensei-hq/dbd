@@ -852,7 +852,7 @@ async fn deploy_design(design: &mut Design, project_dir: &Path, run: &DeployRun<
             super::announce_adoptions(design, &**adapter, true).await?;
         }
         // The migrations its apply phase executes first, built before anything
-        // is printed: it refuses where the run does — an unresolved `-- TODO`
+        // is printed: it refuses where the run does — an unresolved marker
         // in a pending data script — and a refused preview should not list a
         // plan first, as this one listed its entity count.
         let preview = match &adapter {
