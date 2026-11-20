@@ -9,8 +9,9 @@ name: Release
 # This runs here rather than in `make bump` on purpose. Publishing from the
 # recipe makes the release depend on whichever token happens to be in the
 # maintainer's ~/.cargo/credentials.toml, and a rejected token strands the
-# release *after* the tag is already public. Here the credential is a repo
-# secret, the tree is the tagged one, and a failure is replayable.
+# release *after* the tag is already public. Here the credential is minted
+# per-run via crates.io trusted publishing (OIDC) — no stored token — the
+# tree is the tagged one, and a failure is replayable.
 on:
   push:
     tags: ['v*']
@@ -27,10 +28,14 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-# Least privilege: this job reads the repo and talks to crates.io with its own
-# token. It never pushes, comments, or creates a release.
+# Least privilege: this job reads the repo, mints a short-lived crates.io
+# token via OIDC trusted publishing, and publishes with it. It never pushes,
+# comments, or creates a release.
 permissions:
   contents: read
+  # Required for the OIDC exchange in the authenticate step below; without it
+  # GitHub refuses to issue the identity token that crates.io trusts.
+  id-token: write
 
 jobs:
   publish:
@@ -53,7 +58,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # No cargo caching on this job on purpose: it publishes to crates.io,
+      # and an irreversible publish builds cold, never on cache state a
+      # lower-privilege run could have poisoned (zizmor cache-poisoning).
+      # Releases are infrequent enough that the cold build is cheap.
+      - uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2
+        with:
+          tool: zizmor@1.29
+      # Security gate, before anything slow or irreversible: the tagged tree's
+      # workflows must be zizmor-clean. Same definition as CI and pre-commit
+      # (`make _check-security`) — tags do not trigger CI, so without this
+      # step a workflow finding would reach the publish unchecked.
+      - name: security gate
+        run: make _check-security
 
       # `git tag` and the version `sed` are separate steps in `make bump`, so
       # nothing structural keeps them equal. A mismatch here would upload a
@@ -84,13 +101,21 @@ jobs:
       - name: cargo doc (documentation links)
         run: cargo doc --workspace --no-deps --all-features --locked
 
+      # Trusted publishing: exchange this run's OIDC identity for a short-lived
+      # crates.io token. Both crates trust this repo + workflow (configured on
+      # crates.io, per crate), so one token covers both uploads below. The
+      # action revokes the token when the job finishes.
+      - name: authenticate to crates.io (OIDC trusted publishing)
+        id: crates-auth
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1
+
       # Published one crate at a time, in dependency order, skipping any version
       # already on the registry. `cargo publish --workspace` would refuse the
       # whole set if either crate were already up — which is precisely the state
       # a retry starts from after a partial failure.
       - name: publish
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
         run: |
           set -euo pipefail
           version="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')"

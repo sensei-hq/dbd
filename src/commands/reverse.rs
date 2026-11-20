@@ -732,7 +732,7 @@ fn merge_snapshot(
     // `create_snapshot` bumps design.yaml's version and writes snapshot+migration
     // files itself — do not duplicate that here.
     //
-    // NOTE: both calls below happen *after* apply_overwrite has written all DDL
+    // Both calls below happen *after* apply_overwrite has written all DDL
     // files. A failure here leaves the project in a partial-apply state (files
     // overwritten, no snapshot). Recover via version control.
     let design = dbd_core::Design::from_config_with_dir(config_path, env, Some(project_dir)).context(

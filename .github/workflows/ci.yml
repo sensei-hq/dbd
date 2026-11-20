@@ -148,3 +148,24 @@ jobs:
         working-directory: site
         env:
           CF_PAGES: '1'
+
+  # Workflow security gate. Fails on zizmor findings (unpinned actions,
+  # cache poisoning, missing trusted publishing, ...). Its own job so a
+  # security failure is legible on its own and needs no toolchain — the
+  # install action drops a pinned, checksum-verified zizmor on PATH.
+  # The `make` target is the one definition: pre-commit and `make bump`
+  # (via `_check-ci`) and the release workflow run the same command.
+  security:
+    name: security gate (zizmor)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          # Nothing here needs git auth after checkout — zizmor audits files,
+          # not history — so persisting the token only risks leaking it.
+          persist-credentials: false
+      - uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2
+        with:
+          tool: zizmor@1.29
+      - name: security gate
+        run: make _check-security

@@ -74,6 +74,8 @@ mode = "comment"
 
 [[plugin]]
 name = "trufflehog"
+mode = "block"
 
 [[plugin]]
 name = "zizmor"
+mode = "block"

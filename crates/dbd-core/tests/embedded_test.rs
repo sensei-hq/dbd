@@ -8993,7 +8993,7 @@ async fn the_enum_value_removal_migration_applies() {
         .await
         .expect("seed rows");
 
-    // ── remove 'meh', snapshot, and resolve the data TODO as a user would ──
+    // ── remove 'meh', snapshot, and resolve the data marker as a user would ──
     let design = load("'ok', 'bad'");
     dbd_core::snapshot::create_snapshot(design.entities(), dir, &config, "drop meh").unwrap();
     let todos = dbd_core::snapshot::scan_data_sql_todos(dir).unwrap();
@@ -10491,8 +10491,8 @@ async fn a_version_failing_after_its_enum_values_commit_runs_again_once_fixed() 
 
 // ── A preview refuses and orders as the run does ─────────────────────────────
 
-/// `apply` refuses a pending migration whose `data.sql` still holds a `--
-/// TODO:`, but `apply --dry-run` listed the migration — the TODO's `'???'`
+/// `apply` refuses a pending migration whose `data.sql` still holds a marker,
+/// but `apply --dry-run` listed the migration — the marker's `'???'`
 /// included — and said "no issues". The preview refuses with the run's own
 /// words, and so does `Design::apply` under `dry_run`.
 #[tokio::test]

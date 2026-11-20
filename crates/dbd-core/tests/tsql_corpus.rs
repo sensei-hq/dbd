@@ -281,7 +281,7 @@ fn the_file_kinds_of_a_real_corpus_are_recorded() {
     println!("  ── not classified ──");
     println!("  parse error {errored:>6}  ({:.1}%)", pct(errored, total));
     println!("  unreadable  {unreadable:>6}\n");
-    println!("  NOTE: these are T-SQL files read by the PostgreSQL reader —");
+    println!("  These are T-SQL files read by the PostgreSQL reader —");
     println!("  the parse-error share is the gap the T-SQL reader closes.\n");
 }
 

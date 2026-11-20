@@ -594,7 +594,7 @@ fn snapshot_design(
         }
     }
 
-    // Print TODO items
+    // Print unresolved items
     if !result.todos.is_empty() {
         output::always("\nAction required:");
         for todo in &result.todos {
