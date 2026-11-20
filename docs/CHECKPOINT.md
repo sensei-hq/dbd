@@ -1,22 +1,30 @@
 # Checkpoint
 
-**Slice:** patch 0.27.5 — released. #99 (an unread schema named as a schema;
-`release` names each file) and the `cargo doc` pre-commit gate (#100).
+**Slice:** workflow security hardening + qlty noise (on `develop`, unreleased).
 
 ## Done
 
-- 0.27.5 on crates.io (dbd-cli, dbd-core); tag v0.27.5; release PR #102
-  merged to `main` (df174b83). #99 closed.
-- Installed 0.27.5 reproduces each #99 fix: `snapshot` reads `1 file(s) could
-  not be parsed and 1 schema is not valid` / `schema a.b`; `graph` warns
-  `schema a.b is not valid`; `release` names `t.ddl` and its error.
-- Gate on develop: check-ci with cargo doc, embedded 363/363, cli_live 83/83.
-- No open issues or PRs; branches pruned; one worktree.
+- `release.yml`: OIDC trusted publishing for dbd-core + dbd-cli (registry
+  publishers registered, no stored token), cargo cache removed (cold builds).
+- `make _check-security` (zizmor 1.29, offline): prerequisite of `_check-ci`,
+  CI `security` job, pre-publish in `release.yml`; `tests/security_gate.rs`
+  pins the wiring. qlty exits 0 with findings, so zizmor directly.
+- qlty: 0 security issues; TODO/NOTE notes 61 → 33 (all functional hits).
+- zizmor/trufflehog set to `mode = "block"` (red Cloud statuses on findings).
 
 ## Next
 
-- Nothing pending: `main` CI green on df174b83.
+- `cargo install zizmor --version 1.29.0 --locked` (one-time; pre-commit
+  and `make bump` now require it), then `make bump patch` when ready —
+  the next release carries all of this.
 
 ## Open
 
-- None.
+- Revoke the crates.io API token + delete `CARGO_REGISTRY_TOKEN` after the
+  first green OIDC publish.
+- Trufflehog has no CLI gate (same exit-0); Cloud red-status only — add a
+  dedicated secret-scan step? Qlty Cloud red-status behavior unverified.
+
+## Broken
+
+- None known.
