@@ -31,7 +31,12 @@ endif
 # plain `cargo` and is unaffected.
 export CARGO_INCREMENTAL := 0
 
-.PHONY: help bump patch minor major install clean sweep _check-clean _check-ci
+# Pinned zizmor minor for the security gate: patch releases float (no new
+# audits in patches), minors do not. `tests/security_gate.rs` pins this
+# identical to the `zizmor@` installs in ci.yml and release.yml.
+ZIZMOR_VERSION := 1.29
+
+.PHONY: help bump patch minor major install clean sweep _check-clean _check-ci _check-security
 
 # Install from the working tree, then reclaim target/, leaving the install's own
 # status in `ok` for the caller to act on. Shared verbatim by `install` and the
@@ -72,7 +77,8 @@ help:
 	@echo ""
 	@echo "All bump targets refuse to run if the working tree has uncommitted"
 	@echo "changes or local HEAD differs from origin/<current branch>, and require"
-	@echo "tests, clippy and rustfmt to pass first. After a successful push, bump"
+	@echo "the security gate, tests, clippy, rustfmt and docs to pass first."
+	@echo "After a successful push, bump"
 	@echo "installs the released binary into ~/.cargo/bin, then runs"
 	@echo "'cargo clean' to reclaim disk (next dev build recompiles fresh)."
 	@echo ""
@@ -197,10 +203,10 @@ _check-clean:
 	   exit 1; \
 	 fi
 
-# Pre-flight: tests, clippy, formatting and documentation links must pass
-# before a release — every source check CI runs but the embedded suites and
-# the audit (guarded by tests/pre_commit_hook.rs).
-_check-ci:
+# Pre-flight: the security gate, tests, clippy, formatting and documentation
+# links must pass before a release — every source check CI runs but the
+# embedded suites and the audit (guarded by tests/pre_commit_hook.rs).
+_check-ci: _check-security
 	@echo "Running cargo test..."
 	@cargo test --workspace --quiet
 	@echo "Running cargo clippy..."
@@ -210,3 +216,27 @@ _check-ci:
 	@echo "Running cargo doc..."
 	@cargo doc --workspace --no-deps --all-features --quiet
 	@echo "All checks passed."
+
+# Security gate: audit the repo's automation surface with zizmor. Runs first
+# in `_check-ci` (as its prerequisite), in CI's `security` job, and in
+# `release.yml` before the publish — one definition, guarded by
+# tests/security_gate.rs.
+#
+# zizmor directly, not `qlty check`: qlty reports security findings but exits
+# 0 with them present (verified: high findings, `--fail-level low`, still 0),
+# so it cannot gate. zizmor exits nonzero on any finding in its default
+# persona, audits offline (deterministic, no network flakiness), and needs no
+# toolchain — just the binary on PATH. CI and release install the pinned
+# minor; locally it is a one-time `cargo install` (see below).
+_check-security:
+	@if ! command -v zizmor >/dev/null 2>&1; then \
+	  echo "zizmor $(ZIZMOR_VERSION).x is required for the security gate but is not on PATH."; \
+	  echo "Install it with: cargo install zizmor --version $(ZIZMOR_VERSION).0 --locked"; \
+	  exit 1; \
+	fi
+	@if ! zizmor --version | grep -qF "zizmor $(ZIZMOR_VERSION)."; then \
+	  echo "zizmor $(ZIZMOR_VERSION).x required, found: $$(zizmor --version)"; \
+	  echo "Install it with: cargo install zizmor --version $(ZIZMOR_VERSION).0 --locked"; \
+	  exit 1; \
+	fi
+	@zizmor .
